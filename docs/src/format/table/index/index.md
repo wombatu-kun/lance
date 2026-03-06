@@ -29,7 +29,7 @@ remapping after compaction.
 
 Lance indices are designed with the following design choices in mind:
 
-1. **Indices are loaded on demand**: A dataset and be loaded and read without loading any indices.
+1. **Indices are loaded on demand**: A dataset can be loaded and read without loading any indices.
    Indices are only loaded when a query can benefit from them.
    This design minimizes memory usage and speeds up dataset opening time.
 2. **Indices can be loaded progressively**: indices are designed so that only the necessary parts
