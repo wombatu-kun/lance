@@ -1018,6 +1018,23 @@ impl Field {
     pub fn is_unenforced_primary_key(&self) -> bool {
         self.unenforced_primary_key_position.is_some()
     }
+
+    /// Re-parse well-known metadata keys and update the corresponding structured fields.
+    ///
+    /// Call this after modifying `field.metadata` directly (e.g., via UpdateConfig)
+    /// to keep structured fields like `unenforced_primary_key_position` in sync.
+    pub fn sync_embedded_metadata(&mut self) {
+        self.unenforced_primary_key_position = self
+            .metadata
+            .get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+            .and_then(|s| s.parse::<u32>().ok())
+            .or_else(|| {
+                self.metadata
+                    .get(LANCE_UNENFORCED_PRIMARY_KEY)
+                    .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
+                    .map(|_| 0)
+            });
+    }
 }
 
 impl fmt::Display for Field {
@@ -1098,16 +1115,6 @@ impl TryFrom<&ArrowField> for Field {
             }
             _ => vec![],
         };
-        let unenforced_primary_key_position = metadata
-            .get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
-            .and_then(|s| s.parse::<u32>().ok())
-            .or_else(|| {
-                // Backward compatibility: use 0 for legacy boolean flag
-                metadata
-                    .get(LANCE_UNENFORCED_PRIMARY_KEY)
-                    .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
-                    .map(|_| 0)
-            });
         let is_blob_v2 = has_blob_v2_extension(field);
 
         if is_blob_v2 {
@@ -1125,7 +1132,7 @@ impl TryFrom<&ArrowField> for Field {
             LogicalType::try_from(field.data_type())?
         };
 
-        Ok(Self {
+        let mut result = Self {
             id,
             parent_id: -1,
             name: field.name().clone(),
@@ -1144,8 +1151,10 @@ impl TryFrom<&ArrowField> for Field {
             nullable: field.is_nullable(),
             children,
             dictionary: None,
-            unenforced_primary_key_position,
-        })
+            unenforced_primary_key_position: None,
+        };
+        result.sync_embedded_metadata();
+        Ok(result)
     }
 }
 
