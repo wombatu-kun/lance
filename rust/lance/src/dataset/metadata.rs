@@ -557,4 +557,285 @@ mod tests {
 
         assert!(matches!(result, Err(Error::InvalidInput { .. })));
     }
+
+    /// Helper to create a simple dataset with a non-nullable `id` field suitable for PK tests.
+    async fn test_dataset_for_pk() -> Dataset {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_update_field_metadata_sets_unenforced_primary_key() {
+        let mut dataset = test_dataset_for_pk().await;
+
+        // Set the boolean primary key metadata on the "id" field
+        dataset
+            .update_field_metadata()
+            .update("id", [("lance-schema:unenforced-primary-key", "true")])
+            .unwrap()
+            .await
+            .unwrap();
+
+        let field = dataset.schema().field("id").unwrap();
+        assert!(
+            field.is_unenforced_primary_key(),
+            "Field should be recognized as unenforced primary key after metadata update"
+        );
+        assert_eq!(
+            field.unenforced_primary_key_position,
+            Some(0),
+            "Legacy boolean flag should map to position 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_field_metadata_sets_unenforced_primary_key_position() {
+        let mut dataset = test_dataset_for_pk().await;
+
+        // Set both the boolean flag and explicit position
+        dataset
+            .update_field_metadata()
+            .update(
+                "id",
+                [
+                    ("lance-schema:unenforced-primary-key", "true"),
+                    ("lance-schema:unenforced-primary-key:position", "2"),
+                ],
+            )
+            .unwrap()
+            .await
+            .unwrap();
+
+        let field = dataset.schema().field("id").unwrap();
+        assert!(field.is_unenforced_primary_key());
+        assert_eq!(
+            field.unenforced_primary_key_position,
+            Some(2),
+            "Explicit position should take precedence over boolean flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_field_metadata_removes_unenforced_primary_key() {
+        let mut dataset = test_dataset_for_pk().await;
+
+        // First, set the primary key
+        dataset
+            .update_field_metadata()
+            .update("id", [("lance-schema:unenforced-primary-key", "true")])
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .schema()
+                .field("id")
+                .unwrap()
+                .is_unenforced_primary_key()
+        );
+
+        // Now remove it by setting value to None (delete the key)
+        dataset
+            .update_field_metadata()
+            .update(
+                "id",
+                [("lance-schema:unenforced-primary-key", Option::<&str>::None)],
+            )
+            .unwrap()
+            .await
+            .unwrap();
+
+        let field = dataset.schema().field("id").unwrap();
+        assert!(
+            !field.is_unenforced_primary_key(),
+            "Field should no longer be a primary key after removing the metadata key"
+        );
+        assert_eq!(field.unenforced_primary_key_position, None);
+    }
+
+    #[tokio::test]
+    async fn test_update_field_metadata_replace_clears_unenforced_primary_key() {
+        let mut dataset = test_dataset_for_pk().await;
+
+        // First, set the primary key
+        dataset
+            .update_field_metadata()
+            .update("id", [("lance-schema:unenforced-primary-key", "true")])
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .schema()
+                .field("id")
+                .unwrap()
+                .is_unenforced_primary_key()
+        );
+
+        // Replace all metadata with unrelated keys — PK metadata should be cleared
+        dataset
+            .update_field_metadata()
+            .replace("id", [("some-other-key", "some-value")])
+            .unwrap()
+            .await
+            .unwrap();
+
+        let field = dataset.schema().field("id").unwrap();
+        assert!(
+            !field.is_unenforced_primary_key(),
+            "Primary key status should be cleared after replacing metadata without PK keys"
+        );
+        assert_eq!(field.unenforced_primary_key_position, None);
+    }
+
+    #[tokio::test]
+    async fn test_update_field_metadata_primary_key_roundtrip() {
+        use lance_core::utils::tempfile::TempDir;
+
+        let dir = TempDir::default();
+        let uri = dir.path_str();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Set PK metadata via update
+        dataset
+            .update_field_metadata()
+            .update(
+                "id",
+                [
+                    ("lance-schema:unenforced-primary-key", "true"),
+                    ("lance-schema:unenforced-primary-key:position", "1"),
+                ],
+            )
+            .unwrap()
+            .await
+            .unwrap();
+
+        // Reload the dataset from storage to verify protobuf round-trip
+        let reloaded = Dataset::open(&uri).await.unwrap();
+        let field = reloaded.schema().field("id").unwrap();
+        assert!(
+            field.is_unenforced_primary_key(),
+            "Primary key should survive protobuf round-trip after metadata update"
+        );
+        assert_eq!(
+            field.unenforced_primary_key_position,
+            Some(1),
+            "Primary key position should survive protobuf round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_field_metadata_primary_key_used_by_merge_insert() {
+        use crate::dataset::write::merge_insert::*;
+
+        let mut dataset = test_dataset_for_pk().await;
+
+        // Set PK via metadata update (the bug scenario)
+        dataset
+            .update_field_metadata()
+            .update("id", [("lance-schema:unenforced-primary-key", "true")])
+            .unwrap()
+            .await
+            .unwrap();
+
+        let dataset = Arc::new(dataset);
+
+        // Prepare new data that overlaps with existing
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Utf8, true),
+        ]));
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 4])),
+                Arc::new(arrow_array::StringArray::from(vec!["updated", "new"])),
+            ],
+        )
+        .unwrap();
+
+        // MergeInsert with empty `on` keys — should default to the unenforced PK
+        let mut builder = MergeInsertBuilder::try_new(dataset.clone(), Vec::new()).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll);
+        let job = builder.try_build().unwrap();
+
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+        let new_stream = lance_datafusion::utils::reader_to_stream(new_reader);
+
+        let (updated_dataset, stats) = job.execute(new_stream).await.unwrap();
+
+        assert_eq!(stats.num_inserted_rows, 1, "id=4 should be inserted");
+        assert_eq!(stats.num_updated_rows, 1, "id=2 should be updated");
+
+        let result = updated_dataset.scan().try_into_batch().await.unwrap();
+        let ids = result
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = result
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+
+        let mut pairs: Vec<(i32, String)> = (0..ids.len())
+            .map(|i| (ids.value(i), values.value(i).to_string()))
+            .collect();
+        pairs.sort_by_key(|(id, _)| *id);
+
+        assert_eq!(
+            pairs,
+            vec![
+                (1, "a".to_string()),
+                (2, "updated".to_string()),
+                (3, "c".to_string()),
+                (4, "new".to_string()),
+            ]
+        );
+    }
 }
