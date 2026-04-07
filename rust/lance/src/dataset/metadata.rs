@@ -838,4 +838,61 @@ mod tests {
             ]
         );
     }
+
+    #[tokio::test]
+    async fn test_update_field_metadata_invalid_pk_position_returns_error() {
+        let mut dataset = test_dataset_for_pk().await;
+
+        let result = dataset
+            .update_field_metadata()
+            .update(
+                "id",
+                [("lance-schema:unenforced-primary-key:position", "abc")],
+            )
+            .unwrap()
+            .await;
+
+        assert!(result.is_err(), "Non-numeric position should return error");
+        assert!(matches!(result.unwrap_err(), Error::InvalidInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_update_field_metadata_negative_pk_position_returns_error() {
+        let mut dataset = test_dataset_for_pk().await;
+
+        let result = dataset
+            .update_field_metadata()
+            .update(
+                "id",
+                [("lance-schema:unenforced-primary-key:position", "-1")],
+            )
+            .unwrap()
+            .await;
+
+        assert!(result.is_err(), "Negative position should return error");
+        assert!(matches!(result.unwrap_err(), Error::InvalidInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_update_field_metadata_overflow_pk_position_returns_error() {
+        let mut dataset = test_dataset_for_pk().await;
+
+        let result = dataset
+            .update_field_metadata()
+            .update(
+                "id",
+                [(
+                    "lance-schema:unenforced-primary-key:position",
+                    "99999999999",
+                )],
+            )
+            .unwrap()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Overflowing u32 position should return error"
+        );
+        assert!(matches!(result.unwrap_err(), Error::InvalidInput { .. }));
+    }
 }
