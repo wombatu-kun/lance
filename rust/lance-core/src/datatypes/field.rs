@@ -1003,17 +1003,22 @@ impl Field {
     ///
     /// Call this after modifying `field.metadata` directly (e.g., via UpdateConfig)
     /// to keep structured fields like `unenforced_primary_key_position` in sync.
-    pub fn sync_embedded_metadata(&mut self) {
-        self.unenforced_primary_key_position = self
-            .metadata
-            .get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
-            .and_then(|s| s.parse::<u32>().ok())
-            .or_else(|| {
+    pub fn sync_embedded_metadata(&mut self) -> Result<()> {
+        self.unenforced_primary_key_position =
+            if let Some(s) = self.metadata.get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION) {
+                Some(s.parse::<u32>().map_err(|e| {
+                    Error::invalid_input(format!(
+                        "Invalid value '{}' for {}: {}",
+                        s, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, e
+                    ))
+                })?)
+            } else {
                 self.metadata
                     .get(LANCE_UNENFORCED_PRIMARY_KEY)
                     .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
                     .map(|_| 0)
-            });
+            };
+        Ok(())
     }
 }
 
@@ -1133,7 +1138,7 @@ impl TryFrom<&ArrowField> for Field {
             dictionary: None,
             unenforced_primary_key_position: None,
         };
-        result.sync_embedded_metadata();
+        result.sync_embedded_metadata()?;
         Ok(result)
     }
 }
@@ -1798,5 +1803,26 @@ mod tests {
         field.unloaded_mut();
         assert_eq!(field.children.len(), 5);
         assert_eq!(field.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+    }
+
+    #[test]
+    fn test_try_from_arrow_field_invalid_pk_position_returns_error() {
+        let arrow_field =
+            ArrowField::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_string(),
+                "not_a_number".to_string(),
+            )]));
+
+        let result = Field::try_from(&arrow_field);
+        assert!(
+            result.is_err(),
+            "Invalid pk position should fail in TryFrom"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not_a_number"),
+            "Error should include the invalid value: {}",
+            err_msg
+        );
     }
 }

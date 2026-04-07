@@ -2213,7 +2213,7 @@ impl Transaction {
                 for (field_id, field_metadata_update) in field_metadata_updates {
                     if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
                         apply_update_map(&mut field.metadata, field_metadata_update);
-                        field.sync_embedded_metadata();
+                        field.sync_embedded_metadata()?;
                     } else {
                         return Err(Error::invalid_input_source(
                             format!("Field with id {} does not exist", field_id).into(),
