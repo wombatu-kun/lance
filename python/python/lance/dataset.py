@@ -3719,7 +3719,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.drop_index(name)
 
-    def prewarm_index(self, name: str):
+    def prewarm_index(self, name: str, *, with_position: bool = False):
         """
         Prewarm an index
 
@@ -3731,8 +3731,12 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         name: str
             The name of the index to prewarm.
+        with_position: bool, default False
+            This is only supported for ``INVERTED`` indices. If True, positions are
+            also loaded into the cache during prewarm so phrase queries do not need a
+            separate lazy positions read.
         """
-        return self._ds.prewarm_index(name)
+        return self._ds.prewarm_index(name, with_position=with_position)
 
     def merge_index_metadata(
         self,
