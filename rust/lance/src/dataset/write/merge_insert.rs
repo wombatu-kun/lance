@@ -1479,10 +1479,12 @@ impl MergeInsertJob {
     /// Check if the merge insert operation can use the fast path (create_plan).
     ///
     /// The fast path is only available for specific conditions:
-    /// - when_matched is UpdateAll or UpdateIf or Fail
-    /// - Either use_index is false OR there's no scalar index on join key
-    /// - Source schema matches dataset schema exactly
-    /// - when_not_matched_by_source is Keep, Delete, or DeleteIf
+    /// - `when_matched` is `UpdateAll`, `UpdateIf`, `Fail`, `Delete`, or `DoNothing`
+    /// - Either `use_index` is false OR there's no scalar index on the join key
+    /// - Source schema matches the dataset schema exactly, OR the operation is
+    ///   delete-only / find-or-create with the source containing at least the
+    ///   key columns
+    /// - `when_not_matched_by_source` is `Keep`, `Delete`, or `DeleteIf`
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
         // Convert to lance schema for comparison
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
@@ -1523,6 +1525,7 @@ impl MergeInsertJob {
                 | WhenMatched::UpdateIf(_)
                 | WhenMatched::Fail
                 | WhenMatched::Delete
+                | WhenMatched::DoNothing
         ) && (!self.params.use_index || !has_scalar_index)
             && schema_ok
             && matches!(
@@ -4349,6 +4352,64 @@ mod tests {
         ).await.unwrap();
     }
 
+    /// Verifies that a default find-or-create merge insert
+    /// (`WhenMatched::DoNothing` + `WhenNotMatched::InsertAll`) is routed
+    /// through the v2 `FullSchemaMergeInsertExec` path. Prior to this
+    /// change, `can_use_create_plan` rejected `DoNothing` outright and the
+    /// operation fell back to the legacy v1 `Merger`; the assertion below
+    /// would fail on `main`. See lance-format/lance#6441.
+    #[tokio::test]
+    async fn test_fast_path_find_or_create() {
+        let data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(1))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(32));
+
+        // Create dataset with initial data
+        let ds = Dataset::write(data, "memory://", None).await.unwrap();
+
+        // Default MergeInsertBuilder config is find-or-create:
+        //   when_matched = DoNothing, when_not_matched = InsertAll.
+        let merge_insert_job =
+            crate::dataset::MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+                .unwrap()
+                .try_build()
+                .unwrap();
+
+        // Source data with a mix of already-present and new keys.
+        let new_data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(2))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let new_data = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
+        let new_data_stream = reader_to_stream(Box::new(new_data));
+
+        // Should reach the v2 fast path (`create_plan` + FullSchemaMergeInsertExec).
+        // Dropping to v1 here would return an error from create_plan instead.
+        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+
+        // The join is Right because we keep unmatched source rows (InsertAll)
+        // but discard unmatched target rows (DoNothing on when_matched,
+        // Keep on when_not_matched_by_source). The CASE expression simplifies
+        // to `_rowaddr IS NULL → Insert, else Nothing`; we leave the exact
+        // shape of the Projection flexible via "..." wildcards.
+        assert_plan_node_equals(
+            plan,
+            "MergeInsert: on=[key], when_matched=DoNothing, when_not_matched=InsertAll, when_not_matched_by_source=Keep
+  CoalescePartitionsExec
+    ProjectionExec: expr=[...CASE WHEN _rowaddr@1 IS NULL THEN 2 ELSE 0 END as __action]
+      HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)]...
+        CooperativeExec
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        RepartitionExec...
+          ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
+            StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn test_skip_auto_cleanup() {
         let tmpdir = TempStrDir::default();
@@ -4728,6 +4789,102 @@ mod tests {
         assert!(
             matches!(result2, Err(crate::Error::TooMuchWriteContention { .. })),
             "Expected TooMuchWriteContention (retryable conflict exhausted), got: {:?}",
+            result2
+        );
+    }
+
+    /// Concurrency regression for lance-format/lance#6441: two concurrent
+    /// find-or-create jobs (`WhenMatched::DoNothing` + `WhenNotMatched::InsertAll`)
+    /// both try to insert the same fresh key. The second must fail with
+    /// `TooMuchWriteContention` because the bloom-filter-backed
+    /// `inserted_rows_filter` detects the overlap during rebase. Before
+    /// routing find-or-create through v2 this did not work at all: the v1
+    /// path returned `inserted_rows_filter=None`, so there was nothing to
+    /// intersect against during conflict resolution.
+    #[tokio::test]
+    async fn test_concurrent_find_or_create_same_new_key() {
+        // Schema with an unenforced primary key on "id" — that is what
+        // activates bloom-filter conflict detection.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_string(),
+                    "true".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        // Initial dataset with ids 0..=3 — id=100 is not present.
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(UInt32Array::from(vec![0, 0, 0, 0])),
+            ],
+        )
+        .unwrap();
+
+        let dataset = InsertBuilder::new("memory://")
+            .execute(vec![initial])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Both jobs try to find-or-create the same new id=100.
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![100])),
+                Arc::new(UInt32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![100])),
+                Arc::new(UInt32Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+
+        // b2 is built against version 1 with zero retries, so when it needs
+        // to rebase against b1's commit the bloom-filter intersection decides
+        // the outcome directly.
+        let b2 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::DoNothing)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .conflict_retries(0)
+            .try_build()
+            .unwrap();
+
+        // First job commits successfully, producing version 2 with id=100.
+        let s1 = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(vec![Ok(batch1.clone())]),
+        );
+        let b1 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::DoNothing)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        let result1 = b1.execute(Box::pin(s1) as SendableRecordBatchStream).await;
+        assert!(result1.is_ok(), "First find-or-create should succeed");
+
+        // Second job fails because its inserted_rows_filter overlaps b1's.
+        let s2 = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(vec![Ok(batch2.clone())]),
+        );
+        let result2 = b2.execute(Box::pin(s2) as SendableRecordBatchStream).await;
+
+        assert!(
+            matches!(result2, Err(crate::Error::TooMuchWriteContention { .. })),
+            "Expected TooMuchWriteContention (bloom-filter conflict) for find-or-create, got: {:?}",
             result2
         );
     }
@@ -5383,6 +5540,37 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         assert!(verbose_plan.contains("MergeInsert"));
         // Verbose should also match the expected pattern
         assert_string_matches(&verbose_plan, expected_pattern).unwrap();
+    }
+
+    /// Asserts that `explain_plan()` is supported for a default find-or-create
+    /// configuration (`WhenMatched::DoNothing` + `WhenNotMatched::InsertAll`).
+    /// Before lance-format/lance#6441 this returned `Error::NotSupported`
+    /// because the job fell back to the legacy v1 path.
+    #[tokio::test]
+    async fn test_explain_plan_find_or_create() {
+        let dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col("name", array::cycle_utf8_literals(&["a", "b", "c"]))
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(3))
+            .await
+            .unwrap();
+
+        // Default builder config == find-or-create.
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .try_build()
+                .unwrap();
+
+        let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
+
+        let expected_pattern = "\
+MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_not_matched_by_source=Keep...
+  CoalescePartitionsExec...
+    HashJoinExec...join_type=Right...
+      LanceRead...
+      StreamingTableExec: partition_sizes=1, projection=[id, name]";
+        assert_string_matches(&plan, expected_pattern).unwrap();
     }
 
     #[tokio::test]
