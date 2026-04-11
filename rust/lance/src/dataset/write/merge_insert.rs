@@ -3987,6 +3987,131 @@ mod tests {
             }
         }
 
+        /// Partial-schema v2 upsert must correctly handle `camelCase` column
+        /// names both in the join key and in a column that is *omitted* from
+        /// the source. DataFusion's `col()` lowercases unquoted identifiers,
+        /// so the partial-schema fill-in wraps the target reference in double
+        /// quotes (`target."<name>"`) and `on_cols` are likewise quoted. This
+        /// test pins that behavior down — prior to this, the v2 partial-schema
+        /// path had no coverage for case-sensitive column names.
+        #[tokio::test]
+        async fn test_merge_insert_subcols_v2_camel_case_column() {
+            // Target dataset: camelCase join key AND a camelCase nullable
+            // column that will be omitted from the source schema.
+            let full_schema = Arc::new(Schema::new(vec![
+                Field::new("userId", DataType::Utf8, false),
+                Field::new("score", DataType::UInt32, true),
+                Field::new("extraData", DataType::Utf8, true),
+            ]));
+            let full_batch = RecordBatch::try_new(
+                full_schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["u1", "u2", "u3"])),
+                    Arc::new(UInt32Array::from(vec![10, 20, 30])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
+            .unwrap();
+            let ds = Dataset::write(
+                Box::new(RecordBatchIterator::new([Ok(full_batch)], full_schema)),
+                "memory://",
+                None,
+            )
+            .await
+            .unwrap();
+            let ds = Arc::new(ds);
+
+            // Partial-schema source: no `extraData`. Updates `u2` and inserts `u_new`.
+            let partial_schema = Arc::new(Schema::new(vec![
+                Field::new("userId", DataType::Utf8, false),
+                Field::new("score", DataType::UInt32, true),
+            ]));
+            let partial_batch = RecordBatch::try_new(
+                partial_schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["u2", "u_new"])),
+                    Arc::new(UInt32Array::from(vec![22, 99])),
+                ],
+            )
+            .unwrap();
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(partial_batch)],
+                partial_schema,
+            ));
+
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["userId".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+            let (updated_ds, stats) = job
+                .execute_reader(reader)
+                .await
+                .expect("camelCase partial-schema upsert must succeed on v2");
+
+            assert_eq!(stats.num_updated_rows, 1);
+            assert_eq!(stats.num_inserted_rows, 1);
+            assert_eq!(stats.num_deleted_rows, 0);
+
+            // Read the whole dataset back and index by userId so assertions
+            // are independent of physical row order.
+            let data = updated_ds
+                .scan()
+                .scan_in_order(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(data.num_rows(), 4);
+            assert_eq!(data.num_columns(), 3);
+
+            let user_ids = data
+                .column_by_name("userId")
+                .expect("camelCase join key column must be present in result")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let scores = data
+                .column_by_name("score")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            let extra = data
+                .column_by_name("extraData")
+                .expect("camelCase omitted column must be present in result")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            let mut by_user: std::collections::HashMap<String, (u32, Option<String>)> =
+                std::collections::HashMap::new();
+            for i in 0..data.num_rows() {
+                let extra_val = if extra.is_null(i) {
+                    None
+                } else {
+                    Some(extra.value(i).to_string())
+                };
+                by_user.insert(user_ids.value(i).to_string(), (scores.value(i), extra_val));
+            }
+
+            // Untouched rows: unchanged.
+            assert_eq!(by_user["u1"], (10, Some("a".to_string())));
+            assert_eq!(by_user["u3"], (30, Some("c".to_string())));
+            // Updated row: score bumped, camelCase `extraData` preserved from target.
+            assert_eq!(
+                by_user["u2"],
+                (22, Some("b".to_string())),
+                "partial-schema update must preserve camelCase `extraData` from the target side of the join"
+            );
+            // Inserted row: camelCase column must be NULL (outer-join target side is NULL).
+            assert_eq!(
+                by_user["u_new"],
+                (99, None),
+                "partial-schema insert must produce NULL for omitted camelCase column"
+            );
+        }
+
         /// End-to-end bloom-filter conflict-detection check for a
         /// partial-schema upsert. With the v2 path enabled for partial
         /// schema, the returned transaction must carry a populated
