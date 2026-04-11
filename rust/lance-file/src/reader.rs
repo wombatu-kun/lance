@@ -342,6 +342,13 @@ pub struct FileReaderOptions {
     /// will be read in multiple chunks to control memory usage.
     /// Default: 8MB (DEFAULT_READ_CHUNK_SIZE)
     pub read_chunk_size: u64,
+    /// If set, the reader will produce batches whose total size in bytes
+    /// is approximately this value, overriding the row-based `batch_size`.
+    ///
+    /// This can be set at the dataset level (via `ReadParams::file_reader_options`)
+    /// to provide a default for all scans, or at the scanner level (via
+    /// `Scanner::batch_size_bytes`) to override per scan.
+    pub batch_size_bytes: Option<u64>,
 }
 
 impl Default for FileReaderOptions {
@@ -349,6 +356,7 @@ impl Default for FileReaderOptions {
         Self {
             decoder_config: DecoderConfig::default(),
             read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
+            batch_size_bytes: None,
         }
     }
 }
@@ -871,6 +879,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
+        batch_size_bytes: Option<u64>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Reading range {:?} with batch_size {} from file with {} rows and {} columns into schema with {} columns",
@@ -887,7 +896,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
-            batch_size_bytes: None,
+            batch_size_bytes,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
@@ -921,6 +930,7 @@ impl FileReader {
             projection,
             filter,
             self.options.decoder_config.clone(),
+            self.options.batch_size_bytes,
         )
     }
 
@@ -935,6 +945,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
+        batch_size_bytes: Option<u64>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
@@ -951,7 +962,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
-            batch_size_bytes: None,
+            batch_size_bytes,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -983,6 +994,7 @@ impl FileReader {
             projection,
             FilterExpression::no_filter(),
             self.options.decoder_config.clone(),
+            self.options.batch_size_bytes,
         )
     }
 
@@ -997,6 +1009,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
+        batch_size_bytes: Option<u64>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         debug!(
@@ -1015,7 +1028,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
-            batch_size_bytes: None,
+            batch_size_bytes,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1047,6 +1060,7 @@ impl FileReader {
             projection,
             filter,
             self.options.decoder_config.clone(),
+            self.options.batch_size_bytes,
         )
     }
 
@@ -1194,7 +1208,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
-            batch_size_bytes: None,
+            batch_size_bytes: self.options.batch_size_bytes,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -1234,7 +1248,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
-            batch_size_bytes: None,
+            batch_size_bytes: self.options.batch_size_bytes,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1274,7 +1288,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
-            batch_size_bytes: None,
+            batch_size_bytes: self.options.batch_size_bytes,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
