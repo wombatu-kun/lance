@@ -1025,20 +1025,27 @@ impl Field {
     /// to keep structured fields like `unenforced_primary_key_position` in sync.
     pub fn sync_embedded_metadata(&mut self) -> Result<()> {
         self.unenforced_primary_key_position =
-            if let Some(s) = self.metadata.get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION) {
-                Some(s.parse::<u32>().map_err(|e| {
-                    Error::invalid_input(format!(
-                        "Invalid value '{}' for {}: {}",
-                        s, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, e
-                    ))
-                })?)
-            } else {
-                self.metadata
-                    .get(LANCE_UNENFORCED_PRIMARY_KEY)
-                    .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
-                    .map(|_| 0)
-            };
+            parse_unenforced_primary_key_position(&self.metadata)?;
         Ok(())
+    }
+}
+
+fn parse_unenforced_primary_key_position(
+    metadata: &HashMap<String, String>,
+) -> Result<Option<u32>> {
+    if let Some(s) = metadata.get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION) {
+        let parsed = s.parse::<u32>().map_err(|e| {
+            Error::invalid_input(format!(
+                "Invalid value '{}' for {}: {}",
+                s, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, e
+            ))
+        })?;
+        Ok(Some(parsed))
+    } else {
+        Ok(metadata
+            .get(LANCE_UNENFORCED_PRIMARY_KEY)
+            .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
+            .map(|_| 0))
     }
 }
 
@@ -1137,7 +1144,9 @@ impl TryFrom<&ArrowField> for Field {
             LogicalType::try_from(field.data_type())?
         };
 
-        let mut result = Self {
+        let unenforced_primary_key_position = parse_unenforced_primary_key_position(&metadata)?;
+
+        Ok(Self {
             id,
             parent_id: -1,
             name: field.name().clone(),
@@ -1156,10 +1165,8 @@ impl TryFrom<&ArrowField> for Field {
             nullable: field.is_nullable(),
             children,
             dictionary: None,
-            unenforced_primary_key_position: None,
-        };
-        result.sync_embedded_metadata()?;
-        Ok(result)
+            unenforced_primary_key_position,
+        })
     }
 }
 
