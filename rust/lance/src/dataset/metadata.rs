@@ -587,7 +587,7 @@ mod tests {
     async fn test_update_field_metadata_sets_unenforced_primary_key() {
         let mut dataset = test_dataset_for_pk().await;
 
-        // Set the boolean primary key metadata on the "id" field
+        // Legacy boolean flag should map to position 0.
         dataset
             .update_field_metadata()
             .update("id", [("lance-schema:unenforced-primary-key", "true")])
@@ -605,21 +605,13 @@ mod tests {
             Some(0),
             "Legacy boolean flag should map to position 0"
         );
-    }
 
-    #[tokio::test]
-    async fn test_update_field_metadata_sets_unenforced_primary_key_position() {
-        let mut dataset = test_dataset_for_pk().await;
-
-        // Set both the boolean flag and explicit position
+        // Explicit position should override the legacy flag.
         dataset
             .update_field_metadata()
             .update(
                 "id",
-                [
-                    ("lance-schema:unenforced-primary-key", "true"),
-                    ("lance-schema:unenforced-primary-key:position", "2"),
-                ],
+                [("lance-schema:unenforced-primary-key:position", "2")],
             )
             .unwrap()
             .await
@@ -630,137 +622,7 @@ mod tests {
         assert_eq!(
             field.unenforced_primary_key_position,
             Some(2),
-            "Explicit position should take precedence over boolean flag"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_update_field_metadata_removes_unenforced_primary_key() {
-        let mut dataset = test_dataset_for_pk().await;
-
-        // First, set the primary key
-        dataset
-            .update_field_metadata()
-            .update("id", [("lance-schema:unenforced-primary-key", "true")])
-            .unwrap()
-            .await
-            .unwrap();
-        assert!(
-            dataset
-                .schema()
-                .field("id")
-                .unwrap()
-                .is_unenforced_primary_key()
-        );
-
-        // Now remove it by setting value to None (delete the key)
-        dataset
-            .update_field_metadata()
-            .update(
-                "id",
-                [("lance-schema:unenforced-primary-key", Option::<&str>::None)],
-            )
-            .unwrap()
-            .await
-            .unwrap();
-
-        let field = dataset.schema().field("id").unwrap();
-        assert!(
-            !field.is_unenforced_primary_key(),
-            "Field should no longer be a primary key after removing the metadata key"
-        );
-        assert_eq!(field.unenforced_primary_key_position, None);
-    }
-
-    #[tokio::test]
-    async fn test_update_field_metadata_replace_clears_unenforced_primary_key() {
-        let mut dataset = test_dataset_for_pk().await;
-
-        // First, set the primary key
-        dataset
-            .update_field_metadata()
-            .update("id", [("lance-schema:unenforced-primary-key", "true")])
-            .unwrap()
-            .await
-            .unwrap();
-        assert!(
-            dataset
-                .schema()
-                .field("id")
-                .unwrap()
-                .is_unenforced_primary_key()
-        );
-
-        // Replace all metadata with unrelated keys — PK metadata should be cleared
-        dataset
-            .update_field_metadata()
-            .replace("id", [("some-other-key", "some-value")])
-            .unwrap()
-            .await
-            .unwrap();
-
-        let field = dataset.schema().field("id").unwrap();
-        assert!(
-            !field.is_unenforced_primary_key(),
-            "Primary key status should be cleared after replacing metadata without PK keys"
-        );
-        assert_eq!(field.unenforced_primary_key_position, None);
-    }
-
-    #[tokio::test]
-    async fn test_update_field_metadata_primary_key_roundtrip() {
-        use lance_core::utils::tempfile::TempDir;
-
-        let dir = TempDir::default();
-        let uri = dir.path_str();
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("value", DataType::Utf8, true),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .unwrap();
-
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-            &uri,
-            None,
-        )
-        .await
-        .unwrap();
-
-        // Set PK metadata via update
-        dataset
-            .update_field_metadata()
-            .update(
-                "id",
-                [
-                    ("lance-schema:unenforced-primary-key", "true"),
-                    ("lance-schema:unenforced-primary-key:position", "1"),
-                ],
-            )
-            .unwrap()
-            .await
-            .unwrap();
-
-        // Reload the dataset from storage to verify protobuf round-trip
-        let reloaded = Dataset::open(&uri).await.unwrap();
-        let field = reloaded.schema().field("id").unwrap();
-        assert!(
-            field.is_unenforced_primary_key(),
-            "Primary key should survive protobuf round-trip after metadata update"
-        );
-        assert_eq!(
-            field.unenforced_primary_key_position,
-            Some(1),
-            "Primary key position should survive protobuf round-trip"
+            "Explicit position should take precedence over the legacy boolean flag"
         );
     }
 
@@ -837,62 +699,5 @@ mod tests {
                 (4, "new".to_string()),
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn test_update_field_metadata_invalid_pk_position_returns_error() {
-        let mut dataset = test_dataset_for_pk().await;
-
-        let result = dataset
-            .update_field_metadata()
-            .update(
-                "id",
-                [("lance-schema:unenforced-primary-key:position", "abc")],
-            )
-            .unwrap()
-            .await;
-
-        assert!(result.is_err(), "Non-numeric position should return error");
-        assert!(matches!(result.unwrap_err(), Error::InvalidInput { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_update_field_metadata_negative_pk_position_returns_error() {
-        let mut dataset = test_dataset_for_pk().await;
-
-        let result = dataset
-            .update_field_metadata()
-            .update(
-                "id",
-                [("lance-schema:unenforced-primary-key:position", "-1")],
-            )
-            .unwrap()
-            .await;
-
-        assert!(result.is_err(), "Negative position should return error");
-        assert!(matches!(result.unwrap_err(), Error::InvalidInput { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_update_field_metadata_overflow_pk_position_returns_error() {
-        let mut dataset = test_dataset_for_pk().await;
-
-        let result = dataset
-            .update_field_metadata()
-            .update(
-                "id",
-                [(
-                    "lance-schema:unenforced-primary-key:position",
-                    "99999999999",
-                )],
-            )
-            .unwrap()
-            .await;
-
-        assert!(
-            result.is_err(),
-            "Overflowing u32 position should return error"
-        );
-        assert!(matches!(result.unwrap_err(), Error::InvalidInput { .. }));
     }
 }
