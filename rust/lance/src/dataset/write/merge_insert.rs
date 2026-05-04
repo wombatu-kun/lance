@@ -4224,9 +4224,10 @@ mod tests {
                 .transaction_file
                 .clone()
                 .expect("transaction file must be written");
-            let tx_read = read_transaction_file(dataset.object_store(), &dataset.base, &tx_path)
-                .await
-                .unwrap();
+            let tx_read =
+                read_transaction_file(dataset.object_store.as_ref(), &dataset.base, &tx_path)
+                    .await
+                    .unwrap();
             match &tx_read.operation {
                 Operation::Update {
                     inserted_rows_filter,
