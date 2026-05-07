@@ -507,7 +507,8 @@ async fn can_use_binary_copy_impl(
             };
             let full_path = dataset
                 .data_file_dir(data_file)?
-                .child(data_file.path.as_str());
+                .clone()
+                .join(data_file.path.as_str());
             let scan_scheduler = ScanScheduler::new(
                 object_store.clone(),
                 SchedulerConfig::max_bandwidth(&object_store),
@@ -3548,7 +3549,7 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("ScalarIndexQuery: query=[category = 1]@category_idx"),
+            plan.contains("ScalarIndexQuery: query=[category = 1]@category_idx(Bitmap)"),
             "Expected index query in plan: {}",
             plan
         );
@@ -3642,7 +3643,7 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("ScalarIndexQuery: query=[id >= 2000 && id < 3000]@id_idx"),
+            plan.contains("ScalarIndexQuery: query=[id >= 2000 && id < 3000]@id_idx(BTree)"),
             "Expected scalar index query in plan: {}",
             plan
         );
@@ -4004,7 +4005,9 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("ScalarIndexQuery: query=[array_has_any(labels, List([1]))]@labels_idx"),
+            plan.contains(
+                "ScalarIndexQuery: query=[array_has_any(labels, List([1]))]@labels_idx(LabelList)",
+            ),
             "Expected scalar index query in plan: {}",
             plan
         );
