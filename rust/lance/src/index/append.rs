@@ -332,7 +332,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         let mut indices = Vec::with_capacity(old_indices.len());
         for idx in old_indices {
             match dataset
-                .open_generic_index(&field_path, &idx.uuid.to_string(), &NoOpMetricsCollector)
+                .open_generic_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
                 .await
             {
                 Ok(index) => indices.push(index),
@@ -523,11 +523,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 frag_bitmap |= &effective_old_frags;
 
                 let index = dataset
-                    .open_scalar_index(
-                        &field_path,
-                        &old_indices[0].uuid.to_string(),
-                        &NoOpMetricsCollector,
-                    )
+                    .open_scalar_index(&field_path, &old_indices[0].uuid, &NoOpMetricsCollector)
                     .await?;
 
                 let update_criteria = index.update_criteria();
@@ -556,7 +552,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     super::scalar::build_scalar_index(
                         dataset.as_ref(),
                         column.name.as_str(),
-                        &new_uuid.to_string(),
+                        new_uuid,
                         &params,
                         true,
                         None,
@@ -565,8 +561,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     )
                     .await?
                 } else {
-                    let new_store =
-                        LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+                    let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
                     let old_data_filter = if dataset.manifest.uses_stable_row_ids() {
                         // Stable row IDs are opaque IDs, so fragment-bit filtering on
                         // (row_id >> 32) is invalid. Build an exact allow-list from retained
@@ -756,11 +751,7 @@ mod tests {
         let mut num_rows = 0;
         for index in indices.iter() {
             let index = dataset
-                .open_vector_index(
-                    "vector",
-                    index.uuid.to_string().as_str(),
-                    &NoOpMetricsCollector,
-                )
+                .open_vector_index("vector", &index.uuid, &NoOpMetricsCollector)
                 .await
                 .unwrap();
             num_rows += index.num_rows();

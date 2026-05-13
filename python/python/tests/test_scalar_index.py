@@ -95,6 +95,23 @@ def data_table(indexed_dataset: lance.LanceDataset):
     return indexed_dataset.scanner().to_table()
 
 
+def test_create_scalar_index_rejects_invalid_uuid(tmp_path):
+    """Invalid UUID strings passed to create_scalar_index and merge_index_metadata
+    must surface as a Python ValueError at the FFI boundary."""
+    data = pa.table({"id": pa.array(range(100), type=pa.int64())})
+    dataset = lance.write_dataset(data, tmp_path / "ds")
+
+    with pytest.raises(ValueError, match="Invalid UUID"):
+        dataset.create_scalar_index(
+            column="id",
+            index_type="BTREE",
+            index_uuid="not-a-uuid",
+        )
+
+    with pytest.raises(ValueError, match="Invalid UUID"):
+        dataset.merge_index_metadata("also-not-a-uuid", index_type="BTREE")
+
+
 @pytest.fixture
 def btree_comparison_datasets(tmp_path):
     """Setup datasets for B-tree comparison tests"""

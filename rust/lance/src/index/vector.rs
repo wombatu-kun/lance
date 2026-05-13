@@ -560,7 +560,7 @@ pub(crate) async fn build_distributed_vector_index(
     dataset: &Dataset,
     column: &str,
     _name: &str,
-    uuid: &str,
+    uuid: Uuid,
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     fragment_ids: &[u32],
@@ -586,8 +586,7 @@ pub(crate) async fn build_distributed_vector_index(
 
     let filtered_dataset = dataset.clone();
 
-    let segment_uuid = Uuid::parse_str(uuid)
-        .map_err(|err| Error::invalid_input(format!("Invalid index UUID '{uuid}': {err}")))?;
+    let segment_uuid = uuid;
     let index_dir = dataset.indices_dir().join(segment_uuid.to_string());
 
     let fragment_filter = fragment_ids.to_vec();
@@ -906,7 +905,7 @@ pub(crate) async fn build_vector_index(
     dataset: &Dataset,
     column: &str,
     name: &str,
-    uuid: &str,
+    uuid: Uuid,
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
@@ -928,7 +927,7 @@ pub(crate) async fn build_vector_index(
                 IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
                     dataset.clone(),
                     column.to_owned(),
-                    dataset.indices_dir().clone().join(uuid),
+                    dataset.indices_dir().clone().join(uuid.to_string()),
                     params.metric_type,
                     shuffler,
                     Some(ivf_params),
@@ -944,7 +943,7 @@ pub(crate) async fn build_vector_index(
                 IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
                     dataset.clone(),
                     column.to_owned(),
-                    dataset.indices_dir().clone().join(uuid),
+                    dataset.indices_dir().clone().join(uuid.to_string()),
                     params.metric_type,
                     shuffler,
                     Some(ivf_params),
@@ -990,7 +989,7 @@ pub(crate) async fn build_vector_index(
                     let mut builder = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
-                        dataset.indices_dir().join(uuid),
+                        dataset.indices_dir().join(uuid.to_string()),
                         params.metric_type,
                         shuffler,
                         Some(ivf_params),
@@ -1018,7 +1017,7 @@ pub(crate) async fn build_vector_index(
             IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
-                dataset.indices_dir().clone().join(uuid),
+                dataset.indices_dir().clone().join(uuid.to_string()),
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
@@ -1041,7 +1040,7 @@ pub(crate) async fn build_vector_index(
             let mut builder = IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
-                dataset.indices_dir().join(uuid),
+                dataset.indices_dir().join(uuid.to_string()),
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
@@ -1068,7 +1067,7 @@ pub(crate) async fn build_vector_index(
                     IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
-                        dataset.indices_dir().clone().join(uuid),
+                        dataset.indices_dir().clone().join(uuid.to_string()),
                         params.metric_type,
                         shuffler,
                         Some(ivf_params),
@@ -1084,7 +1083,7 @@ pub(crate) async fn build_vector_index(
                     IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
-                        dataset.indices_dir().clone().join(uuid),
+                        dataset.indices_dir().clone().join(uuid.to_string()),
                         params.metric_type,
                         shuffler,
                         Some(ivf_params),
@@ -1114,7 +1113,7 @@ pub(crate) async fn build_vector_index(
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
-                dataset.indices_dir().clone().join(uuid),
+                dataset.indices_dir().clone().join(uuid.to_string()),
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
@@ -1142,7 +1141,7 @@ pub(crate) async fn build_vector_index(
             IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
-                dataset.indices_dir().clone().join(uuid),
+                dataset.indices_dir().clone().join(uuid.to_string()),
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
@@ -1170,7 +1169,7 @@ pub(crate) async fn build_vector_index(
 pub(crate) async fn build_vector_index_incremental(
     dataset: &Dataset,
     column: &str,
-    uuid: &str,
+    uuid: Uuid,
     params: &VectorIndexParams,
     existing_index: Arc<dyn VectorIndex>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
@@ -1227,7 +1226,7 @@ pub(crate) async fn build_vector_index_incremental(
         Some(progress.clone()),
     );
 
-    let index_dir = dataset.indices_dir().join(uuid);
+    let index_dir = dataset.indices_dir().join(uuid.to_string());
 
     // Determine the index type and build incrementally
     let (sub_index_type, quantization_type) = existing_index.sub_index_type();
@@ -1422,7 +1421,7 @@ pub(crate) async fn build_empty_vector_index(
     _dataset: &Dataset,
     column: &str,
     name: &str,
-    _uuid: &str,
+    _uuid: Uuid,
     _params: &VectorIndexParams,
 ) -> Result<()> {
     // For now, return a NotImplementedError to indicate this functionality
@@ -1447,14 +1446,14 @@ pub(crate) async fn remap_vector_index(
     mapping: &HashMap<u64, Option<u64>>,
 ) -> Result<()> {
     let old_index = dataset
-        .open_vector_index(column, &old_uuid.to_string(), &NoOpMetricsCollector)
+        .open_vector_index(column, old_uuid, &NoOpMetricsCollector)
         .await?;
 
     if let Some(ivf_index) = old_index.as_any().downcast_ref::<IVFIndex>() {
         remap_index_file(
             dataset.as_ref(),
-            &old_uuid.to_string(),
-            &new_uuid.to_string(),
+            old_uuid,
+            new_uuid,
             old_metadata.dataset_version,
             ivf_index,
             mapping,
@@ -1470,7 +1469,7 @@ pub(crate) async fn remap_vector_index(
         // it's v3 index
         remap_index_file_v3(
             dataset.as_ref(),
-            &new_uuid.to_string(),
+            new_uuid,
             old_index,
             mapping,
             column.to_string(),
@@ -1485,7 +1484,7 @@ pub(crate) async fn remap_vector_index(
 #[instrument(level = "debug", skip(dataset, vec_idx, reader))]
 pub(crate) async fn open_vector_index(
     dataset: Arc<Dataset>,
-    uuid: &str,
+    uuid: &Uuid,
     vec_idx: &lance_index::pb::VectorIndex,
     reader: Arc<dyn Reader>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
@@ -1516,7 +1515,7 @@ pub(crate) async fn open_vector_index(
                 }
                 let ivf = IvfModel::try_from(ivf_pb.to_owned())?;
                 last_stage = Some(Arc::new(IVFIndex::try_new(
-                    uuid,
+                    *uuid,
                     ivf,
                     reader.clone(),
                     last_stage.unwrap(),
@@ -1563,7 +1562,7 @@ pub(crate) async fn open_vector_index(
 pub(crate) async fn open_vector_index_v2(
     dataset: Arc<Dataset>,
     column: &str,
-    uuid: &str,
+    uuid: &Uuid,
     reader: PreviousFileReader,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
@@ -1586,7 +1585,10 @@ pub(crate) async fn open_vector_index_v2(
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
-            let aux_path = index_dir.clone().join(uuid).join(INDEX_AUXILIARY_FILE_NAME);
+            let aux_path = index_dir
+                .clone()
+                .join(uuid.to_string())
+                .join(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = object_store.open(&aux_path).await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
@@ -1601,7 +1603,7 @@ pub(crate) async fn open_vector_index_v2(
             let ivf = IvfModel::try_from(pb_ivf)?;
 
             Arc::new(IVFIndex::try_new(
-                uuid,
+                *uuid,
                 ivf,
                 reader.object_reader.clone(),
                 Arc::new(hnsw),
@@ -1613,7 +1615,10 @@ pub(crate) async fn open_vector_index_v2(
         }
 
         "IVF_HNSW_SQ" => {
-            let aux_path = index_dir.clone().join(uuid).join(INDEX_AUXILIARY_FILE_NAME);
+            let aux_path = index_dir
+                .clone()
+                .join(uuid.to_string())
+                .join(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = object_store.open(&aux_path).await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
@@ -1631,7 +1636,7 @@ pub(crate) async fn open_vector_index_v2(
             let ivf = IvfModel::try_from(pb_ivf)?;
 
             Arc::new(IVFIndex::try_new(
-                uuid,
+                *uuid,
                 ivf,
                 reader.object_reader.clone(),
                 Arc::new(hnsw),
@@ -1688,11 +1693,7 @@ pub async fn initialize_vector_index(
     let column_name = field_names[0];
 
     let source_vector_index = source_dataset
-        .open_vector_index(
-            column_name,
-            &source_index.uuid.to_string(),
-            &NoOpMetricsCollector,
-        )
+        .open_vector_index(column_name, &source_index.uuid, &NoOpMetricsCollector)
         .await?;
 
     let metric_type = source_vector_index.metric_type();
@@ -1764,7 +1765,7 @@ pub async fn initialize_vector_index(
     build_vector_index_incremental(
         target_dataset,
         column_name,
-        &new_uuid.to_string(),
+        new_uuid,
         &params,
         source_vector_index,
         frag_reuse_index,
@@ -1997,11 +1998,7 @@ mod tests {
 
         // Verify the index type and parameters match
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let stats = target_vector_index.statistics().unwrap();
@@ -2029,11 +2026,7 @@ mod tests {
 
         // Verify centroids are shared between source and target indices
         let source_vector_index = source_dataset
-            .open_vector_index(
-                "vector",
-                &source_index.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &source_index.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -2212,11 +2205,7 @@ mod tests {
 
         // Verify the index type and parameters match
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let stats = target_vector_index.statistics().unwrap();
@@ -2248,11 +2237,7 @@ mod tests {
 
         // Verify centroids are shared between source and target indices
         let source_vector_index = source_dataset
-            .open_vector_index(
-                "vector",
-                &source_index.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &source_index.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -2358,7 +2343,7 @@ mod tests {
         let invalid_id = max_id + 1000;
 
         // let params = VectorIndexParams::ivf_flat(4, MetricType::L2);
-        let uuid = Uuid::new_v4().to_string();
+        let uuid = Uuid::new_v4();
 
         let mut ivf_params = IvfBuildParams {
             num_partitions: Some(4),
@@ -2386,7 +2371,7 @@ mod tests {
             &dataset,
             "vector",
             "vector_ivf_flat_dist",
-            &uuid,
+            uuid,
             &params,
             None,
             &[invalid_id],
@@ -2412,7 +2397,7 @@ mod tests {
             .into_reader_rows(RowCount::from(128), BatchCount::from(1));
         let dataset = Dataset::write(reader, &uri, None).await.unwrap();
 
-        let uuid = Uuid::new_v4().to_string();
+        let uuid = Uuid::new_v4();
         let mut ivf_params = IvfBuildParams {
             num_partitions: Some(4),
             ..Default::default()
@@ -2439,7 +2424,7 @@ mod tests {
             &dataset,
             "vector",
             "vector_ivf_flat_dist",
-            &uuid,
+            uuid,
             &params,
             None,
             &[],
@@ -2501,7 +2486,7 @@ mod tests {
         let dataset = Dataset::write(reader, &uri, None).await.unwrap();
 
         let params = VectorIndexParams::ivf_flat(4, MetricType::L2);
-        let uuid = Uuid::new_v4().to_string();
+        let uuid = Uuid::new_v4();
         let progress = Arc::new(RecordingProgress {
             train_ivf_complete: AtomicBool::new(false),
             saw_train_ivf_progress_before_complete: AtomicBool::new(false),
@@ -2512,7 +2497,7 @@ mod tests {
             &dataset,
             "vector",
             "vector_ivf_flat_progress",
-            &uuid,
+            uuid,
             &params,
             None,
             progress.clone(),
@@ -2546,11 +2531,11 @@ mod tests {
         let dataset = Dataset::write(reader, &uri, None).await.unwrap();
 
         let params = VectorIndexParams::ivf_flat(4, MetricType::L2);
-        let uuid = Uuid::new_v4().to_string();
+        let uuid = Uuid::new_v4();
 
         // Pre-create a malformed global training file that is missing the
         // `lance:global_ivf_centroids` metadata key.
-        let out_base = dataset.indices_dir().join(&*uuid);
+        let out_base = dataset.indices_dir().join(uuid.to_string());
         let training_path = out_base.clone().join("global_training.idx");
 
         let writer = dataset
@@ -2581,7 +2566,7 @@ mod tests {
             &dataset,
             "vector",
             "vector_ivf_flat_dist",
-            &uuid,
+            uuid,
             &params,
             None,
             &[valid_id],
@@ -2670,20 +2655,12 @@ mod tests {
 
         // Open both indices to compare centroids
         let source_vector_index = source_dataset
-            .open_vector_index(
-                "vector",
-                &source_index.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &source_index.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -2797,11 +2774,7 @@ mod tests {
         // Verify that the optimized index still shares centroids with the source
         let target_indices = target_dataset.load_indices().await.unwrap();
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -2907,11 +2880,7 @@ mod tests {
 
         // Verify the index type and parameters match
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let stats = target_vector_index.statistics().unwrap();
@@ -2943,11 +2912,7 @@ mod tests {
 
         // Verify centroids are shared between source and target indices
         let source_vector_index = source_dataset
-            .open_vector_index(
-                "vector",
-                &source_index.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &source_index.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -3133,11 +3098,7 @@ mod tests {
 
         // Verify the index type and parameters match
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let stats = target_vector_index.statistics().unwrap();
@@ -3165,11 +3126,7 @@ mod tests {
 
         // Verify centroids are shared between source and target indices
         let source_vector_index = source_dataset
-            .open_vector_index(
-                "vector",
-                &source_index.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &source_index.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -3391,11 +3348,7 @@ mod tests {
 
         // Verify the index type and parameters match
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let stats = target_vector_index.statistics().unwrap();
@@ -3423,11 +3376,7 @@ mod tests {
 
         // Verify centroids are shared between source and target indices
         let source_vector_index = source_dataset
-            .open_vector_index(
-                "vector",
-                &source_index.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &source_index.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 

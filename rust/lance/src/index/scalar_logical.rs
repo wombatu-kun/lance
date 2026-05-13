@@ -292,13 +292,15 @@ pub async fn open_named_scalar_index(
             index_name, column
         ))),
         1 => {
-            let uuid = indices[0].uuid.to_string();
-            dataset.open_scalar_index(column, &uuid, metrics).await
+            dataset
+                .open_scalar_index(column, &indices[0].uuid, metrics)
+                .await
         }
         _ => {
-            let segments = try_join_all(indices.iter().map(|index| {
-                let uuid = index.uuid.to_string();
-                async move { dataset.open_scalar_index(column, &uuid, metrics).await }
+            let segments = try_join_all(indices.iter().map(|index| async move {
+                dataset
+                    .open_scalar_index(column, &index.uuid, metrics)
+                    .await
             }))
             .await?;
 

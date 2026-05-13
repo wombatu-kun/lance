@@ -3569,7 +3569,7 @@ impl Scanner {
                         .dataset
                         .open_vector_index(
                             q.column.as_str(),
-                            &selected_index_segments[0].uuid.to_string(),
+                            &selected_index_segments[0].uuid,
                             &NoOpMetricsCollector,
                         )
                         .await?;
@@ -3599,11 +3599,7 @@ impl Scanner {
                 // at least for newer indexes.
                 let idx = self
                     .dataset
-                    .open_vector_index(
-                        q.column.as_str(),
-                        &index.uuid.to_string(),
-                        &NoOpMetricsCollector,
-                    )
+                    .open_vector_index(q.column.as_str(), &index.uuid, &NoOpMetricsCollector)
                     .await?;
                 let index_metric = idx.metric_type();
 
