@@ -89,6 +89,7 @@ use lance_linalg::distance::MetricType;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+use uuid::Uuid;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
@@ -2304,10 +2305,22 @@ impl Dataset {
             None
         };
 
-        let index_uuid: Option<String> = if let Some(kwargs) = kwargs {
+        let index_uuid: Option<Uuid> = if let Some(kwargs) = kwargs {
             kwargs
                 .get_item("index_uuid")?
-                .and_then(|v| if v.is_none() { None } else { Some(v.extract()) })
+                .and_then(|v| {
+                    if v.is_none() {
+                        None
+                    } else {
+                        Some(v.extract::<String>())
+                    }
+                })
+                .transpose()?
+                .map(|s| {
+                    Uuid::parse_str(&s).map_err(|e| {
+                        PyValueError::new_err(format!("Invalid UUID string for index_uuid: {e}"))
+                    })
+                })
                 .transpose()?
         } else {
             None
@@ -2410,6 +2423,9 @@ impl Dataset {
         batch_readhead: Option<usize>,
         progress_callback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        let parsed_uuid = Uuid::parse_str(index_uuid).map_err(|e| {
+            PyValueError::new_err(format!("Invalid UUID string for index_uuid: {e}"))
+        })?;
         let mut progress_handler =
             Self::make_index_progress_handler_from_callback(progress_callback)?;
         let progress: Arc<dyn IndexBuildProgress> = progress_handler
@@ -2421,7 +2437,7 @@ impl Dataset {
             async {
                 self.ds
                     .merge_index_metadata(
-                        index_uuid,
+                        &parsed_uuid,
                         IndexType::try_from(index_type)?,
                         batch_readhead,
                         progress,
@@ -3070,11 +3086,7 @@ impl Dataset {
 
             let vindex = self
                 .ds
-                .open_vector_index(
-                    column_name,
-                    &idx_meta.uuid.to_string(),
-                    &NoOpMetricsCollector,
-                )
+                .open_vector_index(column_name, &idx_meta.uuid, &NoOpMetricsCollector)
                 .await
                 .infer_error()?;
 

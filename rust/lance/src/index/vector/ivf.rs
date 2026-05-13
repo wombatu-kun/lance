@@ -151,7 +151,7 @@ impl UnsizedCacheKey for LegacyIVFPartitionKey {
 /// IVF Index.
 /// WARNING: Internal API with no stability guarantees.
 pub struct IVFIndex {
-    uuid: String,
+    uuid: Uuid,
 
     /// Ivf model
     pub ivf: IvfModel,
@@ -170,16 +170,15 @@ pub struct IVFIndex {
 
 impl DeepSizeOf for IVFIndex {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.uuid.deep_size_of_children(context)
-            + self.reader.deep_size_of_children(context)
-            + self.sub_index.deep_size_of_children(context)
+        // `Uuid` is a fixed 16-byte struct with no heap children, so contributes 0.
+        self.reader.deep_size_of_children(context) + self.sub_index.deep_size_of_children(context)
     }
 }
 
 impl IVFIndex {
     /// Create a new IVF index.
     pub(crate) fn try_new(
-        uuid: &str,
+        uuid: Uuid,
         ivf: IvfModel,
         reader: Arc<dyn Reader>,
         sub_index: Arc<dyn VectorIndex>,
@@ -195,7 +194,7 @@ impl IVFIndex {
 
         let num_partitions = ivf.num_partitions();
         Ok(Self {
-            uuid: uuid.to_owned(),
+            uuid,
             ivf,
             reader,
             sub_index,
@@ -1126,7 +1125,7 @@ impl Index for IVFIndex {
 
         Ok(serde_json::to_value(IvfIndexStatistics {
             index_type: self.index_type().to_string(),
-            uuid: self.uuid.clone(),
+            uuid: self.uuid.to_string(),
             uri: to_local_path(self.reader.path()),
             metric_type: self.metric_type.to_string(),
             num_partitions: self.ivf.num_partitions(),
@@ -1614,7 +1613,7 @@ pub async fn build_ivf_pq_index(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
-    uuid: &str,
+    uuid: Uuid,
     metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
@@ -1657,7 +1656,7 @@ pub async fn build_ivf_hnsw_pq_index(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
-    uuid: &str,
+    uuid: Uuid,
     metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     hnsw_params: &HnswBuildParams,
@@ -1758,13 +1757,13 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn remap_index_file_v3(
     dataset: &Dataset,
-    new_uuid: &str,
+    new_uuid: &Uuid,
     index: Arc<dyn VectorIndex>,
     mapping: &HashMap<u64, Option<u64>>,
     column: String,
 ) -> Result<Vec<IndexFile>> {
     let dataset = dataset.clone();
-    let index_dir = dataset.indices_dir().join(new_uuid);
+    let index_dir = dataset.indices_dir().join(new_uuid.to_string());
     let (_, element_type) = get_vector_type(dataset.schema(), &column)?;
     match index.sub_index_type() {
         (SubIndexType::Flat, QuantizationType::Flat) => match element_type {
@@ -1855,8 +1854,8 @@ pub(crate) async fn remap_index_file_v3(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn remap_index_file(
     dataset: &Dataset,
-    old_uuid: &str,
-    new_uuid: &str,
+    old_uuid: &Uuid,
+    new_uuid: &Uuid,
     old_version: u64,
     index: &IVFIndex,
     mapping: &HashMap<u64, Option<u64>>,
@@ -1865,8 +1864,14 @@ pub(crate) async fn remap_index_file(
     transforms: Vec<pb::Transform>,
 ) -> Result<IndexFile> {
     let object_store = dataset.object_store.as_ref();
-    let old_path = dataset.indices_dir().join(old_uuid).join(INDEX_FILE_NAME);
-    let new_path = dataset.indices_dir().join(new_uuid).join(INDEX_FILE_NAME);
+    let old_path = dataset
+        .indices_dir()
+        .join(old_uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let new_path = dataset
+        .indices_dir()
+        .join(new_uuid.to_string())
+        .join(INDEX_FILE_NAME);
 
     let file_sizes = dataset
         .load_index(old_uuid)
@@ -1934,7 +1939,7 @@ async fn write_ivf_pq_file(
     index_dir: Path,
     column: &str,
     index_name: &str,
-    uuid: &str,
+    uuid: Uuid,
     dataset_version: u64,
     mut ivf: IvfModel,
     pq: ProductQuantizer,
@@ -1945,7 +1950,10 @@ async fn write_ivf_pq_file(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<IndexFile> {
-    let path = index_dir.clone().join(uuid).join(INDEX_FILE_NAME);
+    let path = index_dir
+        .clone()
+        .join(uuid.to_string())
+        .join(INDEX_FILE_NAME);
     let mut writer = object_store.create(&path).await?;
 
     let start = std::time::Instant::now();
@@ -2031,7 +2039,7 @@ async fn write_ivf_hnsw_file(
     dataset: &Dataset,
     column: &str,
     _index_name: &str,
-    uuid: &str,
+    uuid: Uuid,
     mut ivf: IvfModel,
     quantizer: Quantizer,
     distance_type: DistanceType,
@@ -2043,7 +2051,10 @@ async fn write_ivf_hnsw_file(
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
     let object_store = dataset.object_store.as_ref();
-    let path = dataset.indices_dir().join(uuid).join(INDEX_FILE_NAME);
+    let path = dataset
+        .indices_dir()
+        .join(uuid.to_string())
+        .join(INDEX_FILE_NAME);
     let writer = object_store.create(&path).await?;
 
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
@@ -2064,7 +2075,7 @@ async fn write_ivf_hnsw_file(
 
     let aux_path = dataset
         .indices_dir()
-        .join(uuid)
+        .join(uuid.to_string())
         .join(INDEX_AUXILIARY_FILE_NAME);
     let aux_writer = object_store.create(&aux_path).await?;
     let schema = Schema::new(vec![
@@ -4687,13 +4698,12 @@ mod tests {
         let pq_params = PQBuildParams::new(NUM_SUBVECTORS as usize, NUM_BITS as usize);
 
         let uuid = Uuid::new_v4();
-        let uuid_str = uuid.to_string();
 
         build_ivf_pq_index(
             &dataset,
             WellKnownIvfPqData::COLUMN,
             INDEX_NAME,
-            &uuid_str,
+            uuid,
             MetricType::L2,
             &ivf_params,
             &pq_params,
@@ -4738,7 +4748,7 @@ mod tests {
             .unwrap();
 
         let index = dataset_mut
-            .open_vector_index(WellKnownIvfPqData::COLUMN, &uuid_str, &NoOpMetricsCollector)
+            .open_vector_index(WellKnownIvfPqData::COLUMN, &uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -4782,12 +4792,11 @@ mod tests {
         let mapping = build_mapping(row_ids_to_modify, row_ids_to_remove, max_id);
 
         let new_uuid = Uuid::new_v4();
-        let new_uuid_str = new_uuid.to_string();
 
         remap_index_file(
             &dataset_mut,
-            &uuid_str,
-            &new_uuid_str,
+            &uuid,
+            &new_uuid,
             dataset_mut.version().version,
             ivf_index,
             &mapping,
@@ -4834,11 +4843,7 @@ mod tests {
             .unwrap();
 
         let remapped = dataset_mut
-            .open_vector_index(
-                WellKnownIvfPqData::COLUMN,
-                &new_uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index(WellKnownIvfPqData::COLUMN, &new_uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let ivf_remapped = remapped.as_any().downcast_ref::<IVFIndex>().unwrap();
@@ -5894,11 +5899,7 @@ mod tests {
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
         let idx = dataset
-            .open_generic_index(
-                "vector",
-                indices[0].uuid.to_string().as_str(),
-                &NoOpMetricsCollector,
-            )
+            .open_generic_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let ivf_idx = idx.as_any().downcast_ref::<v2::IvfPq>().unwrap();

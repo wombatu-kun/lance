@@ -61,15 +61,16 @@ async fn open_fts_segment(
     segment: &IndexMetadata,
     metrics: &IndexMetrics,
 ) -> Result<Arc<InvertedIndex>> {
-    let uuid = segment.uuid.to_string();
-    let index = dataset.open_generic_index(column, &uuid, metrics).await?;
+    let index = dataset
+        .open_generic_index(column, &segment.uuid, metrics)
+        .await?;
     let inverted = index
         .as_any()
         .downcast_ref::<InvertedIndex>()
         .ok_or_else(|| {
             Error::invalid_input(format!(
                 "Index for column {} and segment {} is not an inverted index",
-                column, uuid
+                column, segment.uuid
             ))
         })?;
     Ok(Arc::new(inverted.clone()))
@@ -2188,7 +2189,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let index = dataset
-            .open_generic_index("text", &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+            .open_generic_index("text", &index_meta.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let inverted_index = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
@@ -2251,7 +2252,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let index = dataset
-            .open_generic_index("text", &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+            .open_generic_index("text", &index_meta.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let inverted_index = index.as_any().downcast_ref::<InvertedIndex>().unwrap();

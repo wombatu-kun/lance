@@ -212,7 +212,7 @@ mod test {
                 ]))),
             });
             IVFIndex::try_new(
-                &Uuid::new_v4().to_string(),
+                Uuid::new_v4(),
                 ivf,
                 reader.into(),
                 mock_sub_index,

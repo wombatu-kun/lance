@@ -52,7 +52,7 @@ pub struct CreateIndexBuilder<'a> {
     replace: bool,
     train: bool,
     fragments: Option<Vec<u32>>,
-    index_uuid: Option<String>,
+    index_uuid: Option<Uuid>,
     preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     progress: Arc<dyn IndexBuildProgress>,
     /// Transaction properties to store with this commit.
@@ -102,7 +102,7 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
-    pub fn index_uuid(mut self, uuid: String) -> Self {
+    pub fn index_uuid(mut self, uuid: Uuid) -> Self {
         self.index_uuid = Some(uuid);
         self
     }
@@ -209,11 +209,7 @@ impl<'a> CreateIndexBuilder<'a> {
             self.index_uuid.as_deref(),
         )?;
 
-        let index_id = match &self.index_uuid {
-            Some(uuid_str) => Uuid::parse_str(uuid_str)
-                .map_err(|e| Error::index(format!("Invalid UUID string provided: {}", e)))?,
-            None => Uuid::new_v4(),
-        };
+        let index_id = self.index_uuid.unwrap_or_else(Uuid::new_v4);
         let mut output_index_uuid = index_id;
         let created_index = match (self.index_type, self.params.index_name()) {
             (
@@ -287,7 +283,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     build_scalar_index(
                         self.dataset,
                         column,
-                        &index_id.to_string(),
+                        index_id,
                         &params,
                         train,
                         self.fragments.clone(),
@@ -309,7 +305,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 build_scalar_index(
                     self.dataset,
                     column,
-                    &index_id.to_string(),
+                    index_id,
                     params,
                     train,
                     self.fragments.clone(),
@@ -335,7 +331,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 build_scalar_index(
                     self.dataset,
                     column,
-                    &index_id.to_string(),
+                    index_id,
                     &params,
                     train,
                     self.fragments.clone(),
@@ -374,7 +370,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             self.dataset,
                             column,
                             &index_name,
-                            &index_id.to_string(),
+                            index_id,
                             vec_params,
                             fri,
                             fragments,
@@ -389,7 +385,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             self.dataset,
                             column,
                             &index_name,
-                            &index_id.to_string(),
+                            index_id,
                             vec_params,
                             fri,
                             self.progress.clone(),
@@ -402,7 +398,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         self.dataset,
                         column,
                         &index_name,
-                        &index_id.to_string(),
+                        index_id,
                         vec_params,
                     )
                     .await?
@@ -437,7 +433,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     ))?;
 
                 if train {
-                    ext.create_index(self.dataset, column, &index_id.to_string(), self.params)
+                    ext.create_index(self.dataset, column, &index_id, self.params)
                         .await?;
                 } else {
                     todo!("create empty vector index when train=false");
@@ -1039,7 +1035,7 @@ mod tests {
         let params = InvertedIndexParams::default();
         let fragments = dataset.get_fragments();
         let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
-        let shared_uuid = Uuid::new_v4().to_string();
+        let shared_uuid = Uuid::new_v4();
         let build_progress = Arc::new(RecordingProgress::default());
 
         for &fragment_id in &fragment_ids {
@@ -1047,11 +1043,11 @@ mod tests {
                 CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
                     .name("distributed_index".to_string())
                     .fragments(vec![fragment_id])
-                    .index_uuid(shared_uuid.clone())
+                    .index_uuid(shared_uuid)
                     .progress(build_progress.clone());
 
             let index_metadata = builder.execute_uncommitted().await.unwrap();
-            assert_eq!(index_metadata.uuid.to_string(), shared_uuid);
+            assert_eq!(index_metadata.uuid, shared_uuid);
             assert_eq!(index_metadata.name, "distributed_index");
 
             let fragment_bitmap = index_metadata.fragment_bitmap.as_ref().unwrap();
@@ -2053,7 +2049,7 @@ mod tests {
 
         CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
             .name("vector_idx".to_string())
-            .index_uuid(uuid.to_string())
+            .index_uuid(uuid)
             .execute_uncommitted()
             .await
             .unwrap();

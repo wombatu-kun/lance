@@ -535,7 +535,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         let mut indices = Vec::with_capacity(old_indices.len());
         for idx in old_indices {
             match dataset
-                .open_generic_index(&field_path, &idx.uuid.to_string(), &NoOpMetricsCollector)
+                .open_generic_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
                 .await
             {
                 Ok(index) => indices.push(index),
@@ -883,11 +883,7 @@ mod tests {
         let mut num_rows = 0;
         for index in indices.iter() {
             let index = dataset
-                .open_vector_index(
-                    "vector",
-                    index.uuid.to_string().as_str(),
-                    &NoOpMetricsCollector,
-                )
+                .open_vector_index("vector", &index.uuid, &NoOpMetricsCollector)
                 .await
                 .unwrap();
             num_rows += index.num_rows();

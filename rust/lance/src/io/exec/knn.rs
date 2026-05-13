@@ -58,6 +58,7 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
 use tokio::sync::Notify;
+use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
@@ -714,7 +715,7 @@ pub fn new_knn_exec(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
-        indices.iter().map(|idx| idx.uuid.to_string()).collect_vec(),
+        indices.iter().map(|idx| idx.uuid).collect_vec(),
         query.clone(),
     )?;
 
@@ -760,7 +761,7 @@ pub struct ANNIvfPartitionExec {
     pub query: Query,
 
     /// The UUIDs of the indices to search.
-    pub index_uuids: Vec<String>,
+    pub index_uuids: Vec<Uuid>,
 
     pub properties: Arc<PlanProperties>,
 
@@ -768,7 +769,7 @@ pub struct ANNIvfPartitionExec {
 }
 
 impl ANNIvfPartitionExec {
-    pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<String>, query: Query) -> Result<Self> {
+    pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<Uuid>, query: Query) -> Result<Self> {
         let dataset_schema = dataset.schema();
         get_vector_type(dataset_schema, &query.column)?;
         if index_uuids.is_empty() {
@@ -910,7 +911,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     dist_q_c_list_builder.append_value(dist_q_c.iter());
                     let dist_q_c_col = dist_q_c_list_builder.finish();
 
-                    let uuid_col = StringArray::from(vec![uuid.as_str()]);
+                    let uuid_col = StringArray::from(vec![uuid.to_string()]);
                     let batch = RecordBatch::try_new(
                         KNN_PARTITION_SCHEMA.clone(),
                         vec![
@@ -1549,7 +1550,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             Arc::new(part_id.unwrap().as_primitive::<UInt32Type>().clone());
                         let dist_q_c =
                             Arc::new(dist_q_c.unwrap().as_primitive::<Float32Type>().clone());
-                        let uuid = uuid.unwrap().to_string();
+                        let uuid = Uuid::parse_str(uuid.unwrap()).map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Invalid UUID in __index_uuid column: {e}"
+                            ))
+                        })?;
                         Ok((partitions, dist_q_c, uuid))
                     })
                     .collect_vec();
