@@ -376,11 +376,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .copied()
                     .unwrap_or(old_indices[old_indices.len() - 1]);
                 let reference_index = dataset
-                    .open_scalar_index(
-                        &field_path,
-                        &reference_idx.uuid.to_string(),
-                        &NoOpMetricsCollector,
-                    )
+                    .open_scalar_index(&field_path, &reference_idx.uuid, &NoOpMetricsCollector)
                     .await?;
                 let update_criteria = reference_index.update_criteria();
                 if update_criteria.requires_old_data {
@@ -398,7 +394,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     let created_index = super::scalar::build_scalar_index(
                         dataset.as_ref(),
                         column.name.as_str(),
-                        &new_uuid.to_string(),
+                        new_uuid,
                         &params,
                         true,
                         None,
@@ -437,11 +433,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         effective_old_frags |= &effective;
                     }
                     let scalar_index = dataset
-                        .open_scalar_index(
-                            &field_path,
-                            &idx.uuid.to_string(),
-                            &NoOpMetricsCollector,
-                        )
+                        .open_scalar_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
                         .await?;
                     let inverted_index = scalar_index
                         .as_any()
@@ -470,14 +462,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 };
 
                 let new_uuid = Uuid::new_v4();
-                let new_store =
-                    LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+                let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
                 let created_index = if selected_indices.is_empty() {
                     let params = reference_index.derive_index_params()?;
                     super::scalar::build_scalar_index(
                         dataset.as_ref(),
                         column.name.as_str(),
-                        &new_uuid.to_string(),
+                        new_uuid,
                         &params,
                         true,
                         None,
