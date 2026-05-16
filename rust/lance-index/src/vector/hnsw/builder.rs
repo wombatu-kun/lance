@@ -246,17 +246,14 @@ impl HNSW {
         self.inner.num_nodes(level)
     }
 
-    /// Returns the in-memory builder nodes.
+    /// Returns the in-memory builder nodes, if this graph was freshly built.
     ///
-    /// Only valid for a freshly built graph. A disk-loaded graph is
-    /// Arrow-backed and has no `GraphBuilderNode`s; calling this on one
-    /// panics.
-    pub fn nodes(&self) -> Arc<Vec<GraphBuilderNode>> {
+    /// A disk-loaded graph is Arrow-backed and has no `GraphBuilderNode`s,
+    /// so this returns `None` for it.
+    pub fn nodes(&self) -> Option<Arc<Vec<GraphBuilderNode>>> {
         match &self.inner.graph {
-            HnswGraph::Built(nodes) => nodes.clone(),
-            HnswGraph::Loaded(_) => {
-                panic!("HNSW::nodes() is only available on a freshly built graph, not a loaded one")
-            }
+            HnswGraph::Built(nodes) => Some(nodes.clone()),
+            HnswGraph::Loaded(_) => None,
         }
     }
 
@@ -275,56 +272,94 @@ impl HNSW {
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
 
-        // The level descent + bottom beam search are identical across graph
-        // backends; only the view types differ. A local macro keeps the
-        // search loop single-sourced without a generic helper whose return
-        // type would have to name the view lifetime.
-        macro_rules! run_search {
-            ($level_view:expr, $bottom_view:expr) => {{
-                let mut ep = ep;
-                for level in (0..self.max_level()).rev() {
-                    let cur_level = $level_view(level);
-                    ep = greedy_search_borrowed(
-                        &cur_level,
-                        ep,
-                        &dist_calc,
-                        self.inner.params.prefetch_distance,
-                    );
-                }
-                let bottom_level = $bottom_view;
-                let mut visited = visited_generator.generate(storage.len());
-                beam_search_borrowed(
-                    &bottom_level,
-                    &ep,
-                    params,
-                    &dist_calc,
-                    bitset.as_ref(),
-                    prefetch_distance,
-                    &mut visited,
-                )
-                .into_iter()
-                .take(k)
-                .collect::<Vec<OrderedNode>>()
-            }};
-        }
-
+        // The level descent + bottom beam search are identical across
+        // graph backends; only the view types differ. `run_search` is
+        // generic over those view types so the loop is single-sourced:
+        // each backend supplies a per-level view closure and a
+        // bottom-level view.
         let result = match &self.inner.graph {
             HnswGraph::Built(nodes) => {
                 let nodes = nodes.as_slice();
-                run_search!(
+                self.run_search(
+                    ep,
+                    k,
+                    params,
+                    bitset.as_ref(),
+                    visited_generator,
+                    storage.len(),
+                    prefetch_distance,
+                    &dist_calc,
                     |level| ImmutableHnswLevelView::new(level, nodes),
-                    ImmutableHnswBottomView::new(nodes)
+                    ImmutableHnswBottomView::new(nodes),
                 )
             }
             HnswGraph::Loaded(graph) => {
                 let graph = graph.as_ref();
-                run_search!(
+                self.run_search(
+                    ep,
+                    k,
+                    params,
+                    bitset.as_ref(),
+                    visited_generator,
+                    storage.len(),
+                    prefetch_distance,
+                    &dist_calc,
                     |level| LoadedHnswLevelView::new(level, graph),
-                    LoadedHnswBottomView::new(graph)
+                    LoadedHnswBottomView::new(graph),
                 )
             }
         };
         Ok(result)
+    }
+
+    /// Drives the shared HNSW query path over backend-specific graph
+    /// views: a per-level view produced by `make_level` and a
+    /// bottom-level view `bottom`. The views borrow their backing store
+    /// and are created, used, and dropped entirely within this call;
+    /// only the owned result escapes. Monomorphizing over `L`/`B` is the
+    /// single seam that lets the in-memory and disk-loaded backends
+    /// share one search loop.
+    #[allow(clippy::too_many_arguments)]
+    fn run_search<L, B>(
+        &self,
+        ep: OrderedNode,
+        k: usize,
+        params: &HnswQueryParams,
+        bitset: Option<&Visited>,
+        visited_generator: &mut VisitedGenerator,
+        storage_len: usize,
+        prefetch_distance: Option<usize>,
+        dist_calc: &impl DistCalculator,
+        make_level: impl Fn(u16) -> L,
+        bottom: B,
+    ) -> Vec<OrderedNode>
+    where
+        L: BorrowingGraph,
+        B: BorrowingGraph,
+    {
+        let mut ep = ep;
+        for level in (0..self.max_level()).rev() {
+            let cur_level = make_level(level);
+            ep = greedy_search_borrowed(
+                &cur_level,
+                ep,
+                dist_calc,
+                self.inner.params.prefetch_distance,
+            );
+        }
+        let mut visited = visited_generator.generate(storage_len);
+        beam_search_borrowed(
+            &bottom,
+            &ep,
+            params,
+            dist_calc,
+            bitset,
+            prefetch_distance,
+            &mut visited,
+        )
+        .into_iter()
+        .take(k)
+        .collect::<Vec<OrderedNode>>()
     }
 
     #[instrument(level = "debug", skip(self, query, bitset, storage))]
@@ -1243,15 +1278,6 @@ impl IvfSubIndex for HNSW {
 }
 
 #[cfg(test)]
-impl HNSW {
-    /// Whether the graph is the Arrow-backed (disk-loaded) representation
-    /// rather than the in-memory `Vec<GraphBuilderNode>` build representation.
-    pub(crate) fn is_loaded_graph(&self) -> bool {
-        matches!(self.inner.graph, HnswGraph::Loaded(_))
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -1273,6 +1299,7 @@ mod tests {
     use object_store::path::Path;
     use rstest::rstest;
 
+    use super::HnswGraph;
     use crate::scalar::IndexWriter;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
@@ -1442,10 +1469,10 @@ mod tests {
             HnswBuildParams::default().num_edges(20).ef_construction(50),
         )
         .unwrap();
-        assert!(!builder.is_loaded_graph());
+        assert!(!matches!(builder.inner.graph, HnswGraph::Loaded(_)));
 
         let loaded = HNSW::load(builder.to_batch().unwrap()).unwrap();
-        assert!(loaded.is_loaded_graph());
+        assert!(matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
         assert_eq!(loaded.len(), total);
 
         let k = total.min(10);
@@ -1543,7 +1570,7 @@ mod tests {
         // graph searches bit-identically to the in-memory build (old `load`
         // semantics preserved via the `Sparse` last-write-wins map).
         let loaded = HNSW::load(batch).unwrap();
-        assert!(loaded.is_loaded_graph());
+        assert!(matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
         let params = HnswQueryParams {
             ef: 50,
             lower_bound: None,
@@ -1577,7 +1604,7 @@ mod tests {
         assert!(loaded.is_empty());
         assert_eq!(loaded.len(), 0);
         // A 0-row load short-circuits to the empty (Built) graph.
-        assert!(!loaded.is_loaded_graph());
+        assert!(!matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
         assert_eq!(loaded.to_batch().unwrap().num_rows(), 0);
     }
 
@@ -1601,7 +1628,7 @@ mod tests {
 
         let b1 = builder.to_batch().unwrap();
         let loaded = HNSW::load(b1.clone()).unwrap();
-        assert!(loaded.is_loaded_graph());
+        assert!(matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
         let b2 = loaded.to_batch().unwrap();
         assert_eq!(b1, b2);
 
@@ -1638,10 +1665,10 @@ mod tests {
             HnswBuildParams::default().num_edges(20).ef_construction(50),
         )
         .unwrap();
-        assert!(!builder.is_loaded_graph());
+        assert!(!matches!(builder.inner.graph, HnswGraph::Loaded(_)));
 
         let loaded = HNSW::load(builder.to_batch().unwrap()).unwrap();
-        assert!(loaded.is_loaded_graph());
+        assert!(matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
         assert!(
             loaded.deep_size_of() < builder.deep_size_of(),
             "loaded graph ({}) should be lighter than built ({})",
