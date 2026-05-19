@@ -64,7 +64,7 @@ pub(crate) async fn finalize_segment_files_if_needed(
 
     let store = Arc::new(LanceIndexStore::from_dataset_for_new(
         dataset,
-        &segment.uuid.to_string(),
+        &segment.uuid,
     )?);
     lance_index::scalar::inverted::builder::merge_index_files(
         dataset.object_store.as_ref(),
