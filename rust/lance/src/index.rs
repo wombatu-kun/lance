@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::FutureExt;
 use itertools::Itertools;
-use lance_core::cache::CacheKey;
+use lance_core::cache::{CacheKey, UnsizedCacheKey};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;

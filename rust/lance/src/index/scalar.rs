@@ -432,6 +432,7 @@ pub async fn open_scalar_index(
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
+    let index_uuid = index.uuid;
     let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
 
     let index_details = fetch_index_details(dataset, column, index).await?;
@@ -461,7 +462,7 @@ pub async fn open_scalar_index(
         .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
         .await?;
 
-    tracing::info!(target: TRACE_IO_EVENTS, index_uuid = uuid_str, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
+    tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
     metrics.record_index_load();
 
     plugin.put_in_cache(&index_cache, index.clone()).await?;
