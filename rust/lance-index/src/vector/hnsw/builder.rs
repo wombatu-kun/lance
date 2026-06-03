@@ -1028,16 +1028,25 @@ impl IvfSubIndex for HNSW {
             let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
             if level == 0 {
                 // `to_batch` writes every node at level 0 exactly once in
-                // ascending `__vector_id` (== node id) order, and the level-0
-                // slice is exactly `[0, N)`, so the row index *is* the node
-                // id.
-                debug_assert!(
-                    ids.values()
-                        .iter()
-                        .enumerate()
-                        .all(|(i, id)| *id == i as u32),
-                    "level 0 __vector_id must equal the row index"
-                );
+                // ascending `__vector_id` (== node id) order, so the level-0
+                // slice is exactly `[0, N)` and the row index *is* the node
+                // id. The `Dense` lookup below depends on this: in a release
+                // build a violated invariant would silently make search read
+                // the wrong neighbor list, so enforce it at load time (not via
+                // `debug_assert!`) and reject a malformed or version-
+                // incompatible batch.
+                if let Some((row, id)) = ids
+                    .values()
+                    .iter()
+                    .enumerate()
+                    .find(|&(row, id)| *id != row as u32)
+                {
+                    return Err(Error::index(format!(
+                        "HNSW level-0 __vector_id must equal the row index, but \
+                         row {row} has __vector_id {id}; the on-disk batch is \
+                         malformed or was written by an incompatible version"
+                    )));
+                }
                 level_lookup.push(LevelLookup::Dense);
             } else {
                 // Upper levels: explicit id -> row map. No ordering/alignment
@@ -1054,6 +1063,20 @@ impl IvfSubIndex for HNSW {
                 level_lookup.push(LevelLookup::Sparse(id_to_row));
             }
             level_neighbors.push(neighbors);
+        }
+
+        // `entry_point` is read from untrusted metadata and indexes the `Dense`
+        // level-0 lookup directly; an out-of-range value would read past the
+        // level-0 neighbor buffer during search. Validate it under the same
+        // persisted-format invariant as the level-0 ids above.
+        let num_nodes = level_count[0];
+        if hnsw_metadata.entry_point as usize >= num_nodes {
+            return Err(Error::index(format!(
+                "HNSW entry_point {} is out of range for a graph with {num_nodes} \
+                 nodes; the on-disk batch is malformed or was written by an \
+                 incompatible version",
+                hnsw_metadata.entry_point
+            )));
         }
 
         let visited_generator_queue =
@@ -1281,7 +1304,7 @@ impl IvfSubIndex for HNSW {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, FixedSizeListArray, UInt8Array};
+    use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt32Array};
     use arrow_schema::Schema;
     use deepsize::DeepSizeOf;
     use lance_arrow::FixedSizeListArrayExt;
@@ -1585,6 +1608,90 @@ mod tests {
             .search_basic(query, 10, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
+    }
+
+    /// `load()` must reject a batch whose level-0 `__vector_id` no longer
+    /// matches the row index. The `LevelLookup::Dense` fast path relies on
+    /// `row == id`, and the old `debug_assert!` was compiled out of release
+    /// builds -- so a corrupt batch must fail at the `load()` boundary instead
+    /// of silently searching the wrong neighbor lists.
+    #[tokio::test]
+    async fn test_load_rejects_misaligned_level0_id() {
+        use arrow::array::AsArray;
+        use arrow::datatypes::UInt32Type;
+
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+
+        let batch = builder.to_batch().unwrap();
+        // Row 0 is always a level-0 node; break its `__vector_id == row`
+        // invariant while preserving the (metadata-bearing) schema.
+        let mut ids = batch
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        ids[0] = ids.len() as u32;
+        let mut columns = batch.columns().to_vec();
+        columns[0] = Arc::new(UInt32Array::from(ids));
+        let corrupted = RecordBatch::try_new(batch.schema(), columns).unwrap();
+
+        assert!(
+            HNSW::load(corrupted).is_err(),
+            "load() must reject a misaligned level-0 __vector_id"
+        );
+    }
+
+    /// `load()` must reject metadata whose `entry_point` is out of range for
+    /// the node count: it indexes the `Dense` level-0 lookup directly, so an
+    /// out-of-range value would read past the level-0 neighbor buffer at search
+    /// time.
+    #[tokio::test]
+    async fn test_load_rejects_out_of_range_entry_point() {
+        use super::{HNSW_METADATA_KEY, HnswMetadata};
+
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+
+        let batch = builder.to_batch().unwrap();
+        let mut metadata = batch.schema_ref().metadata().clone();
+        let mut md: HnswMetadata =
+            serde_json::from_str(metadata.get(HNSW_METADATA_KEY).unwrap()).unwrap();
+        // Valid entry points are `[0, N)`; `level_offsets[1]` == N is one past.
+        let n = md.level_offsets[1];
+        md.entry_point = n as u32;
+        metadata.insert(
+            HNSW_METADATA_KEY.to_string(),
+            serde_json::to_string(&md).unwrap(),
+        );
+        // Rebuild the batch under the rewritten metadata. `with_schema` would
+        // reject this: it requires the new metadata to be a superset, but we
+        // are changing an existing key's value, not adding one.
+        let schema = batch.schema().as_ref().clone().with_metadata(metadata);
+        let corrupted = RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).unwrap();
+
+        assert!(
+            HNSW::load(corrupted).is_err(),
+            "load() must reject an out-of-range entry_point"
+        );
     }
 
     /// An empty index round-trips: 0-row `to_batch` -> `load` -> empty graph.
