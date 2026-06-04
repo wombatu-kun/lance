@@ -206,7 +206,7 @@ impl<'a> CreateIndexBuilder<'a> {
             self.index_type,
             self.params,
             self.fragments.as_ref(),
-            self.index_uuid.as_deref(),
+            self.index_uuid.as_ref(),
         )?;
 
         let index_id = self.index_uuid.unwrap_or_else(Uuid::new_v4);
@@ -274,7 +274,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     build_bitmap_index_segment(
                         self.dataset,
                         column,
-                        &index_id.to_string(),
+                        index_id,
                         fragments,
                         self.progress.clone(),
                     )
@@ -552,7 +552,7 @@ fn ensure_index_uuid_allowed(
     index_type: IndexType,
     params: &dyn IndexParams,
     fragments: Option<&Vec<u32>>,
-    index_uuid: Option<&str>,
+    index_uuid: Option<&Uuid>,
 ) -> Result<()> {
     let is_btree = index_type == IndexType::BTree
         || params
@@ -1156,7 +1156,7 @@ mod tests {
 
         let err = dataset
             .merge_index_metadata(
-                &Uuid::new_v4().to_string(),
+                &Uuid::new_v4(),
                 IndexType::BTree,
                 None,
                 Arc::new(NoopIndexBuildProgress),
@@ -1307,7 +1307,7 @@ mod tests {
             let err = CreateIndexBuilder::new(&mut dataset, &["value"], index_type, &params)
                 .name("value_btree_segments".to_string())
                 .fragments(vec![fragment_id])
-                .index_uuid(Uuid::new_v4().to_string())
+                .index_uuid(Uuid::new_v4())
                 .execute_uncommitted()
                 .await
                 .unwrap_err();

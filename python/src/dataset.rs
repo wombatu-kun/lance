@@ -89,7 +89,6 @@ use lance_linalg::distance::MetricType;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
-use uuid::Uuid;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;

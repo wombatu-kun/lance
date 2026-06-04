@@ -335,7 +335,7 @@ pub(super) async fn build_scalar_index(
 pub(super) async fn build_bitmap_index_segment(
     dataset: &Dataset,
     column: &str,
-    uuid: &str,
+    uuid: Uuid,
     fragment_ids: Vec<u32>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
@@ -358,7 +358,7 @@ pub(super) async fn build_bitmap_index_segment(
         load_training_data(dataset, column, criteria, None, true, Some(fragment_ids)).await?;
     progress.stage_complete("load_data").await?;
 
-    let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
+    let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
     plugin
         .train_index(
             training_data,
