@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::FutureExt;
 use itertools::Itertools;
-use lance_core::cache::{CacheKey, UnsizedCacheKey};
+use lance_core::cache::CacheKey;
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;
@@ -273,34 +273,6 @@ fn segment_has_btree_details(segment: &IndexMetadata) -> bool {
 }
 
 // Cache keys for different index types
-#[derive(Debug, Clone)]
-pub struct ScalarIndexCacheKey<'a> {
-    pub uuid: &'a Uuid,
-    pub fri_uuid: Option<&'a Uuid>,
-}
-
-impl<'a> ScalarIndexCacheKey<'a> {
-    pub fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
-        Self { uuid, fri_uuid }
-    }
-}
-
-impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
-    type ValueType = dyn ScalarIndex;
-
-    fn key(&self) -> std::borrow::Cow<'_, str> {
-        if let Some(fri_uuid) = self.fri_uuid {
-            format!("{}-{}", self.uuid, fri_uuid).into()
-        } else {
-            self.uuid.to_string().into()
-        }
-    }
-
-    fn type_name() -> &'static str {
-        "ScalarIndex"
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct LegacyVectorIndexCacheKey<'a> {
     uuid: &'a Uuid,
