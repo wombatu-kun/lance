@@ -123,7 +123,7 @@ async fn rebuild_scalar_segment(
     reference_index: &Arc<dyn ScalarIndex>,
     field_path: &str,
     column_name: &str,
-    uuid: &str,
+    uuid: Uuid,
     fragment_ids: Vec<u32>,
 ) -> Result<CreatedIndex> {
     let params = reference_index.derive_index_params()?;
@@ -186,11 +186,7 @@ async fn merge_scalar_indices<'a>(
         .copied()
         .unwrap_or(old_indices[old_indices.len() - 1]);
     let reference_index = dataset
-        .open_scalar_index(
-            field_path,
-            &reference_idx.uuid.to_string(),
-            &NoOpMetricsCollector,
-        )
+        .open_scalar_index(field_path, &reference_idx.uuid, &NoOpMetricsCollector)
         .await?;
 
     // Effective = bitmap ∩ live fragments; deleted = bitmap \ live fragments.
@@ -230,7 +226,7 @@ async fn merge_scalar_indices<'a>(
             &reference_index,
             field_path,
             column_name,
-            &new_uuid.to_string(),
+            new_uuid,
             frag_bitmap.iter().collect(),
         )
         .await?
@@ -239,7 +235,7 @@ async fn merge_scalar_indices<'a>(
         let new_data_stream =
             load_unindexed_training_data(dataset.as_ref(), field_path, &update_criteria, unindexed)
                 .await?;
-        let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+        let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
         let old_data_filter =
             build_old_data_filter(dataset.as_ref(), &effective_old_frags, &deleted_old_frags)
                 .await?;
