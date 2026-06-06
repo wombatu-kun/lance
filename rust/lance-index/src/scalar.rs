@@ -8,6 +8,7 @@ use arrow_array::{BooleanArray, ListArray, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
+use datafusion::functions::regex::regexplike::RegexpLikeFunc;
 use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -633,9 +634,15 @@ impl AnyQuery for LabelListQuery {
 pub enum TextQuery {
     /// Retrieve all row ids where the text contains the given string
     StringContains(String),
-    // TODO: In the future we should be able to do string-insensitive contains
-    // as well as partial matches (e.g. LIKE 'foo%') and potentially even
-    // some regular expressions
+    /// Retrieve all row ids whose text matches the given regular expression.
+    ///
+    /// The pattern is a full regular expression (as accepted by `regexp_like`).
+    /// The index returns a candidate superset that the scan rechecks, so any
+    /// pattern is sound; patterns with no usable trigram structure simply fall
+    /// back to rechecking every row.
+    Regex(String),
+    // TODO: In the future we should be able to do case-insensitive contains
+    // as well as partial matches (e.g. LIKE 'foo%').
 }
 
 impl AnyQuery for TextQuery {
@@ -654,6 +661,17 @@ impl AnyQuery for TextQuery {
                 args: vec![
                     Expr::Column(Column::new_unqualified(col)),
                     Expr::Literal(ScalarValue::Utf8(Some(substr.clone())), None),
+                ],
+            }),
+            // `regexp_like` returns Boolean directly, so the reconstructed
+            // expression can be used as-is for the recheck filter (no IsNotNull
+            // wrapper, unlike `regexp_match`). It is the semantic equivalent of
+            // the original predicate for the "does it match" question.
+            Self::Regex(pattern) => Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(RegexpLikeFunc::new().into()),
+                args: vec![
+                    Expr::Column(Column::new_unqualified(col)),
+                    Expr::Literal(ScalarValue::Utf8(Some(pattern.clone())), None),
                 ],
             }),
         }
