@@ -14,10 +14,12 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::FileReader;
 use lance_io::ReadBatchParams;
+use lance_io::scheduler::IoStats;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
 use std::{
     any::Any,
+    borrow::Cow,
     collections::BinaryHeap,
     mem::size_of,
     ops::{Deref, DerefMut},
@@ -621,14 +623,32 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     }
 
     pub async fn load_partition(&self, part_id: usize) -> Result<Q::Storage> {
+        self.load_partition_with_io_stats(part_id, None).await
+    }
+
+    /// Load a partition's quantization storage, optionally measuring the exact
+    /// I/O it performs into `io_stats`.
+    ///
+    /// When `io_stats` is `Some`, the partition is read through a reader whose
+    /// scheduler also records into the sink (a cheap clone that shares all
+    /// cached metadata, so no file is re-opened).  When `None`, the normal
+    /// uninstrumented reader is used.
+    pub async fn load_partition_with_io_stats(
+        &self,
+        part_id: usize,
+        io_stats: Option<IoStats>,
+    ) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
         let batch = if range.is_empty() {
             let schema = self.reader.schema();
             let arrow_schema = arrow_schema::Schema::from(schema.as_ref());
             RecordBatch::new_empty(Arc::new(arrow_schema))
         } else {
-            let batches = self
-                .reader
+            let reader = match &io_stats {
+                Some(io_stats) => Cow::Owned(self.reader.with_io_stats(io_stats.recorder())),
+                None => Cow::Borrowed(&self.reader),
+            };
+            let batches = reader
                 .read_stream(
                     ReadBatchParams::Range(range),
                     u32::MAX,
