@@ -11,6 +11,7 @@ pub mod cpu;
 pub mod deletion;
 pub mod futures;
 pub mod hash;
+pub mod io_stats;
 pub mod mask;
 pub mod parse;
 pub mod path;
