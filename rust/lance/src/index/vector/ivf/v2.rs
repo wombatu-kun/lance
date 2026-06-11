@@ -1258,9 +1258,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<Q::Storage> {
-        self.storage
-            .load_partition_with_io_stats(partition_id, io_stats)
-            .await
+        self.storage.load_partition(partition_id, io_stats).await
     }
 
     /// preprocess the query vector given the partition id.
@@ -2767,7 +2765,7 @@ mod tests {
     async fn load_partition_row_ids(index: &IvfPq, partition_idx: usize) -> Vec<u64> {
         index
             .storage
-            .load_partition(partition_idx)
+            .load_partition(partition_idx, None)
             .await
             .unwrap()
             .row_ids()

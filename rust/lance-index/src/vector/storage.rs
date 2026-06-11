@@ -622,10 +622,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.num_partitions()
     }
 
-    pub async fn load_partition(&self, part_id: usize) -> Result<Q::Storage> {
-        self.load_partition_with_io_stats(part_id, None).await
-    }
-
     /// Load a partition's quantization storage, optionally measuring the exact
     /// I/O it performs into `io_stats`.
     ///
@@ -633,7 +629,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// scheduler also records into the sink (a cheap clone that shares all
     /// cached metadata, so no file is re-opened).  When `None`, the normal
     /// uninstrumented reader is used.
-    pub async fn load_partition_with_io_stats(
+    pub async fn load_partition(
         &self,
         part_id: usize,
         io_stats: Option<IoStats>,
