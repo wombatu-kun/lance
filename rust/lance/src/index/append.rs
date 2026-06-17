@@ -879,7 +879,7 @@ mod tests {
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };
     use lance_linalg::distance::MetricType;
-    use lance_testing::datagen::generate_random_array;
+    use lance_testing::datagen::{generate_random_array, generate_random_array_with_seed};
     use rstest::rstest;
 
     use crate::dataset::builder::DatasetBuilder;
@@ -1101,6 +1101,30 @@ mod tests {
         );
     }
 
+    /// Vector dimension used by `test_query_delta_indices`. Shared by the test
+    /// body and `deterministic_ivf_centroids` so the supplied centroids always
+    /// match the generated data.
+    const DELTA_INDEX_DIM: usize = 64;
+
+    /// Fixed IVF centroids for the IVF_HNSW_SQ case of `test_query_delta_indices`.
+    ///
+    /// Supplying centroids makes the delta-index build fully deterministic:
+    /// `try_with_centroids` skips IVF centroid training, which is the only
+    /// non-deterministic step left on this path (it draws a random training-data
+    /// sample and runs unseeded k-means init). HNSW level assignment is already
+    /// seeded and SQ does not sample here, so with seeded input data the whole
+    /// build is reproducible and the exact neighbor-id assertion no longer flakes
+    /// (issue #2125, PR #6953).
+    fn deterministic_ivf_centroids() -> Arc<FixedSizeListArray> {
+        Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                generate_random_array_with_seed::<Float32Type>(2 * DELTA_INDEX_DIM, [7; 32]),
+                DELTA_INDEX_DIM as i32,
+            )
+            .unwrap(),
+        )
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_query_delta_indices(
@@ -1108,20 +1132,20 @@ mod tests {
             VectorIndexParams::ivf_pq(2, 8, 4, MetricType::L2, 2),
             VectorIndexParams::with_ivf_hnsw_sq_params(
                 MetricType::L2,
-                IvfBuildParams::new(2),
+                IvfBuildParams::try_with_centroids(2, deterministic_ivf_centroids()).unwrap(),
                 HnswBuildParams::default(),
                 SQBuildParams::default()
             )
         )]
         index_params: VectorIndexParams,
     ) {
-        const DIM: usize = 64;
+        const DIM: usize = DELTA_INDEX_DIM;
         const TOTAL: usize = 1000;
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        let vectors = generate_random_array(TOTAL * DIM);
+        let vectors = generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [13; 32]);
 
         let schema = Arc::new(Schema::new(vec![
             Field::new(
