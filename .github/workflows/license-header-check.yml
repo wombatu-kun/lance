@@ -31,9 +31,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ./bin
-          curl -sfSL "https://github.com/lluissm/license-header-checker/releases/download/v${LHC_VERSION}/license-header-checker_${LHC_VERSION}_linux_amd64.tar.gz" -o /tmp/lhc.tar.gz
-          tar -xzf /tmp/lhc.tar.gz -C ./bin license-header-checker
-          rm -f /tmp/lhc.tar.gz
+          base="https://github.com/lluissm/license-header-checker/releases/download/v${LHC_VERSION}"
+          asset="license-header-checker_${LHC_VERSION}_linux_amd64.tar.gz"
+          curl -sfSL "${base}/${asset}" -o "/tmp/${asset}"
+          curl -sfSL "${base}/checksums.txt" -o /tmp/lhc-checksums.txt
+          # Verify the download against the release checksums before extracting so a
+          # corrupted or tampered asset cannot be executed. This restores the
+          # integrity check the upstream install.sh performed via hash_sha256_verify.
+          (cd /tmp && sha256sum -c --ignore-missing lhc-checksums.txt)
+          tar -xzf "/tmp/${asset}" -C ./bin license-header-checker
+          rm -f "/tmp/${asset}" /tmp/lhc-checksums.txt
       - name: Check license headers (rust)
         run: ./bin/license-header-checker -a -v ./rust/license_header.txt rust rs && [[ -z `git status -s` ]]
       - name: Check license headers (python)
