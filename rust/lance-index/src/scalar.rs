@@ -18,7 +18,10 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::{any::Any, ops::Bound, sync::Arc};
 
-use datafusion_expr::{Expr, expr::ScalarFunction};
+use datafusion_expr::{
+    Expr,
+    expr::{Like, ScalarFunction},
+};
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -452,6 +455,19 @@ pub enum SargableQuery {
     LikePrefix(ScalarValue),
 }
 
+/// Escape the LIKE metacharacters (`\`, `%`, `_`) in a literal string so it can be
+/// embedded in a LIKE pattern and matched literally (paired with `ESCAPE '\'`).
+fn escape_like_pattern(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 impl AnyQuery for SargableQuery {
     fn as_any(&self) -> &dyn Any {
         self
@@ -553,16 +569,36 @@ impl AnyQuery for SargableQuery {
             )),
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone(), None)),
-            Self::LikePrefix(prefix) => {
-                let pattern = match prefix {
-                    ScalarValue::Utf8(Some(s)) => ScalarValue::Utf8(Some(format!("{}%", s))),
-                    ScalarValue::LargeUtf8(Some(s)) => {
-                        ScalarValue::LargeUtf8(Some(format!("{}%", s)))
+            Self::LikePrefix(prefix) => match prefix {
+                ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
+                    // The prefix is a literal string. If it contains LIKE metacharacters
+                    // (`_`, `%`, `\`) they must be escaped before appending the `%` wildcard;
+                    // otherwise an inexact recheck (e.g. zone maps) would treat them as
+                    // wildcards and over-match rows that do not start with the literal prefix.
+                    // When the prefix has no metacharacters we keep the plain
+                    // `col LIKE 'prefix%'` form (no `ESCAPE`), identical to the prior behavior,
+                    // so DataFusion's optimized prefix matcher still applies.
+                    let escaped = escape_like_pattern(s);
+                    let needs_escape = escaped.as_str() != s.as_str();
+                    let pattern = format!("{}%", escaped);
+                    let pattern_value = match prefix {
+                        ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(Some(pattern)),
+                        _ => ScalarValue::Utf8(Some(pattern)),
+                    };
+                    if needs_escape {
+                        Expr::Like(Like {
+                            negated: false,
+                            expr: Box::new(col_expr),
+                            pattern: Box::new(Expr::Literal(pattern_value, None)),
+                            escape_char: Some('\\'),
+                            case_insensitive: false,
+                        })
+                    } else {
+                        col_expr.like(Expr::Literal(pattern_value, None))
                     }
-                    other => other.clone(),
-                };
-                col_expr.like(Expr::Literal(pattern, None))
-            }
+                }
+                other => col_expr.like(Expr::Literal(other.clone(), None)),
+            },
         }
     }
 
@@ -1075,4 +1111,39 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// This returns a ScalarIndexParams that can be used to recreate an index
     /// with the same configuration on another dataset.
     fn derive_index_params(&self) -> Result<ScalarIndexParams>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_like_prefix_to_expr_escapes_metacharacters() {
+        // The stored prefix is a literal string, so LIKE metacharacters in it must be
+        // escaped when the recheck predicate is rebuilt; otherwise `_`/`%` would act as
+        // wildcards and over-match. The reconstructed expression uses `ESCAPE '\'`.
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("a_b%x".to_string())));
+        let Expr::Like(like) = query.to_expr("name".to_string()) else {
+            panic!("expected a LIKE expression");
+        };
+        assert_eq!(like.escape_char, Some('\\'));
+        assert!(!like.negated);
+        assert!(!like.case_insensitive);
+        let Expr::Literal(ScalarValue::Utf8(Some(pattern)), _) = like.pattern.as_ref() else {
+            panic!("expected a Utf8 literal pattern");
+        };
+        assert_eq!(pattern.as_str(), "a\\_b\\%x%");
+
+        // A prefix without metacharacters only gains the trailing wildcard and keeps the
+        // plain `LIKE 'app%'` form (no `ESCAPE`) so the optimized prefix matcher still applies.
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("app".to_string())));
+        let Expr::Like(like) = query.to_expr("name".to_string()) else {
+            panic!("expected a LIKE expression");
+        };
+        assert_eq!(like.escape_char, None);
+        let Expr::Literal(ScalarValue::Utf8(Some(pattern)), _) = like.pattern.as_ref() else {
+            panic!("expected a Utf8 literal pattern");
+        };
+        assert_eq!(pattern.as_str(), "app%");
+    }
 }

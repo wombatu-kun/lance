@@ -257,6 +257,7 @@ pub struct SargableQueryParser {
     index_name: String,
     index_type: String,
     needs_recheck: bool,
+    supports_like_prefix: bool,
 }
 
 impl SargableQueryParser {
@@ -265,7 +266,16 @@ impl SargableQueryParser {
             index_name,
             index_type,
             needs_recheck,
+            supports_like_prefix: true,
         }
+    }
+
+    /// Bitmap (and similar) indexes cannot answer prefix queries; disabling
+    /// `LikePrefix` emission makes `LIKE`/`starts_with` predicates fall back to
+    /// ordinary filtering instead of failing at search time.
+    pub fn without_like_prefix(mut self) -> Self {
+        self.supports_like_prefix = false;
+        self
     }
 }
 
@@ -380,6 +390,11 @@ impl ScalarQueryParser for SargableQueryParser {
     ) -> Option<IndexedExpression> {
         // Handle starts_with(col, 'prefix') -> convert to LikePrefix query
         if func.name() == "starts_with" && args.len() == 2 {
+            // Indexes that cannot answer prefix queries (e.g. bitmap) fall back to
+            // ordinary filtering rather than emitting a query they would reject.
+            if !self.supports_like_prefix {
+                return None;
+            }
             // Extract the prefix from the second argument
             let prefix = match &args[1] {
                 Expr::Literal(ScalarValue::Utf8(Some(s)), _) => ScalarValue::Utf8(Some(s.clone())),
@@ -417,6 +432,12 @@ impl ScalarQueryParser for SargableQueryParser {
     ) -> Option<IndexedExpression> {
         // Case-insensitive LIKE (ILIKE) cannot be efficiently pruned with zone maps
         if like.case_insensitive {
+            return None;
+        }
+
+        // Indexes that cannot answer prefix queries (e.g. bitmap) fall back to
+        // ordinary filtering rather than emitting a query they would reject.
+        if !self.supports_like_prefix {
             return None;
         }
 
@@ -3306,6 +3327,73 @@ mod tests {
             .visit_like("color", &like(pattern.clone()), &pattern)
             .expect("LIKE prefix should use the BTree index");
         assert_like_prefix(&indexed, &ScalarValue::Utf8(Some("foo".to_string())), false);
+    }
+
+    #[test]
+    fn test_sargable_query_parser_without_like_prefix() {
+        // Bitmap indexes configure the parser with `without_like_prefix`: a bitmap index
+        // cannot answer `LikePrefix` queries (its `search` rejects them), so `starts_with` /
+        // `LIKE 'prefix%'` must not be turned into an index query. Returning `None` lets the
+        // predicate fall back to ordinary filtering instead of failing at search time.
+        let bitmap_parser =
+            SargableQueryParser::new("color_idx".to_string(), "BITMAP".to_string(), false)
+                .without_like_prefix();
+        let btree_parser =
+            SargableQueryParser::new("color_idx".to_string(), "BTree".to_string(), false);
+
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, false)]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+        let Expr::ScalarFunction(starts_with) = state
+            .create_logical_expr("starts_with(color, 'foo')", &df_schema)
+            .unwrap()
+        else {
+            panic!("expected starts_with to parse as a scalar function");
+        };
+
+        let pattern = ScalarValue::Utf8(Some("foo%".to_string()));
+        let like = Like::new(
+            false,
+            Box::new(Expr::Column(Column::new_unqualified("color"))),
+            Box::new(Expr::Literal(pattern.clone(), None)),
+            None,
+            false,
+        );
+
+        // Bitmap parser: both prefix paths fall back (return `None`).
+        assert!(
+            bitmap_parser
+                .visit_scalar_function(
+                    "color",
+                    &DataType::Utf8,
+                    starts_with.func.as_ref(),
+                    &starts_with.args,
+                )
+                .is_none(),
+            "bitmap parser must not emit a LikePrefix for starts_with"
+        );
+        assert!(
+            bitmap_parser.visit_like("color", &like, &pattern).is_none(),
+            "bitmap parser must not emit a LikePrefix for LIKE"
+        );
+
+        // A prefix-capable parser (e.g. BTree) still emits the index query.
+        assert!(
+            btree_parser
+                .visit_scalar_function(
+                    "color",
+                    &DataType::Utf8,
+                    starts_with.func.as_ref(),
+                    &starts_with.args,
+                )
+                .is_some(),
+            "BTree parser should still emit a LikePrefix for starts_with"
+        );
+        assert!(
+            btree_parser.visit_like("color", &like, &pattern).is_some(),
+            "BTree parser should still emit a LikePrefix for LIKE"
+        );
     }
 
     #[test]
