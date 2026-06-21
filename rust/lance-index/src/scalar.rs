@@ -570,7 +570,9 @@ impl AnyQuery for SargableQuery {
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone(), None)),
             Self::LikePrefix(prefix) => match prefix {
-                ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
+                ScalarValue::Utf8(Some(s))
+                | ScalarValue::LargeUtf8(Some(s))
+                | ScalarValue::Utf8View(Some(s)) => {
                     // The prefix is a literal string. If it contains LIKE metacharacters
                     // (`_`, `%`, `\`) they must be escaped before appending the `%` wildcard;
                     // otherwise an inexact recheck (e.g. zone maps) would treat them as
@@ -578,6 +580,11 @@ impl AnyQuery for SargableQuery {
                     // When the prefix has no metacharacters we keep the plain
                     // `col LIKE 'prefix%'` form (no `ESCAPE`), identical to the prior behavior,
                     // so DataFusion's optimized prefix matcher still applies.
+                    // A `Utf8View` prefix is handled here too (rather than falling through to
+                    // the catch-all arm, which would rebuild the recheck without the trailing
+                    // `%` and silently turn prefix matching into equality matching) and is
+                    // normalized to a `Utf8` pattern below, mirroring how the parser normalizes
+                    // `Utf8View` to `Utf8` (see `expression.rs`).
                     let escaped = escape_like_pattern(s);
                     let needs_escape = escaped.as_str() != s.as_str();
                     let pattern = format!("{}%", escaped);
@@ -1137,6 +1144,30 @@ mod tests {
         // A prefix without metacharacters only gains the trailing wildcard and keeps the
         // plain `LIKE 'app%'` form (no `ESCAPE`) so the optimized prefix matcher still applies.
         let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("app".to_string())));
+        let Expr::Like(like) = query.to_expr("name".to_string()) else {
+            panic!("expected a LIKE expression");
+        };
+        assert_eq!(like.escape_char, None);
+        let Expr::Literal(ScalarValue::Utf8(Some(pattern)), _) = like.pattern.as_ref() else {
+            panic!("expected a Utf8 literal pattern");
+        };
+        assert_eq!(pattern.as_str(), "app%");
+
+        // A `Utf8View` prefix must get the same treatment instead of falling through to the
+        // catch-all arm: it is normalized to a `Utf8` pattern that keeps the trailing `%`
+        // (and `ESCAPE '\'` when the prefix has metacharacters), so prefix pruning preserves
+        // starts-with semantics rather than degrading to equality.
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8View(Some("a_b%x".to_string())));
+        let Expr::Like(like) = query.to_expr("name".to_string()) else {
+            panic!("expected a LIKE expression");
+        };
+        assert_eq!(like.escape_char, Some('\\'));
+        let Expr::Literal(ScalarValue::Utf8(Some(pattern)), _) = like.pattern.as_ref() else {
+            panic!("expected a Utf8 literal pattern");
+        };
+        assert_eq!(pattern.as_str(), "a\\_b\\%x%");
+
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8View(Some("app".to_string())));
         let Expr::Like(like) = query.to_expr("name".to_string()) else {
             panic!("expected a LIKE expression");
         };
