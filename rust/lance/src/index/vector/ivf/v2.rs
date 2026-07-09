@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use std::{
     any::Any,
     collections::{BinaryHeap, HashMap},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use crate::index::vector::{IndexFileVersion, builder::index_type_string};
@@ -105,6 +105,41 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     pub(crate) index_file_size: u64,
     pub(crate) aux_file_size: u64,
 }
+
+/// Number of prepared partitions handed to a single `spawn_cpu` dispatch on the
+/// streaming search path.
+///
+/// The streaming path deliberately avoids per-partition CPU-task fan-out (a measured
+/// 14-30% latency win, see #6475). Searching a batch of partitions per `spawn_cpu`
+/// keeps most of that benefit — the per-dispatch overhead is paid once per
+/// `STREAMING_SEARCH_BATCH_SIZE` partitions instead of once per partition — while
+/// keeping the channel `recv`/`send` in async code so no CPU-pool thread ever parks on
+/// a channel (which can deadlock the pool on small hosts, see #7642). `should_stop` is
+/// still checked per partition, so early-stop granularity is unchanged.
+///
+/// This is a tunable knob: larger batches amortize dispatch overhead further and keep
+/// more work on a single CPU thread, at the cost of more prepared partitions held in
+/// memory at once. The batch is an upper bound: the search loop greedily drains
+/// whatever is already prepared rather than waiting for a full batch, so a slow
+/// producer yields small batches (matching the old search-as-it-arrives latency) and
+/// only a fast producer fills whole ones. Override with the
+/// `LANCE_IVF_STREAMING_SEARCH_BATCH_SIZE` environment variable.
+pub(crate) const DEFAULT_STREAMING_SEARCH_BATCH_SIZE: usize = 16;
+
+pub(crate) static STREAMING_SEARCH_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let batch_size = std::env::var("LANCE_IVF_STREAMING_SEARCH_BATCH_SIZE")
+        .map(|value| {
+            value
+                .parse()
+                .expect("failed to parse LANCE_IVF_STREAMING_SEARCH_BATCH_SIZE")
+        })
+        .unwrap_or(DEFAULT_STREAMING_SEARCH_BATCH_SIZE);
+    assert!(
+        batch_size > 0,
+        "LANCE_IVF_STREAMING_SEARCH_BATCH_SIZE must be greater than 0, got {batch_size}"
+    );
+    batch_size
+});
 
 struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
     query: Query,
@@ -1257,8 +1292,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             )));
         }
 
+        // The prepared channel holds a full search batch so that partitions prepared
+        // while the previous batch is being searched are ready for the next greedy
+        // drain, instead of serializing producer and consumer through a single slot.
         let (prepared_tx, mut prepared_rx) =
-            mpsc::channel::<Result<PreparedPartitionSearch<S, Q>>>(1);
+            mpsc::channel::<Result<PreparedPartitionSearch<S, Q>>>(*STREAMING_SEARCH_BATCH_SIZE);
         let (batch_tx, batch_rx) = mpsc::channel::<DataFusionResult<RecordBatch>>(1);
 
         let prepare_index = self.clone();
@@ -1296,54 +1334,133 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         let distance_type = self.distance_type;
         let search_metrics = metrics.clone();
-        let batch_tx_for_search = batch_tx.clone();
         let search_control = control.clone();
+        // Search prepared partitions in batches. Each batch is searched in a single
+        // `spawn_cpu` dispatch (amortizing the per-dispatch overhead the single-worker
+        // design in #6475 avoided), but the channel `recv`/`send` stay in async code so
+        // no CPU-pool thread ever parks on a channel — parking one can deadlock the pool
+        // on small hosts (#7642). `should_stop` is checked per partition, so early-stop
+        // granularity is unchanged.
+        //
+        // Batches are formed greedily: wait for one prepared partition, then drain
+        // whatever else is already prepared, up to the batch size. Waiting for a full
+        // batch instead would delay the first search (and the early-stop feedback it
+        // produces) behind up to a whole batch of prepare I/O, which is significant
+        // when prepare parallelism is low.
         tokio::spawn(async move {
-            let search_result = spawn_cpu(move || -> DataFusionResult<()> {
-                while let Some(prepared) = prepared_rx.blocking_recv() {
-                    let prepared = match prepared {
-                        Ok(prepared) => prepared,
-                        Err(err) => {
-                            let _ =
-                                batch_tx_for_search.blocking_send(Err(DataFusionError::from(err)));
-                            return Ok(());
-                        }
-                    };
+            loop {
+                // Stop pulling as soon as the search is done — or the receiver of our
+                // results is gone — so the producer stops preparing partitions we
+                // would never search.
+                if search_control
+                    .as_ref()
+                    .is_some_and(|control| control.should_stop())
+                    || batch_tx.is_closed()
+                {
+                    return;
+                }
 
-                    if search_control
-                        .as_ref()
-                        .is_some_and(|control| control.should_stop())
-                    {
-                        return Ok(());
-                    }
-
-                    let batch = Self::run_prepared_partition_search(
-                        distance_type,
-                        prepared,
-                        search_metrics.as_ref(),
-                    )
-                    .map_err(DataFusionError::from);
-                    match batch {
-                        Ok(batch) => {
-                            if let Some(control) = search_control.as_ref() {
-                                control.record_batch(&batch);
-                            }
-                            if batch_tx_for_search.blocking_send(Ok(batch)).is_err() {
-                                return Ok(());
-                            }
+                let mut prepared_batch = Vec::with_capacity(*STREAMING_SEARCH_BATCH_SIZE);
+                let mut prepare_error = None;
+                let mut producer_done = false;
+                match prepared_rx.recv().await {
+                    Some(Ok(prepared)) => prepared_batch.push(prepared),
+                    Some(Err(err)) => prepare_error = Some(DataFusionError::from(err)),
+                    None => producer_done = true,
+                }
+                while prepare_error.is_none()
+                    && !producer_done
+                    && prepared_batch.len() < *STREAMING_SEARCH_BATCH_SIZE
+                {
+                    match prepared_rx.try_recv() {
+                        Ok(Ok(prepared)) => prepared_batch.push(prepared),
+                        Ok(Err(err)) => {
+                            prepare_error = Some(DataFusionError::from(err));
                         }
-                        Err(err) => {
-                            let _ = batch_tx_for_search.blocking_send(Err(err));
-                            return Ok(());
+                        // Nothing else is prepared yet; search what we have rather
+                        // than waiting for more.
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            producer_done = true;
                         }
                     }
                 }
-                Ok(())
-            })
-            .await;
 
-            if let Err(err) = search_result {
-                let _ = batch_tx.send(Err(err)).await;
+                if !prepared_batch.is_empty() {
+                    let search_metrics = search_metrics.clone();
+                    let search_control = search_control.clone();
+                    // `is_closed` is synchronously callable, so a sender clone lets the
+                    // CPU loop notice a dropped receiver between partitions instead of
+                    // searching out the whole batch for a cancelled query. (A `select!`
+                    // on `closed()` would not help here: `spawn_cpu` closures are not
+                    // cancellable, so abandoning the await leaves the work running.)
+                    let cancel_probe = batch_tx.clone();
+                    let search_output = spawn_cpu(move || {
+                        let mut outputs: Vec<DataFusionResult<RecordBatch>> =
+                            Vec::with_capacity(prepared_batch.len());
+                        // `stopped` means the whole search should end (an error, an
+                        // early-stop signal, or cancellation), not just this batch.
+                        let mut stopped = false;
+                        for prepared in prepared_batch {
+                            if search_control
+                                .as_ref()
+                                .is_some_and(|control| control.should_stop())
+                                || cancel_probe.is_closed()
+                            {
+                                stopped = true;
+                                break;
+                            }
+                            match Self::run_prepared_partition_search(
+                                distance_type,
+                                prepared,
+                                search_metrics.as_ref(),
+                            )
+                            .map_err(DataFusionError::from)
+                            {
+                                Ok(batch) => {
+                                    if let Some(control) = search_control.as_ref() {
+                                        control.record_batch(&batch);
+                                    }
+                                    outputs.push(Ok(batch));
+                                }
+                                Err(err) => {
+                                    outputs.push(Err(err));
+                                    stopped = true;
+                                    break;
+                                }
+                            }
+                        }
+                        Ok::<_, DataFusionError>((outputs, stopped))
+                    })
+                    .await;
+
+                    let (outputs, stopped) = match search_output {
+                        Ok(output) => output,
+                        // Defensive: the closure always returns Ok (search errors are
+                        // captured per partition in `outputs`), so this arm should be
+                        // unreachable. Forward and stop rather than drop silently.
+                        Err(err) => {
+                            let _ = batch_tx.send(Err(err)).await;
+                            return;
+                        }
+                    };
+                    for output in outputs {
+                        if batch_tx.send(output).await.is_err() {
+                            return;
+                        }
+                    }
+                    if stopped {
+                        return;
+                    }
+                }
+
+                if let Some(err) = prepare_error {
+                    let _ = batch_tx.send(Err(err)).await;
+                    return;
+                }
+                if producer_done {
+                    return;
+                }
             }
         });
 
