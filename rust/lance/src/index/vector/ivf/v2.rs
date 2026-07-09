@@ -1921,8 +1921,8 @@ mod tests {
     use arrow::datatypes::{Float64Type, UInt8Type, UInt64Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
-        Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Float64Array,
-        Int64Array, ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
+        Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
+        ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -1943,7 +1943,7 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         Dataset,
-        index::vector::{StageParams, VectorIndex, VectorIndexParams},
+        index::vector::{VectorIndex, VectorIndexParams},
     };
     use crate::{
         dataset::optimize::{CompactionOptions, compact_files},
@@ -1987,14 +1987,6 @@ mod tests {
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
-
-    /// Seed for the deterministic IVF_RQ rotation used by `determinize_rq_params`.
-    /// RaBitQ picks a random rotation at build time (unseeded), which makes the
-    /// recall of `test_build_ivf_rq` non-deterministic and borderline against its
-    /// `>= 0.5` bar. Pinning the rotation (and the IVF centroids) makes recall
-    /// reproducible. This is the single knob to bump if a case ever dips below its
-    /// bar.
-    const RQ_SEED: u64 = 42;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
@@ -3986,171 +3978,6 @@ mod tests {
         assert_lt!(sq_meta.bounds.end, FRAGMENT_OFFSETS[1] as f64);
     }
 
-    /// Deterministic IVF centroids for the RQ recall tests: partition `k` is the
-    /// mean of every row whose index satisfies `row_index % nlist == k`. For
-    /// `nlist == 1` this is the global mean (what k-means converges to for a single
-    /// cluster); for `nlist == 4` it yields distinct, near-central centroids. The
-    /// output value type matches the dataset so the IVF stage accepts it verbatim.
-    fn fixed_rq_centroids(fsl: &FixedSizeListArray, nlist: usize) -> Arc<FixedSizeListArray> {
-        let n = fsl.len();
-        let mut sums = vec![0.0f64; nlist * DIM];
-        let mut counts = vec![0usize; nlist];
-        match fsl.value_type() {
-            DataType::Float32 => {
-                let values = fsl.values().as_primitive::<Float32Type>();
-                for row in 0..n {
-                    let k = row % nlist;
-                    counts[k] += 1;
-                    for d in 0..DIM {
-                        sums[k * DIM + d] += values.value(row * DIM + d) as f64;
-                    }
-                }
-            }
-            DataType::Float64 => {
-                let values = fsl.values().as_primitive::<Float64Type>();
-                for row in 0..n {
-                    let k = row % nlist;
-                    counts[k] += 1;
-                    for d in 0..DIM {
-                        sums[k * DIM + d] += values.value(row * DIM + d);
-                    }
-                }
-            }
-            dt => unreachable!("RQ centroids: unexpected value type {dt:?}"),
-        }
-        for k in 0..nlist {
-            let count = counts[k].max(1) as f64;
-            for d in 0..DIM {
-                sums[k * DIM + d] /= count;
-            }
-        }
-        let centroids = match fsl.value_type() {
-            DataType::Float32 => FixedSizeListArray::try_new_from_values(
-                Float32Array::from(sums.iter().map(|&x| x as f32).collect::<Vec<_>>()),
-                DIM as i32,
-            )
-            .unwrap(),
-            DataType::Float64 => {
-                FixedSizeListArray::try_new_from_values(Float64Array::from(sums), DIM as i32)
-                    .unwrap()
-            }
-            dt => unreachable!("RQ centroids: unexpected value type {dt:?}"),
-        };
-        Arc::new(centroids)
-    }
-
-    /// A deterministic, genuinely mixing (Haar-like) orthogonal matrix, built from
-    /// seeded Gaussian entries (Box-Muller) orthonormalized by modified
-    /// Gram-Schmidt over its rows. Production builds this with an unseeded
-    /// `random_orthogonal` (private to `lance-index`); we reproduce an equivalent
-    /// deterministically in-crate. The value type must match the dataset because
-    /// the quantize path downcasts `rotate_mat` to the dataset's primitive type.
-    fn deterministic_orthogonal_fsl(value_type: &DataType, seed: u64) -> FixedSizeListArray {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut matrix = vec![0.0f64; DIM * DIM];
-        for entry in matrix.iter_mut() {
-            let u1: f64 = rng.random::<f64>().max(1e-12);
-            let u2: f64 = rng.random::<f64>();
-            *entry = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
-        }
-        // Modified Gram-Schmidt over the DIM rows.
-        for i in 0..DIM {
-            for j in 0..i {
-                let dot: f64 = (0..DIM)
-                    .map(|k| matrix[i * DIM + k] * matrix[j * DIM + k])
-                    .sum();
-                for k in 0..DIM {
-                    matrix[i * DIM + k] -= dot * matrix[j * DIM + k];
-                }
-            }
-            let norm: f64 = (0..DIM)
-                .map(|k| matrix[i * DIM + k] * matrix[i * DIM + k])
-                .sum::<f64>()
-                .sqrt();
-            for k in 0..DIM {
-                matrix[i * DIM + k] /= norm;
-            }
-        }
-        match value_type {
-            DataType::Float32 => FixedSizeListArray::try_new_from_values(
-                Float32Array::from(matrix.iter().map(|&x| x as f32).collect::<Vec<_>>()),
-                DIM as i32,
-            )
-            .unwrap(),
-            DataType::Float64 => {
-                FixedSizeListArray::try_new_from_values(Float64Array::from(matrix), DIM as i32)
-                    .unwrap()
-            }
-            dt => unreachable!("RQ rotate_mat: unexpected value type {dt:?}"),
-        }
-    }
-
-    /// Build a fixed `RabitQuantizationMetadata` so the RQ quantizer reuses this
-    /// rotation instead of generating a fresh random one. Mirrors the field layout
-    /// of `RabitQuantizer::new_with_rotation`.
-    fn fixed_rq_rotation_metadata(
-        rotation_type: RQRotationType,
-        num_bits: u8,
-        value_type: &DataType,
-        seed: u64,
-    ) -> RabitQuantizationMetadata {
-        match rotation_type {
-            RQRotationType::Fast => {
-                // 4 rounds, one sign bit per dimension per round; see
-                // `fast_rotation_signs_len` in lance-index bq/rotation.rs.
-                let mut rng = StdRng::seed_from_u64(seed);
-                let mut signs = vec![0u8; 4 * DIM.div_ceil(8)];
-                rng.fill(&mut signs[..]);
-                RabitQuantizationMetadata {
-                    rotate_mat: None,
-                    rotate_mat_position: None,
-                    fast_rotation_signs: Some(signs),
-                    rotation_type: RQRotationType::Fast,
-                    code_dim: DIM as u32,
-                    num_bits,
-                    packed: false,
-                    query_estimator: RabitQueryEstimator::RawQuery,
-                }
-            }
-            RQRotationType::Matrix => RabitQuantizationMetadata {
-                rotate_mat: Some(deterministic_orthogonal_fsl(value_type, seed)),
-                rotate_mat_position: None,
-                fast_rotation_signs: None,
-                rotation_type: RQRotationType::Matrix,
-                code_dim: DIM as u32,
-                num_bits,
-                packed: false,
-                query_estimator: RabitQueryEstimator::RawQuery,
-            },
-        }
-    }
-
-    /// Make an IVF_RQ build deterministic by pinning both the IVF centroids and the
-    /// RaBitQ rotation via the existing build-param seams. Non-RQ params are
-    /// returned unchanged, so the SQ/PQ/flat/HNSW callers of the shared test
-    /// helpers are unaffected.
-    fn determinize_rq_params(
-        params: &VectorIndexParams,
-        nlist: usize,
-        fsl: &FixedSizeListArray,
-    ) -> VectorIndexParams {
-        let Some(StageParams::RQ(rq)) = params.stages.last() else {
-            return params.clone();
-        };
-        let mut rq = rq.clone();
-        rq.rotation = Some(fixed_rq_rotation_metadata(
-            rq.rotation_type,
-            rq.num_bits,
-            &fsl.value_type(),
-            RQ_SEED,
-        ));
-        let ivf =
-            IvfBuildParams::try_with_centroids(nlist, fixed_rq_centroids(fsl, nlist)).unwrap();
-        let mut params = params.clone();
-        params.stages = vec![StageParams::Ivf(ivf), StageParams::RQ(rq)];
-        params
-    }
-
     async fn test_index(
         params: VectorIndexParams,
         nlist: usize,
@@ -4201,7 +4028,6 @@ mod tests {
             Some((dataset, vectors)) => (dataset, vectors),
             None => generate_test_dataset::<T>(test_uri, range).await,
         };
-        let params = determinize_rq_params(&params, nlist, &vectors);
 
         let vector_column = "vector";
         dataset
@@ -4285,7 +4111,6 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
-        let params = determinize_rq_params(&params, nlist, &vectors);
 
         let vector_column = "vector";
         dataset
@@ -4586,17 +4411,19 @@ mod tests {
         test_index_impl::<Float32Type>(params, nlist, 0.75, -1.0..1.0, None).await;
     }
 
-    // RQ doesn't perform well for random data
-    // need to verify recall with real-world dataset (e.g. sift1m)
+    // These queries probe every partition, so recall here measures RaBitQ quantization
+    // error alone. At 1 bit per dimension it averages ~0.67 on this uniformly random,
+    // L2-normalized data, and each build draws a fresh random rotation, so no bar worth
+    // asserting sits clear of the spread. 5 bits lifts recall to ~0.97; its `ex_bits = 4`
+    // also covers a FastScan ex-code kernel that the multi-bit test below never reaches.
     #[rstest]
-    #[case(1, DistanceType::L2, 0.5)]
-    #[case(1, DistanceType::Cosine, 0.5)]
-    #[case(1, DistanceType::Dot, 0.5)]
-    #[case(4, DistanceType::L2, 0.5)]
-    #[case(4, DistanceType::Cosine, 0.5)]
-    #[case(4, DistanceType::Dot, 0.5)]
+    #[case(1, DistanceType::L2, 0.9)]
+    #[case(1, DistanceType::Cosine, 0.9)]
+    #[case(1, DistanceType::Dot, 0.9)]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
-    // #[ignore = "Temporarily skipping flaky 4-bit IVF_RQ tests"]
     async fn test_build_ivf_rq(
         #[case] nlist: usize,
         #[case] distance_type: DistanceType,
@@ -4605,7 +4432,7 @@ mod tests {
     ) {
         let _ = env_logger::try_init();
         let ivf_params = IvfBuildParams::new(nlist);
-        let rq_params = RQBuildParams::with_rotation_type(1, rotation_type);
+        let rq_params = RQBuildParams::with_rotation_type(5, rotation_type);
         let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
@@ -4860,10 +4687,6 @@ mod tests {
         let test_uri = test_dir.as_str();
 
         let (mut dataset, vectors) = generate_multivec_test_dataset::<T>(test_uri, range).await;
-        // The multivec column is a List<FixedSizeList<T>>; centroids/rotation are
-        // computed over the inner per-vector FixedSizeList.
-        let inner_vectors = vectors.values();
-        let params = determinize_rq_params(&params, nlist, inner_vectors.as_fixed_size_list());
 
         dataset
             .create_index(
