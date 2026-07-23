@@ -831,7 +831,12 @@ impl ObjectStore {
         if self.scheme == "file-object-store" {
             // file-object-store tries to do everything as similarly as possible to the remote
             // object stores. But we still have to delete the directory entries afterwards.
-            return super::local::remove_dir_all(&path);
+            // Deleting the files above can already prune the now-empty directory, so treat a
+            // missing directory here as success rather than an error.
+            return match super::local::remove_dir_all(&path) {
+                Err(Error::NotFound { .. }) => Ok(()),
+                other => other,
+            };
         }
         Ok(())
     }

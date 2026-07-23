@@ -1529,6 +1529,17 @@ mod tests {
             Ok(file_count)
         }
 
+        /// Absolute on-disk path of an index's `_indices/<uuid>/` directory.
+        /// Used to assert the directory itself (not just its files) is removed,
+        /// which the object-store `exists()` check cannot observe (an empty
+        /// directory has no object key).
+        fn index_dir_on_disk(&self, uuid: Uuid) -> std::path::PathBuf {
+            std::path::Path::new(self._tmpdir.as_str())
+                .join("my_db")
+                .join("_indices")
+                .join(uuid.to_string())
+        }
+
         async fn count_blob_files(&self) -> Result<usize> {
             let registry = Arc::new(ObjectStoreRegistry::default());
             let (os, path) =
@@ -2354,6 +2365,12 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(
+            !fixture.index_dir_on_disk(seg_a).exists(),
+            "empty _indices/<uuid> directory left behind after cleanup"
+        );
+        assert!(fixture.index_dir_on_disk(seg_b).exists());
+        assert!(fixture.index_dir_on_disk(seg_c).exists());
     }
 
     #[tokio::test]
@@ -2411,6 +2428,8 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(!fixture.index_dir_on_disk(staging_uuid).exists());
+        assert!(!fixture.index_dir_on_disk(built_segment_uuid).exists());
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ impl ObjectStoreProvider for FileStoreProvider {
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
-            inner: Arc::new(LocalFileSystem::new()),
+            inner: Arc::new(LocalFileSystem::new().with_automatic_cleanup(true)),
             scheme: base_path.scheme().to_owned(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
