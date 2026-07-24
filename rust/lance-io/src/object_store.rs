@@ -1461,6 +1461,34 @@ mod tests {
     }
 
     async fn test_delete_prunes_empty_dirs(scheme: &str) {
+        let (path, store, file) = prune_fixture(scheme).await;
+        store.delete(&file).await.unwrap();
+        assert_pruned(&path);
+    }
+
+    #[tokio::test]
+    async fn test_remove_stream_prunes_empty_dirs_local_store() {
+        test_remove_stream_prunes_empty_dirs("").await;
+    }
+
+    #[tokio::test]
+    async fn test_remove_stream_prunes_empty_dirs_file_object_store() {
+        test_remove_stream_prunes_empty_dirs("file-object-store").await;
+    }
+
+    async fn test_remove_stream_prunes_empty_dirs(scheme: &str) {
+        let (path, store, file) = prune_fixture(scheme).await;
+        store
+            .remove_stream(futures::stream::once(async { Ok(file) }).boxed())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_pruned(&path);
+    }
+
+    /// A `foo/bar/nested/test_file` to delete, next to a `foo/zoo/keep_file` that must
+    /// stop the upward walk at `foo/`.
+    async fn prune_fixture(scheme: &str) -> (TempStdDir, Arc<ObjectStore>, Path) {
         let path = TempStdDir::default();
         let nested = path.join("foo").join("bar").join("nested");
         create_dir_all(&nested).unwrap();
@@ -1479,15 +1507,15 @@ mod tests {
         let url = dir_url(&path, scheme);
         let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
         let file = base
-            .child("foo")
-            .child("bar")
-            .child("nested")
-            .child("test_file");
-        store.delete(&file).await.unwrap();
+            .join("foo")
+            .join("bar")
+            .join("nested")
+            .join("test_file");
+        (path, store, file)
+    }
 
-        assert!(!nested.exists());
+    fn assert_pruned(path: &TempStdDir) {
         assert!(!path.join("foo").join("bar").exists());
-        // foo/ still holds zoo/, so the walk upwards stops there.
         assert!(path.join("foo").join("zoo").join("keep_file").exists());
     }
 
