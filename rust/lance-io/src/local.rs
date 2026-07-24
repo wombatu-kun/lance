@@ -49,6 +49,22 @@ pub fn remove_dir_all(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove `path`'s ancestor directories that are now empty, stopping at the first one
+/// that is not. Best effort.
+///
+/// `LocalFileSystem::with_automatic_cleanup` cannot do this: it derives its stop boundary
+/// from a rootless `file:///` URL, which `Url::to_file_path` rejects on Windows.
+pub fn prune_empty_parent_dirs(path: &Path) {
+    let local_path = to_local_path(path);
+    let mut parent = std::path::Path::new(&local_path).parent();
+    while let Some(dir) = parent {
+        if dir.as_os_str().is_empty() || std::fs::remove_dir(dir).is_err() {
+            break;
+        }
+        parent = dir.parent();
+    }
+}
+
 /// Copy a file from one location to another, supporting cross-filesystem copies.
 ///
 /// Unlike hard links, this function works across filesystem boundaries.
