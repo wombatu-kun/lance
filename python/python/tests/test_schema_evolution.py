@@ -380,6 +380,82 @@ def test_alter_columns(tmp_path: Path):
         dataset.alter_columns({"path": "x"})
 
 
+def _index(ds, name):
+    return next(idx for idx in ds.describe_indices() if idx.name == name)
+
+
+def _index_names(ds):
+    return {idx.name for idx in ds.describe_indices()}
+
+
+def test_rebuild_btree_index_after_casting_column_to_int8(tmp_path: Path):
+    uri = str(tmp_path / "t")
+    schema = pa.schema([("a", pa.int32()), ("b", pa.int32())])
+
+    ds = lance.write_dataset(
+        pa.table({"a": [1, 2, 3], "b": [10, 20, 30]}, schema=schema), uri
+    )
+    for off in (4, 7):
+        ds = lance.write_dataset(
+            pa.table(
+                {
+                    "a": [off, off + 1, off + 2],
+                    "b": [off * 10, off * 10 + 10, off * 10 + 20],
+                },
+                schema=schema,
+            ),
+            uri,
+            mode="append",
+        )
+    assert len(ds.get_fragments()) == 3
+
+    ds.create_scalar_index("a", "BTREE", name="a_idx")
+    ds.create_scalar_index("b", "BTREE", name="b_idx")
+    assert _index_names(ds) == {"a_idx", "b_idx"}
+    assert "@a_idx(BTree)" in ds.scanner(filter="a = 5").explain_plan(True)
+    field_ids_before = _index(ds, "a_idx").fields
+
+    ds.alter_columns({"path": "a", "data_type": pa.int8()})
+    assert ds.schema.field("a").type == pa.int8()
+
+    # The cast rewrites the column under a fresh field id, so the index that
+    # referenced the old field id is dropped from the manifest, and the scan
+    # falls back to a full scan with a refine filter.
+    assert _index_names(ds) == {"b_idx"}
+    assert "ScalarIndexQuery" not in ds.scanner(filter="a = 5").explain_plan(True)
+
+    # Recreating the index under the same name must not raise.
+    ds.create_scalar_index("a", "BTREE", name="a_idx", replace=False)
+
+    reopened = lance.dataset(uri)
+    assert _index_names(reopened) == {"a_idx", "b_idx"}
+    rebuilt = _index(reopened, "a_idx")
+    assert rebuilt.num_rows_indexed == 9
+    assert rebuilt.fields != field_ids_before
+    assert "@a_idx(BTree)" in reopened.scanner(filter="a = 5").explain_plan(True)
+    assert reopened.to_table(filter="a = 5") == pa.table(
+        {"a": pa.array([5], pa.int8()), "b": pa.array([50], pa.int32())}
+    )
+    reopened.validate()
+
+
+def test_cast_to_int8_is_atomic_when_a_value_does_not_fit(tmp_path: Path):
+    uri = str(tmp_path / "t")
+    ds = lance.write_dataset(
+        pa.table({"a": [1, 1024]}, schema=pa.schema([("a", pa.int32())])), uri
+    )
+    ds.create_scalar_index("a", "BTREE", name="a_idx")
+    version_before = ds.version
+
+    with pytest.raises(OSError, match="Can't cast value 1024 to type Int8"):
+        ds.alter_columns({"path": "a", "data_type": pa.int8()})
+
+    reopened = lance.dataset(uri)
+    assert reopened.version == version_before
+    assert reopened.schema.field("a").type == pa.int32()
+    assert _index_names(reopened) == {"a_idx"}
+
+
 def test_merge_columns(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

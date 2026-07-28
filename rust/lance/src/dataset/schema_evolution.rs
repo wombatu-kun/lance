@@ -1983,6 +1983,116 @@ mod test {
         Ok(())
     }
 
+    /// Casting a column moves it to a fresh field id, which drops the index
+    /// attached to the old id. Rebuilding that index under the same name must
+    /// not collide with the "already exists with different fields" check in the
+    /// index builder.
+    #[rstest]
+    #[tokio::test]
+    async fn test_rebuild_scalar_index_under_same_name_after_cast(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use crate::index::DatasetIndexExt;
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..9)),
+                Arc::new(Int32Array::from_iter_values((0..9).map(|v| v * 10))),
+            ],
+        )?;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        for column in ["a", "b"] {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await?;
+        }
+        let fields_before = dataset
+            .load_indices()
+            .await?
+            .iter()
+            .find(|idx| idx.name == "a_idx")
+            .expect("a_idx was created")
+            .fields
+            .clone();
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("a".into()).cast_to(DataType::Int8)])
+            .await?;
+        dataset.validate().await?;
+        assert_eq!(
+            dataset.schema().field("a").unwrap().data_type(),
+            DataType::Int8
+        );
+
+        // The cast dropped the index on `a`; `b` kept its field id and its index.
+        let names = dataset
+            .load_indices()
+            .await?
+            .iter()
+            .map(|idx| idx.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["b_idx".to_string()]);
+
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::Scalar,
+                Some("a_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await?;
+
+        let rebuilt = dataset
+            .load_indices()
+            .await?
+            .iter()
+            .find(|idx| idx.name == "a_idx")
+            .expect("a_idx was rebuilt")
+            .clone();
+        assert_ne!(rebuilt.fields, fields_before);
+
+        // Legacy wraps the index lookup in MaterializeIndex and v2 in
+        // ScalarIndexQuery, but both name the index in the query itself.
+        let plan = dataset.scan().filter("a = 5")?.explain_plan(false).await?;
+        assert!(
+            plan.contains("@a_idx(BTree)"),
+            "rebuilt index should be used, got: {plan}"
+        );
+        let matched = dataset.scan().filter("a = 5")?.try_into_batch().await?;
+        assert_eq!(matched.num_rows(), 1);
+
+        Ok(())
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_drop_columns(
