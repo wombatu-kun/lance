@@ -1996,6 +1996,13 @@ mod test {
         use crate::index::DatasetIndexExt;
         use lance_index::{IndexType, scalar::ScalarIndexParams};
 
+        // Enough rows that training the index has to spill: the sort carries
+        // (value, row id) and DataFusion reserves each batch at twice its size,
+        // so 10M rows is well past the memory pool the index builder runs under.
+        const NUM_ROWS: i32 = 10_000_000;
+        // `a` cycles through the Int8 range so the cast itself succeeds.
+        const CYCLE: i32 = 128;
+
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false),
             ArrowField::new("b", DataType::Int32, false),
@@ -2003,8 +2010,10 @@ mod test {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int32Array::from_iter_values(0..9)),
-                Arc::new(Int32Array::from_iter_values((0..9).map(|v| v * 10))),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..NUM_ROWS).map(|v| v % CYCLE),
+                )),
+                Arc::new(Int32Array::from_iter_values(0..NUM_ROWS)),
             ],
         )?;
 
@@ -2016,12 +2025,11 @@ mod test {
             test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
-                max_rows_per_file: 3,
                 ..Default::default()
             }),
         )
         .await?;
-        assert_eq!(dataset.get_fragments().len(), 3);
+        assert!(dataset.get_fragments().len() > 1);
 
         for column in ["a", "b"] {
             dataset
@@ -2088,7 +2096,7 @@ mod test {
             "rebuilt index should be used, got: {plan}"
         );
         let matched = dataset.scan().filter("a = 5")?.try_into_batch().await?;
-        assert_eq!(matched.num_rows(), 1);
+        assert_eq!(matched.num_rows(), (NUM_ROWS / CYCLE) as usize);
 
         Ok(())
     }

@@ -392,22 +392,22 @@ def test_rebuild_btree_index_after_casting_column_to_int8(tmp_path: Path):
     uri = str(tmp_path / "t")
     schema = pa.schema([("a", pa.int32()), ("b", pa.int32())])
 
-    ds = lance.write_dataset(
-        pa.table({"a": [1, 2, 3], "b": [10, 20, 30]}, schema=schema), uri
-    )
-    for off in (4, 7):
+    # Enough rows that training the index has to spill: the sort carries
+    # (value, row id) and DataFusion reserves each batch at twice its size, so
+    # 10M rows is well past the memory pool the index builder runs under.
+    num_rows = 10_000_000
+    # `a` cycles through the Int8 range so the cast itself succeeds.
+    cycle = 128
+    rows_per_append = num_rows // 5
+
+    for start in range(0, num_rows, rows_per_append):
+        rows = np.arange(start, start + rows_per_append, dtype=np.int32)
         ds = lance.write_dataset(
-            pa.table(
-                {
-                    "a": [off, off + 1, off + 2],
-                    "b": [off * 10, off * 10 + 10, off * 10 + 20],
-                },
-                schema=schema,
-            ),
+            pa.table({"a": rows % cycle, "b": rows}, schema=schema),
             uri,
-            mode="append",
+            mode="create" if start == 0 else "append",
         )
-    assert len(ds.get_fragments()) == 3
+    assert len(ds.get_fragments()) > 1
 
     ds.create_scalar_index("a", "BTREE", name="a_idx")
     ds.create_scalar_index("b", "BTREE", name="b_idx")
@@ -430,12 +430,10 @@ def test_rebuild_btree_index_after_casting_column_to_int8(tmp_path: Path):
     reopened = lance.dataset(uri)
     assert _index_names(reopened) == {"a_idx", "b_idx"}
     rebuilt = _index(reopened, "a_idx")
-    assert rebuilt.num_rows_indexed == 9
+    assert rebuilt.num_rows_indexed == num_rows
     assert rebuilt.fields != field_ids_before
     assert "@a_idx(BTree)" in reopened.scanner(filter="a = 5").explain_plan(True)
-    assert reopened.to_table(filter="a = 5") == pa.table(
-        {"a": pa.array([5], pa.int8()), "b": pa.array([50], pa.int32())}
-    )
+    assert reopened.count_rows(filter="a = 5") == num_rows // cycle
     reopened.validate()
 
 
