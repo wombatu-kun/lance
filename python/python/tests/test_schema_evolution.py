@@ -396,14 +396,13 @@ def test_rebuild_btree_index_after_casting_column_to_int8(tmp_path: Path):
     # (value, row id) and DataFusion reserves each batch at twice its size, so
     # 10M rows is well past the memory pool the index builder runs under.
     num_rows = 10_000_000
-    # `a` cycles through the Int8 range so the cast itself succeeds.
-    cycle = 128
     rows_per_append = num_rows // 5
 
+    # Both columns hold 10M distinct ascending values.
     for start in range(0, num_rows, rows_per_append):
         rows = np.arange(start, start + rows_per_append, dtype=np.int32)
         ds = lance.write_dataset(
-            pa.table({"a": rows % cycle, "b": rows}, schema=schema),
+            pa.table({"a": rows, "b": rows}, schema=schema),
             uri,
             mode="create" if start == 0 else "append",
         )
@@ -415,7 +414,13 @@ def test_rebuild_btree_index_after_casting_column_to_int8(tmp_path: Path):
     assert "@a_idx(BTree)" in ds.scanner(filter="a = 5").explain_plan(True)
     field_ids_before = _index(ds, "a_idx").fields
 
-    ds.alter_columns({"path": "a", "data_type": pa.int8()})
+    # A SQL frontend narrows the column the way `ALTER TABLE ... TYPE tinyint`
+    # does: a soft cast that nulls the values which do not fit, so the statement
+    # succeeds even though the column holds 10M distinct values. alter_columns
+    # cannot express that - it rejects the cast on the first out-of-range value.
+    ds.add_columns({"a_i8": "TRY_CAST(a AS TINYINT)"}, read_columns=["a"])
+    ds.drop_columns(["a"])
+    ds.alter_columns({"path": "a_i8", "name": "a"})
     assert ds.schema.field("a").type == pa.int8()
 
     # The cast rewrites the column under a fresh field id, so the index that
@@ -433,7 +438,7 @@ def test_rebuild_btree_index_after_casting_column_to_int8(tmp_path: Path):
     assert rebuilt.num_rows_indexed == num_rows
     assert rebuilt.fields != field_ids_before
     assert "@a_idx(BTree)" in reopened.scanner(filter="a = 5").explain_plan(True)
-    assert reopened.count_rows(filter="a = 5") == num_rows // cycle
+    assert reopened.count_rows(filter="a = 5") == 1
     reopened.validate()
 
 

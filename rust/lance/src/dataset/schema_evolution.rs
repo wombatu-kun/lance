@@ -1983,10 +1983,10 @@ mod test {
         Ok(())
     }
 
-    /// Casting a column moves it to a fresh field id, which drops the index
-    /// attached to the old id. Rebuilding that index under the same name must
-    /// not collide with the "already exists with different fields" check in the
-    /// index builder.
+    /// Narrowing a column to Int8 moves it to a fresh field id, which drops the
+    /// index attached to the old id. Rebuilding that index under the same name
+    /// must not collide with the "already exists with different fields" check in
+    /// the index builder, and must survive training over 10M rows.
     #[rstest]
     #[tokio::test]
     async fn test_rebuild_scalar_index_under_same_name_after_cast(
@@ -2000,9 +2000,8 @@ mod test {
         // (value, row id) and DataFusion reserves each batch at twice its size,
         // so 10M rows is well past the memory pool the index builder runs under.
         const NUM_ROWS: i32 = 10_000_000;
-        // `a` cycles through the Int8 range so the cast itself succeeds.
-        const CYCLE: i32 = 128;
 
+        // Both columns hold 10M distinct ascending values.
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false),
             ArrowField::new("b", DataType::Int32, false),
@@ -2010,9 +2009,7 @@ mod test {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int32Array::from_iter_values(
-                    (0..NUM_ROWS).map(|v| v % CYCLE),
-                )),
+                Arc::new(Int32Array::from_iter_values(0..NUM_ROWS)),
                 Arc::new(Int32Array::from_iter_values(0..NUM_ROWS)),
             ],
         )?;
@@ -2051,8 +2048,24 @@ mod test {
             .fields
             .clone();
 
+        // A SQL frontend narrows the column the way `ALTER TABLE ... TYPE tinyint`
+        // does: a soft cast that nulls the values which do not fit, so the
+        // statement succeeds even though the column holds 10M distinct values.
+        // `alter_columns` cannot express that - it rejects the cast on the first
+        // out-of-range value.
         dataset
-            .alter_columns(&[ColumnAlteration::new("a".into()).cast_to(DataType::Int8)])
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(
+                    "a_i8".to_string(),
+                    "try_cast(a as tinyint)".to_string(),
+                )]),
+                Some(vec!["a".to_string()]),
+                None,
+            )
+            .await?;
+        dataset.drop_columns(&["a"]).await?;
+        dataset
+            .alter_columns(&[ColumnAlteration::new("a_i8".into()).rename("a".into())])
             .await?;
         dataset.validate().await?;
         assert_eq!(
@@ -2096,7 +2109,7 @@ mod test {
             "rebuilt index should be used, got: {plan}"
         );
         let matched = dataset.scan().filter("a = 5")?.try_into_batch().await?;
-        assert_eq!(matched.num_rows(), (NUM_ROWS / CYCLE) as usize);
+        assert_eq!(matched.num_rows(), 1);
 
         Ok(())
     }
