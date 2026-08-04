@@ -1880,7 +1880,7 @@ mod tests {
         let ep = OrderedNode::new(0, dist_calc.distance(0).into());
         let mut visited_generator = VisitedGenerator::new(N);
 
-        let results = hnsw.run_search(
+        let (results, _) = hnsw.run_search(
             ep.clone(),
             3,
             &query_params,
@@ -1910,7 +1910,7 @@ mod tests {
         }
         let mut expanded_generator = VisitedGenerator::new(N);
         calls.store(0, Ordering::Relaxed);
-        let results = hnsw.run_search_acorn(
+        let (results, _) = hnsw.run_search_acorn(
             ep,
             &query_params,
             &mask,
