@@ -68,7 +68,7 @@ use std::{
 };
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_stream::wrappers::IntervalStream;
-use tracing::{Span, debug, info, instrument};
+use tracing::{Span, debug, info, instrument, warn};
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
@@ -321,6 +321,18 @@ impl<'a> CleanupTask<'a> {
         inspection: CleanupInspection,
     ) -> Result<RemovalStats> {
         let removal_stats = Mutex::new(RemovalStats::default());
+        let removes_empty_dirs = matches!(
+            self.dataset.object_store.scheme(),
+            "file" | "file+uring" | "file-object-store"
+        );
+        let indices_dir = self.dataset.indices_dir();
+        let retained_index_dirs = inspection
+            .referenced_files
+            .index_uuids
+            .iter()
+            .map(|uuid| indices_dir.clone().join(uuid.as_str()))
+            .collect::<HashSet<_>>();
+        let index_dirs_to_remove = Mutex::new(HashSet::new());
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
 
@@ -338,6 +350,8 @@ impl<'a> CleanupTask<'a> {
         let build_listing_stream = |dir: Path, file_type: Option<RemovedFileType>| {
             let inspection_ref = &inspection;
             let removal_stats_ref = &removal_stats;
+            let indices_dir_ref = &indices_dir;
+            let index_dirs_ref = &index_dirs_to_remove;
             self.dataset
                 .object_store
                 .read_dir_all(&dir, inspection.earliest_retained_manifest_time)
@@ -361,7 +375,20 @@ impl<'a> CleanupTask<'a> {
                         maybe_in_progress,
                         inspection_ref,
                     );
-                    if matches!(path_to_remove, Ok(Some(..))) {
+                    if let Ok(Some(path)) = &path_to_remove {
+                        if removes_empty_dirs && matches!(file_type, Some(RemovedFileType::Index)) {
+                            let mut index_dirs = index_dirs_ref.lock().unwrap();
+                            let mut parent = path.parent();
+                            while let Some(dir_path) = parent {
+                                if dir_path == *indices_dir_ref
+                                    || !dir_path.prefix_matches(indices_dir_ref)
+                                {
+                                    break;
+                                }
+                                index_dirs.insert(dir_path.clone());
+                                parent = dir_path.parent();
+                            }
+                        }
                         let mut stats = removal_stats_ref.lock().unwrap();
                         stats.bytes_removed += obj_meta.size;
                         if let Some(file_type) = file_type {
@@ -440,6 +467,25 @@ impl<'a> CleanupTask<'a> {
             .try_for_each(|_| future::ready(Ok(())));
 
         delete_fut.await?;
+
+        if removes_empty_dirs
+            && let Err(error) = self
+                .dataset
+                .object_store
+                .remove_empty_dirs(
+                    indices_dir.clone(),
+                    retained_index_dirs,
+                    index_dirs_to_remove.into_inner().unwrap(),
+                    (!self.policy.delete_unverified).then_some(verification_threshold),
+                )
+                .await
+        {
+            warn!(
+                path = indices_dir.as_ref(),
+                error = %error,
+                "Failed to remove empty index directories"
+            );
+        }
 
         let mut removal_stats = removal_stats.into_inner().unwrap();
         removal_stats.old_versions = num_old_manifests as u64;
@@ -1204,6 +1250,7 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
+    use rstest::rstest;
     use uuid::Uuid;
 
     #[derive(Debug)]
@@ -1270,7 +1317,7 @@ mod tests {
     struct MockDatasetFixture {
         // This is a temporary directory that will be deleted when the fixture
         // is dropped
-        _tmpdir: TempStrDir,
+        tmpdir: TempStrDir,
         dataset_path: String,
         mock_store: Arc<MockObjectStore>,
     }
@@ -1290,10 +1337,17 @@ mod tests {
             };
             let dataset_path = format!("file-object-store://{path_prefix}{tmpdir_path}/my_db");
             Ok(Self {
-                _tmpdir: tmpdir,
+                tmpdir,
                 dataset_path,
                 mock_store: Arc::new(MockObjectStore::new()),
             })
+        }
+
+        fn local_index_dir(&self, uuid: Uuid) -> std::path::PathBuf {
+            std::path::Path::new(self.tmpdir.as_str())
+                .join("my_db")
+                .join(crate::dataset::INDICES_DIR)
+                .join(uuid.to_string())
         }
 
         fn os_params(&self) -> ObjectStoreParams {
@@ -2261,6 +2315,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_removes_preexisting_empty_index_directories() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let mut dataset = fixture.open().await.unwrap();
+        let field_id = dataset.schema().field("indexable").unwrap().id;
+        let stale_uuid = Uuid::new_v4();
+        let nested_stale_uuid = Uuid::new_v4();
+        let referenced_uuid = Uuid::new_v4();
+
+        std::fs::create_dir_all(fixture.local_index_dir(stale_uuid)).unwrap();
+        std::fs::create_dir_all(
+            fixture
+                .local_index_dir(nested_stale_uuid)
+                .join("empty_nested_dir"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(fixture.local_index_dir(referenced_uuid)).unwrap();
+
+        let referenced_index = dummy_index_metadata(&dataset, field_id, referenced_uuid, [0_u32]);
+        let create_index_tx = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![referenced_index],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(create_index_tx, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        MockClock::set_system_time(real_now + TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        let in_progress_uuid = Uuid::new_v4();
+        write_dummy_index_artifact(&dataset, in_progress_uuid)
+            .await
+            .unwrap();
+        let in_progress_empty_dir = fixture
+            .local_index_dir(in_progress_uuid)
+            .join("empty_in_progress_dir");
+        std::fs::create_dir_all(&in_progress_empty_dir).unwrap();
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(removed.index_files_removed, 0);
+        assert!(!fixture.local_index_dir(stale_uuid).exists());
+        assert!(!fixture.local_index_dir(nested_stale_uuid).exists());
+        assert!(fixture.local_index_dir(referenced_uuid).exists());
+        assert!(fixture.local_index_dir(in_progress_uuid).exists());
+        assert!(in_progress_empty_dir.exists());
+    }
+
+    #[rstest]
+    #[case::default_policy(false, true)]
+    #[case::delete_unverified(true, false)]
+    #[tokio::test]
+    async fn cleanup_applies_unverified_policy_to_fresh_empty_index_directory(
+        #[case] delete_unverified: bool,
+        #[case] should_preserve: bool,
+    ) {
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        MockClock::set_system_time(real_now);
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let in_progress_dir = fixture.local_index_dir(Uuid::new_v4());
+        std::fs::create_dir_all(&in_progress_dir).unwrap();
+
+        fixture
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(7).unwrap(),
+                Some(delete_unverified),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(in_progress_dir.exists(), should_preserve);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_does_not_remove_empty_directory_through_index_symlink() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_empty_dir = outside.path().join("must_remain");
+        std::fs::create_dir_all(&outside_empty_dir).unwrap();
+
+        let link_path = fixture.local_index_dir(Uuid::new_v4());
+        std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &link_path).unwrap();
+
+        fixture
+            .run_cleanup_with_override(utc_now(), Some(true), None)
+            .await
+            .unwrap();
+
+        assert!(outside_empty_dir.exists());
+        assert!(link_path.is_symlink());
+    }
+
+    #[tokio::test]
     async fn cleanup_old_replaced_segment_keeps_still_referenced_segments() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
@@ -2312,6 +2479,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(removed.index_files_removed, 2);
+        assert!(!fixture.local_index_dir(seg_a).exists());
         assert!(
             !dataset
                 .object_store
@@ -2382,6 +2550,8 @@ mod tests {
 
         assert_eq!(removed.old_versions, 0);
         assert_eq!(removed.index_files_removed, 4);
+        assert!(!fixture.local_index_dir(staging_uuid).exists());
+        assert!(!fixture.local_index_dir(built_segment_uuid).exists());
         assert!(
             !dataset
                 .object_store
