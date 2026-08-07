@@ -88,7 +88,7 @@ async fn write_without_encoding_hint(
     );
 
     let mut flat = Vec::with_capacity(graph.len() * width as usize);
-    for local_id in 0..graph.len() {
+    for local_id in 0..graph.len() as u32 {
         let neighbors = graph.neighbors(local_id);
         flat.extend_from_slice(neighbors);
         flat.resize(flat.len() + width as usize - neighbors.len(), NO_NEIGHBOR);

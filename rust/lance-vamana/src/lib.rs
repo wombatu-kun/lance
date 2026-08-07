@@ -10,9 +10,11 @@
 //! extra visibility and this crate is not a member anyway, so the boundary it
 //! compiles against is the same one an out-of-tree crate sees.
 
+pub mod build;
 pub mod format;
 pub mod io;
 pub mod partition;
+pub mod search;
 pub mod segment;
 
 pub use format::{IndexMetadata, RowIdMode};

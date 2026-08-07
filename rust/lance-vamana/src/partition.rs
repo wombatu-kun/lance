@@ -84,6 +84,16 @@ impl PartitionGraph {
         })
     }
 
+    /// A partition whose vertices have no out-edges yet.
+    ///
+    /// This is what a build starts from and mutates in place through
+    /// [`Self::set_neighbors`]: the padded layout is already the one a builder
+    /// wants, so there is no separate in-memory graph type to convert from.
+    pub fn edgeless(max_degree: u32, row_ids: Vec<u64>) -> Result<Self> {
+        let adjacency = vec![Vec::new(); row_ids.len()];
+        Self::try_new(max_degree, row_ids, adjacency)
+    }
+
     pub fn max_degree(&self) -> u32 {
         self.max_degree
     }
@@ -101,14 +111,66 @@ impl PartitionGraph {
     }
 
     /// Out-edges of `local_id`, with the padding trimmed off.
-    pub fn neighbors(&self, local_id: usize) -> &[u32] {
-        let width = self.max_degree as usize;
-        let slots = &self.neighbors[local_id * width..(local_id + 1) * width];
+    pub fn neighbors(&self, local_id: u32) -> &[u32] {
+        let slots = self.slots(local_id);
         let degree = slots
             .iter()
             .position(|neighbor| *neighbor == NO_NEIGHBOR)
-            .unwrap_or(width);
+            .unwrap_or(slots.len());
         &slots[..degree]
+    }
+
+    /// Replace the out-edges of `local_id`.
+    ///
+    /// The vertex keeps its slot, so a prune that shortens a neighbour list
+    /// moves nothing else on disk. That is the whole reason the width is fixed.
+    pub fn set_neighbors(&mut self, local_id: u32, neighbors: &[u32]) -> Result<()> {
+        let num_rows = self.row_ids.len();
+        if local_id as usize >= num_rows {
+            return Err(Error::invalid_input(format!(
+                "Vamana vertex {local_id} is outside a partition of {num_rows} vertices"
+            )));
+        }
+        if neighbors.len() > self.max_degree as usize {
+            return Err(Error::invalid_input(format!(
+                "Vamana vertex {local_id} was given degree {} which exceeds max_degree {}",
+                neighbors.len(),
+                self.max_degree
+            )));
+        }
+        for neighbor in neighbors {
+            if *neighbor as usize >= num_rows {
+                return Err(Error::invalid_input(format!(
+                    "Vamana vertex {local_id} points at local id {neighbor}, \
+                     but the partition holds only {num_rows} vertices"
+                )));
+            }
+            if *neighbor == local_id {
+                return Err(Error::invalid_input(format!(
+                    "Vamana vertex {local_id} points at itself"
+                )));
+            }
+        }
+        debug_assert!(
+            {
+                let mut sorted = neighbors.to_vec();
+                sorted.sort_unstable();
+                sorted.windows(2).all(|pair| pair[0] != pair[1])
+            },
+            "vertex {local_id} was given a duplicate out-edge: {neighbors:?}"
+        );
+
+        let width = self.max_degree as usize;
+        let start = local_id as usize * width;
+        self.neighbors[start..start + neighbors.len()].copy_from_slice(neighbors);
+        self.neighbors[start + neighbors.len()..start + width].fill(NO_NEIGHBOR);
+        Ok(())
+    }
+
+    fn slots(&self, local_id: u32) -> &[u32] {
+        let width = self.max_degree as usize;
+        let start = local_id as usize * width;
+        &self.neighbors[start..start + width]
     }
 
     pub fn to_batch(&self) -> Result<RecordBatch> {
