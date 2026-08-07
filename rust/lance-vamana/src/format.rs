@@ -12,7 +12,26 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema};
 use lance_core::{Error, Result};
 use lance_encoding::constants::{STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY};
+use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
+
+/// Name of the file describing a segment.
+///
+/// Not a free choice: Lance decides whether an index is a vector index or a
+/// scalar one by looking for this exact name among the segment's files.
+pub const INDEX_FILE_NAME: &str = "index.idx";
+
+/// Id of the IVF partition a row of `index.idx` describes.
+pub const PARTITION_ID_COLUMN: &str = "__partition_id";
+
+/// Local id of the vertex a search of that partition starts from.
+pub const MEDOID_COLUMN: &str = "__medoid";
+
+/// Number of vertices in that partition.
+pub const NUM_ROWS_COLUMN: &str = "__num_rows";
+
+/// Name of that partition's file within the segment directory.
+pub const FILE_COLUMN: &str = "__file";
 
 /// Row ids of the vertices, in the space named by [`RowIdMode`].
 pub const ROW_ID_COLUMN: &str = "__row_id";
@@ -35,6 +54,12 @@ pub const FORMAT_VERSION: u32 = 1;
 
 /// Schema metadata key under which [`IndexMetadata`] is stored as JSON.
 pub const INDEX_METADATA_KEY: &str = "lance-vamana:index";
+
+/// Schema metadata key holding the index of the global buffer with the IVF model.
+///
+/// The routing model is a protobuf blob rather than a column because it is read
+/// in full or not at all, and a global buffer is exactly one ranged read.
+pub const IVF_POSITION_KEY: &str = "lance-vamana:ivf";
 
 /// Which identifier space [`ROW_ID_COLUMN`] is expressed in.
 ///
@@ -62,8 +87,30 @@ pub struct IndexMetadata {
     /// Pruning slack. `1.0` reproduces the HNSW diversity heuristic exactly.
     pub alpha: f32,
     pub dimension: u32,
-    pub distance_type: String,
+    #[serde(with = "distance_type_as_name")]
+    pub distance_type: DistanceType,
     pub row_id_mode: RowIdMode,
+}
+
+/// `DistanceType` carries no serde impls, and its `Display` / `TryFrom<&str>`
+/// pair is the spelling Lance already persists everywhere else.
+mod distance_type_as_name {
+    use lance_linalg::distance::DistanceType;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(
+        distance_type: &DistanceType,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&distance_type.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<DistanceType, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        DistanceType::try_from(name.as_str()).map_err(D::Error::custom)
+    }
 }
 
 impl IndexMetadata {
@@ -131,6 +178,25 @@ pub fn partition_schema(max_degree: u32) -> Result<Schema> {
     ]))
 }
 
+/// Arrow schema of `index.idx`: one row per *non-empty* partition.
+///
+/// No column is nullable because an empty partition is not listed at all. It has
+/// no vertices, so it has no entry point and no file, and leaving the row out is
+/// the only encoding of that which cannot disagree with itself.
+pub fn index_schema() -> Schema {
+    Schema::new(vec![
+        Field::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
+        Field::new(MEDOID_COLUMN, DataType::UInt32, false),
+        Field::new(NUM_ROWS_COLUMN, DataType::UInt32, false),
+        Field::new(FILE_COLUMN, DataType::Utf8, false),
+    ])
+}
+
+/// Canonical file name of a partition within its segment directory.
+pub fn partition_file_name(partition_id: u32) -> String {
+    format!("part_{partition_id:05}.idx")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,11 +208,26 @@ mod tests {
             max_degree: 64,
             alpha: 1.2,
             dimension: 128,
-            distance_type: "l2".to_string(),
+            distance_type: DistanceType::Cosine,
             row_id_mode: RowIdMode::Address,
         };
         let parsed = IndexMetadata::from_json(&metadata.to_json().unwrap()).unwrap();
         assert_eq!(parsed, metadata);
+    }
+
+    #[test]
+    fn metadata_rejects_an_unknown_distance_type() {
+        let json = serde_json::json!({
+            "format_version": FORMAT_VERSION,
+            "max_degree": 64,
+            "alpha": 1.2,
+            "dimension": 128,
+            "distance_type": "manhattan",
+            "row_id_mode": "address",
+        })
+        .to_string();
+        let error = IndexMetadata::from_json(&json).unwrap_err();
+        assert!(error.to_string().contains("manhattan"), "{error}");
     }
 
     #[test]

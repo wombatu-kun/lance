@@ -13,6 +13,8 @@
 pub mod format;
 pub mod io;
 pub mod partition;
+pub mod segment;
 
 pub use format::{IndexMetadata, RowIdMode};
 pub use partition::PartitionGraph;
+pub use segment::{PartitionEntry, SegmentManifest};

@@ -23,9 +23,12 @@ use lance_file::versions::create_writer;
 use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_vamana::format::{NEIGHBORS_COLUMN, NO_NEIGHBOR, ROW_ID_COLUMN, partition_schema};
-use lance_vamana::io::{PARTITION_FILE_VERSION, open_partition, read_partition, read_vertices};
+use lance_vamana::io::{SEGMENT_FILE_VERSION, open_file, read_partition, read_rows};
 use lance_vamana::partition::PartitionGraph;
 use object_store::path::Path;
+
+mod common;
+use common::sample_graph;
 
 const VERTICES: usize = 4096;
 
@@ -46,21 +49,6 @@ impl IoStatsRecorder for ByteCounter {
         let total: u64 = ranges.iter().map(|range| range.end - range.start).sum();
         self.bytes.fetch_add(total, Ordering::Relaxed);
     }
-}
-
-fn sample_graph(max_degree: u32, vertices: usize) -> PartitionGraph {
-    let row_ids = (0..vertices as u64).map(|i| i * 3 + 1).collect::<Vec<_>>();
-    let adjacency = (0..vertices)
-        .map(|local_id| {
-            // Degrees vary so the padding is exercised, and a few vertices are
-            // saturated so the full width is exercised too.
-            let degree = local_id % (max_degree as usize + 1);
-            (0..degree)
-                .map(|k| ((local_id + k + 1) % vertices) as u32)
-                .collect()
-        })
-        .collect();
-    PartitionGraph::try_new(max_degree, row_ids, adjacency).unwrap()
 }
 
 fn local_store_and_path(dir: &tempfile::TempDir, name: &str) -> (Arc<ObjectStore>, Path) {
@@ -119,7 +107,7 @@ async fn write_without_encoding_hint(
 
     let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref()).unwrap();
     let mut writer = create_writer(
-        PARTITION_FILE_VERSION,
+        SEGMENT_FILE_VERSION,
         store.create(path).await.unwrap(),
         schema,
         FileWriterOptions::default(),
@@ -132,12 +120,12 @@ async fn write_without_encoding_hint(
 /// Bytes charged for reading `vertices`, measured on a reader of its own so the
 /// fixed cost of opening the file is charged to every arm identically.
 async fn bytes_to_read(store: Arc<ObjectStore>, path: &Path, vertices: Range<usize>) -> u64 {
-    let reader = open_partition(store, path, Some(&[NEIGHBORS_COLUMN]))
+    let reader = open_file(store, path, Some(&[NEIGHBORS_COLUMN]))
         .await
         .unwrap();
     let counter = Arc::new(ByteCounter::default());
     let reader = reader.with_io_stats(counter.clone());
-    read_vertices(&reader, vertices).await.unwrap();
+    read_rows(&reader, vertices).await.unwrap();
     counter.bytes()
 }
 
@@ -174,7 +162,7 @@ async fn partition_round_trips_through_a_file() {
         .unwrap();
     assert!(size > 0);
 
-    let reader = open_partition(store, &path, None).await.unwrap();
+    let reader = open_file(store, &path, None).await.unwrap();
     assert_eq!(read_partition(&reader).await.unwrap(), graph);
 }
 
@@ -301,7 +289,7 @@ async fn vertices_are_addressed_independently_across_partitions() {
     }
 
     for (partition, (path, graph)) in &written {
-        let reader = open_partition(store.clone(), path, None).await.unwrap();
+        let reader = open_file(store.clone(), path, None).await.unwrap();
         assert_eq!(
             &read_partition(&reader).await.unwrap(),
             graph,
@@ -310,7 +298,7 @@ async fn vertices_are_addressed_independently_across_partitions() {
 
         // A slice out of the middle must line up with the same vertices in memory.
         let middle = 7..19;
-        let batch = read_vertices(&reader, middle.clone()).await.unwrap();
+        let batch = read_rows(&reader, middle.clone()).await.unwrap();
         let row_ids = batch[ROW_ID_COLUMN]
             .as_any()
             .downcast_ref::<UInt64Array>()
