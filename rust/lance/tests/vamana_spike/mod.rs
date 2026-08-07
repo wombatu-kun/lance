@@ -15,6 +15,7 @@ use std::sync::Arc;
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance::Dataset;
+use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::{DatasetIndexExt, IndexSegment};
 use lance_arrow::FixedSizeListArrayExt;
@@ -22,6 +23,8 @@ use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::create_writer;
 use lance_file::writer::FileWriterOptions;
 use lance_index::INDEX_FILE_NAME;
+use lance_index::IndexType;
+use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use uuid::Uuid;
 
 const DIM: i32 = 8;
@@ -580,5 +583,80 @@ async fn q0_2_new_fragments_get_their_own_segment() {
     assert_eq!(
         after, want,
         "the base segment must survive a delta commit that never mentions it"
+    );
+}
+
+/// Q0.4 - what does `compact_files` do to an index it cannot open?
+///
+/// Compaction rewrites row addresses, so every index has to be remapped. The
+/// remap dispatch opens each index first, and an out-of-tree format cannot be
+/// opened by the built-in reader. The plan predicted the index would be dropped
+/// from the manifest. It is not: it is **stranded**. The manifest entry and its
+/// files survive untouched while its fragment coverage now names only fragments
+/// that no longer exist, so it indexes nothing.
+///
+/// A built-in index on the same dataset is the control arm - without it we could
+/// not tell "our index was mistreated" from "compaction does this to everyone".
+#[tokio::test]
+async fn q0_4_compaction_strands_an_unreadable_index() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = write_vector_dataset(uri, 4, 8).await;
+
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("builtin_control".to_string()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let uuid = Uuid::new_v4();
+    write_handwritten_index_file(&dataset, uuid, INDEX_FILE_NAME, 2).await;
+    commit_spike_segment(&mut dataset, "vamana_compact", uuid, vector_details()).await;
+    let fragments_before = fragment_ids(&dataset);
+    assert_eq!(fragments_before.len(), 4);
+
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    // Guard: without this the assertions below could pass vacuously because
+    // compaction never rewrote anything.
+    assert!(
+        metrics.fragments_removed > 0,
+        "compaction must actually rewrite fragments, got {metrics:?}"
+    );
+
+    let after = Dataset::open(uri).await.unwrap();
+    let live: roaring::RoaringBitmap = fragment_ids(&after).into_iter().collect();
+    assert!(
+        live.is_disjoint(&fragments_before.iter().copied().collect()),
+        "compaction must have produced brand new fragment ids"
+    );
+    let indices = after.load_indices().await.unwrap();
+    let effective = |name: &str| -> Vec<u32> {
+        indices
+            .iter()
+            .find(|idx| idx.name == name)
+            .unwrap_or_else(|| panic!("index '{name}' vanished from the manifest"))
+            .effective_fragment_bitmap(&live)
+            .map(|b| b.iter().collect())
+            .unwrap_or_default()
+    };
+
+    assert_eq!(
+        effective("builtin_control"),
+        live.iter().collect::<Vec<_>>(),
+        "control: a built-in index follows compaction onto the new fragments"
+    );
+    assert!(
+        effective("vamana_compact").is_empty(),
+        "an unreadable index is stranded, covering no live fragment"
     );
 }
