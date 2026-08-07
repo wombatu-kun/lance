@@ -15,7 +15,7 @@ use std::sync::Arc;
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance::Dataset;
-use lance::dataset::WriteParams;
+use lance::dataset::{WriteMode, WriteParams};
 use lance::index::{DatasetIndexExt, IndexSegment};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::version::ConcreteFileVersion;
@@ -126,24 +126,99 @@ async fn commit_spike_segment_versioned(
     details: Arc<prost_types::Any>,
     index_version: i32,
 ) {
-    let field_id = dataset.schema().field("vec").unwrap().id;
-    let fragment_ids = dataset
+    let all_fragments = fragment_ids(dataset);
+    commit_spike_segments_versioned(
+        dataset,
+        index_name,
+        vec![(uuid, all_fragments)],
+        details,
+        index_version,
+    )
+    .await
+    .unwrap()
+}
+
+fn fragment_ids(dataset: &Dataset) -> Vec<u32> {
+    dataset
         .get_fragments()
         .iter()
         .map(|f| f.id() as u32)
+        .collect()
+}
+
+/// Commit an explicit set of `(uuid, fragment ids)` segments under one index name.
+///
+/// Returns the error instead of unwrapping: the rejection cases are the point.
+async fn commit_spike_segments(
+    dataset: &mut Dataset,
+    index_name: &str,
+    segments: Vec<(Uuid, Vec<u32>)>,
+) -> lance::Result<()> {
+    commit_spike_segments_versioned(dataset, index_name, segments, vector_details(), 1).await
+}
+
+async fn commit_spike_segments_versioned(
+    dataset: &mut Dataset,
+    index_name: &str,
+    segments: Vec<(Uuid, Vec<u32>)>,
+    details: Arc<prost_types::Any>,
+    index_version: i32,
+) -> lance::Result<()> {
+    let field_id = dataset.schema().field("vec").unwrap().id;
+    let dataset_version = dataset.manifest.version;
+    let segments = segments
+        .into_iter()
+        .map(|(uuid, frags)| {
+            IndexSegment::new(
+                uuid,
+                frags,
+                [field_id],
+                details.clone(),
+                index_version,
+                dataset_version,
+            )
+        })
         .collect::<Vec<_>>();
-    let segment = IndexSegment::new(
-        uuid,
-        fragment_ids,
-        [field_id],
-        details,
-        index_version,
-        dataset.manifest.version,
-    );
     dataset
-        .commit_existing_index_segments(index_name, "vec", vec![segment])
+        .commit_existing_index_segments(index_name, "vec", segments)
         .await
-        .unwrap();
+}
+
+/// Append more rows, producing at least one new fragment.
+async fn append_vector_rows(uri: &str, rows: usize) {
+    let existing = Dataset::open(uri).await.unwrap();
+    let schema = Arc::new(arrow_schema::Schema::from(existing.schema()));
+    let ids = Int32Array::from_iter_values(10_000..(10_000 + rows as i32));
+    let values =
+        Float32Array::from_iter_values((0..rows * DIM as usize).map(|i| (i % 89) as f32 / 89.0));
+    let vectors = arrow_array::FixedSizeListArray::try_new_from_values(values, DIM).unwrap();
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vectors)]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            max_rows_per_file: rows,
+            max_rows_per_group: rows,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+/// Committed segment uuids for `index_name`, read back through a fresh open.
+async fn committed_uuids(uri: &str, index_name: &str) -> Vec<Uuid> {
+    let reopened = Dataset::open(uri).await.unwrap();
+    reopened
+        .load_indices_by_name(index_name)
+        .await
+        .unwrap()
+        .iter()
+        .map(|idx| idx.uuid)
+        .collect()
 }
 
 /// Q0.1 - can a hand-written index directory be committed and survive a reopen?
@@ -323,4 +398,187 @@ async fn q0_1_future_index_version_is_dropped_silently() {
             "case {case}: unexpected survival of index_version 999"
         );
     }
+}
+
+/// Q0.2 - recommitting the same fragment coverage replaces the segment.
+///
+/// The plan assumed this would be rejected because the commit path checks for
+/// disjoint coverage. It is not: that check runs only across the segments of a
+/// single call, and an existing segment fully covered by the incoming set is
+/// removed rather than refused.
+#[tokio::test]
+async fn q0_2_same_coverage_replaces_the_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = write_vector_dataset(uri, 2, 8).await;
+    let all = fragment_ids(&dataset);
+
+    let first = Uuid::new_v4();
+    write_handwritten_index_file(&dataset, first, INDEX_FILE_NAME, 2).await;
+    commit_spike_segments(&mut dataset, "vamana_replace", vec![(first, all.clone())])
+        .await
+        .unwrap();
+    assert_eq!(committed_uuids(uri, "vamana_replace").await, vec![first]);
+
+    let second = Uuid::new_v4();
+    write_handwritten_index_file(&dataset, second, INDEX_FILE_NAME, 2).await;
+    commit_spike_segments(&mut dataset, "vamana_replace", vec![(second, all)])
+        .await
+        .unwrap();
+    assert_eq!(
+        committed_uuids(uri, "vamana_replace").await,
+        vec![second],
+        "the old segment must be gone, not kept alongside"
+    );
+}
+
+/// Q0.2 - a disjoint segment survives while its sibling is rewritten.
+///
+/// This is the commit shape consolidation (S5) needs: rewrite one segment, say
+/// nothing about the others, and they are left exactly as they were.
+#[tokio::test]
+async fn q0_2_disjoint_segment_survives_sibling_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = write_vector_dataset(uri, 4, 8).await;
+    let all = fragment_ids(&dataset);
+    assert_eq!(all.len(), 4);
+    let (left, right) = (all[..2].to_vec(), all[2..].to_vec());
+
+    let seg_left = Uuid::new_v4();
+    let seg_right = Uuid::new_v4();
+    write_handwritten_index_file(&dataset, seg_left, INDEX_FILE_NAME, 2).await;
+    write_handwritten_index_file(&dataset, seg_right, INDEX_FILE_NAME, 2).await;
+    commit_spike_segments(
+        &mut dataset,
+        "vamana_sibling",
+        vec![(seg_left, left.clone()), (seg_right, right)],
+    )
+    .await
+    .unwrap();
+    let mut before = committed_uuids(uri, "vamana_sibling").await;
+    before.sort();
+    let mut expected = vec![seg_left, seg_right];
+    expected.sort();
+    assert_eq!(before, expected);
+
+    // Rewrite only the left segment.
+    let seg_left_v2 = Uuid::new_v4();
+    write_handwritten_index_file(&dataset, seg_left_v2, INDEX_FILE_NAME, 2).await;
+    commit_spike_segments(&mut dataset, "vamana_sibling", vec![(seg_left_v2, left)])
+        .await
+        .unwrap();
+
+    let mut after = committed_uuids(uri, "vamana_sibling").await;
+    after.sort();
+    let mut want = vec![seg_left_v2, seg_right];
+    want.sort();
+    assert_eq!(
+        after, want,
+        "the untouched segment must survive a commit that never mentions it"
+    );
+}
+
+/// Q0.2 - covering only part of an existing segment is rejected.
+///
+/// This is the constraint that forces segments to be fragment-aligned. An IVF
+/// partition cuts across fragments, so "rewrite one partition" can never be
+/// expressed as a commit: the resulting segment would cover a slice of every
+/// sibling's fragments and orphan the rest.
+#[tokio::test]
+async fn q0_2_partial_coverage_of_existing_segment_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = write_vector_dataset(uri, 2, 8).await;
+    let all = fragment_ids(&dataset);
+
+    let whole = Uuid::new_v4();
+    write_handwritten_index_file(&dataset, whole, INDEX_FILE_NAME, 2).await;
+    commit_spike_segments(&mut dataset, "vamana_partial", vec![(whole, all.clone())])
+        .await
+        .unwrap();
+
+    let half = Uuid::new_v4();
+    write_handwritten_index_file(&dataset, half, INDEX_FILE_NAME, 1).await;
+    let err = commit_spike_segments(&mut dataset, "vamana_partial", vec![(half, vec![all[0]])])
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("orphan fragments"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        committed_uuids(uri, "vamana_partial").await,
+        vec![whole],
+        "a rejected commit must leave the index untouched"
+    );
+}
+
+/// Q0.2 - overlapping coverage *within one call* is the check the plan mistook
+/// for a check against the manifest. Pinning it keeps the two rules apart.
+#[tokio::test]
+async fn q0_2_overlap_within_one_commit_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = write_vector_dataset(uri, 2, 8).await;
+    let all = fragment_ids(&dataset);
+
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    write_handwritten_index_file(&dataset, a, INDEX_FILE_NAME, 1).await;
+    write_handwritten_index_file(&dataset, b, INDEX_FILE_NAME, 1).await;
+    let err = commit_spike_segments(
+        &mut dataset,
+        "vamana_overlap",
+        vec![(a, all.clone()), (b, vec![all[0]])],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("overlapping fragment coverage"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Q0.2 - a segment covering only newly appended fragments can be added without
+/// touching the existing ones. This is the append path (S6 mode (a)).
+#[tokio::test]
+async fn q0_2_new_fragments_get_their_own_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = write_vector_dataset(uri, 2, 8).await;
+    let base_fragments = fragment_ids(&dataset);
+
+    let base = Uuid::new_v4();
+    write_handwritten_index_file(&dataset, base, INDEX_FILE_NAME, 2).await;
+    commit_spike_segments(
+        &mut dataset,
+        "vamana_append",
+        vec![(base, base_fragments.clone())],
+    )
+    .await
+    .unwrap();
+
+    append_vector_rows(uri, 8).await;
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    let fresh = fragment_ids(&dataset)
+        .into_iter()
+        .filter(|id| !base_fragments.contains(id))
+        .collect::<Vec<_>>();
+    assert!(!fresh.is_empty(), "append must produce new fragments");
+
+    let delta = Uuid::new_v4();
+    write_handwritten_index_file(&dataset, delta, INDEX_FILE_NAME, 1).await;
+    commit_spike_segments(&mut dataset, "vamana_append", vec![(delta, fresh)])
+        .await
+        .unwrap();
+
+    let mut after = committed_uuids(uri, "vamana_append").await;
+    after.sort();
+    let mut want = vec![base, delta];
+    want.sort();
+    assert_eq!(
+        after, want,
+        "the base segment must survive a delta commit that never mentions it"
+    );
 }
