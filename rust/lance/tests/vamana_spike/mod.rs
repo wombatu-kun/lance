@@ -10,8 +10,10 @@
 //!
 //! Throwaway: this is executable documentation of the S0 answers, not a feature.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance::Dataset;
@@ -19,6 +21,8 @@ use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::{DatasetIndexExt, IndexSegment};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::ROW_ID;
+use lance_core::utils::address::RowAddress;
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::create_writer;
 use lance_file::writer::FileWriterOptions;
@@ -31,6 +35,15 @@ const DIM: i32 = 8;
 
 /// A dataset with a vector column, split across `num_frags` fragments.
 async fn write_vector_dataset(uri: &str, num_frags: usize, rows_per_frag: usize) -> Dataset {
+    write_vector_dataset_with(uri, num_frags, rows_per_frag, false).await
+}
+
+async fn write_vector_dataset_with(
+    uri: &str,
+    num_frags: usize,
+    rows_per_frag: usize,
+    enable_stable_row_ids: bool,
+) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, false),
         ArrowField::new(
@@ -58,6 +71,7 @@ async fn write_vector_dataset(uri: &str, num_frags: usize, rows_per_frag: usize)
         Some(WriteParams {
             max_rows_per_file: rows_per_frag,
             max_rows_per_group: rows_per_frag,
+            enable_stable_row_ids,
             ..Default::default()
         }),
     )
@@ -659,4 +673,173 @@ async fn q0_4_compaction_strands_an_unreadable_index() {
         effective("vamana_compact").is_empty(),
         "an unreadable index is stranded, covering no live fragment"
     );
+}
+
+/// Collect every deleted row address by reading the fragments' deletion vectors.
+///
+/// This is the S4 `DeleteList` prototype: cost is proportional to the number of
+/// deleted rows, not to the size of the dataset.
+async fn deleted_row_addresses(dataset: &Dataset) -> HashSet<u64> {
+    let mut deleted = HashSet::new();
+    for fragment in dataset.get_fragments() {
+        let Some(deletion_vector) = fragment.get_deletion_vector().await.unwrap() else {
+            continue;
+        };
+        for row_offset in deletion_vector.iter() {
+            deleted.insert(RowAddress::new_from_parts(fragment.id() as u32, row_offset).into());
+        }
+    }
+    deleted
+}
+
+async fn scan_row_ids(dataset: &Dataset) -> Vec<u64> {
+    let batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+    batch[ROW_ID]
+        .as_primitive::<arrow_array::types::UInt64Type>()
+        .values()
+        .to_vec()
+}
+
+/// Q0.5 - can the live-row mask be built from outside the crate, cheaply?
+#[tokio::test]
+async fn q0_5_deletion_vectors_build_the_delete_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = write_vector_dataset(uri, 4, 8).await;
+
+    dataset.delete("id % 3 == 0").await.unwrap();
+    let deleted_count = dataset.count_deleted_rows().await.unwrap();
+    assert!(deleted_count > 0, "fixture must actually delete something");
+    // Deletions must land in more than one fragment, or a per-fragment bug is invisible.
+    let touched = futures::future::join_all(
+        dataset
+            .get_fragments()
+            .iter()
+            .map(|f| async move { f.count_deletions().await.unwrap() }),
+    )
+    .await
+    .into_iter()
+    .filter(|n| *n > 0)
+    .count();
+    assert!(touched > 1, "deletions must span several fragments");
+
+    let deleted = deleted_row_addresses(&dataset).await;
+    assert_eq!(
+        deleted.len(),
+        deleted_count,
+        "the delete list must match Lance's own count"
+    );
+
+    let live = scan_row_ids(&dataset).await;
+    assert_eq!(live.len(), dataset.count_rows(None).await.unwrap());
+    assert!(
+        live.iter().all(|id| !deleted.contains(id)),
+        "a scan must never return a row the delete list covers"
+    );
+}
+
+/// Every row address the fragments physically hold, deleted or not.
+async fn all_row_addresses(dataset: &Dataset) -> HashSet<u64> {
+    let mut addresses = HashSet::new();
+    for fragment in dataset.get_fragments() {
+        let physical_rows = fragment.physical_rows().await.unwrap() as u32;
+        for row_offset in 0..physical_rows {
+            addresses.insert(RowAddress::new_from_parts(fragment.id() as u32, row_offset).into());
+        }
+    }
+    addresses
+}
+
+/// Q0.6 - which identifier does the index store, and how does it get rows back?
+///
+/// With the default write params `_rowid` is a row *address*: fragment id in the
+/// high 32 bits, offset in the low 32. The proof is exact rather than by shape -
+/// the live ids and the delete list of Q0.5 partition the fragments' physical
+/// rows with nothing left over, which can only hold if both are the same space.
+/// So the delete list applies directly to whatever the index stored, no mapping.
+#[tokio::test]
+async fn q0_6_row_id_is_an_address_and_round_trips_through_take_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = write_vector_dataset(uri, 4, 8).await;
+    dataset.delete("id % 3 == 0").await.unwrap();
+
+    let live = scan_row_ids(&dataset).await;
+    let deleted = deleted_row_addresses(&dataset).await;
+    let live_set = live.iter().copied().collect::<HashSet<_>>();
+    assert_eq!(live_set.len(), live.len(), "row ids must be unique");
+    assert!(live_set.is_disjoint(&deleted));
+    assert_eq!(
+        live_set.union(&deleted).copied().collect::<HashSet<_>>(),
+        all_row_addresses(&dataset).await,
+        "live ids and the delete list must exactly partition the physical rows"
+    );
+
+    // The index stores these ids; this is how it hands rows back on the stage-I
+    // query path, where Lance's scanner is not involved.
+    let taken = dataset
+        .take_rows(&live, dataset.schema().clone())
+        .await
+        .unwrap();
+    assert_eq!(taken.num_rows(), live.len());
+    let taken_ids = taken["id"]
+        .as_primitive::<arrow_array::types::Int32Type>()
+        .values()
+        .to_vec();
+    assert!(
+        taken_ids.iter().all(|id| id % 3 != 0),
+        "take_rows must not resurrect deleted rows"
+    );
+    let expected = dataset.scan().try_into_batch().await.unwrap()["id"]
+        .as_primitive::<arrow_array::types::Int32Type>()
+        .values()
+        .to_vec();
+    assert_eq!(taken_ids, expected, "take_rows must preserve the id order");
+}
+
+/// Q0.6 - with stable row ids enabled the two spaces come apart.
+///
+/// Deletion vectors always index by fragment offset, so the Q0.5 delete list is
+/// always in address space. Once `_rowid` stops being an address the delete list
+/// can no longer be applied to stored ids, and the index must either store
+/// addresses or carry a mapping.
+///
+/// Note the trap this test exists to avoid: a small stable id such as 5 decodes
+/// to fragment 0 offset 5, which *looks* like a valid address. Any check based
+/// on the shape of a single id is therefore useless; only the partition
+/// property distinguishes the two spaces.
+#[tokio::test]
+async fn q0_6_stable_row_ids_diverge_from_addresses() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = write_vector_dataset_with(uri, 4, 8, true).await;
+    dataset.delete("id % 3 == 0").await.unwrap();
+
+    let live = scan_row_ids(&dataset).await;
+    let deleted = deleted_row_addresses(&dataset).await;
+    let live_set = live.iter().copied().collect::<HashSet<_>>();
+
+    assert_ne!(
+        live_set.union(&deleted).copied().collect::<HashSet<_>>(),
+        all_row_addresses(&dataset).await,
+        "stable row ids must NOT partition the address space - if they did, this \
+         whole test would be pointless and the two modes could be treated alike"
+    );
+    assert!(
+        live.iter().all(|id| *id < RowAddress::FRAGMENT_SIZE),
+        "stable ids are allocated sequentially, not per fragment"
+    );
+    assert!(
+        deleted
+            .iter()
+            .any(|addr| *addr >= RowAddress::FRAGMENT_SIZE),
+        "the delete list still spans fragments, i.e. it is still address space"
+    );
+
+    // Whatever the space, take_rows still works on what the scan handed us.
+    let taken = dataset
+        .take_rows(&live, dataset.schema().clone())
+        .await
+        .unwrap();
+    assert_eq!(taken.num_rows(), live.len());
 }
