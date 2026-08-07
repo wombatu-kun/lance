@@ -19,9 +19,20 @@ use crate::search::{Comparisons, SearchScratch, greedy_search};
 #[derive(Debug, Clone, PartialEq)]
 pub struct BuildParams {
     /// `R`: the fixed width of every vertex's neighbour list.
+    ///
+    /// The parameter that decides whether high recall is reachable at all. On
+    /// SIFT1M against Lance's HNSW at matched memory, `32` loses at every recall
+    /// above 0.97 and `64` wins at every recall, by a margin that grows with it.
     pub max_degree: u32,
     /// `L`: the beam each build-time search keeps. Sets both build cost and
     /// graph quality, and is unrelated to the beam a query later uses.
+    ///
+    /// Raising it is not free improvement. At `max_degree = 32` on SIFT1M,
+    /// doubling this to 200 made query cost at recall 0.99 *worse* by a quarter:
+    /// a wider search hands the prune more candidates, and it spends the few
+    /// slots there are on long, diverse edges rather than the local ones the
+    /// last few points of recall need. At `max_degree = 64` doubling it changed
+    /// nothing measurable while costing 2.5x the build.
     pub search_list_size: usize,
     /// `alpha` for the second pass. The first pass is always `1.0`.
     pub alpha: f32,
@@ -37,6 +48,9 @@ pub struct BuildParams {
 }
 
 impl Default for BuildParams {
+    /// The best of the four `(max_degree, search_list_size)` pairs measured on
+    /// SIFT1M: 18-26% cheaper per query than Lance's HNSW at matched memory,
+    /// and cheaper to build than it too.
     fn default() -> Self {
         Self {
             max_degree: 64,
