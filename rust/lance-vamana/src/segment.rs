@@ -25,8 +25,10 @@ pub struct PartitionEntry {
     pub num_rows: u32,
     /// File name within the segment directory, never a path.
     ///
-    /// Stored rather than derived from `partition_id` so that a reader can find
-    /// the partitions without knowing this crate's naming convention.
+    /// Stored rather than derived from `partition_id` so that a reader follows
+    /// the table instead of a naming convention. Today every writer in this
+    /// crate fills it from [`crate::format::partition_file_name`], so the two
+    /// always agree and nothing yet exercises the difference.
     pub file: String,
 }
 

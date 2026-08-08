@@ -14,7 +14,9 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt32Type;
+use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt64Array};
 use arrow_schema::{Fields, Schema as ArrowSchema};
 use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_encoding::constants::{STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY};
@@ -131,12 +133,85 @@ struct VertexCost {
 }
 
 async fn vertex_cost(store: Arc<ObjectStore>, path: &Path, columns: &[&str]) -> VertexCost {
-    let one = bytes_to_read(store.clone(), path, columns, 0..1).await;
-    let five = bytes_to_read(store, path, columns, 0..5).await;
+    vertex_cost_at(store, path, columns, 0).await
+}
+
+async fn vertex_cost_at(
+    store: Arc<ObjectStore>,
+    path: &Path,
+    columns: &[&str],
+    start: usize,
+) -> VertexCost {
+    let one = bytes_to_read(store.clone(), path, columns, start..start + 1).await;
+    let five = bytes_to_read(store, path, columns, start..start + 5).await;
     VertexCost {
         marginal: (five as f64 - one as f64) / 4.0,
         single: one,
     }
+}
+
+/// The same partition written through a nullable schema, optionally with one
+/// vertex's neighbour list actually set to null.
+async fn write_nullable(store: &ObjectStore, path: &Path, partition: &Partition, hole: bool) {
+    let hinted = partition.to_batch().unwrap();
+    let neighbors = hinted[NEIGHBORS_COLUMN].as_fixed_size_list();
+    let width = neighbors.value_length() as usize;
+    let slots = neighbors
+        .values()
+        .as_primitive::<UInt32Type>()
+        .values()
+        .to_vec();
+    let rows = (0..partition.len()).map(|vertex| {
+        if hole && vertex == partition.len() / 2 {
+            None
+        } else {
+            Some(
+                slots[vertex * width..(vertex + 1) * width]
+                    .iter()
+                    .map(|neighbor| Some(*neighbor))
+                    .collect::<Vec<_>>(),
+            )
+        }
+    });
+    let neighbors = FixedSizeListArray::from_iter_primitive::<UInt32Type, _, _>(
+        rows.collect::<Vec<_>>(),
+        width as i32,
+    );
+
+    let fields = hinted
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            let field = field.as_ref().clone().with_nullable(true);
+            if field.name() == NEIGHBORS_COLUMN {
+                Arc::new(field.with_data_type(neighbors.data_type().clone()))
+            } else {
+                Arc::new(field)
+            }
+        })
+        .collect::<Fields>();
+    let arrow_schema = Arc::new(ArrowSchema::new(fields));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            hinted.column(0).clone(),
+            Arc::new(neighbors),
+            hinted.column(2).clone(),
+        ],
+    )
+    .unwrap();
+
+    let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref()).unwrap();
+    let mut writer = create_writer(
+        SEGMENT_FILE_VERSION,
+        store.create(path).await.unwrap(),
+        schema,
+        FileWriterOptions::default(),
+    )
+    .unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    writer.finish().await.unwrap();
 }
 
 /// The fixture both measurement tests share: identical data, one arm hinted and
@@ -362,6 +437,83 @@ async fn vertices_are_addressed_independently_across_partitions() {
             .to_vec();
         assert_eq!(row_ids, partition.graph().row_ids()[middle].to_vec());
     }
+}
+
+/// The stride has to hold everywhere in the file, not only at its head.
+///
+/// Every other measurement here reads vertices 0..5, and Lance flushes a column
+/// into a new page once it has buffered enough of it - so a stride exact at the
+/// start and drifting across a page boundary would be invisible. This file is
+/// sized past that threshold and measured at both ends.
+#[tokio::test]
+async fn the_stride_holds_past_a_page_boundary() {
+    // 8 MiB per column is the default flush threshold, so 128 B per vertex needs
+    // well over 65k vertices to reach a second page.
+    const MANY: usize = 200_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = local_store_and_path(&dir, "many.idx");
+    lance_vamana::io::write_partition(
+        &store,
+        &path,
+        &sample_partition(MAX_DEGREE, MANY, DIMENSION),
+    )
+    .await
+    .unwrap();
+
+    let head = vertex_cost_at(store.clone(), &path, &[NEIGHBORS_COLUMN], 0).await;
+    let tail = vertex_cost_at(store.clone(), &path, &[NEIGHBORS_COLUMN], MANY - 8).await;
+    println!(
+        "neighbours: head marginal={} tail marginal={}",
+        head.marginal, tail.marginal
+    );
+    assert_eq!(head.marginal, NEIGHBOR_STRIDE);
+    assert_eq!(
+        tail.marginal, NEIGHBOR_STRIDE,
+        "the stride drifted down the file"
+    );
+
+    let tail = vertex_cost_at(store, &path, &[VECTOR_COLUMN], MANY - 8).await;
+    assert_eq!(
+        tail.marginal, VECTOR_STRIDE,
+        "the stride drifted down the file"
+    );
+}
+
+/// The layout's other precondition, measured rather than assumed - and it turns
+/// out to be narrower than "the column must not be nullable".
+///
+/// A nullable *flag* costs nothing: Lance downgrades a validity bitmap with no
+/// nulls in it back to the no-null case, so the stride survives. What costs is an
+/// actual null, which adds a control word to every value in the column. The
+/// non-nullable field is therefore not the thing that buys the stride; it is what
+/// makes a null impossible to write in the first place, and Arrow enforces it.
+#[tokio::test]
+async fn a_null_costs_the_stride_but_a_nullable_flag_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let partition = sample_partition(MAX_DEGREE, VERTICES, DIMENSION);
+
+    let (store, permissive) = local_store_and_path(&dir, "nullable.idx");
+    write_nullable(&store, &permissive, &partition, false).await;
+    let permissive = vertex_cost(store.clone(), &permissive, &[NEIGHBORS_COLUMN]).await;
+
+    let (_, holed) = local_store_and_path(&dir, "with_a_null.idx");
+    write_nullable(&store, &holed, &partition, true).await;
+    let holed = vertex_cost(store, &holed, &[NEIGHBORS_COLUMN]).await;
+
+    println!(
+        "nullable flag only: marginal={}\nwith one null:      marginal={}",
+        permissive.marginal, holed.marginal
+    );
+    assert_eq!(
+        permissive.marginal, NEIGHBOR_STRIDE,
+        "a validity bitmap with no nulls in it should have been dropped"
+    );
+    assert!(
+        holed.marginal > NEIGHBOR_STRIDE,
+        "one null must widen every value; got {} against a stride of {NEIGHBOR_STRIDE}",
+        holed.marginal
+    );
 }
 
 /// Guard against the schema drifting away from what the layout needs.

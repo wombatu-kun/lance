@@ -20,6 +20,7 @@ use lance::Dataset;
 use lance::dataset::ProjectionRequest;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::index::DatasetIndexExt;
+use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
 use lance_vamana::query::{SearchParams, VamanaIndex};
@@ -169,16 +170,96 @@ async fn top_k_matches_lance_brute_force() {
         measured.partitions
     );
 
+    // Bars pinned to the measured pair rather than set loosely around it. The
+    // build is seeded and the queries are fixed, so both numbers are stable; a
+    // bar of "recall >= 0.95, cost < a quarter of the dataset" would have let
+    // cost regress by half while still reading as a specification.
     assert!(
-        measured.recall >= 0.95,
-        "recall@{K} was {:.4}",
+        measured.recall >= 0.98,
+        "recall@{K} was {:.4}, measured at 0.9925",
         measured.recall
     );
     assert!(
-        measured.comparisons < rows / 4.0,
-        "a graph that touches a quarter of the dataset is a scan in a costume: {:.0} of {rows}",
-        measured.comparisons
+        (1150.0..1500.0).contains(&measured.comparisons),
+        "a query cost {:.0} comparisons, measured at 1309 ({:.1}% of {rows} rows)",
+        measured.comparisons,
+        100.0 * measured.comparisons / rows
     );
+}
+
+/// Cosine is stored differently from every other metric - the builder normalises
+/// the vectors it writes - and it is routed differently too, by L2 over those
+/// unit vectors, because the router panics on cosine. Neither detour is visible
+/// from the outside, so the only way to know they compose is to ask Lance.
+#[tokio::test]
+async fn a_cosine_index_matches_lance_cosine_brute_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = measurement_fixture();
+    let mut dataset = fixture.write(uri).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &params().with_distance_type(DistanceType::Cosine),
+    )
+    .await
+    .unwrap();
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(index.metadata().distance_type, DistanceType::Cosine);
+
+    let search = SearchParams::new(K)
+        .with_nprobes(PARTITIONS as usize)
+        .with_search_list_size(BEAM);
+    let queries = random_vectors(QUERIES, 4242);
+    let mut total = 0.0;
+    for query in &queries {
+        let key = Float32Array::from(query.clone());
+        let mut scanner = dataset.scan();
+        scanner.nearest(VECTOR_COLUMN, &key, K).unwrap();
+        scanner.distance_metric(DistanceType::Cosine);
+        scanner.use_index(false);
+        scanner.with_row_id();
+        let exact = scanner.try_into_batch().await.unwrap()[lance_core::ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+
+        let found = index
+            .search(query, &search)
+            .await
+            .unwrap()
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_id)
+            .collect::<Vec<_>>();
+        total += recall(&found, &exact);
+    }
+    let recall = total / queries.len() as f64;
+    println!("cosine -> recall@{K}={recall:.4}");
+    assert!(recall >= 0.95, "cosine recall@{K} was {recall:.4}");
+}
+
+/// `Comparisons` holds a `Cell`, so it is `!Sync`, and a reference to one alive
+/// across an `.await` would make this future `!Send`. No ordinary test would
+/// notice: `#[tokio::test]` defaults to a single-threaded runtime that never
+/// asks. `tokio::spawn` does ask.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_search_can_be_spawned_onto_another_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = indexed_dataset(uri, &small_fixture()).await;
+    let index = std::sync::Arc::new(VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap());
+
+    let query = random_vectors(1, 8)[0].clone();
+    let found = tokio::spawn(async move {
+        index
+            .search(&query, &SearchParams::new(K).with_search_list_size(BEAM))
+            .await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(found.neighbors.len(), K);
 }
 
 /// Routing is a trade, and both halves of it have to be visible. A driver that
@@ -413,10 +494,10 @@ async fn a_query_of_the_wrong_width_is_refused() {
     assert!(error.to_string().contains("smaller than k"), "{error}");
 }
 
-/// Probing past the end of the routing table asks for every partition, not for
-/// an error and not for a panic.
+/// Probing past the end of the routing table asks for every partition it has,
+/// not for an error and not for a panic.
 #[tokio::test]
-async fn nprobes_beyond_the_partition_count_is_harmless() {
+async fn probing_past_the_end_of_the_table_is_clamped() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let dataset = indexed_dataset(uri, &small_fixture()).await;
@@ -442,7 +523,14 @@ async fn nprobes_beyond_the_partition_count_is_harmless() {
         .await
         .unwrap();
     assert_eq!(all.neighbors, beyond.neighbors);
-    assert_eq!(all.partitions_read, beyond.partitions_read);
+    assert_eq!(
+        all.partitions_read, beyond.partitions_read,
+        "asking for ten times the partitions read a different number of them"
+    );
+    assert_eq!(
+        all.partitions_read, PARTITIONS as usize,
+        "the small fixture should populate every partition, so both arms read them all"
+    );
 }
 
 /// An empty partition has no row in the segment table and no file of its own,

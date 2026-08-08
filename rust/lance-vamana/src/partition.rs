@@ -504,6 +504,40 @@ mod tests {
         assert_eq!(graph.neighbors(2), &[0, 1]);
     }
 
+    /// The only mutator the builder has. Its whole contract is that a shortened
+    /// list moves nothing else, which is the reason the width is fixed at all.
+    #[test]
+    fn set_neighbors_rewrites_one_vertex_and_repads_it() {
+        let mut graph = sample_graph(4);
+        let untouched = graph.neighbors(2).to_vec();
+
+        graph.set_neighbors(0, &[3, 1, 2]).unwrap();
+        assert_eq!(graph.neighbors(0), &[3, 1, 2]);
+        graph.set_neighbors(0, &[1]).unwrap();
+        assert_eq!(
+            graph.neighbors(0),
+            &[1],
+            "the tail of a shortened list was not re-padded, so a stale edge survived"
+        );
+        assert_eq!(graph.neighbors(2), untouched.as_slice());
+    }
+
+    #[test]
+    fn set_neighbors_refuses_what_it_cannot_store() {
+        let mut graph = sample_graph(4);
+        for (neighbors, expected) in [
+            (vec![0u32], "points at itself"),
+            (vec![9], "local id 9"),
+            (vec![1, 2, 3, 1, 2], "exceeds max_degree"),
+        ] {
+            let error = graph.set_neighbors(0, &neighbors).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        let error = graph.set_neighbors(9, &[1]).unwrap_err();
+        assert!(error.to_string().contains("outside a partition"), "{error}");
+    }
+
     #[test]
     fn a_self_edge_is_rejected() {
         let error = PartitionGraph::try_new(2, vec![7, 8], vec![vec![0], vec![]]).unwrap_err();

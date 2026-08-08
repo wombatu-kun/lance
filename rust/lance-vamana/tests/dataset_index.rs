@@ -17,7 +17,6 @@ use arrow_array::{Array, FixedSizeListArray};
 use lance::Dataset;
 use lance::dataset::ProjectionRequest;
 use lance::index::DatasetIndexExt;
-use lance_io::object_store::ObjectStore;
 use lance_vamana::builder::{
     INDEX_DETAILS_TYPE_URL, IndexParams, build_segment, create_index, live_fragments,
 };
@@ -403,5 +402,4 @@ async fn a_segment_is_readable_through_the_datasets_own_store() {
         PARTITIONS as usize,
         "the router must describe every partition, populated or not"
     );
-    let _: &ObjectStore = dataset.object_store(None).await.unwrap().as_ref();
 }

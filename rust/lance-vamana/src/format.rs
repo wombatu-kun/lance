@@ -158,8 +158,12 @@ impl IndexMetadata {
 ///   picks full-zip only once a value reaches 256 bytes - `max_degree >= 64`, or
 ///   `dimension >= 64` - and quietly falls back to mini-block below that, which
 ///   reintroduces chunk amplification and destroys the addressing.
-/// - Both the column and its item are non-nullable. A null anywhere adds a
-///   control word to every value, so the stride stops being a clean multiple.
+/// - Both the column and its item are non-nullable. What costs is an actual
+///   null, not the flag: a null anywhere adds a control word to *every* value in
+///   the column and the stride stops being a clean multiple (measured at 133
+///   bytes against a stride of 128). Lance drops a validity bitmap that holds no
+///   nulls, so a merely nullable column keeps its stride - declaring the field
+///   non-nullable is what makes a null impossible to write at all.
 ///
 /// The two columns stay separate rather than being interleaved into one wide
 /// value because their access patterns differ: consolidation rewrites the edges
