@@ -66,6 +66,9 @@ pub struct IndexParams {
     /// Iteration bound for the router's k-means.
     pub kmeans_max_iters: u32,
     /// Vectors sampled per centroid when training the router.
+    ///
+    /// Capped at 512 by Lance, which re-slices the training set to `512 * k`
+    /// before it starts, so anything above that has no effect.
     pub kmeans_sample_rate: usize,
 }
 
@@ -391,9 +394,16 @@ fn train_router(
     // with its own `TODO: use seed for Rng` beside it - so leaving the init to it
     // makes a build unreproducible, and an A/B over two such builds measures the
     // dice. Handing k sampled rows in as the starting centroids uses the public
-    // `Incremental` init and puts the whole build back under one seed. Hierarchical
+    // `Incremental` init and puts the build back under one seed. Hierarchical
     // clustering is switched off for the same reason: above k = 256 it takes over
     // the training and reproducibility would silently stop holding.
+    //
+    // One hole remains and is not ours to close: whenever an iteration leaves a
+    // cluster empty, Lance splits it using an RNG it seeds from the OS as well.
+    // So a build is reproducible while every centroid keeps at least one member,
+    // which is the normal case but not a guarantee - Lance itself warns about
+    // the data shapes that break it. An A/B at high partition counts should
+    // check that the trained centroids match before trusting the comparison.
     let init = gather(
         &training,
         &rand::seq::index::sample(rng, training.len(), k)

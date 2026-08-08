@@ -613,8 +613,6 @@ async fn q0_2_new_fragments_get_their_own_segment() {
 /// not tell "our index was mistreated" from "compaction does this to everyone".
 #[tokio::test]
 async fn q0_4_compaction_strands_an_unreadable_index() {
-    let _ = env_logger::builder().is_test(true).try_init();
-
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut dataset = write_vector_dataset(uri, 4, 8).await;

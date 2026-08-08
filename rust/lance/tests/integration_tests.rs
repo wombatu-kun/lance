@@ -10,4 +10,3 @@ mod query;
 mod topk_late_materialization;
 #[cfg(feature = "slow_tests")]
 mod utils;
-mod vamana_spike;

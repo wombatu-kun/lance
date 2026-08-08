@@ -15,7 +15,8 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-lance = { path = "../lance" }
+# Default features pull the whole cloud-SDK tree; this crate indexes local files.
+lance = { path = "../lance", default-features = false }
 lance-arrow = { path = "../lance-arrow" }
 lance-core = { path = "../lance-core" }
 lance-encoding = { path = "../lance-encoding" }
@@ -23,12 +24,10 @@ lance-file = { path = "../lance-file" }
 lance-index = { path = "../lance-index" }
 lance-io = { path = "../lance-io" }
 lance-linalg = { path = "../lance-linalg" }
-lance-table = { path = "../lance-table" }
 
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
 arrow-select = "58.0.0"
-bytes = "1.11.1"
 futures = "0.3"
 object_store = "0.13.2"
 prost = "0.14.1"
@@ -40,6 +39,5 @@ serde_json = "1"
 uuid = { version = "1.2", features = ["v4"] }
 
 [dev-dependencies]
-lance-encoding = { path = "../lance-encoding" }
 tempfile = "3"
 tokio = { version = "1.23", features = ["macros", "rt-multi-thread"] }
