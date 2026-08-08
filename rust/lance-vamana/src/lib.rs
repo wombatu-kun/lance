@@ -11,12 +11,14 @@
 //! compiles against is the same one an out-of-tree crate sees.
 
 pub mod build;
+pub mod builder;
 pub mod format;
 pub mod io;
 pub mod partition;
 pub mod search;
 pub mod segment;
 
+pub use builder::{IndexParams, create_index};
 pub use format::{IndexMetadata, RowIdMode};
 pub use partition::{Partition, PartitionGraph};
 pub use segment::{PartitionEntry, SegmentManifest};
