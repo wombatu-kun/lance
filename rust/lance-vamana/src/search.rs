@@ -8,12 +8,50 @@
 //! runs it to answer. Both want the same thing, so it lives on its own.
 
 use std::cell::Cell;
+use std::sync::Arc;
 
-use lance_core::{Error, Result};
+use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array};
+use lance_core::{Error, ROW_ID, Result};
+use lance_index::vector::flat::index::FlatMetadata;
+use lance_index::vector::flat::storage::{FLAT_COLUMN, FlatFloatStorage};
 use lance_index::vector::graph::{OrderedFloat, OrderedNode};
+use lance_index::vector::quantizer::QuantizerStorage;
 use lance_index::vector::storage::DistCalculator;
+use lance_linalg::distance::DistanceType;
 
 use crate::partition::PartitionGraph;
+
+/// Wrap vectors and their row ids in the [`VectorStore`] the primitives here want.
+///
+/// [`FlatFloatStorage::try_from_batch`] and not [`FlatFloatStorage::new`]: the
+/// latter synthesises row ids `0..n`, and a build reads them straight into the
+/// graph. The graph would then name positions instead of rows, and every answer
+/// would point at the wrong data - while committing, reopening and searching
+/// perfectly happily.
+///
+/// [`VectorStore`]: lance_index::vector::storage::VectorStore
+pub fn flat_storage(
+    row_ids: &[u64],
+    vectors: &FixedSizeListArray,
+    distance_type: DistanceType,
+) -> Result<FlatFloatStorage> {
+    let batch = RecordBatch::try_from_iter_with_nullable(vec![
+        (
+            ROW_ID,
+            Arc::new(UInt64Array::from(row_ids.to_vec())) as ArrayRef,
+            false,
+        ),
+        (FLAT_COLUMN, Arc::new(vectors.clone()) as ArrayRef, false),
+    ])?;
+    FlatFloatStorage::try_from_batch(
+        batch,
+        &FlatMetadata {
+            dim: vectors.value_length() as usize,
+        },
+        distance_type,
+        None,
+    )
+}
 
 /// Counts distance computations.
 ///

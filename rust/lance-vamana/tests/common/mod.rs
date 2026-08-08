@@ -72,6 +72,9 @@ pub struct DatasetFixture {
     pub stable_row_ids: bool,
     /// Make every n-th vector null, to exercise the skip path.
     pub null_every: Option<usize>,
+    /// Draw the vectors from this many distinct values instead of all-distinct.
+    /// A handful of values with many centroids leaves most partitions empty.
+    pub distinct_vectors: Option<usize>,
     pub seed: u64,
 }
 
@@ -82,6 +85,7 @@ impl Default for DatasetFixture {
             rows_per_fragment: 512,
             stable_row_ids: false,
             null_every: None,
+            distinct_vectors: None,
             seed: 11,
         }
     }
@@ -109,16 +113,18 @@ impl DatasetFixture {
         )]));
 
         let mut rng = SmallRng::seed_from_u64(self.seed);
+        let pool = (0..self.distinct_vectors.unwrap_or(self.rows()))
+            .map(|_| {
+                (0..VECTOR_DIM)
+                    .map(|_| Some(rng.random::<f32>()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
             (0..self.rows())
-                .map(|row| {
-                    let vector = (0..VECTOR_DIM)
-                        .map(|_| Some(rng.random::<f32>()))
-                        .collect::<Vec<_>>();
-                    match self.null_every {
-                        Some(every) if row % every == 0 => None,
-                        _ => Some(vector),
-                    }
+                .map(|row| match self.null_every {
+                    Some(every) if row % every == 0 => None,
+                    _ => Some(pool[row % pool.len()].clone()),
                 })
                 .collect::<Vec<_>>(),
             VECTOR_DIM,
@@ -139,4 +145,21 @@ impl DatasetFixture {
         .await
         .unwrap()
     }
+}
+
+/// Query vectors drawn the same way as the dataset's, from a different seed.
+pub fn random_vectors(count: usize, seed: u64) -> Vec<Vec<f32>> {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    (0..count)
+        .map(|_| (0..VECTOR_DIM).map(|_| rng.random::<f32>()).collect())
+        .collect()
+}
+
+/// The fraction of `truth` that `found` recovered.
+pub fn recall(found: &[u64], truth: &[u64]) -> f64 {
+    let truth_set = found
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    truth.iter().filter(|row| truth_set.contains(row)).count() as f64 / truth.len() as f64
 }

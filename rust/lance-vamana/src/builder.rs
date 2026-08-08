@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{Array, FixedSizeListArray, UInt32Array};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
 use futures::TryStreamExt;
@@ -24,11 +24,8 @@ use lance::Dataset;
 use lance::index::{DatasetIndexExt, IndexSegment};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, ROW_ID, Result};
-use lance_index::vector::flat::index::FlatMetadata;
-use lance_index::vector::flat::storage::{FLAT_COLUMN, FlatFloatStorage};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::{KMeans, KMeansParams, compute_partitions_arrow_array};
-use lance_index::vector::quantizer::QuantizerStorage;
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_fsl;
 use object_store::path::Path;
@@ -40,7 +37,7 @@ use crate::build::{BuildParams, build_partition};
 use crate::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
 use crate::io::SegmentWriter;
 use crate::partition::Partition;
-use crate::search::Comparisons;
+use crate::search::{Comparisons, flat_storage};
 use crate::segment::SegmentManifest;
 
 /// On-disk index version recorded in the dataset manifest.
@@ -398,27 +395,7 @@ fn build_one(
         .map(|row| row_ids[*row as usize])
         .collect::<Vec<_>>();
 
-    // `try_from_batch` and not `FlatFloatStorage::new`: the latter synthesises
-    // row ids `0..n`, and `build_partition` reads them straight into the graph.
-    // The graph would then name positions instead of rows, and every result
-    // would point at the wrong data.
-    let batch = RecordBatch::try_from_iter_with_nullable(vec![
-        (
-            ROW_ID,
-            Arc::new(UInt64Array::from(member_row_ids)) as ArrayRef,
-            false,
-        ),
-        (FLAT_COLUMN, Arc::new(taken.clone()) as ArrayRef, false),
-    ])?;
-    let store = FlatFloatStorage::try_from_batch(
-        batch,
-        &FlatMetadata {
-            dim: taken.value_length() as usize,
-        },
-        params.distance_type,
-        None,
-    )?;
-
+    let store = flat_storage(&member_row_ids, &taken, params.distance_type)?;
     let built = build_partition(&store, &params.graph, comparisons)?;
     Ok((Partition::try_new(built.graph, taken)?, built.medoid))
 }
