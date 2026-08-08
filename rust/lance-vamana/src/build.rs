@@ -295,11 +295,22 @@ pub fn robust_prune<S: VectorStore>(
 
     let mut pool = candidates;
     pool.retain(|candidate| candidate.id != point);
-    pool.sort_unstable_by(|a, b| a.dist.cmp(&b.dist).then(a.id.cmp(&b.id)));
+    // Deduplicated by id before being ordered by distance: `dedup_by_key` only
+    // collapses neighbours, and the same id arriving twice with two different
+    // distances would not be adjacent under a distance ordering.
+    pool.sort_unstable_by(|a, b| a.id.cmp(&b.id).then(a.dist.cmp(&b.dist)));
     pool.dedup_by_key(|candidate| candidate.id);
+    pool.sort_unstable_by(|a, b| a.dist.cmp(&b.dist).then(a.id.cmp(&b.id)));
     let mut pool = VecDeque::from(pool);
 
     let mut selected = Vec::with_capacity(max_degree);
+    // Candidates that sit exactly on top of an already selected vertex. The
+    // diversity rule occludes them, and for diversity it is right - they point
+    // in no new direction. But they are the *same* point, not a worse one, and
+    // dropping every one of them is what turns a partition of duplicates into a
+    // chain: `alpha * 0 > 0` is false at every alpha, so the first selection
+    // empties the pool and the vertex keeps a single out-edge.
+    let mut coincident: Vec<OrderedNode> = Vec::new();
     while let Some(nearest) = pool.pop_front() {
         selected.push(nearest.id);
         if selected.len() == max_degree {
@@ -307,7 +318,29 @@ pub fn robust_prune<S: VectorStore>(
         }
         let from_nearest = store.dist_calculator_from_id(nearest.id);
         comparisons.record(pool.len() as u64);
-        pool.retain(|candidate| alpha * from_nearest.distance(candidate.id) > candidate.dist.0);
+        pool.retain(|candidate| {
+            let separation = from_nearest.distance(candidate.id);
+            if alpha * separation > candidate.dist.0 {
+                return true;
+            }
+            if separation == 0.0 {
+                coincident.push(candidate.clone());
+            }
+            false
+        });
+    }
+
+    // Only reachable when the pool ran out before the slots did *and* something
+    // was occluded at zero separation, so data without exact duplicates never
+    // takes this path and the graph it builds is unchanged.
+    if selected.len() < max_degree {
+        coincident.sort_unstable_by(|a, b| a.dist.cmp(&b.dist).then(a.id.cmp(&b.id)));
+        for candidate in coincident {
+            if selected.len() == max_degree {
+                break;
+            }
+            selected.push(candidate.id);
+        }
     }
     Ok(selected)
 }
@@ -676,6 +709,55 @@ mod tests {
 
     /// A build that cannot be repeated cannot be A/B tested: two runs would
     /// differ by the dice as much as by whatever was changed between them.
+    /// A partition drawn from a handful of distinct values, which is what IVF
+    /// routing produces from a dataset with duplicates - Lance's own k-means
+    /// warns about exactly this data shape.
+    ///
+    /// Duplicates are the worst case for the diversity rule: every candidate
+    /// occludes every other at zero separation, because `alpha * 0 > 0` is false
+    /// at every alpha. Before the coincident fill each vertex kept a *single*
+    /// out-edge and a walk from the medoid over 400 vertices reached four.
+    ///
+    /// Full reachability is neither restored nor the goal: with identical
+    /// vectors every answer is equally correct, so what has to hold is that a
+    /// walk can still enumerate enough distinct rows to answer a query.
+    #[test]
+    fn a_partition_of_duplicates_keeps_its_edges() {
+        const VERTICES: usize = 400;
+        const DIMENSION: usize = 8;
+        let params = small_params();
+
+        for distinct in [1usize, 2, 4] {
+            let values = Float32Array::from(
+                (0..VERTICES)
+                    .flat_map(|vertex| {
+                        (0..DIMENSION)
+                            .map(move |axis| ((vertex % distinct) * DIMENSION + axis) as f32)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let store = FlatFloatStorage::new(
+                FixedSizeListArray::try_new_from_values(values, DIMENSION as i32).unwrap(),
+                DistanceType::L2,
+            );
+            let built = build_partition(&store, &params, &Comparisons::default()).unwrap();
+
+            for vertex in 0..VERTICES as u32 {
+                assert_eq!(
+                    built.graph.neighbors(vertex).len(),
+                    params.max_degree as usize,
+                    "distinct={distinct}: vertex {vertex} was left short of its slots"
+                );
+            }
+            assert!(
+                reachable(&built.graph, built.medoid) > params.max_degree as usize,
+                "distinct={distinct}: a walk reached {} vertices, so the graph closed \
+                 over the medoid's own neighbourhood",
+                reachable(&built.graph, built.medoid)
+            );
+        }
+    }
+
     #[test]
     fn the_same_seed_builds_the_same_graph() {
         const VERTICES: usize = 300;
