@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt64Type};
-use arrow_array::{Array, FixedSizeListArray};
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use lance::Dataset;
 use lance::dataset::ProjectionRequest;
 use lance::index::DatasetIndexExt;
@@ -401,5 +401,65 @@ async fn a_segment_is_readable_through_the_datasets_own_store() {
         manifest.ivf().num_partitions(),
         PARTITIONS as usize,
         "the router must describe every partition, populated or not"
+    );
+}
+
+/// Committing a Vamana index changes what Lance itself can do with the dataset.
+///
+/// The scanner picks a vector index by field id alone, with no type check, so it
+/// selects our segment and then cannot read it as one of its own; and
+/// `optimize_indices` classifies an index as a vector index by the presence of
+/// `index.idx`, so one unreadable index fails the loop over *every* index.
+///
+/// Neither is a defect in this crate - both follow from there being no way to
+/// register an external vector index type - but both are invisible to any test
+/// that reaches for the exhaustive path with `use_index(false)`, which is every
+/// other test here. Pinned so that an upstream change is noticed rather than
+/// discovered, and so the README cannot drift away from the behaviour.
+#[tokio::test]
+async fn a_committed_index_shadows_lances_own_vector_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = DatasetFixture::default();
+    let mut dataset = fixture.write(uri).await;
+
+    let query = Float32Array::from(vec![0.5f32; common::VECTOR_DIM as usize]);
+    let nearest = |dataset: &Dataset, use_index: bool| {
+        let mut scanner = dataset.scan();
+        scanner.nearest(VECTOR_COLUMN, &query, 5).unwrap();
+        scanner.use_index(use_index);
+        async move { scanner.try_into_batch().await }
+    };
+
+    assert_eq!(nearest(&dataset, true).await.unwrap().num_rows(), 5);
+    create_index(&mut dataset, INDEX_NAME, &params())
+        .await
+        .unwrap();
+
+    let shadowed = nearest(&dataset, true).await.unwrap_err();
+    assert!(
+        shadowed.to_string().contains("Index Metadata not found"),
+        "Lance found a way to read our index: {shadowed}"
+    );
+    assert_eq!(
+        nearest(&dataset, false).await.unwrap().num_rows(),
+        5,
+        "the exhaustive path must stay open, it is the documented escape hatch"
+    );
+
+    let error = dataset
+        .optimize_indices(&Default::default())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Index Metadata not found"));
+    let error = dataset.index_statistics(INDEX_NAME).await.unwrap_err();
+    assert!(error.to_string().contains("Index Metadata not found"));
+
+    // Everything that does not go looking for a vector index is unaffected.
+    let mut scanner = dataset.scan();
+    scanner.project(&[VECTOR_COLUMN]).unwrap();
+    assert_eq!(
+        scanner.try_into_batch().await.unwrap().num_rows(),
+        fixture.rows()
     );
 }

@@ -7,8 +7,21 @@
 //! dataset's public index metadata, routes the query with the IVF model each
 //! segment carries, walks the graph of every probed partition and merges the
 //! answers into dataset row ids. Lance's scanner never sees the query, which is
-//! what makes this work without a patch to Lance - and also what it costs: there
-//! is no predicate prefilter and no refine step here.
+//! what makes this work without a patch to Lance - and also what it costs.
+//!
+//! What this driver does not do, and a caller has to know:
+//!
+//! - **Deleted rows are returned.** There is no delete list yet, so a row
+//!   deleted after the index was built is walked, scored and handed back. Its
+//!   row address will not resolve, so `Dataset::take_rows` drops it silently and
+//!   the caller sees fewer than `k` rows - and it has already displaced a live
+//!   row from the answer. Rebuild the index after deleting.
+//! - **Rows added after the build are invisible.** The index answers from the
+//!   fragments it was built over; Lance's scanner would scan the remainder.
+//! - **No predicate prefilter and no refine step.** Both live in the scanner.
+//!
+//! Committing an index also breaks Lance's own vector search on that column -
+//! see the crate README, and the test that pins it.
 //!
 //! Partitions are read whole and nothing is cached between queries. Both are
 //! deliberate for this stage: the lazy per-vertex traversal and the cache budget
