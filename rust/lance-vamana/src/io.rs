@@ -10,8 +10,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Schema as ArrowSchema};
+use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
@@ -32,9 +32,9 @@ use prost::Message;
 
 use crate::format::{
     INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, NEIGHBORS_COLUMN,
-    index_schema, partition_file_name,
+    VECTOR_COLUMN, index_schema, partition_file_name,
 };
-use crate::partition::PartitionGraph;
+use crate::partition::{Partition, PartitionGraph};
 use crate::segment::{PartitionEntry, SegmentManifest};
 
 /// The file format every file in a segment is written in.
@@ -48,9 +48,9 @@ pub const SEGMENT_FILE_VERSION: ConcreteFileVersion = ConcreteFileVersion::V2_1;
 pub async fn write_partition(
     store: &ObjectStore,
     path: &Path,
-    graph: &PartitionGraph,
+    partition: &Partition,
 ) -> Result<u64> {
-    let batch = graph.to_batch()?;
+    let batch = partition.to_batch()?;
     let schema = lance_core::datatypes::Schema::try_from(batch.schema().as_ref())?;
     let mut writer = create_writer(
         SEGMENT_FILE_VERSION,
@@ -135,35 +135,56 @@ pub async fn read_rows(reader: &FileReader, rows: Range<usize>) -> Result<Record
 }
 
 /// Read a whole partition back into memory.
-pub async fn read_partition(reader: &FileReader) -> Result<PartitionGraph> {
+pub async fn read_partition(reader: &FileReader) -> Result<Partition> {
     let num_rows = reader.metadata().num_rows as usize;
     if num_rows == 0 {
-        // An IVF partition may legitimately hold no vectors, and then there is
-        // no batch to take a schema from - so the width comes from the file.
-        return PartitionGraph::try_new(max_degree(reader)?, Vec::new(), Vec::new());
+        // An IVF partition may legitimately hold no vectors, and then there is no
+        // batch to take a schema from - so both widths come from the file itself.
+        let graph = PartitionGraph::try_new(max_degree(reader)?, Vec::new(), Vec::new())?;
+        let vectors = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            list_width(reader, VECTOR_COLUMN)?,
+            Arc::new(Float32Array::from(Vec::<f32>::new())),
+            None,
+        )?;
+        return Partition::try_new(graph, vectors);
     }
-    PartitionGraph::try_from_batch(&read_rows(reader, 0..num_rows).await?)
+    Partition::try_from_batch(&read_rows(reader, 0..num_rows).await?)
 }
 
 /// The `max_degree` a partition file was written with.
 pub fn max_degree(reader: &FileReader) -> Result<u32> {
+    positive_width(reader, NEIGHBORS_COLUMN)
+}
+
+/// The vector dimension a partition file was written with.
+pub fn dimension(reader: &FileReader) -> Result<u32> {
+    positive_width(reader, VECTOR_COLUMN)
+}
+
+fn positive_width(reader: &FileReader, column: &str) -> Result<u32> {
+    let width = list_width(reader, column)?;
+    u32::try_from(width).map_err(|_| {
+        Error::corrupt_file_named(
+            column,
+            format!("Vamana {column} column has a negative width {width}"),
+        )
+    })
+}
+
+fn list_width(reader: &FileReader, column: &str) -> Result<i32> {
     let schema: ArrowSchema = reader.schema().as_ref().into();
-    let field = schema.field_with_name(NEIGHBORS_COLUMN)?;
+    let field = schema.field_with_name(column)?;
     let DataType::FixedSizeList(_, width) = field.data_type() else {
         return Err(Error::corrupt_file_named(
-            NEIGHBORS_COLUMN,
+            column,
             format!(
-                "Vamana neighbours column has type {}, expected a fixed size list",
+                "Vamana {column} column has type {}, expected a fixed size list",
                 field.data_type()
             ),
         ));
     };
-    u32::try_from(*width).map_err(|_| {
-        Error::corrupt_file_named(
-            NEIGHBORS_COLUMN,
-            format!("Vamana neighbours column has a negative width {width}"),
-        )
-    })
+    Ok(*width)
 }
 
 /// Writes a segment directory one partition at a time.
@@ -195,33 +216,40 @@ impl SegmentWriter {
         }
     }
 
-    /// Write one partition's graph and return the size of its file in bytes.
+    /// Write one partition and return the size of its file in bytes.
     ///
-    /// Partition ids must arrive in ascending order, and `graph` must not be
+    /// Partition ids must arrive in ascending order, and `partition` must not be
     /// empty: an empty partition gets no file and no row in `index.idx`, so
     /// calling this for one would write a file nothing points at.
     pub async fn write_partition(
         &mut self,
         partition_id: u32,
         medoid: u32,
-        graph: &PartitionGraph,
+        partition: &Partition,
     ) -> Result<u64> {
-        if graph.is_empty() {
+        if partition.is_empty() {
             return Err(Error::invalid_input(format!(
                 "Vamana partition {partition_id} is empty; empty partitions are not written"
             )));
         }
-        if graph.max_degree() != self.metadata.max_degree {
+        if partition.graph().max_degree() != self.metadata.max_degree {
             return Err(Error::invalid_input(format!(
                 "Vamana partition {partition_id} has max_degree {} but the segment declares {}",
-                graph.max_degree(),
+                partition.graph().max_degree(),
                 self.metadata.max_degree
             )));
         }
-        if medoid as usize >= graph.len() {
+        if partition.dimension() != self.metadata.dimension {
+            return Err(Error::invalid_input(format!(
+                "Vamana partition {partition_id} has dimension {} but the segment declares {}",
+                partition.dimension(),
+                self.metadata.dimension
+            )));
+        }
+        if medoid as usize >= partition.len() {
             return Err(Error::invalid_input(format!(
                 "Vamana partition {partition_id} has medoid {medoid} but holds only {} vertices",
-                graph.len()
+                partition.len()
             )));
         }
         if let Some(last) = self.partitions.last()
@@ -236,11 +264,11 @@ impl SegmentWriter {
 
         let file = partition_file_name(partition_id);
         let path = self.dir.clone().join(file.as_str());
-        let size = write_partition(&self.store, &path, graph).await?;
+        let size = write_partition(&self.store, &path, partition).await?;
         self.partitions.push(PartitionEntry {
             partition_id,
             medoid,
-            num_rows: graph.len() as u32,
+            num_rows: partition.len() as u32,
             file,
         });
         Ok(size)

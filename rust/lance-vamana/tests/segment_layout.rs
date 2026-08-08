@@ -27,14 +27,14 @@ use lance_vamana::format::{
 use lance_vamana::io::{
     SEGMENT_FILE_VERSION, SegmentWriter, open_file, read_partition, read_segment,
 };
-use lance_vamana::partition::PartitionGraph;
+use lance_vamana::partition::Partition;
 use object_store::path::Path;
 
 mod common;
-use common::sample_graph;
+use common::sample_partition;
 
 const MAX_DEGREE: u32 = 32;
-const DIMENSION: usize = 6;
+const DIMENSION: u32 = 6;
 const PARTITIONS: usize = 8;
 
 /// Sparse on purpose: partitions 1, 4, 6 and 7 hold nothing. Sizes and medoids
@@ -46,7 +46,7 @@ fn index_metadata() -> IndexMetadata {
         format_version: FORMAT_VERSION,
         max_degree: MAX_DEGREE,
         alpha: 1.2,
-        dimension: DIMENSION as u32,
+        dimension: DIMENSION,
         distance_type: DistanceType::Cosine,
         row_id_mode: RowIdMode::Address,
     }
@@ -56,7 +56,7 @@ fn index_metadata() -> IndexMetadata {
 /// transposed or truncated cannot compare equal.
 fn ivf_model() -> IvfModel {
     let values = Float32Array::from(
-        (0..PARTITIONS * DIMENSION)
+        (0..PARTITIONS * DIMENSION as usize)
             .map(|i| i as f32 * 0.25)
             .collect::<Vec<_>>(),
     );
@@ -79,18 +79,18 @@ async fn write_sample_segment(
     dir: &Path,
 ) -> (
     lance_vamana::SegmentManifest,
-    HashMap<u32, (u32, PartitionGraph)>,
+    HashMap<u32, (u32, Partition)>,
 ) {
     let mut writer = SegmentWriter::new(store, dir.clone(), index_metadata(), ivf_model());
     let mut written = HashMap::new();
     for (partition_id, vertices) in POPULATED {
-        let graph = sample_graph(MAX_DEGREE, vertices);
+        let partition = sample_partition(MAX_DEGREE, vertices, DIMENSION);
         let medoid = (vertices / 3) as u32;
         writer
-            .write_partition(partition_id, medoid, &graph)
+            .write_partition(partition_id, medoid, &partition)
             .await
             .unwrap();
-        written.insert(partition_id, (medoid, graph));
+        written.insert(partition_id, (medoid, partition));
     }
     (writer.finish().await.unwrap(), written)
 }
@@ -99,7 +99,7 @@ async fn write_sample_segment(
 async fn segment_round_trips_through_a_directory() {
     let dir = tempfile::tempdir().unwrap();
     let (store, path) = segment_dir(&dir);
-    let (written, graphs) = write_sample_segment(store.clone(), &path).await;
+    let (written, partitions) = write_sample_segment(store.clone(), &path).await;
 
     let read = read_segment(store.clone(), &path).await.unwrap();
     assert_eq!(
@@ -109,19 +109,19 @@ async fn segment_round_trips_through_a_directory() {
     assert_eq!(read.metadata(), &index_metadata());
     assert_eq!(read.ivf(), &ivf_model());
 
-    for (partition_id, (medoid, graph)) in &graphs {
+    for (partition_id, (medoid, partition)) in &partitions {
         let entry = read
             .partition(*partition_id)
             .unwrap_or_else(|| panic!("partition {partition_id} is missing from the table"));
         assert_eq!(entry.medoid, *medoid);
-        assert_eq!(entry.num_rows as usize, graph.len());
+        assert_eq!(entry.num_rows as usize, partition.len());
 
         let reader = open_file(store.clone(), &path.clone().join(entry.file.as_str()), None)
             .await
             .unwrap();
         assert_eq!(
             &read_partition(&reader).await.unwrap(),
-            graph,
+            partition,
             "partition {partition_id} did not round trip"
         );
     }
@@ -181,11 +181,7 @@ async fn the_writer_rejects_an_empty_partition() {
     let mut writer = SegmentWriter::new(store, path, index_metadata(), ivf_model());
 
     let error = writer
-        .write_partition(
-            0,
-            0,
-            &PartitionGraph::try_new(MAX_DEGREE, vec![], vec![]).unwrap(),
-        )
+        .write_partition(0, 0, &sample_partition(MAX_DEGREE, 0, DIMENSION))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("is empty"), "{error}");
@@ -200,10 +196,24 @@ async fn the_writer_rejects_a_partition_of_the_wrong_degree() {
     let mut writer = SegmentWriter::new(store, path, index_metadata(), ivf_model());
 
     let error = writer
-        .write_partition(0, 0, &sample_graph(MAX_DEGREE * 2, 4))
+        .write_partition(0, 0, &sample_partition(MAX_DEGREE * 2, 4, DIMENSION))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("max_degree 64"), "{error}");
+}
+
+/// So is the dimension: the routing model and every other partition assume it.
+#[tokio::test]
+async fn the_writer_rejects_a_partition_of_the_wrong_dimension() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let mut writer = SegmentWriter::new(store, path, index_metadata(), ivf_model());
+
+    let error = writer
+        .write_partition(0, 0, &sample_partition(MAX_DEGREE, 4, DIMENSION + 1))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("dimension 7"), "{error}");
 }
 
 #[tokio::test]
@@ -212,11 +222,11 @@ async fn the_writer_rejects_partitions_out_of_order() {
     let (store, path) = segment_dir(&dir);
     let mut writer = SegmentWriter::new(store, path, index_metadata(), ivf_model());
 
-    let graph = sample_graph(MAX_DEGREE, 4);
-    writer.write_partition(3, 0, &graph).await.unwrap();
-    let error = writer.write_partition(1, 0, &graph).await.unwrap_err();
+    let partition = sample_partition(MAX_DEGREE, 4, DIMENSION);
+    writer.write_partition(3, 0, &partition).await.unwrap();
+    let error = writer.write_partition(1, 0, &partition).await.unwrap_err();
     assert!(error.to_string().contains("ascending order"), "{error}");
-    let error = writer.write_partition(3, 0, &graph).await.unwrap_err();
+    let error = writer.write_partition(3, 0, &partition).await.unwrap_err();
     assert!(error.to_string().contains("ascending order"), "{error}");
 }
 

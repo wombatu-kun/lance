@@ -18,5 +18,5 @@ pub mod search;
 pub mod segment;
 
 pub use format::{IndexMetadata, RowIdMode};
-pub use partition::PartitionGraph;
+pub use partition::{Partition, PartitionGraph};
 pub use segment::{PartitionEntry, SegmentManifest};

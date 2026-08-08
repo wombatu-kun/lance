@@ -39,6 +39,16 @@ pub const ROW_ID_COLUMN: &str = "__row_id";
 /// Out-edges of each vertex as partition-local ids, padded with [`NO_NEIGHBOR`].
 pub const NEIGHBORS_COLUMN: &str = "__neighbors";
 
+/// The vector of each vertex, in the same order as [`NEIGHBORS_COLUMN`].
+///
+/// A graph walk needs a distance for every candidate it considers, so the
+/// vectors have to be reachable at query time. Keeping them in the partition
+/// makes the index self-contained - a query reads its own segment and never the
+/// dataset's data files - and it is the layout the disk-resident traversal
+/// wants: one vertex is one stride of this column plus one stride of
+/// [`NEIGHBORS_COLUMN`], with nothing else read.
+pub const VECTOR_COLUMN: &str = "__vector";
+
 /// Padding slot in [`NEIGHBORS_COLUMN`].
 ///
 /// A vertex's degree is the index of its first padding slot, so degree is not
@@ -50,7 +60,7 @@ pub const NO_NEIGHBOR: u32 = u32::MAX;
 /// Highest partition-local id addressable, given [`NO_NEIGHBOR`] takes the top.
 pub const MAX_PARTITION_ROWS: u32 = u32::MAX - 1;
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Schema metadata key under which [`IndexMetadata`] is stored as JSON.
 pub const INDEX_METADATA_KEY: &str = "lance-vamana:index";
@@ -139,43 +149,54 @@ impl IndexMetadata {
 
 /// Arrow schema of one partition file.
 ///
-/// `__neighbors` is a non-nullable `FixedSizeList<UInt32, max_degree>` so that a
-/// vertex sits at `base + local_id * max_degree * 4` with no read amplification.
-/// Two details make that hold and neither is the default:
+/// Both fixed-size-list columns are laid out so that vertex `local_id` sits at
+/// `base + local_id * stride` with no read amplification: `max_degree * 4` bytes
+/// for `__neighbors`, `dimension * 4` for `__vector`. Two details make that hold
+/// and neither is the default:
 ///
 /// - The full-zip encoding is requested explicitly. Left to the heuristic, Lance
-///   picks full-zip only once a value reaches 256 bytes, i.e. `max_degree >= 64`,
-///   and quietly falls back to mini-block below that, which reintroduces chunk
-///   amplification and destroys the addressing.
-/// - The column is non-nullable. A nullable column adds a control word to every
-///   value, so the stride stops being `max_degree * 4`.
-pub fn partition_schema(max_degree: u32) -> Result<Schema> {
-    if max_degree == 0 {
-        return Err(Error::invalid_input(
-            "Vamana max_degree must be greater than zero".to_string(),
-        ));
+///   picks full-zip only once a value reaches 256 bytes - `max_degree >= 64`, or
+///   `dimension >= 64` - and quietly falls back to mini-block below that, which
+///   reintroduces chunk amplification and destroys the addressing.
+/// - Both the column and its item are non-nullable. A null anywhere adds a
+///   control word to every value, so the stride stops being a clean multiple.
+///
+/// The two columns stay separate rather than being interleaved into one wide
+/// value because their access patterns differ: consolidation rewrites the edges
+/// and not the vectors, and a graph walk reads the vectors and edges but never
+/// the row ids. Separate columns are what makes each of those a projection.
+pub fn partition_schema(max_degree: u32, dimension: u32) -> Result<Schema> {
+    let neighbors = addressable_list(NEIGHBORS_COLUMN, DataType::UInt32, max_degree, "max_degree")?;
+    let vector = addressable_list(VECTOR_COLUMN, DataType::Float32, dimension, "dimension")?;
+    Ok(Schema::new(vec![
+        Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+        neighbors,
+        vector,
+    ]))
+}
+
+/// A non-nullable `FixedSizeList` field that is explicitly full-zip encoded.
+fn addressable_list(name: &str, item_type: DataType, width: u32, what: &str) -> Result<Field> {
+    if width == 0 {
+        return Err(Error::invalid_input(format!(
+            "Vamana {what} must be greater than zero"
+        )));
     }
-    let width = i32::try_from(max_degree).map_err(|_| {
+    let width = i32::try_from(width).map_err(|_| {
         Error::invalid_input(format!(
-            "Vamana max_degree {max_degree} exceeds the maximum Arrow list width {}",
+            "Vamana {what} {width} exceeds the maximum Arrow list width {}",
             i32::MAX
         ))
     })?;
-
-    let neighbors = Field::new(
-        NEIGHBORS_COLUMN,
-        DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt32, false)), width),
+    Ok(Field::new(
+        name,
+        DataType::FixedSizeList(Arc::new(Field::new("item", item_type, false)), width),
         false,
     )
     .with_metadata(HashMap::from([(
         STRUCTURAL_ENCODING_META_KEY.to_string(),
         STRUCTURAL_ENCODING_FULLZIP.to_string(),
-    )]));
-
-    Ok(Schema::new(vec![
-        Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
-        neighbors,
-    ]))
+    )])))
 }
 
 /// Arrow schema of `index.idx`: one row per *non-empty* partition.
@@ -251,30 +272,45 @@ mod tests {
 
     #[test]
     fn partition_schema_requests_fullzip_and_stays_non_nullable() {
-        let schema = partition_schema(32).unwrap();
-        let neighbors = schema.field_with_name(NEIGHBORS_COLUMN).unwrap();
-        assert!(
-            !neighbors.is_nullable(),
-            "a control word would break the stride"
-        );
-        assert_eq!(
-            neighbors.metadata().get(STRUCTURAL_ENCODING_META_KEY),
-            Some(&STRUCTURAL_ENCODING_FULLZIP.to_string()),
-            "below 64 the heuristic would choose mini-block on its own"
-        );
-        match neighbors.data_type() {
-            DataType::FixedSizeList(item, width) => {
-                assert_eq!(*width, 32);
-                assert!(!item.is_nullable());
+        let schema = partition_schema(32, 24).unwrap();
+        // Both widths are under the 256-byte threshold at which Lance would pick
+        // full-zip unprompted, so both columns depend on the explicit hint.
+        for (column, expected_width, expected_item) in [
+            (NEIGHBORS_COLUMN, 32, DataType::UInt32),
+            (VECTOR_COLUMN, 24, DataType::Float32),
+        ] {
+            let field = schema.field_with_name(column).unwrap();
+            assert!(
+                !field.is_nullable(),
+                "{column}: a control word would break the stride"
+            );
+            assert_eq!(
+                field.metadata().get(STRUCTURAL_ENCODING_META_KEY),
+                Some(&STRUCTURAL_ENCODING_FULLZIP.to_string()),
+                "{column}: below 64 the heuristic would choose mini-block on its own"
+            );
+            match field.data_type() {
+                DataType::FixedSizeList(item, width) => {
+                    assert_eq!(*width, expected_width, "{column}");
+                    assert_eq!(*item.data_type(), expected_item, "{column}");
+                    assert!(!item.is_nullable(), "{column}");
+                }
+                other => panic!("unexpected {column} type: {other}"),
             }
-            other => panic!("unexpected neighbours type: {other}"),
         }
     }
 
     #[test]
     fn partition_schema_rejects_a_zero_degree() {
-        let error = partition_schema(0).unwrap_err();
+        let error = partition_schema(0, 8).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("max_degree"));
+        assert!(error.to_string().contains("max_degree"), "{error}");
+    }
+
+    #[test]
+    fn partition_schema_rejects_a_zero_dimension() {
+        let error = partition_schema(32, 0).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("dimension"), "{error}");
     }
 }
