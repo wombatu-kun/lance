@@ -19,8 +19,9 @@ use arrow_array::types::{Float32Type, UInt64Type};
 use lance::Dataset;
 use lance::dataset::ProjectionRequest;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::index::DatasetIndexExt;
 use lance_vamana::build::BuildParams;
-use lance_vamana::builder::{IndexParams, create_index};
+use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
 use lance_vamana::query::{SearchParams, VamanaIndex};
 
 mod common;
@@ -294,24 +295,89 @@ async fn every_answer_resolves_to_the_row_it_names() {
     }
 }
 
-/// A compaction that could not open the index leaves it pointing at fragments
-/// that no longer exist. Returning nothing would look like a real answer.
+/// A compaction that could not open the index leaves it naming fragments that no
+/// longer exist, and every row address it stored for them is dead. Answering
+/// from what remains would look like a real answer.
+///
+/// The compaction is real here, and asserted to be: deleting every row first
+/// would drop the fragments outright and the test would pass without compacting
+/// anything at all.
 #[tokio::test]
-async fn an_index_stranded_by_compaction_is_refused() {
+async fn an_index_over_a_rewritten_fragment_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut dataset = indexed_dataset(uri, &small_fixture()).await;
-    assert!(VamanaIndex::open(&dataset, INDEX_NAME).await.is_ok());
+    VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
-    dataset.delete("true").await.unwrap();
-    compact_files(&mut dataset, CompactionOptions::default(), None)
+    let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
         .await
         .unwrap();
+    assert!(
+        metrics.fragments_removed > 0,
+        "nothing was compacted, so this test proves nothing"
+    );
 
     let error = VamanaIndex::open(&dataset, INDEX_NAME)
         .await
-        .expect_err("a stranded index must not answer queries");
-    assert!(error.to_string().contains("stranded"), "{error}");
+        .expect_err("an index over retired fragments must not answer queries");
+    assert!(error.to_string().contains("no longer has"), "{error}");
+}
+
+/// More than one segment is the normal state of an index that has been extended,
+/// and it is the only case where local ids from different graphs meet.
+#[tokio::test]
+async fn an_index_of_several_segments_answers_from_all_of_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = measurement_fixture();
+    let mut dataset = fixture.write(uri).await;
+
+    let left = build_index_segment(&dataset, &params(), &[0, 1])
+        .await
+        .unwrap();
+    let right = build_index_segment(&dataset, &params(), &[2, 3])
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![left, right])
+        .await
+        .unwrap();
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(index.num_segments(), 2);
+
+    let queries = random_vectors(QUERIES, 4242);
+    let truth = ground_truth(&dataset, &queries).await;
+    let search = SearchParams::new(K)
+        .with_nprobes(PARTITIONS as usize)
+        .with_search_list_size(BEAM);
+    let measured = measure(&index, &queries, &truth, &search).await;
+    println!(
+        "two segments -> recall@{K}={:.4}, {:.0} comparisons, {:.1} partitions",
+        measured.recall, measured.comparisons, measured.partitions
+    );
+
+    // Every row is in exactly one segment, so the merge must never hand back the
+    // same row twice, and it must reach the half that lives in the other one.
+    for query in queries.iter().take(8) {
+        let result = index.search(query, &search).await.unwrap();
+        let ids = result
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), K, "the merge returned a row twice");
+    }
+    assert!(
+        measured.recall >= 0.95,
+        "recall across two segments was {:.4}",
+        measured.recall
+    );
+    assert!(
+        measured.partitions > f64::from(PARTITIONS),
+        "a two-segment index must probe both segments, got {:.1} partitions",
+        measured.partitions
+    );
 }
 
 #[tokio::test]

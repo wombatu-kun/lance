@@ -28,7 +28,7 @@ use lance_linalg::kernels::normalize_arrow;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 
-use crate::builder::routing_distance_type;
+use crate::builder::{routing_distance_type, supported_distance_type};
 use crate::format::{IndexMetadata, RowIdMode};
 use crate::io::{open_file, read_partition, read_segment};
 use crate::partition::Partition;
@@ -128,17 +128,29 @@ impl VamanaIndex {
         let mut segments = Vec::with_capacity(indices.len());
         for index in indices.iter() {
             // A compaction that cannot open an index does not remove it: the
-            // manifest entry survives, pointing at fragments that no longer
-            // exist. The index is not lost, it indexes nothing - and a query
-            // over it would return an empty answer that looks like a real one.
-            if index
-                .effective_fragment_bitmap(&live)
-                .is_none_or(|covered| covered.is_empty())
-            {
+            // manifest entry survives, still naming the fragments it was built
+            // over. The rows of any fragment that has since been rewritten or
+            // dropped are stored here under row addresses that will never
+            // resolve again, and they would win places in the top-k and then be
+            // silently discarded by the caller's `take_rows`.
+            //
+            // So the test is equality with the *declared* coverage, not merely
+            // a non-empty intersection: a compaction usually retires only the
+            // fragments below its size threshold, which leaves the intersection
+            // non-empty and half the index dangling.
+            let Some(declared) = index.fragment_bitmap.as_ref() else {
                 return Err(Error::index(format!(
-                    "index '{index_name}' segment {} covers no live fragment; \
-                     it was most likely stranded by a compaction and has to be rebuilt",
+                    "index '{index_name}' segment {} records no fragment coverage",
                     index.uuid
+                )));
+            };
+            let still_live = declared & &live;
+            if still_live != *declared {
+                return Err(Error::index(format!(
+                    "index '{index_name}' segment {} was built over {} fragments the dataset no \
+                     longer has, so it holds row addresses that cannot resolve; rebuild the index",
+                    index.uuid,
+                    declared.len() - still_live.len()
                 )));
             }
             let dir = dataset.indices_dir().join(index.uuid.to_string());
@@ -178,12 +190,7 @@ impl VamanaIndex {
                 }
             )));
         }
-        if metadata.distance_type == DistanceType::Hamming {
-            return Err(Error::not_supported(
-                "Vamana stores Float32 vectors, which Hamming distance does not apply to"
-                    .to_string(),
-            ));
-        }
+        supported_distance_type(metadata.distance_type)?;
 
         Ok(Self {
             store,
@@ -273,6 +280,11 @@ impl VamanaIndex {
                 .total_cmp(&right.distance)
                 .then(left.row_id.cmp(&right.row_id))
         });
+        // Nothing here guarantees a row appears once: that rests on Lance
+        // refusing to commit segments with overlapping fragment coverage, which
+        // is somebody else's invariant. Sorted by `(distance, row_id)`, copies
+        // of a row are adjacent and cost nothing to drop.
+        found.dedup_by_key(|neighbor| neighbor.row_id);
         found.truncate(params.k);
         Ok(QueryResult {
             neighbors: found,

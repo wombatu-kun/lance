@@ -18,7 +18,9 @@ use lance::Dataset;
 use lance::dataset::ProjectionRequest;
 use lance::index::DatasetIndexExt;
 use lance_io::object_store::ObjectStore;
-use lance_vamana::builder::{INDEX_DETAILS_TYPE_URL, IndexParams, build_segment, create_index};
+use lance_vamana::builder::{
+    INDEX_DETAILS_TYPE_URL, IndexParams, build_segment, create_index, live_fragments,
+};
 use lance_vamana::format::INDEX_FILE_NAME;
 use lance_vamana::io::{open_file, read_partition, read_segment};
 use lance_vamana::partition::Partition;
@@ -289,7 +291,7 @@ async fn the_same_seed_builds_the_same_index() {
     let mut built = Vec::new();
     for run in 0..2 {
         let segment_dir = Path::from_absolute_path(dir.path().join(format!("run_{run}"))).unwrap();
-        let manifest = build_segment(&dataset, &params(), &segment_dir)
+        let manifest = build_segment(&dataset, &params(), &segment_dir, &live_fragments(&dataset))
             .await
             .unwrap();
         let mut partitions = Vec::new();
@@ -308,6 +310,21 @@ async fn the_same_seed_builds_the_same_index() {
 
     assert_eq!(built[0].0, built[1].0, "the routing model or table drifted");
     assert_eq!(built[0].1, built[1].1, "the graphs drifted");
+
+    // Determinism alone would also hold for a builder that ignored the seed
+    // entirely - which is exactly what handing k-means its own starting
+    // centroids is there to prevent. A different seed has to build differently.
+    let mut other = params();
+    other.graph.seed += 1;
+    let elsewhere = Path::from_absolute_path(dir.path().join("other_seed")).unwrap();
+    let other_manifest = build_segment(&dataset, &other, &elsewhere, &live_fragments(&dataset))
+        .await
+        .unwrap();
+    assert_ne!(
+        other_manifest.ivf().centroids,
+        built[0].0.ivf().centroids,
+        "a different seed trained the same router, so the seed is not reaching k-means"
+    );
 }
 
 #[tokio::test]
@@ -329,6 +346,25 @@ async fn more_partitions_than_rows_is_refused() {
     .await
     .unwrap_err();
     assert!(error.to_string().contains("fewer partitions"), "{error}");
+}
+
+/// Dot distance is refused rather than quietly building a worse graph: Lance's
+/// `1 - dot` goes negative for unnormalised vectors, which inverts what the
+/// pruning slack does.
+#[tokio::test]
+async fn a_dot_distance_index_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = DatasetFixture::default().write(uri).await;
+
+    let error = create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &params().with_distance_type(lance_linalg::distance::DistanceType::Dot),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("dot distance"), "{error}");
 }
 
 #[tokio::test]

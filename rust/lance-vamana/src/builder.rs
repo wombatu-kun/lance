@@ -97,6 +97,33 @@ impl IndexParams {
     }
 }
 
+/// Reject the metrics this crate cannot answer correctly.
+///
+/// `Hamming` does not apply to the Float32 vectors the format stores. `Dot` is
+/// refused for a subtler reason: Lance spells dot distance as `1 - dot`, which
+/// goes negative for any pair whose inner product exceeds one - the ordinary
+/// case for the unnormalised vectors `Dot` exists to serve. `RobustPrune` keeps
+/// a candidate when `alpha * d(selected, c) > d(point, c)`, and multiplying a
+/// negative left-hand side by `alpha > 1` *lowers* it, so the pruning slack
+/// tightens the diversity rule instead of relaxing it and the second pass drops
+/// a strict superset of what the first pass drops. The graph comes out sparser
+/// than an `alpha = 1` build, silently. Until that is reworked and measured,
+/// refusing beats shipping a metric that quietly builds a worse index.
+pub fn supported_distance_type(distance_type: DistanceType) -> Result<()> {
+    match distance_type {
+        DistanceType::L2 | DistanceType::Cosine => Ok(()),
+        DistanceType::Hamming => Err(Error::not_supported(
+            "Vamana stores Float32 vectors, which Hamming distance does not apply to".to_string(),
+        )),
+        DistanceType::Dot => Err(Error::not_supported(
+            "Vamana does not support dot distance yet: Lance's dot distance is `1 - dot`, which \
+             is negative for vectors of norm above one, and a negative distance makes the \
+             pruning slack tighten the diversity rule instead of relaxing it"
+                .to_string(),
+        )),
+    }
+}
+
 /// The distance type the IVF router works in.
 ///
 /// Cosine is not one of them: `IvfModel::find_partitions` reaches k-means code
@@ -116,6 +143,31 @@ pub async fn create_index(
     index_name: &str,
     params: &IndexParams,
 ) -> Result<()> {
+    let fragments = live_fragments(dataset);
+    let segment = build_index_segment(dataset, params, &fragments).await?;
+    dataset
+        .commit_existing_index_segments(index_name, &params.column, vec![segment])
+        .await
+}
+
+pub fn live_fragments(dataset: &Dataset) -> Vec<u32> {
+    dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect()
+}
+
+/// Build a segment over `fragments` and describe it, ready to commit.
+///
+/// Separate from [`create_index`] because a segment is the unit of maintenance:
+/// coverage has to be chosen by the caller, and a segment naming a subset of the
+/// fragments is how new data is indexed without rewriting what is already there.
+pub async fn build_index_segment(
+    dataset: &Dataset,
+    params: &IndexParams,
+    fragments: &[u32],
+) -> Result<IndexSegment> {
     let field = dataset.schema().field(&params.column).ok_or_else(|| {
         Error::invalid_input(format!(
             "column '{}' does not exist in the dataset",
@@ -123,39 +175,37 @@ pub async fn create_index(
         ))
     })?;
     let field_id = field.id;
-    let fragments = dataset
-        .get_fragments()
-        .iter()
-        .map(|fragment| fragment.id() as u32)
-        .collect::<Vec<_>>();
     let dataset_version = dataset.manifest.version;
 
     let uuid = Uuid::new_v4();
     let dir = dataset.indices_dir().join(uuid.to_string());
-    build_segment(dataset, params, &dir).await?;
+    build_segment(dataset, params, &dir, fragments).await?;
 
     let details = prost_types::Any {
         type_url: INDEX_DETAILS_TYPE_URL.to_string(),
         value: Vec::new(),
     };
-    let segment = IndexSegment::new(
+    Ok(IndexSegment::new(
         uuid,
-        fragments,
+        fragments.to_vec(),
         [field_id],
         Arc::new(details),
         INDEX_VERSION,
         dataset_version,
-    );
-    dataset
-        .commit_existing_index_segments(index_name, &params.column, vec![segment])
-        .await
+    ))
 }
 
 /// Build one segment into `dir` without committing it.
+///
+/// Only the rows of `fragments` are indexed. That has to be the caller's choice
+/// rather than "everything": a segment's committed coverage is what Lance trusts
+/// it to hold, and a segment naming two fragments while physically holding the
+/// whole dataset would put every other row into two segments at once.
 pub async fn build_segment(
     dataset: &Dataset,
     params: &IndexParams,
     dir: &Path,
+    fragments: &[u32],
 ) -> Result<SegmentManifest> {
     if dataset.manifest().uses_stable_row_ids() {
         // The delete list of stage C is derived from deletion vectors, which are
@@ -173,13 +223,14 @@ pub async fn build_segment(
             "Vamana num_partitions must be greater than zero".to_string(),
         ));
     }
-    if params.distance_type == DistanceType::Hamming {
-        return Err(Error::not_supported(
-            "Vamana stores Float32 vectors, which Hamming distance does not apply to".to_string(),
+    supported_distance_type(params.distance_type)?;
+    if fragments.is_empty() {
+        return Err(Error::invalid_input(
+            "Vamana cannot build a segment over no fragments".to_string(),
         ));
     }
 
-    let (row_ids, vectors) = read_vectors(dataset, &params.column).await?;
+    let (row_ids, vectors) = read_vectors(dataset, &params.column, fragments).await?;
     let dimension = u32::try_from(vectors.value_length()).map_err(|_| {
         Error::invalid_input(format!(
             "column '{}' has a negative vector dimension {}",
@@ -235,10 +286,27 @@ pub async fn build_segment(
 /// Rows whose vector is null are dropped: they have nothing to index, and Lance's
 /// own vector indices skip them too. The index therefore covers a subset of the
 /// dataset's rows, which is exactly what `fragment_bitmap` already allows for.
-async fn read_vectors(dataset: &Dataset, column: &str) -> Result<(Vec<u64>, FixedSizeListArray)> {
+async fn read_vectors(
+    dataset: &Dataset,
+    column: &str,
+    fragments: &[u32],
+) -> Result<(Vec<u64>, FixedSizeListArray)> {
+    let selected = fragments
+        .iter()
+        .map(|id| {
+            dataset
+                .get_fragment(*id as usize)
+                .map(|fragment| fragment.metadata().clone())
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("the dataset has no fragment {id} to index"))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let mut scanner = dataset.scan();
     scanner.project(&[column])?;
     scanner.with_row_id();
+    scanner.with_fragments(selected);
     let batches = scanner
         .try_into_stream()
         .await?
