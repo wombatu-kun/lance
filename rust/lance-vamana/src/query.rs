@@ -321,7 +321,31 @@ impl VamanaIndex {
                     None,
                 )
                 .await?;
-                loaded.push((read_partition(&reader).await?, entry.medoid));
+                let partition = read_partition(&reader).await?;
+                // The writer checks both against the segment on the way out; the
+                // reader has to check them on the way back in. A partition whose
+                // width disagrees with the manifest would be searched with a
+                // query of the wrong length against `flat_storage`, which takes
+                // its dimension from the array - silently wrong distances, not
+                // an error.
+                let declared = segment.manifest.metadata();
+                if partition.graph().max_degree() != declared.max_degree
+                    || partition.dimension() != declared.dimension
+                {
+                    return Err(Error::corrupt_file_named(
+                        entry.file.as_str(),
+                        format!(
+                            "Vamana partition {} holds degree {} and dimension {} but its \
+                             segment declares degree {} and dimension {}",
+                            entry.partition_id,
+                            partition.graph().max_degree(),
+                            partition.dimension(),
+                            declared.max_degree,
+                            declared.dimension
+                        ),
+                    ));
+                }
+                loaded.push((partition, entry.medoid));
             }
         }
         Ok(loaded)

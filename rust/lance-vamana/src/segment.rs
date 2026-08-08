@@ -62,16 +62,26 @@ impl SegmentManifest {
             )));
         }
 
-        if let Some(centroids) = ivf.centroids.as_ref() {
-            let dimension = u32::try_from(centroids.value_length()).unwrap_or(u32::MAX);
-            if dimension != metadata.dimension {
-                return Err(Error::invalid_input(format!(
-                    "Vamana index metadata declares dimension {} but its IVF centroids have \
-                     dimension {dimension}",
-                    metadata.dimension
-                )));
-            }
+        // Without centroids there is nothing to route with, and every remaining
+        // check below would silently evaporate: `IvfModel::num_partitions` falls
+        // back to `offsets.len()`, which the rule above has just required to be
+        // empty. Worse, `IvfModel::find_partitions` unwraps the centroids, so a
+        // segment accepted here would abort the process on its first query.
+        let Some(centroids) = ivf.centroids.as_ref() else {
+            return Err(Error::invalid_input(
+                "Vamana takes an IVF model for routing, and a model without centroids cannot route"
+                    .to_string(),
+            ));
+        };
+        let dimension = u32::try_from(centroids.value_length()).unwrap_or(u32::MAX);
+        if dimension != metadata.dimension {
+            return Err(Error::invalid_input(format!(
+                "Vamana index metadata declares dimension {} but its IVF centroids have \
+                 dimension {dimension}",
+                metadata.dimension
+            )));
         }
+        let num_partitions = ivf.num_partitions();
 
         let mut previous: Option<u32> = None;
         for entry in &partitions {
@@ -102,12 +112,11 @@ impl SegmentManifest {
                     entry.partition_id, entry.file
                 )));
             }
-            if ivf.centroids.is_some() && entry.partition_id as usize >= ivf.num_partitions() {
+            if entry.partition_id as usize >= num_partitions {
                 return Err(Error::invalid_input(format!(
-                    "Vamana partition table names partition {} but the IVF model has only {} \
-                     partitions",
-                    entry.partition_id,
-                    ivf.num_partitions()
+                    "Vamana partition table names partition {} but the IVF model has only \
+                     {num_partitions} partitions",
+                    entry.partition_id
                 )));
             }
         }
@@ -217,6 +226,14 @@ fn u32_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a [u32]> {
     let column = batch
         .column_by_name(name)
         .ok_or_else(|| missing_column(name))?;
+    // `values()` ignores the null mask, so a null would read as whatever the
+    // buffer happens to hold - a null medoid would silently become vertex 0.
+    if column.null_count() != 0 {
+        return Err(Error::corrupt_file_named(
+            name,
+            format!("Vamana partition table column {name} holds nulls"),
+        ));
+    }
     Ok(column
         .as_primitive_opt::<UInt32Type>()
         .ok_or_else(|| {
@@ -348,6 +365,17 @@ mod tests {
 
     /// A model trained by Lance arrives with its partition sizes filled in, and
     /// they would then be a second, unmaintained copy of `num_rows`.
+    /// A routing model with no centroids cannot route, and every other check in
+    /// `try_new` is defined in terms of them - so accepting one would disable the
+    /// lot and hand `find_partitions` an unwrap it would abort on.
+    #[test]
+    fn an_ivf_model_without_centroids_is_rejected() {
+        let error = SegmentManifest::try_new(metadata(4), IvfModel::empty(), vec![entry(0, 4)])
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("without centroids"), "{error}");
+    }
+
     #[test]
     fn an_ivf_model_carrying_partition_sizes_is_rejected() {
         let mut sized = ivf(8, 4);

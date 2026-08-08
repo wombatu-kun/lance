@@ -98,6 +98,9 @@ pub fn build_partition<S: VectorStore>(
             "Vamana medoid sample size must be greater than zero".to_string(),
         ));
     }
+    // Checked here and not left to the second pass: `robust_prune` would reject
+    // it, but only after the whole first pass had already run.
+    validate_alpha(params.alpha)?;
 
     let mut rng = SmallRng::seed_from_u64(params.seed);
     // Indexed rather than iterated: a vertex's local id is its position here, so
@@ -218,6 +221,11 @@ pub fn medoid<S: VectorStore>(
             "Vamana cannot pick a medoid from an empty partition".to_string(),
         ));
     }
+    if sample_size == 0 {
+        return Err(Error::invalid_input(
+            "Vamana medoid sample size must be greater than zero".to_string(),
+        ));
+    }
     let sample = if sample_size >= num_vertices {
         (0..num_vertices as u32).collect::<Vec<_>>()
     } else {
@@ -261,6 +269,15 @@ pub fn medoid<S: VectorStore>(
 /// out-edges into that set; here the caller does it, which is what lets the same
 /// function serve both a vertex's own prune and a back-edge that has to fight
 /// for a slot.
+fn validate_alpha(alpha: f32) -> Result<()> {
+    if alpha.is_nan() || alpha < 1.0 {
+        return Err(Error::invalid_input(format!(
+            "Vamana alpha must be at least 1.0, got {alpha}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn robust_prune<S: VectorStore>(
     store: &S,
     point: u32,
@@ -269,11 +286,7 @@ pub fn robust_prune<S: VectorStore>(
     max_degree: usize,
     comparisons: &Comparisons,
 ) -> Result<Vec<u32>> {
-    if alpha.is_nan() || alpha < 1.0 {
-        return Err(Error::invalid_input(format!(
-            "Vamana alpha must be at least 1.0, got {alpha}"
-        )));
-    }
+    validate_alpha(alpha)?;
     if max_degree == 0 {
         return Err(Error::invalid_input(
             "Vamana max_degree must be greater than zero".to_string(),

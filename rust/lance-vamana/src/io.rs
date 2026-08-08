@@ -50,6 +50,14 @@ pub async fn write_partition(
     path: &Path,
     partition: &Partition,
 ) -> Result<u64> {
+    // The format says an empty partition gets no row in `index.idx` and no file.
+    // `SegmentWriter` enforces that; this function is public and delegated to, so
+    // it has to enforce it too rather than write a file nothing can point at.
+    if partition.is_empty() {
+        return Err(Error::invalid_input(
+            "Vamana will not write a file for an empty partition".to_string(),
+        ));
+    }
     let batch = partition.to_batch()?;
     let schema = lance_core::datatypes::Schema::try_from(batch.schema().as_ref())?;
     let mut writer = create_writer(
@@ -154,22 +162,14 @@ pub async fn read_partition(reader: &FileReader) -> Result<Partition> {
 
 /// The `max_degree` a partition file was written with.
 pub fn max_degree(reader: &FileReader) -> Result<u32> {
-    positive_width(reader, NEIGHBORS_COLUMN)
-}
-
-/// The vector dimension a partition file was written with.
-pub fn dimension(reader: &FileReader) -> Result<u32> {
-    positive_width(reader, VECTOR_COLUMN)
-}
-
-fn positive_width(reader: &FileReader, column: &str) -> Result<u32> {
-    let width = list_width(reader, column)?;
-    u32::try_from(width).map_err(|_| {
-        Error::corrupt_file_named(
-            column,
-            format!("Vamana {column} column has a negative width {width}"),
-        )
-    })
+    let width = list_width(reader, NEIGHBORS_COLUMN)?;
+    if width <= 0 {
+        return Err(Error::corrupt_file_named(
+            NEIGHBORS_COLUMN,
+            format!("Vamana {NEIGHBORS_COLUMN} column has width {width}, which must be positive"),
+        ));
+    }
+    Ok(width as u32)
 }
 
 fn list_width(reader: &FileReader, column: &str) -> Result<i32> {
@@ -332,9 +332,28 @@ pub async fn read_segment(store: Arc<ObjectStore>, dir: &Path) -> Result<Segment
                 format!("Vamana segment has an unreadable {IVF_POSITION_KEY}: {e}"),
             )
         })?;
-    let ivf = IvfModel::try_from(pb::Ivf::decode(
-        reader.read_global_buffer(ivf_position).await?,
-    )?)?;
+    // Global buffer indices are one-based - buffer 0 is the file's own schema
+    // descriptor - so a stored 0 is corruption, not a model.
+    if ivf_position == 0 {
+        return Err(Error::corrupt_file_named(
+            INDEX_FILE_NAME,
+            format!("Vamana segment stores {IVF_POSITION_KEY} = 0, which is the file descriptor"),
+        ));
+    }
+    let proto = pb::Ivf::decode(reader.read_global_buffer(ivf_position).await?)?;
+    // `IvfModel::try_from` asserts these agree and would abort the process on a
+    // malformed buffer rather than report it.
+    if !proto.offsets.is_empty() && proto.offsets.len() != proto.lengths.len() {
+        return Err(Error::corrupt_file_named(
+            INDEX_FILE_NAME,
+            format!(
+                "Vamana segment carries an IVF model with {} offsets and {} lengths",
+                proto.offsets.len(),
+                proto.lengths.len()
+            ),
+        ));
+    }
+    let ivf = IvfModel::try_from(proto)?;
 
     let num_rows = reader.metadata().num_rows as usize;
     let batch = if num_rows == 0 {

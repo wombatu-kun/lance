@@ -74,6 +74,13 @@ impl PartitionGraph {
                          but the partition holds only {num_rows} vertices"
                     )));
                 }
+                // `set_neighbors` refuses these, so this constructor has to as
+                // well; otherwise the two ways of building a graph disagree.
+                if *neighbor as usize == local_id {
+                    return Err(Error::invalid_input(format!(
+                        "Vamana vertex {local_id} points at itself"
+                    )));
+                }
                 neighbors[local_id * width + slot] = *neighbor;
             }
         }
@@ -329,6 +336,12 @@ fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
             ),
         )
     })?;
+    if max_degree == 0 {
+        return Err(Error::corrupt_file_named(
+            NEIGHBORS_COLUMN,
+            "Vamana neighbours column has zero width".to_string(),
+        ));
+    }
     if row_ids.len() != neighbors.len() {
         return Err(Error::corrupt_file_named(
             NEIGHBORS_COLUMN,
@@ -339,21 +352,68 @@ fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
             ),
         ));
     }
+    if neighbors.null_count() != 0 || neighbors.values().null_count() != 0 {
+        return Err(Error::corrupt_file_named(
+            NEIGHBORS_COLUMN,
+            "Vamana neighbours column holds nulls".to_string(),
+        ));
+    }
+
+    let slots = neighbors
+        .values()
+        .as_primitive_opt::<UInt32Type>()
+        .ok_or_else(|| {
+            Error::corrupt_file_named(
+                NEIGHBORS_COLUMN,
+                "Vamana neighbour ids are not UInt32".to_string(),
+            )
+        })?
+        .values();
+
+    // Everything below is what `try_new` enforces on the write path. It has to
+    // be enforced here too and cannot be delegated to it, because the sentinel
+    // padding is legal on disk and `try_new` takes trimmed lists. Without these
+    // checks an out-of-range id read off disk indexes straight into the visit
+    // marks and the vector buffer during a search, so a single flipped byte in
+    // a partition file panics the process instead of being reported.
+    let num_rows = row_ids.len();
+    let width = max_degree as usize;
+    // Arrow already guarantees `values.len() == len * size`, but the slicing
+    // below is what keeps the search in bounds, so it is checked rather than
+    // assumed.
+    let expected = num_rows.checked_mul(width).ok_or_else(|| {
+        Error::corrupt_file_named(
+            NEIGHBORS_COLUMN,
+            format!("Vamana partition claims {num_rows} rows of width {width}"),
+        )
+    })?;
+    if slots.len() != expected {
+        return Err(Error::corrupt_file_named(
+            NEIGHBORS_COLUMN,
+            format!(
+                "Vamana adjacency holds {} ids, expected {expected} for {num_rows} vertices of \
+                 width {width}",
+                slots.len()
+            ),
+        ));
+    }
+    for (slot, neighbor) in slots.iter().enumerate() {
+        if *neighbor != NO_NEIGHBOR && *neighbor as usize >= num_rows {
+            return Err(Error::corrupt_file_named(
+                NEIGHBORS_COLUMN,
+                format!(
+                    "Vamana vertex {} points at local id {neighbor}, but the partition holds \
+                     only {num_rows} vertices",
+                    slot / width
+                ),
+            ));
+        }
+    }
 
     Ok(PartitionGraph {
         max_degree,
         row_ids,
-        neighbors: neighbors
-            .values()
-            .as_primitive_opt::<UInt32Type>()
-            .ok_or_else(|| {
-                Error::corrupt_file_named(
-                    NEIGHBORS_COLUMN,
-                    "Vamana neighbour ids are not UInt32".to_string(),
-                )
-            })?
-            .values()
-            .to_vec(),
+        neighbors: slots.to_vec(),
     })
 }
 
@@ -436,9 +496,19 @@ mod tests {
 
     #[test]
     fn a_saturated_vertex_uses_every_slot() {
-        let graph = PartitionGraph::try_new(2, vec![7, 8], vec![vec![1, 0], vec![0, 1]]).unwrap();
-        assert_eq!(graph.neighbors(0), &[1, 0]);
-        assert_eq!(graph.neighbors(1), &[0, 1]);
+        let graph =
+            PartitionGraph::try_new(2, vec![7, 8, 9], vec![vec![1, 2], vec![2, 0], vec![0, 1]])
+                .unwrap();
+        assert_eq!(graph.neighbors(0), &[1, 2]);
+        assert_eq!(graph.neighbors(1), &[2, 0]);
+        assert_eq!(graph.neighbors(2), &[0, 1]);
+    }
+
+    #[test]
+    fn a_self_edge_is_rejected() {
+        let error = PartitionGraph::try_new(2, vec![7, 8], vec![vec![0], vec![]]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("points at itself"), "{error}");
     }
 
     #[test]
@@ -454,6 +524,53 @@ mod tests {
         assert_eq!(partition.dimension(), DIMENSION as u32);
         assert_eq!(partition.vector(0), &[0.0, 1.0, 2.0]);
         assert_eq!(partition.vector(2), &[6.0, 7.0, 8.0]);
+    }
+
+    /// Rebuild a partition's batch with one adjacency slot overwritten.
+    fn with_slot(partition: &Partition, slot: usize, value: u32) -> RecordBatch {
+        let batch = partition.to_batch().unwrap();
+        let neighbors = batch[NEIGHBORS_COLUMN].as_fixed_size_list();
+        let mut values = neighbors
+            .values()
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        values[slot] = value;
+        let patched = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::UInt32, false)),
+            neighbors.value_length(),
+            Arc::new(UInt32Array::from(values)),
+            None,
+        )
+        .unwrap();
+        RecordBatch::try_new(
+            batch.schema(),
+            vec![
+                batch.column(0).clone(),
+                Arc::new(patched),
+                batch.column(2).clone(),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The read path has to enforce what the write path does. An id past the end
+    /// of the partition indexes straight into the visit marks during a search, so
+    /// without this check a single flipped byte panics the process.
+    #[test]
+    fn an_out_of_range_edge_read_back_is_rejected() {
+        let partition = sample_partition(4);
+        let error = Partition::try_from_batch(&with_slot(&partition, 0, 99)).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("local id 99"), "{error}");
+    }
+
+    /// The sentinel is not an id and must stay legal wherever it appears.
+    #[test]
+    fn padding_read_back_is_not_mistaken_for_an_edge() {
+        let partition = sample_partition(4);
+        let restored = Partition::try_from_batch(&with_slot(&partition, 0, NO_NEIGHBOR)).unwrap();
+        assert_eq!(restored.graph().neighbors(0), &[] as &[u32]);
     }
 
     #[test]

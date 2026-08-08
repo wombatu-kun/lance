@@ -298,3 +298,102 @@ async fn a_segment_without_its_ivf_model_is_rejected() {
     let error = read_segment(store, &path).await.unwrap_err();
     assert!(error.to_string().contains(IVF_POSITION_KEY), "{error}");
 }
+
+/// Write an `index.idx` by hand with whatever schema metadata is asked for.
+async fn write_hand_made_index(
+    store: &ObjectStore,
+    dir: &Path,
+    metadata: &[(&str, String)],
+    global_buffer: Option<Vec<u8>>,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::UInt32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from(vec![1u32]))],
+    )
+    .unwrap();
+    let mut writer = create_writer(
+        SEGMENT_FILE_VERSION,
+        store
+            .create(&dir.clone().join(INDEX_FILE_NAME))
+            .await
+            .unwrap(),
+        lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap(),
+        FileWriterOptions::default(),
+    )
+    .unwrap();
+    if let Some(bytes) = global_buffer {
+        writer.add_global_buffer(bytes.into()).await.unwrap();
+    }
+    for (key, value) in metadata {
+        writer.add_schema_metadata(*key, value.clone());
+    }
+    writer.write_batch(&batch).await.unwrap();
+    writer.finish().await.unwrap();
+}
+
+/// Global buffer indices are one-based; buffer 0 is the file's own descriptor.
+#[tokio::test]
+async fn a_segment_pointing_at_the_descriptor_buffer_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    write_hand_made_index(
+        &store,
+        &path,
+        &[
+            (INDEX_METADATA_KEY, index_metadata().to_json().unwrap()),
+            (IVF_POSITION_KEY, "0".to_string()),
+        ],
+        None,
+    )
+    .await;
+
+    let error = read_segment(store, &path).await.unwrap_err();
+    assert!(error.to_string().contains("file descriptor"), "{error}");
+}
+
+/// `IvfModel::try_from` asserts these agree; without a guard here a malformed
+/// buffer aborts the process instead of being reported.
+#[tokio::test]
+async fn an_ivf_model_with_mismatched_offsets_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let malformed = lance_index::pb::Ivf {
+        offsets: vec![0, 1, 2],
+        lengths: vec![],
+        ..Default::default()
+    };
+    write_hand_made_index(
+        &store,
+        &path,
+        &[
+            (INDEX_METADATA_KEY, index_metadata().to_json().unwrap()),
+            (IVF_POSITION_KEY, "1".to_string()),
+        ],
+        Some(prost::Message::encode_to_vec(&malformed)),
+    )
+    .await;
+
+    let error = read_segment(store, &path).await.unwrap_err();
+    assert!(error.to_string().contains("3 offsets"), "{error}");
+}
+
+/// The rule "an empty partition gets no file" belongs to the format, not to one
+/// writer: the free function is public and is what `SegmentWriter` delegates to.
+#[tokio::test]
+async fn the_free_writer_refuses_an_empty_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let error = lance_vamana::io::write_partition(
+        &store,
+        &path.clone().join("part_00000.idx"),
+        &sample_partition(MAX_DEGREE, 0, DIMENSION),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("empty partition"), "{error}");
+}
