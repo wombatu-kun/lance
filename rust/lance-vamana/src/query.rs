@@ -9,16 +9,21 @@
 //! answers into dataset row ids. Lance's scanner never sees the query, which is
 //! what makes this work without a patch to Lance - and also what it costs.
 //!
+//! Deleted rows are excluded, with one boundary worth stating: the delete list
+//! is read once, when the index is opened. A row deleted afterwards is still
+//! returned until the index is reopened. That is the same staleness every other
+//! reader of an immutable snapshot has, but here it is invisible - the answer
+//! looks identical either way - so it is spelled out rather than implied.
+//!
 //! What this driver does not do, and a caller has to know:
 //!
-//! - **Deleted rows are returned.** There is no delete list yet, so a row
-//!   deleted after the index was built is walked, scored and handed back. Its
-//!   row address will not resolve, so `Dataset::take_rows` drops it silently and
-//!   the caller sees fewer than `k` rows - and it has already displaced a live
-//!   row from the answer. Rebuild the index after deleting.
 //! - **Rows added after the build are invisible.** The index answers from the
 //!   fragments it was built over; Lance's scanner would scan the remainder.
 //! - **No predicate prefilter and no refine step.** Both live in the scanner.
+//! - **Fewer than `k` rows come back when a probed partition is mostly
+//!   deleted.** Deleted vertices are still walked - they carry the edges that
+//!   hold the graph together - but they are dropped from the answer, and a walk
+//!   only ever produces `search_list_size` candidates to draw from.
 //!
 //! Committing an index also breaks Lance's own vector search on that column -
 //! see the crate README, and the test that pins it.
@@ -33,13 +38,14 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Float32Array};
 use lance::Dataset;
 use lance::index::DatasetIndexExt;
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_index::vector::storage::VectorStore;
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use object_store::path::Path;
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::builder::{routing_distance_type, supported_distance_type};
 use crate::format::{IndexMetadata, RowIdMode};
@@ -110,6 +116,13 @@ pub struct VamanaIndex {
     store: Arc<ObjectStore>,
     metadata: IndexMetadata,
     segments: Vec<Segment>,
+    /// Row addresses deleted as of [`VamanaIndex::open`].
+    ///
+    /// A snapshot, not a live view: the graph files hold vertices for rows that
+    /// have since been deleted, and nothing rewrites them, so the only way to
+    /// tell a live vertex from a dead one is to ask the dataset - once, here,
+    /// rather than on every query.
+    deleted: RoaringTreemap,
 }
 
 #[derive(Debug)]
@@ -232,10 +245,17 @@ impl VamanaIndex {
         }
         supported_distance_type(metadata.distance_type)?;
 
+        let covered = segments
+            .iter()
+            .flat_map(|segment| segment.manifest.metadata().fragments.iter().copied())
+            .collect::<RoaringBitmap>();
+        let deleted = deleted_row_addresses(dataset, &covered).await?;
+
         Ok(Self {
             store,
             metadata,
             segments,
+            deleted,
         })
     }
 
@@ -309,10 +329,23 @@ impl VamanaIndex {
             )?;
             // Local ids are per partition, so they become row ids *before* the
             // merge: every partition has a vertex 0, and they are different rows.
-            found.extend(walk.candidates.iter().take(params.k).map(|node| Neighbor {
-                row_id: partition.graph().row_ids()[node.id as usize],
-                distance: node.dist.0,
-            }));
+            //
+            // Deleted vertices are dropped here and not earlier. They are still
+            // walked, because they carry the out-edges that keep the graph
+            // connected - removing them from the traversal would strand whatever
+            // they were the only route to. Filtering before `take` rather than
+            // after is what makes `k` mean "k live rows" instead of "k rows, some
+            // of which the caller will find missing".
+            found.extend(
+                walk.candidates
+                    .iter()
+                    .map(|node| Neighbor {
+                        row_id: partition.graph().row_ids()[node.id as usize],
+                        distance: node.dist.0,
+                    })
+                    .filter(|neighbor| !self.deleted.contains(neighbor.row_id))
+                    .take(params.k),
+            );
         }
 
         found.sort_by(|left, right| {
@@ -402,4 +435,33 @@ impl VamanaIndex {
         }
         Ok(loaded)
     }
+}
+
+/// Row addresses deleted from the fragments an index covers.
+///
+/// Deletion vectors are per fragment and always in address space, which is why
+/// the index refuses to open over a stable-row-id dataset: there the stored ids
+/// are logical, and a list built here would filter live rows and keep dead ones.
+///
+/// Only the covered fragments are read. The rest cannot contribute a vertex, so
+/// their deletions are somebody else's problem and their deletion files are a
+/// per-fragment read this query would pay for nothing.
+async fn deleted_row_addresses(
+    dataset: &Dataset,
+    covered: &RoaringBitmap,
+) -> Result<RoaringTreemap> {
+    let mut deleted = RoaringTreemap::new();
+    for fragment in dataset.get_fragments() {
+        let fragment_id = fragment.id() as u32;
+        if !covered.contains(fragment_id) {
+            continue;
+        }
+        let Some(deletion_vector) = fragment.get_deletion_vector().await? else {
+            continue;
+        };
+        for row_offset in deletion_vector.iter() {
+            deleted.insert(RowAddress::new_from_parts(fragment_id, row_offset).into());
+        }
+    }
+    Ok(deleted)
 }

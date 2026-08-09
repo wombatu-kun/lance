@@ -51,18 +51,24 @@ Consequences to plan around:
 
 ## What the query path does not do
 
-- **Deleted rows are still returned.** There is no delete list yet, so a row
-  deleted after the index was built is walked, scored and returned. Its row
-  address no longer resolves, so `Dataset::take_rows` will silently drop it and
-  the caller gets fewer than `k` rows; worse, it displaces a live row from the
-  answer. Rebuild the index after deleting, or wait for the delete list.
+- **The delete list is a snapshot taken at open.** Deleted rows are excluded
+  from answers, but the list is read once, when the index is opened. A row
+  deleted afterwards keeps coming back until the index is reopened, and nothing
+  about the answer reveals it.
+- **Fewer than `k` rows come back when a probed partition is mostly deleted.**
+  Deleted vertices are still walked - they carry the edges that hold the graph
+  together - but they are dropped from the answer, and a walk only produces
+  `search_list_size` candidates to draw from.
 - **Rows added after the build are invisible.** The index answers from the
   fragments it was built over. Lance's scanner would scan the unindexed
   remainder; this driver does not.
 - **No predicate prefilter and no refine step.** Both live in Lance's scanner,
   which this driver bypasses.
 - An index whose fragments have been compacted away is **refused** at open
-  rather than answering from what is left; rebuild it.
+  rather than answering from what is left; rebuild it. So is one whose coverage
+  the dataset has edited under it - an in-place column update prunes the
+  rewritten fragments out of the index's `fragment_bitmap` while leaving every
+  row address valid, which no liveness check can see.
 
 ## Building
 

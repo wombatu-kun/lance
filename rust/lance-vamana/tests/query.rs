@@ -517,6 +517,124 @@ async fn an_index_over_a_rewritten_column_is_refused() {
     );
 }
 
+async fn live_row_ids(dataset: &Dataset) -> HashSet<u64> {
+    let mut scanner = dataset.scan();
+    scanner.with_row_id();
+    scanner.project::<&str>(&[]).unwrap();
+    scanner.try_into_batch().await.unwrap()[lance_core::ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect()
+}
+
+/// Deleting a row does not touch the index: the vertex, its edges and its vector
+/// all stay in the partition file, and its address still decodes. The delete list
+/// is the only thing standing between it and the answer.
+///
+/// Checked against Lance's own brute force over the *same* post-delete dataset,
+/// so this is not just "no deleted row came back" - it is also "the live rows the
+/// deleted ones used to displace came back instead".
+#[tokio::test]
+async fn deleted_rows_are_not_returned() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_dataset(uri, &small_fixture()).await;
+
+    dataset.delete("_rowid % 7 == 0").await.unwrap();
+    let deleted_count = dataset.count_deleted_rows().await.unwrap();
+    assert!(deleted_count > 0, "the fixture deleted nothing");
+    let touched = dataset
+        .get_fragments()
+        .iter()
+        .filter(|fragment| fragment.metadata().deletion_file.is_some())
+        .count();
+    assert!(touched > 1, "deletions must span several fragments");
+
+    let live = live_row_ids(&dataset).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let search = SearchParams::new(K)
+        .with_nprobes(PARTITIONS as usize)
+        .with_search_list_size(BEAM);
+
+    let queries = random_vectors(QUERIES, 909);
+    let mut total_recall = 0.0;
+    for query in &queries {
+        let result = index.search(query, &search).await.unwrap();
+        for neighbor in &result.neighbors {
+            assert!(
+                live.contains(&neighbor.row_id),
+                "a deleted row was returned: {}",
+                neighbor.row_id
+            );
+        }
+        assert_eq!(
+            result.neighbors.len(),
+            K,
+            "the delete list cost the query rows it could have filled"
+        );
+        let found = result
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_id)
+            .collect::<Vec<_>>();
+        total_recall += recall(&found, &brute_force(&dataset, query, K).await);
+    }
+    let recall = total_recall / queries.len() as f64;
+    println!("recall@{K} over a dataset with {deleted_count} deleted rows = {recall:.4}");
+    assert!(recall >= 0.95, "recall@{K} was {recall:.4}");
+}
+
+/// The stated boundary, pinned: the delete list is a snapshot taken at open.
+///
+/// Worth a test rather than only a doc line, because the two behaviours are
+/// indistinguishable from the answer alone - a stale list returns rows that look
+/// exactly like live ones until the caller tries to fetch them.
+#[tokio::test]
+async fn the_delete_list_is_a_snapshot_taken_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_dataset(uri, &small_fixture()).await;
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let search = SearchParams::new(K)
+        .with_nprobes(PARTITIONS as usize)
+        .with_search_list_size(BEAM);
+    let query = random_vectors(1, 77).remove(0);
+    let before = index.search(&query, &search).await.unwrap();
+
+    // Delete exactly what that query just returned.
+    let doomed = before
+        .neighbors
+        .iter()
+        .map(|neighbor| neighbor.row_id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    dataset
+        .delete(&format!("_rowid in ({doomed})"))
+        .await
+        .unwrap();
+
+    let stale = index.search(&query, &search).await.unwrap();
+    assert_eq!(
+        stale.neighbors, before.neighbors,
+        "an index opened before the delete must keep answering from its snapshot"
+    );
+
+    let reopened = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let fresh = reopened.search(&query, &search).await.unwrap();
+    let gone = before
+        .neighbors
+        .iter()
+        .map(|neighbor| neighbor.row_id)
+        .collect::<HashSet<_>>();
+    assert!(
+        fresh.neighbors.iter().all(|n| !gone.contains(&n.row_id)),
+        "reopening must pick up the deletions"
+    );
+}
+
 /// The mirror image, and the reason the guard tests equality rather than subset.
 ///
 /// Lance does not only shrink an index's coverage - `Transaction::
