@@ -191,7 +191,7 @@ async fn top_k_matches_lance_brute_force() {
     );
     assert!(
         (1150.0..1500.0).contains(&measured.comparisons),
-        "a query cost {:.0} comparisons, measured at 1309 ({:.1}% of {rows} rows)",
+        "a query cost {:.0} comparisons, measured at 1313 ({:.1}% of {rows} rows)",
         measured.comparisons,
         100.0 * measured.comparisons / rows
     );
@@ -316,6 +316,55 @@ async fn a_narrow_probe_costs_recall_and_buys_work() {
         "a narrow probe must actually save work: {:.0} against {:.0}",
         narrow.comparisons,
         wide.comparisons
+    );
+}
+
+/// Routing measures the query against *every* centroid a segment holds, and
+/// pays for it whether or not a probe lands there. So a query that walks one
+/// four-vertex partition of a 256-partition index costs at least 256
+/// comparisons - where an accounting that counted only the walk would report
+/// about ten, and a finely partitioned index would look free at exactly the
+/// point it stops being.
+///
+/// Routing is a constant per index, so it cancels out of any difference between
+/// two queries. An absolute lower bound is the only thing that can see it.
+#[tokio::test]
+async fn routing_is_charged_for_every_centroid_not_every_probe() {
+    const CENTROIDS: u32 = 256;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = small_fixture().write(uri).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &IndexParams {
+            num_partitions: CENTROIDS,
+            ..params()
+        },
+    )
+    .await
+    .unwrap();
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    // The cheapest walk this driver can be asked for: one probe, one neighbour,
+    // a search list of one.
+    let result = index
+        .search(
+            &random_vectors(1, 7)[0],
+            &SearchParams::new(1).with_nprobes(1),
+        )
+        .await
+        .unwrap();
+    println!(
+        "{CENTROIDS} centroids, one probe, k=1 -> {} comparisons over {} partitions",
+        result.comparisons, result.partitions_read
+    );
+
+    assert_eq!(result.partitions_read, 1);
+    assert!(
+        result.comparisons >= u64::from(CENTROIDS),
+        "a query paid {} comparisons, but routing alone measures {CENTROIDS} centroids",
+        result.comparisons
     );
 }
 
@@ -713,10 +762,10 @@ async fn an_index_of_several_segments_answers_from_all_of_them() {
     let fixture = measurement_fixture();
     let mut dataset = fixture.write(uri).await;
 
-    let left = build_index_segment(&dataset, &params(), &[0, 1])
+    let (left, _) = build_index_segment(&dataset, &params(), &[0, 1])
         .await
         .unwrap();
-    let right = build_index_segment(&dataset, &params(), &[2, 3])
+    let (right, _) = build_index_segment(&dataset, &params(), &[2, 3])
         .await
         .unwrap();
     dataset

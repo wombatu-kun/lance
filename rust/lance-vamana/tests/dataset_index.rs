@@ -223,9 +223,14 @@ async fn rows_without_a_vector_are_skipped() {
         ..Default::default()
     };
     let mut dataset = fixture.write(uri).await;
-    create_index(&mut dataset, INDEX_NAME, &params())
+    let stats = create_index(&mut dataset, INDEX_NAME, &params())
         .await
         .unwrap();
+    assert_eq!(
+        stats.vectors,
+        fixture.indexed_rows(),
+        "the build reported rows it never indexed"
+    );
 
     let (_, partitions) = read_committed(&dataset).await;
     let indexed = partitions
@@ -251,6 +256,43 @@ async fn rows_without_a_vector_are_skipped() {
             .null_count(),
         0,
         "a row with no vector was indexed anyway"
+    );
+}
+
+/// What a build cost is half of what a graph index is, and it used to be counted
+/// and thrown away. A number nobody can read cannot be traded against the query
+/// cost, which is the only comparison that means anything.
+#[tokio::test]
+async fn a_build_reports_what_it_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = DatasetFixture::default();
+    let mut dataset = fixture.write(uri).await;
+
+    let stats = create_index(&mut dataset, INDEX_NAME, &params())
+        .await
+        .unwrap();
+    let (manifest, _) = read_committed(&dataset).await;
+    println!(
+        "{} vectors in {} partitions -> {} build comparisons ({:.1} per vector)",
+        stats.vectors,
+        stats.partitions,
+        stats.comparisons,
+        stats.comparisons as f64 / stats.vectors as f64
+    );
+
+    assert_eq!(stats.vectors, fixture.rows());
+    assert_eq!(
+        stats.partitions,
+        manifest.partitions().len(),
+        "the build counted partitions the segment does not list"
+    );
+    // Pinned to the measured value, not merely to "greater than zero": the whole
+    // point is to notice a build that got three times more expensive.
+    assert!(
+        (1_800_000..2_400_000).contains(&stats.comparisons),
+        "a build cost {} comparisons, measured at 2093461 (1363 per vector)",
+        stats.comparisons
     );
 }
 
@@ -293,9 +335,10 @@ async fn the_same_seed_builds_the_same_index() {
     let mut built = Vec::new();
     for run in 0..2 {
         let segment_dir = Path::from_absolute_path(dir.path().join(format!("run_{run}"))).unwrap();
-        let manifest = build_segment(&dataset, &params(), &segment_dir, &live_fragments(&dataset))
-            .await
-            .unwrap();
+        let (manifest, _) =
+            build_segment(&dataset, &params(), &segment_dir, &live_fragments(&dataset))
+                .await
+                .unwrap();
         let mut partitions = Vec::new();
         for entry in manifest.partitions() {
             let reader = open_file(
@@ -319,9 +362,10 @@ async fn the_same_seed_builds_the_same_index() {
     let mut other = params();
     other.graph.seed += 1;
     let elsewhere = Path::from_absolute_path(dir.path().join("other_seed")).unwrap();
-    let other_manifest = build_segment(&dataset, &other, &elsewhere, &live_fragments(&dataset))
-        .await
-        .unwrap();
+    let (other_manifest, _) =
+        build_segment(&dataset, &other, &elsewhere, &live_fragments(&dataset))
+            .await
+            .unwrap();
     assert_ne!(
         other_manifest.ivf().centroids,
         built[0].0.ivf().centroids,

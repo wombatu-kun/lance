@@ -105,7 +105,13 @@ impl SearchParams {
 pub struct QueryResult {
     /// Nearest first.
     pub neighbors: Vec<Neighbor>,
-    /// Distance computations across every partition this query opened.
+    /// Every distance this query computed: one per centroid of every segment it
+    /// routed through, plus one per vertex any graph walk considered.
+    ///
+    /// Routing is counted because it is paid unconditionally and does not scale
+    /// with `nprobes` - a segment of 4096 centroids charges 4096 distances
+    /// before a single vertex is read. Reporting only the walk would make a
+    /// finely partitioned index look cheap at exactly the point it stops being.
     pub comparisons: u64,
     pub partitions_read: usize,
 }
@@ -305,11 +311,12 @@ impl VamanaIndex {
             query.clone()
         };
 
-        let loaded = self
+        let (loaded, routing) = self
             .read_probed(&routing_query, routing_type, params)
             .await?;
 
         let comparisons = Comparisons::default();
+        comparisons.record(routing);
         let mut found = Vec::with_capacity(loaded.len() * params.k);
         for (partition, medoid) in &loaded {
             let vectors = flat_storage(
@@ -348,19 +355,8 @@ impl VamanaIndex {
             );
         }
 
-        found.sort_by(|left, right| {
-            left.distance
-                .total_cmp(&right.distance)
-                .then(left.row_id.cmp(&right.row_id))
-        });
-        // Nothing here guarantees a row appears once: that rests on Lance
-        // refusing to commit segments with overlapping fragment coverage, which
-        // is somebody else's invariant. Sorted by `(distance, row_id)`, copies
-        // of a row are adjacent and cost nothing to drop.
-        found.dedup_by_key(|neighbor| neighbor.row_id);
-        found.truncate(params.k);
         Ok(QueryResult {
-            neighbors: found,
+            neighbors: merge(found, params.k),
             comparisons: comparisons.get(),
             partitions_read: loaded.len(),
         })
@@ -369,14 +365,18 @@ impl VamanaIndex {
     /// Route the query and read every partition it lands in.
     ///
     /// Reading is finished before any walking starts, so that the walk - the only
-    /// part with a comparison counter - holds no await point.
+    /// part with a comparison counter - holds no await point. The routing cost
+    /// comes back as a plain number for the same reason: `Comparisons` holds a
+    /// `Cell`, and a reference to one alive across an await would make this
+    /// future `!Send`.
     async fn read_probed(
         &self,
         routing_query: &ArrayRef,
         routing_type: DistanceType,
         params: &SearchParams,
-    ) -> Result<Vec<(Partition, u32)>> {
+    ) -> Result<(Vec<(Partition, u32)>, u64)> {
         let mut loaded = Vec::new();
+        let mut routing = 0u64;
         for segment in &self.segments {
             // Every centroid is ranked, not just `nprobes` of them, because a
             // centroid with nothing assigned to it is still a centroid: it can be
@@ -388,6 +388,7 @@ impl VamanaIndex {
                 segment.manifest.ivf().num_partitions(),
                 routing_type,
             )?;
+            routing = routing.saturating_add(segment.manifest.ivf().num_partitions() as u64);
             let mut probed = 0;
             for partition_id in partitions.values() {
                 if probed == params.nprobes {
@@ -433,8 +434,34 @@ impl VamanaIndex {
                 loaded.push((partition, entry.medoid));
             }
         }
-        Ok(loaded)
+        Ok((loaded, routing))
     }
+}
+
+/// Every walk's candidates as one answer: nearest first, each row once, `k` long.
+///
+/// Nothing upstream of here guarantees a row appears once. That rests on Lance
+/// refusing to commit segments whose fragment coverage overlaps, which is
+/// somebody else's invariant, so the merge does not lean on it. Nor does the
+/// dedup ride along with the ordering the caller sees: keyed on the row id in a
+/// pass of its own, it collapses two copies of a row whatever their distances,
+/// where a dedup run after a distance sort would only collapse the copies that
+/// agree to the last bit - and the ones that disagree are exactly the ones worth
+/// not returning twice.
+fn merge(mut found: Vec<Neighbor>, k: usize) -> Vec<Neighbor> {
+    found.sort_by(|left, right| {
+        left.row_id
+            .cmp(&right.row_id)
+            .then(left.distance.total_cmp(&right.distance))
+    });
+    found.dedup_by_key(|neighbor| neighbor.row_id);
+    found.sort_by(|left, right| {
+        left.distance
+            .total_cmp(&right.distance)
+            .then(left.row_id.cmp(&right.row_id))
+    });
+    found.truncate(k);
+    found
 }
 
 /// Row addresses deleted from the fragments an index covers.
@@ -464,4 +491,45 @@ async fn deleted_row_addresses(
         }
     }
     Ok(deleted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn neighbors(pairs: &[(u64, f32)]) -> Vec<Neighbor> {
+        pairs
+            .iter()
+            .map(|(row_id, distance)| Neighbor {
+                row_id: *row_id,
+                distance: *distance,
+            })
+            .collect()
+    }
+
+    fn pairs(neighbors: &[Neighbor]) -> Vec<(u64, f32)> {
+        neighbors
+            .iter()
+            .map(|neighbor| (neighbor.row_id, neighbor.distance))
+            .collect()
+    }
+
+    /// Two copies of a row at different distances are far apart once sorted by
+    /// distance, so a dedup that rode along with that ordering would keep both.
+    #[test]
+    fn the_merge_keeps_the_nearest_copy_of_a_repeated_row() {
+        let merged = merge(neighbors(&[(7, 5.0), (3, 1.0), (7, 0.5), (9, 2.0)]), 10);
+        assert_eq!(pairs(&merged), vec![(7, 0.5), (3, 1.0), (9, 2.0)]);
+    }
+
+    /// `k` counts distinct rows, so the truncation has to come after the dedup
+    /// and not before it.
+    #[test]
+    fn the_merge_fills_k_with_distinct_rows() {
+        let merged = merge(
+            neighbors(&[(1, 0.1), (1, 0.2), (1, 0.3), (2, 0.4), (3, 0.5)]),
+            3,
+        );
+        assert_eq!(pairs(&merged), vec![(1, 0.1), (2, 0.4), (3, 0.5)]);
+    }
 }

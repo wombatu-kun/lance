@@ -100,6 +100,27 @@ impl IndexParams {
     }
 }
 
+/// What building a segment cost.
+///
+/// The counterpart of [`crate::query::QueryResult::comparisons`]. A graph is a
+/// trade between what a build pays and what a query pays, so a change that
+/// halves one by tripling the other is not an improvement - and the only way to
+/// see that is for both numbers to leave the crate. This one is returned rather
+/// than logged for the same reason the query's is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BuildStats {
+    /// Distance computations across every partition's graph construction.
+    ///
+    /// Routing is not in here: assignment measures every vector against every
+    /// centroid inside Lance's own k-means, which reports nothing.
+    pub comparisons: u64,
+    /// Vectors indexed, which is rows of the covered fragments minus those whose
+    /// vector is null.
+    pub vectors: usize,
+    /// Partitions that came out non-empty and were therefore written.
+    pub partitions: usize,
+}
+
 /// Reject the metrics this crate cannot answer correctly.
 ///
 /// `Hamming` does not apply to the Float32 vectors the format stores. `Dot` is
@@ -145,12 +166,13 @@ pub async fn create_index(
     dataset: &mut Dataset,
     index_name: &str,
     params: &IndexParams,
-) -> Result<()> {
+) -> Result<BuildStats> {
     let fragments = live_fragments(dataset);
-    let segment = build_index_segment(dataset, params, &fragments).await?;
+    let (segment, stats) = build_index_segment(dataset, params, &fragments).await?;
     dataset
         .commit_existing_index_segments(index_name, &params.column, vec![segment])
-        .await
+        .await?;
+    Ok(stats)
 }
 
 pub fn live_fragments(dataset: &Dataset) -> Vec<u32> {
@@ -170,7 +192,7 @@ pub async fn build_index_segment(
     dataset: &Dataset,
     params: &IndexParams,
     fragments: &[u32],
-) -> Result<IndexSegment> {
+) -> Result<(IndexSegment, BuildStats)> {
     let field = dataset.schema().field(&params.column).ok_or_else(|| {
         Error::invalid_input(format!(
             "column '{}' does not exist in the dataset",
@@ -182,19 +204,22 @@ pub async fn build_index_segment(
 
     let uuid = Uuid::new_v4();
     let dir = dataset.indices_dir().join(uuid.to_string());
-    build_segment(dataset, params, &dir, fragments).await?;
+    let (_, stats) = build_segment(dataset, params, &dir, fragments).await?;
 
     let details = prost_types::Any {
         type_url: INDEX_DETAILS_TYPE_URL.to_string(),
         value: Vec::new(),
     };
-    Ok(IndexSegment::new(
-        uuid,
-        fragments.to_vec(),
-        [field_id],
-        Arc::new(details),
-        INDEX_VERSION,
-        dataset_version,
+    Ok((
+        IndexSegment::new(
+            uuid,
+            fragments.to_vec(),
+            [field_id],
+            Arc::new(details),
+            INDEX_VERSION,
+            dataset_version,
+        ),
+        stats,
     ))
 }
 
@@ -209,7 +234,7 @@ pub async fn build_segment(
     params: &IndexParams,
     dir: &Path,
     fragments: &[u32],
-) -> Result<SegmentManifest> {
+) -> Result<(SegmentManifest, BuildStats)> {
     if dataset.manifest().uses_stable_row_ids() {
         // The delete list of stage C is derived from deletion vectors, which are
         // always in address space. Applying it to logical ids would filter out
@@ -270,6 +295,10 @@ pub async fn build_segment(
     );
 
     let comparisons = Comparisons::default();
+    let mut stats = BuildStats {
+        vectors: vectors.len(),
+        ..Default::default()
+    };
     for (partition_id, members) in group_by_partition(&assignment, params.num_partitions)
         .into_iter()
         .enumerate()
@@ -281,8 +310,10 @@ pub async fn build_segment(
         writer
             .write_partition(partition_id as u32, medoid, &partition)
             .await?;
+        stats.partitions += 1;
     }
-    writer.finish().await
+    stats.comparisons = comparisons.get();
+    Ok((writer.finish().await?, stats))
 }
 
 /// Read the vector column and the row id of every row that has a vector.
