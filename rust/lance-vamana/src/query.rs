@@ -219,6 +219,10 @@ impl VamanaIndex {
             // a non-empty intersection: a compaction usually retires only the
             // fragments below its size threshold, which leaves the intersection
             // non-empty and half the index dangling.
+            //
+            // The `None` arm is for manifests older than the field itself:
+            // `IndexSegment` carries a plain bitmap, so nothing this crate can
+            // commit reaches it and no test can produce one.
             let Some(declared) = index.fragment_bitmap.as_ref() else {
                 return Err(Error::index(format!(
                     "index '{index_name}' segment {} records no fragment coverage",

@@ -31,12 +31,13 @@ use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{
     INDEX_DETAILS_TYPE_URL, IndexParams, build_index_segment, build_segment, create_index,
 };
-use lance_vamana::format::FORMAT_VERSION;
+use lance_vamana::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
+use lance_vamana::io::SegmentWriter;
 use lance_vamana::query::{SearchParams, VamanaIndex};
 use uuid::Uuid;
 
 mod common;
-use common::{DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, random_vectors, recall};
+use common::{DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, random_vectors, recall, sample_partition};
 
 const INDEX_NAME: &str = "vamana_idx";
 const PARTITIONS: u32 = 4;
@@ -222,6 +223,7 @@ async fn a_cosine_index_matches_lance_cosine_brute_force() {
         .with_search_list_size(BEAM);
     let queries = random_vectors(QUERIES, 4242);
     let mut total = 0.0;
+    let mut comparisons = 0u64;
     for query in &queries {
         let key = Float32Array::from(query.clone());
         let mut scanner = dataset.scan();
@@ -234,19 +236,27 @@ async fn a_cosine_index_matches_lance_cosine_brute_force() {
             .values()
             .to_vec();
 
-        let found = index
-            .search(query, &search)
-            .await
-            .unwrap()
+        let result = index.search(query, &search).await.unwrap();
+        let found = result
             .neighbors
             .iter()
             .map(|neighbor| neighbor.row_id)
             .collect::<Vec<_>>();
         total += recall(&found, &exact);
+        comparisons += result.comparisons;
     }
     let recall = total / queries.len() as f64;
-    println!("cosine -> recall@{K}={recall:.4}");
+    let comparisons = comparisons as f64 / queries.len() as f64;
+    println!("cosine -> recall@{K}={recall:.4}, {comparisons:.0} comparisons");
+
     assert!(recall >= 0.95, "cosine recall@{K} was {recall:.4}");
+    // A cosine index is routed and stored differently from every other metric,
+    // so it gets a cost bar of its own rather than sharing L2's. Recall alone
+    // would pass just as happily for a driver that opened every partition.
+    assert!(
+        (1150.0..1500.0).contains(&comparisons),
+        "a cosine query cost {comparisons:.0} comparisons, measured at 1281"
+    );
 }
 
 /// `Comparisons` holds a `Cell`, so it is `!Sync`, and a reference to one alive
@@ -742,6 +752,104 @@ async fn an_index_credited_with_a_fragment_it_never_read_is_refused() {
     assert!(error.to_string().contains("credits it with 2"), "{error}");
 }
 
+/// A segment claiming stable row ids has to be refused on its own account, not
+/// only through the dataset's setting. The builder will not produce one, so this
+/// half of the check has never run - and the two identifier spaces are not
+/// distinguishable from a stored id, so getting it wrong is silent: the delete
+/// list is built from deletion vectors, which are always addresses, and applying
+/// it to logical ids would filter live rows and return deleted ones.
+#[tokio::test]
+async fn an_index_built_for_stable_row_ids_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = small_fixture().write(uri).await;
+    let covered = (0..dataset.get_fragments().len() as u32).collect::<Vec<_>>();
+
+    let uuid = Uuid::new_v4();
+    let store = dataset.object_store(None).await.unwrap();
+    let centroids =
+        <FixedSizeListArray as lance_arrow::FixedSizeListArrayExt>::try_new_from_values(
+            Float32Array::from(vec![0.5f32; VECTOR_DIM as usize]),
+            VECTOR_DIM,
+        )
+        .unwrap();
+    let mut writer = SegmentWriter::new(
+        store,
+        dataset.indices_dir().join(uuid.to_string()),
+        IndexMetadata {
+            format_version: FORMAT_VERSION,
+            max_degree: 16,
+            alpha: 1.2,
+            dimension: VECTOR_DIM as u32,
+            distance_type: DistanceType::L2,
+            row_id_mode: RowIdMode::Stable,
+            fragments: covered.clone(),
+        },
+        lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
+    );
+    writer
+        .write_partition(0, 0, &sample_partition(16, 8, VECTOR_DIM as u32))
+        .await
+        .unwrap();
+    writer.finish().await.unwrap();
+
+    let details = prost_types::Any {
+        type_url: INDEX_DETAILS_TYPE_URL.to_string(),
+        value: Vec::new(),
+    };
+    let segment = IndexSegment::new(
+        uuid,
+        covered,
+        [dataset.schema().field(VECTOR_COLUMN).unwrap().id],
+        Arc::new(details),
+        FORMAT_VERSION as i32,
+        dataset.manifest.version,
+    );
+    dataset
+        .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![segment])
+        .await
+        .unwrap();
+
+    let error = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect_err("a segment in the wrong identifier space must not answer");
+    assert!(error.to_string().contains("Stable"), "{error}");
+}
+
+/// A query mixes the answers of every segment, so the segments have to agree on
+/// what an answer means. Degree and pruning slack may differ - a segment
+/// appended later is allowed a different graph - but the metric may not, and
+/// nothing downstream of the merge would notice two distance scales.
+#[tokio::test]
+async fn segments_that_disagree_about_their_vectors_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = small_fixture().write(uri).await;
+
+    let (left, _) = build_index_segment(&dataset, &params(), &[0])
+        .await
+        .unwrap();
+    let (right, _) = build_index_segment(
+        &dataset,
+        &params().with_distance_type(DistanceType::Cosine),
+        &[1],
+    )
+    .await
+    .unwrap();
+    dataset
+        .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![left, right])
+        .await
+        .unwrap();
+
+    let error = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect_err("segments measuring distance differently must not be merged");
+    assert!(
+        error.to_string().contains("disagree about the vectors"),
+        "{error}"
+    );
+}
+
 /// The format version lives in two places - the dataset manifest and the
 /// segment's own metadata - and the manifest's copy is the one a reader meets
 /// first. A segment written by a later build has to be turned away there, before
@@ -837,6 +945,13 @@ async fn an_index_of_several_segments_answers_from_all_of_them() {
         measured.recall >= 0.95,
         "recall across two segments was {:.4}",
         measured.recall
+    );
+    // Two segments cost two routing tables and two walks, so the bar is roughly
+    // twice the single-segment one rather than the same number.
+    assert!(
+        (2100.0..2600.0).contains(&measured.comparisons),
+        "a two-segment query cost {:.0} comparisons, measured at 2315",
+        measured.comparisons
     );
     // Exactly four probes in each of the two segments, all eight read. This is
     // also more partitions than a query keeps reads in flight for, so anything

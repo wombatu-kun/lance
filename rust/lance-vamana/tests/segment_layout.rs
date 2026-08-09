@@ -315,6 +315,94 @@ async fn a_segment_without_its_ivf_model_is_rejected() {
     assert!(error.to_string().contains(IVF_POSITION_KEY), "{error}");
 }
 
+/// Write a segment's `index.idx` from a manifest, without writing its partitions.
+///
+/// [`SegmentWriter`] names each partition file itself, so this is what makes a
+/// table naming something else possible to write at all.
+async fn write_index_file(
+    store: &ObjectStore,
+    dir: &Path,
+    manifest: &lance_vamana::SegmentManifest,
+) {
+    let batch = manifest.to_batch().unwrap();
+    let schema = lance_core::datatypes::Schema::try_from(batch.schema().as_ref()).unwrap();
+    let mut writer = create_writer(
+        SEGMENT_FILE_VERSION,
+        store
+            .create(&dir.clone().join(INDEX_FILE_NAME))
+            .await
+            .unwrap(),
+        schema,
+        FileWriterOptions::default(),
+    )
+    .unwrap();
+    writer.add_schema_metadata(INDEX_METADATA_KEY, manifest.metadata().to_json().unwrap());
+    let position = writer
+        .add_global_buffer(
+            prost::Message::encode_to_vec(&lance_index::pb::Ivf::try_from(manifest.ivf()).unwrap())
+                .into(),
+        )
+        .await
+        .unwrap();
+    writer.add_schema_metadata(IVF_POSITION_KEY, position.to_string());
+    writer.write_batch(&batch).await.unwrap();
+    writer.finish().await.unwrap();
+}
+
+/// A partition is found through the `__file` column, not through the
+/// `part_%05d.idx` convention every writer in this crate happens to follow.
+///
+/// The two agree in everything the crate produces, so the only way to tell which
+/// one the reader actually uses is to move a file out from under the convention
+/// and leave the table pointing at where it went.
+#[tokio::test]
+async fn a_partition_is_found_through_the_table_not_the_naming_convention() {
+    const RENAMED: &str = "somewhere-else.bin";
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let partition = sample_partition(MAX_DEGREE, 40, DIMENSION);
+
+    let mut writer = SegmentWriter::new(store.clone(), path.clone(), index_metadata(), ivf_model());
+    writer.write_partition(2, 7, &partition).await.unwrap();
+    writer.finish().await.unwrap();
+
+    std::fs::rename(
+        dir.path().join(partition_file_name(2)),
+        dir.path().join(RENAMED),
+    )
+    .unwrap();
+    let retitled = lance_vamana::SegmentManifest::try_new(
+        index_metadata(),
+        ivf_model(),
+        vec![lance_vamana::PartitionEntry {
+            partition_id: 2,
+            medoid: 7,
+            num_rows: partition.len() as u32,
+            file: RENAMED.to_string(),
+        }],
+    )
+    .unwrap();
+    write_index_file(&store, &path, &retitled).await;
+
+    let read = read_segment(&scan_scheduler(&store), &path, None)
+        .await
+        .unwrap();
+    let entry = read.partition(2).expect("partition 2 is missing");
+    assert_eq!(entry.file, RENAMED);
+    let reader = open_file(
+        &scan_scheduler(&store),
+        &path.clone().join(entry.file.as_str()),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        &read_partition(&reader, entry.num_rows).await.unwrap(),
+        &partition
+    );
+}
+
 /// Write an `index.idx` by hand with whatever schema metadata is asked for.
 async fn write_hand_made_index(
     store: &ObjectStore,
