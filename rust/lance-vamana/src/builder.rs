@@ -40,9 +40,6 @@ use crate::partition::Partition;
 use crate::search::{Comparisons, flat_storage};
 use crate::segment::SegmentManifest;
 
-/// On-disk index version recorded in the dataset manifest.
-pub const INDEX_VERSION: i32 = 1;
-
 /// The `type_url` of the details blob that travels with a committed segment.
 ///
 /// Deliberately ours and deliberately unresolvable by Lance. A url Lance can
@@ -216,7 +213,11 @@ pub async fn build_index_segment(
             fragments.to_vec(),
             [field_id],
             Arc::new(details),
-            INDEX_VERSION,
+            // The manifest records the version of the files it points at, and
+            // there is only one such number. A second one, counted separately
+            // and checked nowhere, would be a version this crate believed in
+            // and nothing enforced.
+            FORMAT_VERSION as i32,
             dataset_version,
         ),
         stats,

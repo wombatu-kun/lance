@@ -29,9 +29,9 @@ use lance::index::{DatasetIndexExt, IndexSegment};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{
-    INDEX_DETAILS_TYPE_URL, INDEX_VERSION, IndexParams, build_index_segment, build_segment,
-    create_index,
+    INDEX_DETAILS_TYPE_URL, IndexParams, build_index_segment, build_segment, create_index,
 };
+use lance_vamana::format::FORMAT_VERSION;
 use lance_vamana::query::{SearchParams, VamanaIndex};
 use uuid::Uuid;
 
@@ -686,6 +686,41 @@ async fn the_delete_list_is_a_snapshot_taken_at_open() {
 
 /// The mirror image, and the reason the guard tests equality rather than subset.
 ///
+/// Build a segment over `built_over`, then commit it under a description the
+/// caller chooses. The coverage and the version Lance records come from here
+/// rather than from the builder, which is the only way to make a segment and its
+/// manifest entry disagree on purpose.
+async fn commit_a_segment_described_as(
+    dataset: &mut Dataset,
+    built_over: &[u32],
+    coverage: &[u32],
+    version: i32,
+) {
+    let uuid = Uuid::new_v4();
+    let segment_dir = dataset.indices_dir().join(uuid.to_string());
+    build_segment(dataset, &params(), &segment_dir, built_over)
+        .await
+        .unwrap();
+
+    let field_id = dataset.schema().field(VECTOR_COLUMN).unwrap().id;
+    let details = prost_types::Any {
+        type_url: INDEX_DETAILS_TYPE_URL.to_string(),
+        value: Vec::new(),
+    };
+    let described = IndexSegment::new(
+        uuid,
+        coverage.to_vec(),
+        [field_id],
+        Arc::new(details),
+        version,
+        dataset.manifest.version,
+    );
+    dataset
+        .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![described])
+        .await
+        .unwrap();
+}
+
 /// Lance does not only shrink an index's coverage - `Transaction::
 /// register_pure_rewrite_rows_update_frags_in_indices` adds fragments *back*
 /// into the bitmap after a pure row rewrite, and it skips only the indices it
@@ -699,34 +734,34 @@ async fn an_index_credited_with_a_fragment_it_never_read_is_refused() {
     let mut dataset = small_fixture().write(uri).await;
     assert!(dataset.get_fragments().len() >= 2);
 
-    let uuid = Uuid::new_v4();
-    let segment_dir = dataset.indices_dir().join(uuid.to_string());
-    build_segment(&dataset, &params(), &segment_dir, &[0])
-        .await
-        .unwrap();
-
-    let field_id = dataset.schema().field(VECTOR_COLUMN).unwrap().id;
-    let details = prost_types::Any {
-        type_url: INDEX_DETAILS_TYPE_URL.to_string(),
-        value: Vec::new(),
-    };
-    let overclaiming = IndexSegment::new(
-        uuid,
-        [0u32, 1],
-        [field_id],
-        Arc::new(details),
-        INDEX_VERSION,
-        dataset.manifest.version,
-    );
-    dataset
-        .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![overclaiming])
-        .await
-        .unwrap();
+    commit_a_segment_described_as(&mut dataset, &[0], &[0, 1], FORMAT_VERSION as i32).await;
 
     let error = VamanaIndex::open(&dataset, INDEX_NAME)
         .await
         .expect_err("a segment credited with rows it never read must not answer");
     assert!(error.to_string().contains("credits it with 2"), "{error}");
+}
+
+/// The format version lives in two places - the dataset manifest and the
+/// segment's own metadata - and the manifest's copy is the one a reader meets
+/// first. A segment written by a later build has to be turned away there, before
+/// any of its files are opened and misread.
+#[tokio::test]
+async fn an_index_at_another_format_version_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = small_fixture().write(uri).await;
+
+    commit_a_segment_described_as(&mut dataset, &[0, 1], &[0, 1], FORMAT_VERSION as i32 + 1).await;
+
+    let error = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect_err("a segment from a later build must not be read by this one");
+    assert!(
+        matches!(error, lance_core::Error::NotSupported { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("format version"), "{error}");
 }
 
 /// The same guard must stay quiet for everything that does not rewrite data.

@@ -60,6 +60,12 @@ pub const NO_NEIGHBOR: u32 = u32::MAX;
 /// Highest partition-local id addressable, given [`NO_NEIGHBOR`] takes the top.
 pub const MAX_PARTITION_ROWS: u32 = u32::MAX - 1;
 
+/// The one version number of this format.
+///
+/// Written twice, to two independently corruptible places - the dataset
+/// manifest's `index_version` and the segment's own [`IndexMetadata`] - and
+/// checked against both on open. Two *different* numbers is what this replaced,
+/// and the one recorded in the manifest was checked nowhere at all.
 pub const FORMAT_VERSION: u32 = 3;
 
 /// Schema metadata key under which [`IndexMetadata`] is stored as JSON.

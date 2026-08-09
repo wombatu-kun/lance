@@ -48,7 +48,7 @@ use object_store::path::Path;
 use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::builder::{routing_distance_type, supported_distance_type};
-use crate::format::{IndexMetadata, RowIdMode};
+use crate::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
 use crate::io::{open_file, read_partition, read_segment};
 use crate::partition::Partition;
 use crate::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
@@ -159,6 +159,19 @@ impl VamanaIndex {
 
         let mut segments = Vec::with_capacity(indices.len());
         for index in indices.iter() {
+            // Checked here as well as in the segment's own metadata, because the
+            // two are separate records in separate files and either can be the
+            // one that is wrong. This one is what makes a refusal cost nothing:
+            // a segment written by a future build is turned away before a single
+            // one of its files is opened.
+            if index.index_version != FORMAT_VERSION as i32 {
+                return Err(Error::not_supported(format!(
+                    "index '{index_name}' segment {} is at format version {}, and this build \
+                     reads version {FORMAT_VERSION}",
+                    index.uuid, index.index_version
+                )));
+            }
+
             // A compaction that cannot open an index does not remove it: the
             // manifest entry survives, still naming the fragments it was built
             // over. The rows of any fragment that has since been rewritten or
