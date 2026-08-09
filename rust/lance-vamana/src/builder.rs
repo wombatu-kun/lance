@@ -260,6 +260,7 @@ pub async fn build_segment(
         dimension,
         distance_type: params.distance_type,
         row_id_mode: RowIdMode::Address,
+        fragments: fragments.to_vec(),
     };
     let mut writer = SegmentWriter::new(
         dataset.object_store(None).await?,

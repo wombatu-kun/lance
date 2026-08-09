@@ -60,7 +60,7 @@ pub const NO_NEIGHBOR: u32 = u32::MAX;
 /// Highest partition-local id addressable, given [`NO_NEIGHBOR`] takes the top.
 pub const MAX_PARTITION_ROWS: u32 = u32::MAX - 1;
 
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Schema metadata key under which [`IndexMetadata`] is stored as JSON.
 pub const INDEX_METADATA_KEY: &str = "lance-vamana:index";
@@ -100,6 +100,16 @@ pub struct IndexMetadata {
     #[serde(with = "distance_type_as_name")]
     pub distance_type: DistanceType,
     pub row_id_mode: RowIdMode,
+    /// Ids of the fragments whose rows this segment physically holds.
+    ///
+    /// The same set is handed to Lance as the segment's committed coverage, so
+    /// the two start out equal - and Lance then edits its copy without telling
+    /// anyone. An in-place column update prunes the rewritten fragments out of
+    /// the manifest's `fragment_bitmap`; a pure row rewrite adds fragments back
+    /// into it. Both leave this list untouched, which is exactly what makes it
+    /// useful: it is the only record of what the segment was built from, so
+    /// comparing the two on open is what turns a silent edit into a refusal.
+    pub fragments: Vec<u32>,
 }
 
 /// `DistanceType` carries no serde impls, and its `Display` / `TryFrom<&str>`
@@ -235,9 +245,29 @@ mod tests {
             dimension: 128,
             distance_type: DistanceType::Cosine,
             row_id_mode: RowIdMode::Address,
+            fragments: vec![0, 3, 7],
         };
         let parsed = IndexMetadata::from_json(&metadata.to_json().unwrap()).unwrap();
         assert_eq!(parsed, metadata);
+    }
+
+    #[test]
+    fn metadata_round_trips_a_stable_row_id_mode() {
+        // The builder refuses to produce this mode, so serde is the only place
+        // the spelling can be exercised at all - and `query::VamanaIndex::open`
+        // rejects an index by reading it back.
+        let metadata = IndexMetadata {
+            format_version: FORMAT_VERSION,
+            max_degree: 16,
+            alpha: 1.0,
+            dimension: 8,
+            distance_type: DistanceType::L2,
+            row_id_mode: RowIdMode::Stable,
+            fragments: vec![0],
+        };
+        let json = metadata.to_json().unwrap();
+        assert!(json.contains("\"stable\""), "{json}");
+        assert_eq!(IndexMetadata::from_json(&json).unwrap(), metadata);
     }
 
     #[test]
@@ -249,6 +279,7 @@ mod tests {
             "dimension": 128,
             "distance_type": "manhattan",
             "row_id_mode": "address",
+            "fragments": [0],
         })
         .to_string();
         let error = IndexMetadata::from_json(&json).unwrap_err();
@@ -264,6 +295,7 @@ mod tests {
             "dimension": 128,
             "distance_type": "l2",
             "row_id_mode": "address",
+            "fragments": [0],
         })
         .to_string();
         let error = IndexMetadata::from_json(&json).unwrap_err();

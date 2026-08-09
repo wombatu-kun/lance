@@ -13,7 +13,7 @@ use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
-use lance::dataset::WriteParams;
+use lance::dataset::{WriteMode, WriteParams};
 use lance_vamana::partition::{Partition, PartitionGraph};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -105,6 +105,15 @@ impl DatasetFixture {
     }
 
     pub async fn write(&self, uri: &str) -> Dataset {
+        self.write_with_mode(uri, WriteMode::Create).await
+    }
+
+    /// Add another round of the same rows as fresh fragments.
+    pub async fn append(&self, uri: &str) -> Dataset {
+        self.write_with_mode(uri, WriteMode::Append).await
+    }
+
+    async fn write_with_mode(&self, uri: &str, mode: WriteMode) -> Dataset {
         let item = Arc::new(Field::new("item", DataType::Float32, true));
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             VECTOR_COLUMN,
@@ -136,6 +145,7 @@ impl DatasetFixture {
             reader,
             uri,
             Some(WriteParams {
+                mode,
                 max_rows_per_file: self.rows_per_fragment,
                 max_rows_per_group: self.rows_per_fragment,
                 enable_stable_row_ids: self.stable_row_ids,

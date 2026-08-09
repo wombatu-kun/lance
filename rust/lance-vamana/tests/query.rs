@@ -11,22 +11,32 @@
 //! vertex in a partition has perfect recall and has answered nothing, so recall
 //! on its own cannot tell a working index from a scan in a costume.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use arrow_array::Float32Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt64Type};
+use arrow_array::{
+    FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    UInt64Array,
+};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::ProjectionRequest;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
-use lance::index::DatasetIndexExt;
+use lance::dataset::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
+use lance::index::{DatasetIndexExt, IndexSegment};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
-use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
+use lance_vamana::builder::{
+    INDEX_DETAILS_TYPE_URL, INDEX_VERSION, IndexParams, build_index_segment, build_segment,
+    create_index,
+};
 use lance_vamana::query::{SearchParams, VamanaIndex};
+use uuid::Uuid;
 
 mod common;
-use common::{DatasetFixture, VECTOR_COLUMN, random_vectors, recall};
+use common::{DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, random_vectors, recall};
 
 const INDEX_NAME: &str = "vamana_idx";
 const PARTITIONS: u32 = 4;
@@ -402,6 +412,178 @@ async fn an_index_over_a_rewritten_fragment_is_refused() {
         .await
         .expect_err("an index over retired fragments must not answer queries");
     assert!(error.to_string().contains("no longer has"), "{error}");
+}
+
+/// Rewrite one fragment's vector column in place, exactly as `update_columns`
+/// does: a new data file inside the *same* fragment, the old one tombstoned, and
+/// every row address left where it was.
+async fn rewrite_vector_column_in_place(dataset: &Dataset, uri: &str, fragment_id: u64) -> Dataset {
+    let mut fragment = dataset.get_fragment(fragment_id as usize).unwrap();
+    let mut scan = fragment.scan();
+    scan.with_row_id();
+    scan.project::<&str>(&[]).unwrap();
+    let row_ids = scan.try_into_batch().await.unwrap()[lance_core::ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let update_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new(lance_core::ROW_ID, DataType::UInt64, false),
+        Field::new(
+            VECTOR_COLUMN,
+            DataType::FixedSizeList(item, VECTOR_DIM),
+            true,
+        ),
+    ]));
+    // Far from anything the fixture drew, so an index answering from the stored
+    // copy and one answering from the new data cannot be confused.
+    let fresh = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        row_ids
+            .iter()
+            .map(|_| Some(vec![Some(9999.0f32); VECTOR_DIM as usize]))
+            .collect::<Vec<_>>(),
+        VECTOR_DIM,
+    );
+    let update_batch = RecordBatch::try_new(
+        update_schema.clone(),
+        vec![Arc::new(UInt64Array::from(row_ids)), Arc::new(fresh)],
+    )
+    .unwrap();
+    let right: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+        vec![Ok(update_batch)],
+        update_schema,
+    ));
+
+    let updated = fragment
+        .update_columns_with_offsets(right, lance_core::ROW_ID, lance_core::ROW_ID)
+        .await
+        .unwrap();
+    let updated_fragment_id = updated.fragment.id;
+    Dataset::commit(
+        uri,
+        Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![updated.fragment],
+            new_fragments: vec![],
+            fields_modified: updated.fields_modified,
+            compacted_sstables: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: Some(UpdatedFragmentOffsets(HashMap::from([(
+                updated_fragment_id,
+                updated.matched_offsets,
+            )]))),
+        },
+        Some(dataset.version().version),
+        None,
+        None,
+        Default::default(),
+        true,
+    )
+    .await
+    .unwrap()
+}
+
+/// The rewrite that no liveness check can see.
+///
+/// `update_columns` keeps the fragment id and every row address, so the fragment
+/// is still live and the index's addresses still resolve - to rows whose vectors
+/// have been replaced. The only signal Lance emits is pruning the fragment out of
+/// the index's `fragment_bitmap`, which shrinks the coverage rather than the
+/// dataset, and a guard that compares coverage against the *dataset* sees nothing
+/// at all. Comparing it against what the segment was built from is what catches it.
+#[tokio::test]
+async fn an_index_over_a_rewritten_column_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = indexed_dataset(uri, &small_fixture()).await;
+    VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+
+    let dataset = rewrite_vector_column_in_place(&dataset, uri, 0).await;
+    assert!(
+        dataset.get_fragments().iter().any(|f| f.id() == 0),
+        "the rewritten fragment must still be live, or the liveness guard would \
+         catch this and the test would prove nothing"
+    );
+
+    let error = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect_err("an index holding vectors that were overwritten must not answer");
+    assert!(
+        error.to_string().contains("rewrote data under it"),
+        "{error}"
+    );
+}
+
+/// The mirror image, and the reason the guard tests equality rather than subset.
+///
+/// Lance does not only shrink an index's coverage - `Transaction::
+/// register_pure_rewrite_rows_update_frags_in_indices` adds fragments *back*
+/// into the bitmap after a pure row rewrite, and it skips only the indices it
+/// recognises as address-domain, which an out-of-tree type is not. Coverage that
+/// grew is a claim to hold rows the segment never read, and a subset test would
+/// wave it through.
+#[tokio::test]
+async fn an_index_credited_with_a_fragment_it_never_read_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = small_fixture().write(uri).await;
+    assert!(dataset.get_fragments().len() >= 2);
+
+    let uuid = Uuid::new_v4();
+    let segment_dir = dataset.indices_dir().join(uuid.to_string());
+    build_segment(&dataset, &params(), &segment_dir, &[0])
+        .await
+        .unwrap();
+
+    let field_id = dataset.schema().field(VECTOR_COLUMN).unwrap().id;
+    let details = prost_types::Any {
+        type_url: INDEX_DETAILS_TYPE_URL.to_string(),
+        value: Vec::new(),
+    };
+    let overclaiming = IndexSegment::new(
+        uuid,
+        [0u32, 1],
+        [field_id],
+        Arc::new(details),
+        INDEX_VERSION,
+        dataset.manifest.version,
+    );
+    dataset
+        .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![overclaiming])
+        .await
+        .unwrap();
+
+    let error = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect_err("a segment credited with rows it never read must not answer");
+    assert!(error.to_string().contains("credits it with 2"), "{error}");
+}
+
+/// The same guard must stay quiet for everything that does not rewrite data.
+///
+/// Appending fragments leaves the committed coverage exactly as it was, so an
+/// index that refused to open after an append would be useless - and the guard
+/// would be testing the dataset's shape rather than its own coverage.
+#[tokio::test]
+async fn appending_rows_leaves_the_index_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = indexed_dataset(uri, &small_fixture()).await;
+    let before = dataset.get_fragments().len();
+
+    let dataset = small_fixture().append(uri).await;
+    assert!(
+        dataset.get_fragments().len() > before,
+        "the append added no fragments, so this test proves nothing"
+    );
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect("an append must not invalidate an index");
+    assert_eq!(index.num_segments(), 1);
 }
 
 /// More than one segment is the normal state of an index that has been extended,

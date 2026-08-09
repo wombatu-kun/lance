@@ -49,6 +49,7 @@ fn index_metadata() -> IndexMetadata {
         dimension: DIMENSION,
         distance_type: DistanceType::Cosine,
         row_id_mode: RowIdMode::Address,
+        fragments: vec![0],
     }
 }
 

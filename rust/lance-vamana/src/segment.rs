@@ -267,6 +267,7 @@ mod tests {
             dimension,
             distance_type: DistanceType::L2,
             row_id_mode: RowIdMode::Address,
+            fragments: vec![0],
         }
     }
 

@@ -168,6 +168,33 @@ impl VamanaIndex {
             }
             let dir = dataset.indices_dir().join(index.uuid.to_string());
             let manifest = read_segment(store.clone(), &dir).await?;
+
+            // The check above asks whether the dataset still has the fragments.
+            // This one asks whether the dataset still credits the segment with
+            // the fragments it was built from, which is a different question
+            // with a different answer: Lance edits an index's coverage in place
+            // and never touches the segment's own files. An in-place column
+            // update removes the rewritten fragments from the bitmap while the
+            // fragment ids and every row address survive, so the fragments are
+            // all still live and the vectors stored here are all stale. A pure
+            // row rewrite goes the other way and credits us with a fragment we
+            // never read. Equality catches both; a subset test catches neither.
+            let built_over = manifest
+                .metadata()
+                .fragments
+                .iter()
+                .copied()
+                .collect::<RoaringBitmap>();
+            if built_over != *declared {
+                return Err(Error::index(format!(
+                    "index '{index_name}' segment {} was built over {} fragments but the dataset \
+                     now credits it with {}, so something rewrote data under it and the vectors it \
+                     holds no longer match the rows at those addresses; rebuild the index",
+                    index.uuid,
+                    built_over.len(),
+                    declared.len()
+                )));
+            }
             segments.push(Segment { dir, manifest });
         }
 
