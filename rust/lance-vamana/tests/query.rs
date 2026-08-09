@@ -838,10 +838,13 @@ async fn an_index_of_several_segments_answers_from_all_of_them() {
         "recall across two segments was {:.4}",
         measured.recall
     );
-    assert!(
-        measured.partitions > f64::from(PARTITIONS),
-        "a two-segment index must probe both segments, got {:.1} partitions",
-        measured.partitions
+    // Exactly four probes in each of the two segments, all eight read. This is
+    // also more partitions than a query keeps reads in flight for, so anything
+    // the buffering dropped past its depth would show up as a shortfall here.
+    assert_eq!(
+        measured.partitions,
+        f64::from(PARTITIONS) * 2.0,
+        "a two-segment index must probe both segments in full"
     );
 }
 

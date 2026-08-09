@@ -25,7 +25,7 @@ use lance_vamana::format::{
     RowIdMode, partition_file_name,
 };
 use lance_vamana::io::{
-    SEGMENT_FILE_VERSION, SegmentWriter, open_file, read_partition, read_segment,
+    SEGMENT_FILE_VERSION, SegmentWriter, open_file, read_partition, read_segment, scan_scheduler,
 };
 use lance_vamana::partition::Partition;
 use object_store::path::Path;
@@ -102,7 +102,9 @@ async fn segment_round_trips_through_a_directory() {
     let (store, path) = segment_dir(&dir);
     let (written, partitions) = write_sample_segment(store.clone(), &path).await;
 
-    let read = read_segment(store.clone(), &path).await.unwrap();
+    let read = read_segment(&scan_scheduler(&store), &path, None)
+        .await
+        .unwrap();
     assert_eq!(
         read, written,
         "the segment read back is not the one written"
@@ -117,9 +119,14 @@ async fn segment_round_trips_through_a_directory() {
         assert_eq!(entry.medoid, *medoid);
         assert_eq!(entry.num_rows as usize, partition.len());
 
-        let reader = open_file(store.clone(), &path.clone().join(entry.file.as_str()), None)
-            .await
-            .unwrap();
+        let reader = open_file(
+            &scan_scheduler(&store),
+            &path.clone().join(entry.file.as_str()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             &read_partition(&reader, entry.num_rows).await.unwrap(),
             partition,
@@ -135,7 +142,9 @@ async fn empty_partitions_leave_no_trace() {
     let (store, path) = segment_dir(&dir);
     write_sample_segment(store.clone(), &path).await;
 
-    let read = read_segment(store.clone(), &path).await.unwrap();
+    let read = read_segment(&scan_scheduler(&store), &path, None)
+        .await
+        .unwrap();
     for partition_id in 0..PARTITIONS as u32 {
         let expected = POPULATED.iter().any(|(id, _)| *id == partition_id);
         assert_eq!(
@@ -169,7 +178,9 @@ async fn a_segment_with_no_partitions_round_trips() {
         .await
         .unwrap();
 
-    let read = read_segment(store, &path).await.unwrap();
+    let read = read_segment(&scan_scheduler(&store), &path, None)
+        .await
+        .unwrap();
     assert!(read.partitions().is_empty());
     assert_eq!(read.metadata(), &index_metadata());
     assert_eq!(read.ivf(), &ivf_model());
@@ -261,7 +272,9 @@ async fn a_foreign_index_file_is_rejected() {
     writer.write_batch(&batch).await.unwrap();
     writer.finish().await.unwrap();
 
-    let error = read_segment(store, &path).await.unwrap_err();
+    let error = read_segment(&scan_scheduler(&store), &path, None)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains(INDEX_METADATA_KEY), "{error}");
 }
 
@@ -296,7 +309,9 @@ async fn a_segment_without_its_ivf_model_is_rejected() {
     writer.write_batch(&batch).await.unwrap();
     writer.finish().await.unwrap();
 
-    let error = read_segment(store, &path).await.unwrap_err();
+    let error = read_segment(&scan_scheduler(&store), &path, None)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains(IVF_POSITION_KEY), "{error}");
 }
 
@@ -353,7 +368,9 @@ async fn a_segment_pointing_at_the_descriptor_buffer_is_rejected() {
     )
     .await;
 
-    let error = read_segment(store, &path).await.unwrap_err();
+    let error = read_segment(&scan_scheduler(&store), &path, None)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("file descriptor"), "{error}");
 }
 
@@ -392,7 +409,9 @@ async fn read_segment_carrying(
         Some(prost::Message::encode_to_vec(&ivf)),
     )
     .await;
-    read_segment(store, dir).await.unwrap_err()
+    read_segment(&scan_scheduler(&store), dir, None)
+        .await
+        .unwrap_err()
 }
 
 /// The v1 centroid layout recovers its width by dividing by the number of

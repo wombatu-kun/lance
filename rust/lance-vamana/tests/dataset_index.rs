@@ -21,7 +21,7 @@ use lance_vamana::builder::{
     INDEX_DETAILS_TYPE_URL, IndexParams, build_segment, create_index, live_fragments,
 };
 use lance_vamana::format::INDEX_FILE_NAME;
-use lance_vamana::io::{open_file, read_partition, read_segment};
+use lance_vamana::io::{open_file, read_partition, read_segment, scan_scheduler};
 use lance_vamana::partition::Partition;
 use lance_vamana::segment::SegmentManifest;
 use object_store::path::Path;
@@ -43,12 +43,18 @@ async fn read_committed(dataset: &Dataset) -> (SegmentManifest, HashMap<u32, Par
     let store = dataset.object_store(None).await.unwrap();
     let dir = dataset.indices_dir().join(indices[0].uuid.to_string());
 
-    let manifest = read_segment(store.clone(), &dir).await.unwrap();
+    let scheduler = scan_scheduler(&store);
+    let manifest = read_segment(&scheduler, &dir, None).await.unwrap();
     let mut partitions = HashMap::new();
     for entry in manifest.partitions() {
-        let reader = open_file(store.clone(), &dir.clone().join(entry.file.as_str()), None)
-            .await
-            .unwrap();
+        let reader = open_file(
+            &scheduler,
+            &dir.clone().join(entry.file.as_str()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         partitions.insert(
             entry.partition_id,
             read_partition(&reader, entry.num_rows).await.unwrap(),
@@ -115,6 +121,21 @@ async fn a_built_index_survives_reopen() {
 
     let (manifest, _) = read_committed(&reopened).await;
     assert_eq!(files.len(), manifest.partitions().len() + 1);
+
+    // A query takes each partition's size from here rather than probing storage
+    // for it, which holds only while Lance records every file it committed under
+    // the name the segment table uses.
+    let sizes = files
+        .iter()
+        .map(|file| (file.path.as_str(), file.size_bytes))
+        .collect::<HashMap<_, _>>();
+    for entry in manifest.partitions() {
+        assert!(
+            sizes.get(entry.file.as_str()).is_some_and(|size| *size > 0),
+            "the manifest records no size for {}, so opening it would cost a probe",
+            entry.file
+        );
+    }
 }
 
 /// The load-bearing test of this stage: what the index stores must be the rows it
@@ -342,8 +363,9 @@ async fn the_same_seed_builds_the_same_index() {
         let mut partitions = Vec::new();
         for entry in manifest.partitions() {
             let reader = open_file(
-                store.clone(),
+                &scan_scheduler(&store),
                 &segment_dir.clone().join(entry.file.as_str()),
+                None,
                 None,
             )
             .await

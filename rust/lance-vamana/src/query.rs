@@ -33,26 +33,28 @@
 //! are separate pieces of work, and putting either in early would make the first
 //! honest measurement of this path harder to read.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Float32Array};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::index::DatasetIndexExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_index::vector::storage::VectorStore;
-use lance_io::object_store::ObjectStore;
+use lance_io::scheduler::ScanScheduler;
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use object_store::path::Path;
 use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::builder::{routing_distance_type, supported_distance_type};
-use crate::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
-use crate::io::{open_file, read_partition, read_segment};
+use crate::format::{FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, RowIdMode};
+use crate::io::{open_file, read_partition, read_segment, scan_scheduler};
 use crate::partition::Partition;
 use crate::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
-use crate::segment::SegmentManifest;
+use crate::segment::{PartitionEntry, SegmentManifest};
 
 /// One answer: a dataset row id and its distance from the query.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -119,7 +121,7 @@ pub struct QueryResult {
 /// A committed Vamana index, opened for querying.
 #[derive(Debug)]
 pub struct VamanaIndex {
-    store: Arc<ObjectStore>,
+    scheduler: Arc<ScanScheduler>,
     metadata: IndexMetadata,
     segments: Vec<Segment>,
     /// Row addresses deleted as of [`VamanaIndex::open`].
@@ -135,7 +137,41 @@ pub struct VamanaIndex {
 struct Segment {
     dir: Path,
     manifest: SegmentManifest,
+    /// Byte size of each file of this segment, as Lance recorded it at commit.
+    ///
+    /// Lance fills this by listing the directory, so it is a fact about the
+    /// files rather than a second copy of one this crate wrote. Handing it to
+    /// the reader is what turns opening a partition into one read rather than a
+    /// size probe followed by a read.
+    file_sizes: HashMap<String, u64>,
 }
+
+/// One partition a query has decided to read, and all of what reading it needs.
+///
+/// Owned rather than borrowed out of the segment. A `Probe<'a>` would make the
+/// closure that turns probes into reads higher-ranked over `'a`, and the search
+/// future built from it stops being `Send` - which takes `tokio::spawn` away
+/// from every caller. The clones are one small string and two numbers per
+/// partition actually read.
+#[derive(Debug)]
+struct Probe {
+    path: Path,
+    size_bytes: Option<u64>,
+    entry: PartitionEntry,
+    /// What the segment declares, to be checked against what the file holds.
+    max_degree: u32,
+    dimension: u32,
+}
+
+/// How many partition reads a query keeps in flight.
+///
+/// The bound is on memory: a partition is read whole, so this is the working set
+/// in partitions however many a query probes. Four rather than one because a
+/// walk cannot start until a read finishes and a store with any latency would
+/// then sit idle through every walk; four rather than `nprobes` because that is
+/// not a bound at all. What the number should be on a high-latency store is a
+/// measurement nobody has taken, so it is deliberately on the small side.
+const PARTITIONS_IN_FLIGHT: usize = 4;
 
 impl VamanaIndex {
     /// Open every segment of `index_name`.
@@ -155,7 +191,7 @@ impl VamanaIndex {
             .iter()
             .map(|fragment| fragment.id() as u32)
             .collect::<RoaringBitmap>();
-        let store = dataset.object_store(None).await?;
+        let scheduler = scan_scheduler(&dataset.object_store(None).await?);
 
         let mut segments = Vec::with_capacity(indices.len());
         for index in indices.iter() {
@@ -199,7 +235,14 @@ impl VamanaIndex {
                 )));
             }
             let dir = dataset.indices_dir().join(index.uuid.to_string());
-            let manifest = read_segment(store.clone(), &dir).await?;
+            let file_sizes = index
+                .files
+                .iter()
+                .flatten()
+                .map(|file| (file.path.clone(), file.size_bytes))
+                .collect::<HashMap<_, _>>();
+            let manifest =
+                read_segment(&scheduler, &dir, file_sizes.get(INDEX_FILE_NAME).copied()).await?;
 
             // The check above asks whether the dataset still has the fragments.
             // This one asks whether the dataset still credits the segment with
@@ -227,7 +270,11 @@ impl VamanaIndex {
                     declared.len()
                 )));
             }
-            segments.push(Segment { dir, manifest });
+            segments.push(Segment {
+                dir,
+                manifest,
+                file_sizes,
+            });
         }
 
         let metadata = segments[0].manifest.metadata().clone();
@@ -271,7 +318,7 @@ impl VamanaIndex {
         let deleted = deleted_row_addresses(dataset, &covered).await?;
 
         Ok(Self {
-            store,
+            scheduler,
             metadata,
             segments,
             deleted,
@@ -324,14 +371,22 @@ impl VamanaIndex {
             query.clone()
         };
 
-        let (loaded, routing) = self
-            .read_probed(&routing_query, routing_type, params)
-            .await?;
+        let (probes, mut comparisons) = self.route(&routing_query, routing_type, params)?;
+        let mut found = Vec::with_capacity(probes.len() * params.k);
+        let mut partitions_read = 0usize;
+        let mut reads = std::pin::pin!(
+            stream::iter(probes)
+                .map(|probe| self.read_probe(probe))
+                .buffered(PARTITIONS_IN_FLIGHT)
+        );
 
-        let comparisons = Comparisons::default();
-        comparisons.record(routing);
-        let mut found = Vec::with_capacity(loaded.len() * params.k);
-        for (partition, medoid) in &loaded {
+        while let Some((partition, medoid)) = reads.try_next().await? {
+            partitions_read += 1;
+            // Created and dropped inside one iteration, never held across the
+            // await above: `Comparisons` holds a `Cell`, and a reference to one
+            // alive across an await point makes this whole future `!Send`, which
+            // would take `tokio::spawn` away from every caller.
+            let walked = Comparisons::default();
             let vectors = flat_storage(
                 partition.graph().row_ids(),
                 partition.vectors(),
@@ -342,10 +397,10 @@ impl VamanaIndex {
             let walk = greedy_search(
                 partition.graph(),
                 &calculator,
-                *medoid,
+                medoid,
                 params.search_list_size,
                 &mut scratch,
-                &comparisons,
+                &walked,
             )?;
             // Local ids are per partition, so they become row ids *before* the
             // merge: every partition has a vertex 0, and they are different rows.
@@ -366,29 +421,28 @@ impl VamanaIndex {
                     .filter(|neighbor| !self.deleted.contains(neighbor.row_id))
                     .take(params.k),
             );
+            comparisons = comparisons.saturating_add(walked.get());
         }
 
         Ok(QueryResult {
             neighbors: merge(found, params.k),
-            comparisons: comparisons.get(),
-            partitions_read: loaded.len(),
+            comparisons,
+            partitions_read,
         })
     }
 
-    /// Route the query and read every partition it lands in.
+    /// Decide which partitions to read, and say what deciding cost.
     ///
-    /// Reading is finished before any walking starts, so that the walk - the only
-    /// part with a comparison counter - holds no await point. The routing cost
-    /// comes back as a plain number for the same reason: `Comparisons` holds a
-    /// `Cell`, and a reference to one alive across an await would make this
-    /// future `!Send`.
-    async fn read_probed(
+    /// No I/O: routing is pure arithmetic over the centroids each segment
+    /// carries, and separating it from the reading is what lets the reads run
+    /// against each other afterwards.
+    fn route(
         &self,
         routing_query: &ArrayRef,
         routing_type: DistanceType,
         params: &SearchParams,
-    ) -> Result<(Vec<(Partition, u32)>, u64)> {
-        let mut loaded = Vec::new();
+    ) -> Result<(Vec<Probe>, u64)> {
+        let mut probes = Vec::new();
         let mut routing = 0u64;
         for segment in &self.segments {
             // Every centroid is ranked, not just `nprobes` of them, because a
@@ -414,40 +468,45 @@ impl VamanaIndex {
                     continue;
                 };
                 probed += 1;
-                let reader = open_file(
-                    self.store.clone(),
-                    &segment.dir.clone().join(entry.file.as_str()),
-                    None,
-                )
-                .await?;
-                let partition = read_partition(&reader, entry.num_rows).await?;
-                // The writer checks both against the segment on the way out; the
-                // reader has to check them on the way back in. A partition whose
-                // width disagrees with the manifest would be searched with a
-                // query of the wrong length against `flat_storage`, which takes
-                // its dimension from the array - silently wrong distances, not
-                // an error.
                 let declared = segment.manifest.metadata();
-                if partition.graph().max_degree() != declared.max_degree
-                    || partition.dimension() != declared.dimension
-                {
-                    return Err(Error::corrupt_file_named(
-                        entry.file.as_str(),
-                        format!(
-                            "Vamana partition {} holds degree {} and dimension {} but its \
-                             segment declares degree {} and dimension {}",
-                            entry.partition_id,
-                            partition.graph().max_degree(),
-                            partition.dimension(),
-                            declared.max_degree,
-                            declared.dimension
-                        ),
-                    ));
-                }
-                loaded.push((partition, entry.medoid));
+                probes.push(Probe {
+                    path: segment.dir.clone().join(entry.file.as_str()),
+                    size_bytes: segment.file_sizes.get(&entry.file).copied(),
+                    entry: entry.clone(),
+                    max_degree: declared.max_degree,
+                    dimension: declared.dimension,
+                });
             }
         }
-        Ok((loaded, routing))
+        Ok((probes, routing))
+    }
+
+    /// Read one probed partition whole.
+    async fn read_probe(&self, probe: Probe) -> Result<(Partition, u32)> {
+        let reader = open_file(&self.scheduler, &probe.path, None, probe.size_bytes).await?;
+        let partition = read_partition(&reader, probe.entry.num_rows).await?;
+        // The writer checks both against the segment on the way out; the reader
+        // has to check them on the way back in. A partition whose width
+        // disagrees with the manifest would be searched with a query of the
+        // wrong length against `flat_storage`, which takes its dimension from
+        // the array - silently wrong distances, not an error.
+        if partition.graph().max_degree() != probe.max_degree
+            || partition.dimension() != probe.dimension
+        {
+            return Err(Error::corrupt_file_named(
+                probe.entry.file.as_str(),
+                format!(
+                    "Vamana partition {} holds degree {} and dimension {} but its segment \
+                     declares degree {} and dimension {}",
+                    probe.entry.partition_id,
+                    partition.graph().max_degree(),
+                    partition.dimension(),
+                    probe.max_degree,
+                    probe.dimension
+                ),
+            ));
+        }
+        Ok((partition, probe.entry.medoid))
     }
 }
 

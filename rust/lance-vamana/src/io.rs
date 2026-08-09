@@ -17,6 +17,7 @@ use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::LanceEncodingsIo;
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::{create_writer, reader_projection_from_column_names};
@@ -70,38 +71,56 @@ pub async fn write_partition(
     Ok(writer.finish().await?.size_bytes)
 }
 
+/// The one scheduler an index reads through.
+///
+/// One per index open, never one per file. A scheduler spawns a background task
+/// and declares an I/O budget of `32 MiB * io_parallelism`, so a query that made
+/// its own per partition would declare `nprobes * segments` budgets and mean
+/// none of them. This is what Lance's own vector index does, once, at open.
+pub fn scan_scheduler(store: &Arc<ObjectStore>) -> Arc<ScanScheduler> {
+    ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(store))
+}
+
 /// Open a file of a segment for reading.
 ///
 /// `columns` narrows what is fetched; pass `None` to read every column.
+/// `size_bytes` skips the size probe when the caller already knows the answer -
+/// Lance records the size of every file of a committed index in the dataset
+/// manifest, so at query time it always does.
 pub async fn open_file(
-    store: Arc<ObjectStore>,
+    scheduler: &Arc<ScanScheduler>,
     path: &Path,
     columns: Option<&[&str]>,
+    size_bytes: Option<u64>,
 ) -> Result<FileReader> {
-    let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
-    let file = scheduler
-        .open_file(path, &CachedFileSize::unknown())
-        .await?;
+    let options = FileReaderOptions::default();
+    let size = size_bytes.map_or_else(CachedFileSize::unknown, CachedFileSize::new);
+    let file = scheduler.open_file(path, &size).await?;
     let reader = FileReader::try_open(
         file.clone(),
         None,
         Arc::<DecoderPlugins>::default(),
         &LanceCache::no_cache(),
-        FileReaderOptions::default(),
+        options.clone(),
     )
     .await?;
 
     let Some(columns) = columns else {
         return Ok(reader);
     };
+    // Reopened from the metadata the first open already read, not from the path.
+    // A projection changes what is decoded, not what the file says about itself,
+    // and `try_open` would go back to storage for the footer to be told so.
     let projection =
         reader_projection_from_column_names(SEGMENT_FILE_VERSION, reader.schema(), columns)?;
-    FileReader::try_open(
-        file,
+    FileReader::try_open_with_file_metadata(
+        Arc::new(LanceEncodingsIo::new(file).with_read_chunk_size(options.read_chunk_size)),
+        path.clone(),
         Some(projection),
         Arc::<DecoderPlugins>::default(),
+        reader.metadata().clone(),
         &LanceCache::no_cache(),
-        FileReaderOptions::default(),
+        options,
     )
     .await
 }
@@ -320,8 +339,18 @@ impl SegmentWriter {
 ///
 /// One read of one small file: the partition table and the routing model are
 /// everything a query needs before it knows which partitions to open.
-pub async fn read_segment(store: Arc<ObjectStore>, dir: &Path) -> Result<SegmentManifest> {
-    let reader = open_file(store, &dir.clone().join(INDEX_FILE_NAME), None).await?;
+pub async fn read_segment(
+    scheduler: &Arc<ScanScheduler>,
+    dir: &Path,
+    size_bytes: Option<u64>,
+) -> Result<SegmentManifest> {
+    let reader = open_file(
+        scheduler,
+        &dir.clone().join(INDEX_FILE_NAME),
+        None,
+        size_bytes,
+    )
+    .await?;
     let schema_metadata = &reader.schema().metadata;
 
     let metadata =

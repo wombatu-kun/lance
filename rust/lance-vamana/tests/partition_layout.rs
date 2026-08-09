@@ -25,7 +25,9 @@ use lance_file::versions::create_writer;
 use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_vamana::format::{NEIGHBORS_COLUMN, ROW_ID_COLUMN, VECTOR_COLUMN, partition_schema};
-use lance_vamana::io::{SEGMENT_FILE_VERSION, open_file, read_partition, read_rows};
+use lance_vamana::io::{
+    SEGMENT_FILE_VERSION, open_file, read_partition, read_rows, scan_scheduler,
+};
 use lance_vamana::partition::Partition;
 use object_store::path::Path;
 
@@ -112,7 +114,9 @@ async fn bytes_to_read(
     columns: &[&str],
     vertices: Range<usize>,
 ) -> u64 {
-    let reader = open_file(store, path, Some(columns)).await.unwrap();
+    let reader = open_file(&scan_scheduler(&store), path, Some(columns), None)
+        .await
+        .unwrap();
     let counter = Arc::new(ByteCounter::default());
     let reader = reader.with_io_stats(counter.clone());
     read_rows(&reader, vertices).await.unwrap();
@@ -238,7 +242,9 @@ async fn partition_round_trips_through_a_file() {
         .unwrap();
     assert!(size > 0);
 
-    let reader = open_file(store, &path, None).await.unwrap();
+    let reader = open_file(&scan_scheduler(&store), &path, None, None)
+        .await
+        .unwrap();
     assert_eq!(
         read_partition(&reader, partition.len() as u32)
             .await
@@ -252,6 +258,33 @@ async fn partition_round_trips_through_a_file() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("segment table lists"), "{error}");
+}
+
+/// The size a caller declares is the size the reader uses. That is what lets a
+/// query open a partition without first asking storage how big it is, and it is
+/// only worth passing if a wrong one is refused rather than quietly re-probed -
+/// otherwise the parameter would be decoration and the probe would still happen.
+#[tokio::test]
+async fn a_declared_file_size_is_the_one_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = local_store_and_path(&dir, "part_00000.idx");
+    let partition = sample_partition(64, 128, DIMENSION);
+    let size = lance_vamana::io::write_partition(&store, &path, &partition)
+        .await
+        .unwrap();
+
+    let scheduler = scan_scheduler(&store);
+    let reader = open_file(&scheduler, &path, None, Some(size))
+        .await
+        .unwrap();
+    assert_eq!(reader.metadata().num_rows, partition.len() as u64);
+
+    assert!(
+        open_file(&scheduler, &path, None, Some(size / 2))
+            .await
+            .is_err(),
+        "the declared size was ignored, so nothing was saved by declaring it"
+    );
 }
 
 /// A partition file must be an ordinary Lance file, not our own format wearing
@@ -431,7 +464,9 @@ async fn vertices_are_addressed_independently_across_partitions() {
     }
 
     for (partition_id, (path, partition)) in &written {
-        let reader = open_file(store.clone(), path, None).await.unwrap();
+        let reader = open_file(&scan_scheduler(&store), path, None, None)
+            .await
+            .unwrap();
         assert_eq!(
             &read_partition(&reader, partition.len() as u32)
                 .await
