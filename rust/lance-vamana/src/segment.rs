@@ -195,6 +195,15 @@ impl SegmentManifest {
         let files = batch
             .column_by_name(FILE_COLUMN)
             .ok_or_else(|| missing_column(FILE_COLUMN))?;
+        // Symmetrical with `u32_column`: `value()` reads through the null mask,
+        // and a null slot's offsets are only equal by convention, so a null file
+        // name would read as whatever bytes the offsets happen to bracket.
+        if files.null_count() != 0 {
+            return Err(Error::corrupt_file_named(
+                FILE_COLUMN,
+                format!("Vamana partition table column {FILE_COLUMN} holds nulls"),
+            ));
+        }
         let files = files.as_string_opt::<i32>().ok_or_else(|| {
             Error::corrupt_file_named(
                 FILE_COLUMN,
@@ -252,7 +261,8 @@ fn u32_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a [u32]> {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{FixedSizeListArray, Float32Array};
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_linalg::distance::DistanceType;
 
@@ -377,6 +387,55 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("without centroids"), "{error}");
+    }
+
+    /// One valid row, with a null put in one column. The values are chosen so
+    /// that dropping a null check does not merely change the error: a null
+    /// partition id or medoid reads back as 0, which is a *valid* entry, so the
+    /// table would be accepted with a row it never held.
+    fn table_with_a_null_in(column: &str) -> RecordBatch {
+        let value = |name: &str, valid: u32| (name != column).then_some(valid);
+        let nullable = |name: &str, data_type: DataType| Field::new(name, data_type, true);
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                nullable(PARTITION_ID_COLUMN, DataType::UInt32),
+                nullable(MEDOID_COLUMN, DataType::UInt32),
+                nullable(NUM_ROWS_COLUMN, DataType::UInt32),
+                nullable(FILE_COLUMN, DataType::Utf8),
+            ])),
+            vec![
+                Arc::new(UInt32Array::from(vec![value(PARTITION_ID_COLUMN, 0)])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![value(MEDOID_COLUMN, 0)])),
+                Arc::new(UInt32Array::from(vec![value(NUM_ROWS_COLUMN, 4)])),
+                Arc::new(StringArray::from(vec![
+                    (column != FILE_COLUMN).then(|| partition_file_name(0)),
+                ])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// `try_from_batch` is handed a batch, not a file, so it cannot lean on
+    /// `index_schema` having declared every column non-nullable.
+    #[test]
+    fn a_null_in_the_partition_table_is_rejected() {
+        for column in [
+            PARTITION_ID_COLUMN,
+            MEDOID_COLUMN,
+            NUM_ROWS_COLUMN,
+            FILE_COLUMN,
+        ] {
+            let error = SegmentManifest::try_from_batch(
+                metadata(4),
+                ivf(8, 4),
+                &table_with_a_null_in(column),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("{column} holds nulls")),
+                "{column}: {error}"
+            );
+        }
     }
 
     #[test]

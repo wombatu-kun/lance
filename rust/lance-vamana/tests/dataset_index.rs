@@ -49,7 +49,10 @@ async fn read_committed(dataset: &Dataset) -> (SegmentManifest, HashMap<u32, Par
         let reader = open_file(store.clone(), &dir.clone().join(entry.file.as_str()), None)
             .await
             .unwrap();
-        partitions.insert(entry.partition_id, read_partition(&reader).await.unwrap());
+        partitions.insert(
+            entry.partition_id,
+            read_partition(&reader, entry.num_rows).await.unwrap(),
+        );
     }
     (manifest, partitions)
 }
@@ -160,7 +163,7 @@ async fn the_index_stores_the_dataset_rows_it_names() {
                 .get(row_id)
                 .unwrap_or_else(|| panic!("row {row_id} is missing from the take"));
             assert_eq!(
-                partition.vector(local_id as u32),
+                partition.vector(local_id as u32).unwrap(),
                 vector_at(vectors, row),
                 "partition {partition_id} vertex {local_id} holds another row's vector"
             );
@@ -302,7 +305,7 @@ async fn the_same_seed_builds_the_same_index() {
             )
             .await
             .unwrap();
-            partitions.push(read_partition(&reader).await.unwrap());
+            partitions.push(read_partition(&reader, entry.num_rows).await.unwrap());
         }
         built.push((manifest, partitions));
     }

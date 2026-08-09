@@ -63,9 +63,11 @@ pub fn flat_storage(
 pub struct Comparisons(Cell<u64>);
 
 impl Comparisons {
+    /// Saturating rather than checked: this is a measurement, and a counter that
+    /// has run out is not a reason to fail the query it was measuring.
     #[inline]
     pub fn record(&self, count: u64) {
-        self.0.set(self.0.get() + count);
+        self.0.set(self.0.get().saturating_add(count));
     }
 
     pub fn get(&self) -> u64 {
@@ -403,5 +405,16 @@ mod tests {
         }
         assert_eq!(lengths, vec![16, 16, 16]);
         assert_eq!(comparisons.get(), 48);
+    }
+
+    /// A full counter pins itself rather than panicking in a debug build and
+    /// wrapping to nearly zero in a release one - the two ways a metric can
+    /// take a query down with it, or lie about it.
+    #[test]
+    fn a_full_comparison_counter_stops_rather_than_wraps() {
+        let comparisons = Comparisons::default();
+        comparisons.record(u64::MAX - 1);
+        comparisons.record(7);
+        assert_eq!(comparisons.get(), u64::MAX);
     }
 }

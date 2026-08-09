@@ -255,10 +255,15 @@ impl Partition {
     }
 
     /// The vector of one vertex, as a slice of the backing buffer.
-    pub fn vector(&self, local_id: u32) -> &[f32] {
+    ///
+    /// `None` when `local_id` is not a vertex of this partition. Local ids reach
+    /// this method from `__neighbors`, which is read off disk, so an id past the
+    /// end is a corrupt file rather than a caller's mistake and must not be an
+    /// index out of bounds.
+    pub fn vector(&self, local_id: u32) -> Option<&[f32]> {
         let dim = self.dimension() as usize;
-        let start = local_id as usize * dim;
-        &self.values()[start..start + dim]
+        let start = (local_id as usize).checked_mul(dim)?;
+        self.values().get(start..start.checked_add(dim)?)
     }
 
     /// Every vector end to end, `dimension` values per vertex.
@@ -556,8 +561,18 @@ mod tests {
     fn a_vertex_vector_is_its_own_slice() {
         let partition = sample_partition(4);
         assert_eq!(partition.dimension(), DIMENSION as u32);
-        assert_eq!(partition.vector(0), &[0.0, 1.0, 2.0]);
-        assert_eq!(partition.vector(2), &[6.0, 7.0, 8.0]);
+        assert_eq!(partition.vector(0), Some([0.0, 1.0, 2.0].as_slice()));
+        assert_eq!(partition.vector(2), Some([6.0, 7.0, 8.0].as_slice()));
+    }
+
+    /// Local ids come out of `__neighbors`, so one past the end is a corrupt
+    /// file arriving at a public method, not a caller slipping.
+    #[test]
+    fn a_vertex_beyond_the_partition_has_no_vector() {
+        let partition = sample_partition(4);
+        assert_eq!(partition.len(), 4);
+        assert!(partition.vector(4).is_none());
+        assert!(partition.vector(u32::MAX).is_none());
     }
 
     /// Rebuild a partition's batch with one adjacency slot overwritten.

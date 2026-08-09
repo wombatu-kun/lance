@@ -143,8 +143,23 @@ pub async fn read_rows(reader: &FileReader, rows: Range<usize>) -> Result<Record
 }
 
 /// Read a whole partition back into memory.
-pub async fn read_partition(reader: &FileReader) -> Result<Partition> {
-    let num_rows = reader.metadata().num_rows as usize;
+///
+/// `expected_rows` comes from the segment table in `index.idx`, which is a
+/// different file from the one being read. Requiring the two to agree is what
+/// keeps a damaged footer from being believed, and it is also the only ceiling
+/// on this read: without it the row count written in the footer is what decides
+/// how much memory to allocate.
+pub async fn read_partition(reader: &FileReader, expected_rows: u32) -> Result<Partition> {
+    if reader.metadata().num_rows != expected_rows as u64 {
+        return Err(Error::corrupt_file_named(
+            "partition",
+            format!(
+                "Vamana partition file holds {} rows but the segment table lists {expected_rows}",
+                reader.metadata().num_rows
+            ),
+        ));
+    }
+    let num_rows = expected_rows as usize;
     if num_rows == 0 {
         // An IVF partition may legitimately hold no vectors, and then there is no
         // batch to take a schema from - so both widths come from the file itself.
@@ -341,8 +356,26 @@ pub async fn read_segment(store: Arc<ObjectStore>, dir: &Path) -> Result<Segment
         ));
     }
     let proto = pb::Ivf::decode(reader.read_global_buffer(ivf_position).await?)?;
-    // `IvfModel::try_from` asserts these agree and would abort the process on a
-    // malformed buffer rather than report it.
+    validate_ivf_model(&proto)?;
+    let ivf = IvfModel::try_from(proto)?;
+
+    let num_rows = reader.metadata().num_rows as usize;
+    let batch = if num_rows == 0 {
+        RecordBatch::new_empty(Arc::new(index_schema()))
+    } else {
+        read_rows(&reader, 0..num_rows).await?
+    };
+    SegmentManifest::try_from_batch(metadata, ivf, &batch)
+}
+
+/// Reject an IVF buffer that [`IvfModel::try_from`] would crash on.
+///
+/// Every case here is a process abort taken on bytes read off disk. `try_from`
+/// is written for models Lance produced itself, so it asserts, divides and
+/// unwraps on fields its own writer always fills - which a buffer arriving from
+/// anywhere else need not.
+fn validate_ivf_model(proto: &pb::Ivf) -> Result<()> {
+    // Asserted rather than checked, so a mismatch aborts instead of reporting.
     if !proto.offsets.is_empty() && proto.offsets.len() != proto.lengths.len() {
         return Err(Error::corrupt_file_named(
             INDEX_FILE_NAME,
@@ -353,13 +386,40 @@ pub async fn read_segment(store: Arc<ObjectStore>, dir: &Path) -> Result<Segment
             ),
         ));
     }
-    let ivf = IvfModel::try_from(proto)?;
+    // The v1 centroid layout is a flat buffer whose width is recovered by
+    // dividing by the number of partitions - taken from `lengths`, which the v1
+    // writer always filled and nothing enforces.
+    if proto.centroids_tensor.is_none() && !proto.centroids.is_empty() && proto.lengths.is_empty() {
+        return Err(Error::corrupt_file_named(
+            INDEX_FILE_NAME,
+            format!(
+                "Vamana segment carries {} legacy centroid values but no partition lengths to \
+                 recover their width from",
+                proto.centroids.len()
+            ),
+        ));
+    }
 
-    let num_rows = reader.metadata().num_rows as usize;
-    let batch = if num_rows == 0 {
-        RecordBatch::new_empty(Arc::new(index_schema()))
-    } else {
-        read_rows(&reader, 0..num_rows).await?
+    let Some(tensor) = proto.centroids_tensor.as_ref() else {
+        return Ok(());
     };
-    SegmentManifest::try_from_batch(metadata, ivf, &batch)
+    let data_type = pb::tensor::DataType::try_from(tensor.data_type).map_err(|_| {
+        Error::corrupt_file_named(
+            INDEX_FILE_NAME,
+            format!(
+                "Vamana segment carries IVF centroids of unknown data type {}",
+                tensor.data_type
+            ),
+        )
+    })?;
+    // Not a crash but a failure deferred: centroids of another width open
+    // cleanly and then fail per query, because routing dispatches on the pair
+    // of centroid and query types and this crate only ever builds an f32 query.
+    if data_type != pb::tensor::DataType::Float32 {
+        return Err(Error::corrupt_file_named(
+            INDEX_FILE_NAME,
+            format!("Vamana segment carries {data_type:?} IVF centroids, expected Float32"),
+        ));
+    }
+    Ok(())
 }

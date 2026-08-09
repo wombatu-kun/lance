@@ -406,7 +406,7 @@ impl VamanaIndex {
                     None,
                 )
                 .await?;
-                let partition = read_partition(&reader).await?;
+                let partition = read_partition(&reader, entry.num_rows).await?;
                 // The writer checks both against the segment on the way out; the
                 // reader has to check them on the way back in. A partition whose
                 // width disagrees with the manifest would be searched with a

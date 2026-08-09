@@ -121,7 +121,7 @@ async fn segment_round_trips_through_a_directory() {
             .await
             .unwrap();
         assert_eq!(
-            &read_partition(&reader).await.unwrap(),
+            &read_partition(&reader, entry.num_rows).await.unwrap(),
             partition,
             "partition {partition_id} did not round trip"
         );
@@ -363,24 +363,109 @@ async fn a_segment_pointing_at_the_descriptor_buffer_is_rejected() {
 async fn an_ivf_model_with_mismatched_offsets_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let (store, path) = segment_dir(&dir);
-    let malformed = lance_index::pb::Ivf {
-        offsets: vec![0, 1, 2],
-        lengths: vec![],
-        ..Default::default()
-    };
+    let error = read_segment_carrying(
+        store,
+        &path,
+        lance_index::pb::Ivf {
+            offsets: vec![0, 1, 2],
+            lengths: vec![],
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(error.to_string().contains("3 offsets"), "{error}");
+}
+
+/// Writes an `index.idx` whose global buffer is `ivf`, and reads it back.
+async fn read_segment_carrying(
+    store: Arc<ObjectStore>,
+    dir: &Path,
+    ivf: lance_index::pb::Ivf,
+) -> lance_core::Error {
     write_hand_made_index(
         &store,
-        &path,
+        dir,
         &[
             (INDEX_METADATA_KEY, index_metadata().to_json().unwrap()),
             (IVF_POSITION_KEY, "1".to_string()),
         ],
-        Some(prost::Message::encode_to_vec(&malformed)),
+        Some(prost::Message::encode_to_vec(&ivf)),
     )
     .await;
+    read_segment(store, dir).await.unwrap_err()
+}
 
-    let error = read_segment(store, &path).await.unwrap_err();
-    assert!(error.to_string().contains("3 offsets"), "{error}");
+/// The v1 centroid layout recovers its width by dividing by the number of
+/// partitions, which it reads from `lengths`; empty, that is a division by zero.
+#[tokio::test]
+async fn an_ivf_model_with_legacy_centroids_and_no_lengths_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let error = read_segment_carrying(
+        store,
+        &path,
+        lance_index::pb::Ivf {
+            centroids: vec![0.5; DIMENSION as usize * PARTITIONS],
+            lengths: vec![],
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        error.to_string().contains("no partition lengths"),
+        "{error}"
+    );
+}
+
+/// `FixedSizeListArray::try_from(&Tensor)` unwraps the enum conversion, so a
+/// data type outside the range aborts the process instead of being reported.
+#[tokio::test]
+async fn an_ivf_model_with_an_unknown_centroid_type_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let error = read_segment_carrying(
+        store,
+        &path,
+        lance_index::pb::Ivf {
+            centroids_tensor: Some(lance_index::pb::Tensor {
+                data_type: 99,
+                shape: vec![PARTITIONS as u32, DIMENSION],
+                data: vec![],
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        error.to_string().contains("unknown data type 99"),
+        "{error}"
+    );
+}
+
+/// Not a crash but a deferred failure: routing dispatches on the pair of
+/// centroid and query types, and this crate only ever builds an f32 query, so a
+/// model of another width opens cleanly and then fails on every search.
+#[tokio::test]
+async fn an_ivf_model_of_another_float_width_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let values = (0..PARTITIONS * DIMENSION as usize)
+        .flat_map(|i| (i as f64).to_le_bytes())
+        .collect::<Vec<u8>>();
+    let error = read_segment_carrying(
+        store,
+        &path,
+        lance_index::pb::Ivf {
+            centroids_tensor: Some(lance_index::pb::Tensor {
+                data_type: lance_index::pb::tensor::DataType::Float64 as i32,
+                shape: vec![PARTITIONS as u32, DIMENSION],
+                data: values,
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(error.to_string().contains("expected Float32"), "{error}");
 }
 
 /// The rule "an empty partition gets no file" belongs to the format, not to one

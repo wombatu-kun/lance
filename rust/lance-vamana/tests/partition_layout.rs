@@ -239,7 +239,19 @@ async fn partition_round_trips_through_a_file() {
     assert!(size > 0);
 
     let reader = open_file(store, &path, None).await.unwrap();
-    assert_eq!(read_partition(&reader).await.unwrap(), partition);
+    assert_eq!(
+        read_partition(&reader, partition.len() as u32)
+            .await
+            .unwrap(),
+        partition
+    );
+
+    // The row count lives in `index.idx` and the rows live here, so a reader
+    // that took the file's word for it would believe a damaged footer.
+    let error = read_partition(&reader, partition.len() as u32 + 1)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("segment table lists"), "{error}");
 }
 
 /// A partition file must be an ordinary Lance file, not our own format wearing
@@ -421,7 +433,9 @@ async fn vertices_are_addressed_independently_across_partitions() {
     for (partition_id, (path, partition)) in &written {
         let reader = open_file(store.clone(), path, None).await.unwrap();
         assert_eq!(
-            &read_partition(&reader).await.unwrap(),
+            &read_partition(&reader, partition.len() as u32)
+                .await
+                .unwrap(),
             partition,
             "partition {partition_id} did not round trip"
         );
