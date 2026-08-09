@@ -6,14 +6,20 @@ tree for convenience but is not a member of its workspace, so the boundary it
 compiles against is the one an out-of-tree crate sees.
 
 ```rust
-lance_vamana::create_index(&mut dataset, "vamana_idx", &IndexParams::new("vec", 64)).await?;
+let built = lance_vamana::create_index(&mut dataset, "vamana_idx", &IndexParams::new("vec", 64)).await?;
+println!("{} vectors cost {} distance computations to index", built.vectors, built.comparisons);
 
 let index = VamanaIndex::open(&dataset, "vamana_idx").await?;
 let answer = index.search(&query, &SearchParams::new(10).with_nprobes(8)).await?;
+println!("answered in {} distance computations", answer.comparisons);
 for neighbor in &answer.neighbors {
     // `neighbor.row_id` is a Lance row address; fetch with `Dataset::take_rows`.
 }
 ```
+
+Both halves of the cost are returned rather than logged: a graph is a trade
+between what a build pays and what a query pays, and a change that improves one
+by spending the other is not visible from either number alone.
 
 ## What this costs the dataset
 
@@ -51,6 +57,9 @@ Consequences to plan around:
 
 ## What the query path does not do
 
+The same list lives on the `query` module, next to the code it describes; the
+two are meant to say the same thing.
+
 - **The delete list is a snapshot taken at open.** Deleted rows are excluded
   from answers, but the list is read once, when the index is opened. A row
   deleted afterwards keeps coming back until the index is reopened, and nothing
@@ -64,11 +73,23 @@ Consequences to plan around:
   remainder; this driver does not.
 - **No predicate prefilter and no refine step.** Both live in Lance's scanner,
   which this driver bypasses.
-- An index whose fragments have been compacted away is **refused** at open
-  rather than answering from what is left; rebuild it. So is one whose coverage
-  the dataset has edited under it - an in-place column update prunes the
-  rewritten fragments out of the index's `fragment_bitmap` while leaving every
-  row address valid, which no liveness check can see.
+- **Partitions are read whole, and nothing is cached between queries.** A query
+  keeps a few reads in flight, so its working set is a few partitions rather
+  than every partition it probes - but a lazy per-vertex traversal and a cache
+  budget are both still ahead.
+
+An index is **refused** at open, rather than answering from what is left, when:
+
+- its fragments have been compacted away, so the row addresses it stored no
+  longer resolve;
+- the dataset has edited its coverage underneath it - an in-place column update
+  prunes the rewritten fragments out of the index's `fragment_bitmap` while
+  leaving every row address valid, which no liveness check can see;
+- the manifest records a format version this build does not read;
+- its segments disagree about the dimension, the metric or the identifier space,
+  because a query merges their answers.
+
+In every case the answer is to rebuild the index.
 
 ## Building
 
@@ -86,12 +107,22 @@ Consequences to plan around:
 
 ## Testing
 
+Run these from `rust/lance-vamana`. The crate is its own workspace root, so the
+repository's own `cargo test --workspace`, `cargo clippy --all` and
+`cargo fmt --all` do not reach it - a change here can leave the root workspace
+green and this crate broken.
+
 ```
-CARGO_INCREMENTAL=0 cargo test
+cd rust/lance-vamana
+CARGO_INCREMENTAL=0 cargo fmt --all
 CARGO_INCREMENTAL=0 cargo clippy --all-targets -- -D warnings
+CARGO_INCREMENTAL=0 cargo test
 ```
 
-Nothing here runs in Lance's CI: the crate is not a workspace member. `tests/spike.rs`
+`CARGO_INCREMENTAL=0` because the incremental cache across the fork's three
+workspaces grows to tens of gigabytes.
+
+Nothing here runs in Lance's CI, for the same reason. `tests/spike.rs`
 is executable documentation of what Lance's public API permits an external index
 to do, and it is where the two facts this design rests on are pinned - that an
 index with an unresolvable details `type_url` survives a reopen, and that a

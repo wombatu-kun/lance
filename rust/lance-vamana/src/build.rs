@@ -209,6 +209,14 @@ fn randomize(graph: &mut PartitionGraph, rng: &mut SmallRng) -> Result<()> {
 /// The true medoid needs every pairwise distance, which no partition can afford
 /// at build time. A uniform sample is scored against itself instead, which is
 /// enough for an entry point: the walk only has to start somewhere unbiased.
+///
+/// "Central" holds for the metrics this crate builds under, where the distance
+/// grows with dissimilarity. It does not hold in general, and this function is
+/// public and generic over the store: under Lance's `Dot`, spelled `1 - dot`,
+/// minimising the summed distance maximises the summed inner product, and the
+/// winner is the vector of largest norm - which sits at the edge of the cloud,
+/// not its middle. [`crate::builder::supported_distance_type`] refuses `Dot`
+/// for a related reason.
 pub fn medoid<S: VectorStore>(
     store: &S,
     sample_size: usize,

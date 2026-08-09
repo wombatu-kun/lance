@@ -9,29 +9,37 @@
 //! answers into dataset row ids. Lance's scanner never sees the query, which is
 //! what makes this work without a patch to Lance - and also what it costs.
 //!
-//! Deleted rows are excluded, with one boundary worth stating: the delete list
-//! is read once, when the index is opened. A row deleted afterwards is still
-//! returned until the index is reopened. That is the same staleness every other
-//! reader of an immutable snapshot has, but here it is invisible - the answer
-//! looks identical either way - so it is spelled out rather than implied.
+//! What this driver does not do, and a caller has to know. The crate README
+//! carries the same list for a reader who is not in the source; the two are
+//! meant to say the same thing.
 //!
-//! What this driver does not do, and a caller has to know:
-//!
-//! - **Rows added after the build are invisible.** The index answers from the
-//!   fragments it was built over; Lance's scanner would scan the remainder.
-//! - **No predicate prefilter and no refine step.** Both live in the scanner.
+//! - **The delete list is a snapshot taken at open.** Deleted rows are excluded
+//!   from answers, but the list is read once, when the index is opened. A row
+//!   deleted afterwards keeps coming back until the index is reopened, and
+//!   nothing about the answer reveals it - which is why it is spelled out.
 //! - **Fewer than `k` rows come back when a probed partition is mostly
 //!   deleted.** Deleted vertices are still walked - they carry the edges that
 //!   hold the graph together - but they are dropped from the answer, and a walk
 //!   only ever produces `search_list_size` candidates to draw from.
+//! - **Rows added after the build are invisible.** The index answers from the
+//!   fragments it was built over; Lance's scanner would scan the remainder.
+//! - **No predicate prefilter and no refine step.** Both live in the scanner.
+//! - **Partitions are read whole, and nothing is cached between queries.** A
+//!   query keeps a few reads going at once, so its working
+//!   set is a few partitions rather than every partition it probes - but the
+//!   lazy per-vertex traversal and the cache budget are both still ahead, and
+//!   putting either in early would make the first honest measurement of this
+//!   path harder to read.
+//!
+//! [`VamanaIndex::open`] refuses outright, rather than answering from what is
+//! left, when the fragments have been compacted away, when the dataset has
+//! edited the index's coverage underneath it, when the manifest records a format
+//! version this build does not read, or when the segments disagree about the
+//! vectors they hold. Each refusal names what to do about it, which is always to
+//! rebuild.
 //!
 //! Committing an index also breaks Lance's own vector search on that column -
 //! see the crate README, and the test that pins it.
-//!
-//! Partitions are read whole and nothing is cached between queries. Both are
-//! deliberate for this stage: the lazy per-vertex traversal and the cache budget
-//! are separate pieces of work, and putting either in early would make the first
-//! honest measurement of this path harder to read.
 
 use std::collections::HashMap;
 use std::sync::Arc;
