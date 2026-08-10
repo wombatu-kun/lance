@@ -276,6 +276,28 @@ mod tests {
         assert_eq!(IndexMetadata::from_json(&json).unwrap(), metadata);
     }
 
+    /// Why `validate_alpha` refuses a non-finite value, stated as a fact about
+    /// the format rather than as a comment: JSON has no spelling for infinity,
+    /// `serde_json` writes `null`, and the index becomes one that was written
+    /// once and can never be opened. The guard lives on the build path, so this
+    /// is the only place the consequence itself can be pinned.
+    #[test]
+    fn a_non_finite_alpha_would_serialise_to_an_unreadable_index() {
+        let metadata = IndexMetadata {
+            format_version: FORMAT_VERSION,
+            max_degree: 64,
+            alpha: f32::INFINITY,
+            dimension: 128,
+            distance_type: DistanceType::L2,
+            row_id_mode: RowIdMode::Address,
+            fragments: vec![0],
+        };
+        let json = metadata.to_json().unwrap();
+        assert!(json.contains("\"alpha\":null"), "{json}");
+        let error = IndexMetadata::from_json(&json).unwrap_err();
+        assert!(error.to_string().contains("invalid type: null"), "{error}");
+    }
+
     #[test]
     fn metadata_rejects_an_unknown_distance_type() {
         let json = serde_json::json!({

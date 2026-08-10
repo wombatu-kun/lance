@@ -93,7 +93,9 @@ impl SearchParams {
         Self {
             k,
             nprobes: 1,
-            search_list_size: k + k / 2,
+            // Saturating because `k` is the caller's number and this is a
+            // constructor, not a place to panic on arithmetic.
+            search_list_size: k.saturating_add(k / 2),
         }
     }
 
@@ -420,6 +422,29 @@ impl VamanaIndex {
                 self.metadata.dimension
             )));
         }
+        // Nothing downstream would report this. Every distance against a
+        // non-finite query is NaN, every ordering here goes through `total_cmp`,
+        // and a negative NaN sorts *ahead* of negative infinity - so the walk
+        // returns `k` arbitrary rows with a NaN distance and a caller comparing
+        // that distance against a threshold accepts all of them.
+        if let Some(position) = query.iter().position(|value| !value.is_finite()) {
+            return Err(Error::invalid_input(format!(
+                "query holds {} at position {position}, which no distance can be measured from",
+                query[position]
+            )));
+        }
+        // Cosine reaches the same place by a different road: the query is
+        // normalised before it is routed, and dividing by a zero norm produces
+        // the NaN directly. Underflow counts - a query of values around 1e-30 has
+        // finite components and a norm of exactly zero in f32.
+        if self.metadata.distance_type == DistanceType::Cosine {
+            let norm_squared = query.iter().map(|value| value * value).sum::<f32>();
+            if norm_squared == 0.0 {
+                return Err(Error::invalid_input(
+                    "query has zero length, which cosine distance is not defined for".to_string(),
+                ));
+            }
+        }
 
         let query: ArrayRef = Arc::new(Float32Array::from(query.to_vec()));
         let routing_type = routing_distance_type(self.metadata.distance_type);
@@ -433,7 +458,14 @@ impl VamanaIndex {
         };
 
         let (probes, mut comparisons) = self.route(&routing_query, routing_type, params)?;
-        let mut found = Vec::with_capacity(probes.len() * params.k);
+        // Sized from what the partitions can actually yield rather than from
+        // `probes.len() * k`: `k` is the caller's, and the product overflows or
+        // asks the allocator for a terabyte long before the walk would notice.
+        let capacity = probes
+            .iter()
+            .map(|probe| (probe.entry.num_rows as usize).min(params.k))
+            .sum::<usize>();
+        let mut found = Vec::with_capacity(capacity);
         let mut partitions_read = 0usize;
         let mut reads = std::pin::pin!(
             stream::iter(probes)
@@ -711,6 +743,16 @@ mod tests {
             3,
         );
         assert_eq!(pairs(&merged), vec![(1, 0.1), (2, 0.4), (3, 0.5)]);
+    }
+
+    /// `k` is the caller's number and the constructor derives a beam from it, so
+    /// the arithmetic has to hold at the top of the range rather than panic
+    /// before the query is even described.
+    #[test]
+    fn an_enormous_k_does_not_overflow_the_beam() {
+        let params = SearchParams::new(usize::MAX);
+        assert_eq!(params.search_list_size, usize::MAX);
+        assert!(params.search_list_size >= params.k);
     }
 
     /// A struct column with a vector leaf, so field ids exist on both sides of a

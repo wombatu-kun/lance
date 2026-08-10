@@ -10,13 +10,19 @@
 //! row ids `0..n`. Nothing about the commit would notice.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt64Type};
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
+    StructArray,
+};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
-use lance::dataset::ProjectionRequest;
+use lance::dataset::{ProjectionRequest, WriteParams};
 use lance::index::DatasetIndexExt;
+use lance_linalg::distance::DistanceType;
 use lance_vamana::builder::{
     INDEX_DETAILS_TYPE_URL, IndexParams, build_segment, create_index, live_fragments,
 };
@@ -532,6 +538,166 @@ async fn a_committed_index_shadows_lances_own_vector_paths() {
         scanner.try_into_batch().await.unwrap().num_rows(),
         fixture.rows()
     );
+}
+
+/// A dataset whose vectors are given cell by cell, so a test can put a null
+/// coordinate or a NaN exactly where it wants one. `DatasetFixture` draws its
+/// vectors at random, which is the right shape for measuring and the wrong one
+/// for pinning a rejection.
+async fn dataset_of_vectors(
+    uri: &str,
+    rows: Vec<Option<Vec<Option<f32>>>>,
+    rows_per_fragment: usize,
+) -> Dataset {
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        VECTOR_COLUMN,
+        DataType::FixedSizeList(item, common::VECTOR_DIM),
+        true,
+    )]));
+    let vectors =
+        FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(rows, common::VECTOR_DIM);
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: rows_per_fragment,
+            max_rows_per_group: rows_per_fragment,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+/// Distinct vectors, one row per entry, as a starting point for a test that then
+/// damages exactly one cell.
+fn plain_vectors(rows: usize) -> Vec<Option<Vec<Option<f32>>>> {
+    (0..rows)
+        .map(|row| {
+            Some(
+                (0..common::VECTOR_DIM as usize)
+                    .map(|axis| Some((row * common::VECTOR_DIM as usize + axis) as f32))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// A null vector has nothing to index and is skipped; a null *coordinate* is a
+/// row whose position is partly unknown, and the byte under it is not a zero the
+/// index may believe. Under L2 `Partition::try_new` catches it, but a cosine
+/// build normalises first and `normalize_fsl` rebuilds the child through
+/// `from_iter_values`, dropping the item-level null mask on the way - so the same
+/// column was an error under one metric and silently indexed under the other.
+#[tokio::test]
+async fn a_null_inside_a_vector_is_refused_under_every_metric() {
+    let mut rows = plain_vectors(40);
+    rows[7].as_mut().unwrap()[3] = None;
+
+    for distance_type in [DistanceType::L2, DistanceType::Cosine] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dataset = dataset_of_vectors(dir.path().to_str().unwrap(), rows.clone(), 20).await;
+        let error = create_index(
+            &mut dataset,
+            INDEX_NAME,
+            &IndexParams::new(VECTOR_COLUMN, 2).with_distance_type(distance_type),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("nulls inside its vectors"),
+            "{distance_type}: {error}"
+        );
+    }
+}
+
+/// A vector that is not finite cannot be assigned to a partition, and the row
+/// has to be nameable: the position the assignment loop knows is into the array
+/// left after null vectors were dropped, which no caller can match against
+/// anything. Row 25 of a 20-row-per-fragment dataset is offset 5 of fragment 1,
+/// so its row id and its position are different numbers on purpose.
+#[tokio::test]
+async fn a_vector_that_cannot_be_assigned_is_named_by_its_row_id() {
+    let mut rows = plain_vectors(40);
+    rows[10] = None;
+    rows[25].as_mut().unwrap()[0] = Some(f32::NAN);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut dataset = dataset_of_vectors(dir.path().to_str().unwrap(), rows, 20).await;
+    let error = create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &IndexParams::new(VECTOR_COLUMN, 2),
+    )
+    .await
+    .unwrap_err();
+
+    let row_id = (1u64 << 32) | 5;
+    assert!(
+        error.to_string().contains(&row_id.to_string()),
+        "the error names a position rather than a row id: {error}"
+    );
+}
+
+/// Zero draws an empty training set, and sampling centroids from nothing panics
+/// inside `rand`. The field is public and has no default of its own.
+#[tokio::test]
+async fn a_zero_kmeans_sample_rate_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = DatasetFixture::default().write(uri).await;
+    let error = create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &params().with_kmeans_sample_rate(0),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("kmeans_sample_rate"), "{error}");
+}
+
+/// `Schema::field` resolves a dotted path, so a nested leaf passes the column
+/// check and then fails inside the build with "column does not exist" - the
+/// scanner projects a nested leaf as its top-level parent, under the parent's
+/// name. Refused where the reason can be given.
+#[tokio::test]
+async fn a_nested_vector_column_is_refused_with_its_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let vector = Field::new(
+        "vec",
+        DataType::FixedSizeList(item, common::VECTOR_DIM),
+        true,
+    );
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "emb",
+        DataType::Struct(vec![vector.clone()].into()),
+        true,
+    )]));
+    let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        plain_vectors(8),
+        common::VECTOR_DIM,
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StructArray::from(vec![(
+            Arc::new(vector),
+            Arc::new(vectors) as ArrayRef,
+        )]))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), uri, None)
+        .await
+        .unwrap();
+
+    let error = create_index(&mut dataset, INDEX_NAME, &IndexParams::new("emb.vec", 2))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("is nested"), "{error}");
 }
 
 /// Copy a checked-in dataset fixture into a temporary directory.

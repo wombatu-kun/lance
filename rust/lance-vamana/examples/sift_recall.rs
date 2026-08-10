@@ -329,7 +329,7 @@ fn main() {
     // way would flatter us against an index that pays only for what it uses.
     let vamana_slots = vectors * degree;
     let used = (0..vectors as u32)
-        .map(|vertex| built.graph.neighbors(vertex).len())
+        .map(|vertex| built.graph.neighbors(vertex).unwrap().len())
         .sum::<usize>();
     println!(
         "\nvamana   R={degree} L={} alpha={}: built in {vamana_build:.1}s, \

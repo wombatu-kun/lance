@@ -207,6 +207,63 @@ async fn top_k_matches_lance_brute_force() {
     );
 }
 
+/// A query nothing can be measured from must be refused, not answered.
+///
+/// Every distance against a non-finite query is NaN, every ordering on this path
+/// goes through `total_cmp`, and a negative NaN sorts ahead of negative infinity
+/// - so the walk would return `k` arbitrary rows carrying a NaN distance, and a
+/// caller filtering on that distance would accept all of them. Under cosine a
+/// zero-length query does the same thing by a different road: normalising it
+/// divides by zero.
+#[tokio::test]
+async fn a_query_that_no_distance_can_be_measured_from_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = small_fixture().write(uri).await;
+    create_index(&mut dataset, INDEX_NAME, &params())
+        .await
+        .unwrap();
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let search = SearchParams::new(K).with_search_list_size(BEAM);
+
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut query = random_vectors(1, 7)[0].clone();
+        query[3] = bad;
+        let error = index.search(&query, &search).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no distance can be measured from"),
+            "{bad}: {error}"
+        );
+    }
+
+    // The zero query is only refused under cosine: under L2 it is an ordinary
+    // point of the space, and answering it is correct.
+    let zero = vec![0.0f32; VECTOR_DIM as usize];
+    index.search(&zero, &search).await.unwrap();
+
+    let cosine_dir = tempfile::tempdir().unwrap();
+    let cosine_uri = cosine_dir.path().to_str().unwrap();
+    let mut dataset = small_fixture().write(cosine_uri).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &params().with_distance_type(DistanceType::Cosine),
+    )
+    .await
+    .unwrap();
+    let cosine = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let error = cosine.search(&zero, &search).await.unwrap_err();
+    assert!(error.to_string().contains("zero length"), "{error}");
+
+    // Underflow reaches the same zero norm from finite components, which a
+    // component-wise check would wave through.
+    let tiny = vec![1e-30f32; VECTOR_DIM as usize];
+    let error = cosine.search(&tiny, &search).await.unwrap_err();
+    assert!(error.to_string().contains("zero length"), "{error}");
+}
+
 /// Cosine is stored differently from every other metric - the builder normalises
 /// the vectors it writes - and it is routed differently too, by L2 over those
 /// unit vectors, because the router panics on cosine. Neither detour is visible

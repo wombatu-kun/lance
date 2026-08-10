@@ -174,7 +174,10 @@ pub fn greedy_search(
     scratch.begin();
     scratch.mark(entry_point);
     comparisons.record(1);
-    let mut list = Vec::with_capacity(search_list_size + 1);
+    // Bounded by the graph as well as by `L`: the list can never hold more than
+    // one entry per vertex, and `L` comes from a caller who may have passed
+    // `usize::MAX`, which this would hand straight to the allocator.
+    let mut list = Vec::with_capacity(search_list_size.min(graph.len()).saturating_add(1));
     list.push(Candidate {
         node: OrderedNode::new(entry_point, OrderedFloat(query.distance(entry_point))),
         expanded: false,
@@ -186,7 +189,7 @@ pub fn greedy_search(
         let nearest_unexpanded = list[position].node.clone();
         visited.push(nearest_unexpanded.clone());
 
-        for neighbor in graph.neighbors(nearest_unexpanded.id) {
+        for neighbor in graph.neighbors(nearest_unexpanded.id)? {
             if !scratch.mark(*neighbor) {
                 continue;
             }

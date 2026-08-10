@@ -135,8 +135,8 @@ pub fn build_partition<S: VectorStore>(
             // The paper folds the current out-edges into the candidate set
             // inside the prune; doing it here keeps the prune ignorant of the
             // graph, which is what lets the back-edge case below reuse it.
-            comparisons.record(graph.neighbors(point).len() as u64);
-            candidates.extend(graph.neighbors(point).iter().map(|neighbor| {
+            comparisons.record(graph.neighbors(point)?.len() as u64);
+            candidates.extend(graph.neighbors(point)?.iter().map(|neighbor| {
                 OrderedNode::new(*neighbor, OrderedFloat(from_point.distance(*neighbor)))
             }));
 
@@ -146,7 +146,7 @@ pub fn build_partition<S: VectorStore>(
             for neighbor in &selected {
                 let neighbor = *neighbor;
                 existing.clear();
-                existing.extend_from_slice(graph.neighbors(neighbor));
+                existing.extend_from_slice(graph.neighbors(neighbor)?);
                 if existing.contains(&point) {
                     continue;
                 }
@@ -277,10 +277,14 @@ pub fn medoid<S: VectorStore>(
 /// out-edges into that set; here the caller does it, which is what lets the same
 /// function serve both a vertex's own prune and a back-edge that has to fight
 /// for a slot.
+/// Infinity is refused as well as NaN, and not for the arithmetic: `serde_json`
+/// writes any non-finite float as `null`, so an infinite alpha serialises
+/// cleanly, commits, and then fails every later `from_json` with "invalid type:
+/// null" - an index that can be written once and never opened again.
 fn validate_alpha(alpha: f32) -> Result<()> {
-    if alpha.is_nan() || alpha < 1.0 {
+    if !alpha.is_finite() || alpha < 1.0 {
         return Err(Error::invalid_input(format!(
-            "Vamana alpha must be at least 1.0, got {alpha}"
+            "Vamana alpha must be a finite value of at least 1.0, got {alpha}"
         )));
     }
     Ok(())
@@ -299,6 +303,34 @@ pub fn robust_prune<S: VectorStore>(
         return Err(Error::invalid_input(
             "Vamana max_degree must be greater than zero".to_string(),
         ));
+    }
+    // One pass over a set that is about to be sorted anyway, and it closes two
+    // holes a caller can walk into. An id past the end of the store slices the
+    // vector buffer out of bounds inside `dist_calculator_from_id`, which panics
+    // rather than reporting - `greedy_search` guards this class of input and
+    // this function did not. A non-finite distance is worse than a panic: every
+    // comparison against NaN is false, so the diversity sweep drops candidate
+    // after candidate and the vertex silently ends up with a single out-edge.
+    let store_len = store.len();
+    for candidate in &candidates {
+        if candidate.id as usize >= store_len {
+            return Err(Error::invalid_input(format!(
+                "Vamana candidate {} is outside a store of {store_len} vectors",
+                candidate.id
+            )));
+        }
+        if !candidate.dist.0.is_finite() {
+            return Err(Error::invalid_input(format!(
+                "Vamana candidate {} has distance {}, which no comparison can order; \
+                 the vectors are most likely not finite",
+                candidate.id, candidate.dist.0
+            )));
+        }
+    }
+    if point as usize >= store_len {
+        return Err(Error::invalid_input(format!(
+            "Vamana vertex {point} is outside a store of {store_len} vectors"
+        )));
     }
 
     let mut pool = candidates;
@@ -588,7 +620,7 @@ mod tests {
         seen[entry_point as usize] = true;
         let mut count = 1;
         while let Some(vertex) = frontier.pop() {
-            for neighbor in graph.neighbors(vertex) {
+            for neighbor in graph.neighbors(vertex).unwrap() {
                 if !seen[*neighbor as usize] {
                     seen[*neighbor as usize] = true;
                     count += 1;
@@ -607,7 +639,7 @@ mod tests {
         let built = build_partition(&storage, &params, &Comparisons::default()).unwrap();
 
         for vertex in 0..VERTICES as u32 {
-            let neighbors = built.graph.neighbors(vertex);
+            let neighbors = built.graph.neighbors(vertex).unwrap();
             assert!(
                 !neighbors.is_empty(),
                 "vertex {vertex} was pruned into a dead end"
@@ -752,7 +784,7 @@ mod tests {
 
             for vertex in 0..VERTICES as u32 {
                 assert_eq!(
-                    built.graph.neighbors(vertex).len(),
+                    built.graph.neighbors(vertex).unwrap().len(),
                     params.max_degree as usize,
                     "distinct={distinct}: vertex {vertex} was left short of its slots"
                 );
@@ -818,7 +850,7 @@ mod tests {
             assert_eq!(built.graph.len(), vertices);
             assert_eq!(reachable(&built.graph, built.medoid), vertices);
             for vertex in 0..vertices as u32 {
-                assert!(built.graph.neighbors(vertex).len() < vertices);
+                assert!(built.graph.neighbors(vertex).unwrap().len() < vertices);
             }
         }
     }
@@ -880,19 +912,86 @@ mod tests {
     }
 
     /// A NaN alpha would make every prune test false and silently keep the
-    /// nearest `max_degree` candidates, so it is rejected rather than compared.
+    /// nearest `max_degree` candidates. An infinite one is worse than useless
+    /// rather than merely wrong: `serde_json` writes any non-finite float as
+    /// `null`, so it commits and then fails every later open.
     #[test]
-    fn a_nan_alpha_is_rejected() {
+    fn an_alpha_that_is_not_finite_is_rejected() {
         let storage = scattered_storage(8, 2);
+        for alpha in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.9] {
+            let error = robust_prune(
+                &storage,
+                0,
+                all_candidates(&storage, 0, 8),
+                alpha,
+                4,
+                &Comparisons::default(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("finite value of at least 1.0"),
+                "alpha {alpha}: {error}"
+            );
+        }
+    }
+
+    /// `dist_calculator_from_id` slices the vector buffer without checking, so an
+    /// id past the end panics the process instead of being reported.
+    /// `greedy_search` guards this class of input; this function did not.
+    #[test]
+    fn a_candidate_outside_the_store_is_rejected() {
+        let storage = scattered_storage(8, 2);
+        let mut candidates = all_candidates(&storage, 0, 8);
+        candidates.push(OrderedNode::new(99, OrderedFloat(0.5)));
+        let error =
+            robust_prune(&storage, 0, candidates, 1.2, 4, &Comparisons::default()).unwrap_err();
+        assert!(error.to_string().contains("outside a store"), "{error}");
+
         let error = robust_prune(
             &storage,
-            0,
+            99,
             all_candidates(&storage, 0, 8),
-            f32::NAN,
+            1.2,
             4,
             &Comparisons::default(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("at least 1.0"), "{error}");
+        assert!(error.to_string().contains("outside a store"), "{error}");
+    }
+
+    /// Every comparison against NaN is false, so the diversity sweep drops each
+    /// candidate in turn and the vertex ends up with one out-edge - a graph
+    /// silently degenerating instead of a build that stops.
+    #[test]
+    fn a_non_finite_distance_is_rejected_rather_than_pruned_away() {
+        let storage = scattered_storage(8, 2);
+        let mut candidates = all_candidates(&storage, 0, 8);
+        candidates[3] = OrderedNode::new(3, OrderedFloat(f32::NAN));
+        let error =
+            robust_prune(&storage, 0, candidates, 1.2, 4, &Comparisons::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("no comparison can order"),
+            "{error}"
+        );
+    }
+
+    /// The same failure reached through the whole build rather than through one
+    /// prune: `create_index` filters non-finite vectors out at assignment, but
+    /// `build_partition` is public and the example calls it directly.
+    #[test]
+    fn a_build_over_non_finite_vectors_stops() {
+        const VERTICES: usize = 64;
+        let mut values = (0..VERTICES * 2).map(|i| i as f32).collect::<Vec<_>>();
+        values[7] = f32::NAN;
+        let storage = FlatFloatStorage::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), 2).unwrap(),
+            DistanceType::L2,
+        );
+        let error =
+            build_partition(&storage, &small_params(), &Comparisons::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("no comparison can order"),
+            "{error}"
+        );
     }
 }

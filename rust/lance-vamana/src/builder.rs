@@ -95,6 +95,11 @@ impl IndexParams {
         self.kmeans_max_iters = kmeans_max_iters;
         self
     }
+
+    pub fn with_kmeans_sample_rate(mut self, kmeans_sample_rate: usize) -> Self {
+        self.kmeans_sample_rate = kmeans_sample_rate;
+        self
+    }
 }
 
 /// What building a segment cost.
@@ -212,6 +217,22 @@ pub async fn build_index_segment(
             params.column
         ))
     })?;
+    // `Schema::field` resolves a dotted path, so a nested leaf gets this far and
+    // then fails three lines into the build with "column does not exist":
+    // `Scanner::project` on a nested leaf yields a column named after its
+    // top-level parent, which `read_vectors` looks for by the full path. Refused
+    // here, where the reason can be stated.
+    if !dataset
+        .schema()
+        .fields
+        .iter()
+        .any(|top_level| top_level.name == params.column)
+    {
+        return Err(Error::not_supported(format!(
+            "column '{}' is nested; Vamana indexes top-level vector columns only",
+            params.column
+        )));
+    }
     let field_id = field.id;
     let dataset_version = dataset.manifest.version;
 
@@ -292,6 +313,15 @@ pub async fn build_segment(
             "Vamana num_partitions must be greater than zero".to_string(),
         ));
     }
+    // Zero draws an empty training set, and sampling k centroids from nothing
+    // panics inside `rand` rather than returning an error.
+    if params.kmeans_sample_rate == 0 {
+        return Err(Error::invalid_input(
+            "Vamana kmeans_sample_rate must be greater than zero; it is how many vectors are \
+             sampled per centroid to train the router"
+                .to_string(),
+        ));
+    }
     supported_distance_type(params.distance_type)?;
     if fragments.is_empty() {
         return Err(Error::invalid_input(
@@ -317,7 +347,7 @@ pub async fn build_segment(
 
     let mut rng = SmallRng::seed_from_u64(params.graph.seed);
     let ivf = train_router(&vectors, params, &mut rng)?;
-    let assignment = assign(&ivf, &vectors, params)?;
+    let assignment = assign(&ivf, &vectors, &row_ids, params)?;
 
     let metadata = IndexMetadata {
         format_version: FORMAT_VERSION,
@@ -419,7 +449,13 @@ async fn read_vectors(
         )));
     }
 
-    let live = (0..vectors.len() as u32)
+    let num_rows = u32::try_from(vectors.len()).map_err(|_| {
+        Error::invalid_input(format!(
+            "column '{column}' holds {} rows, more than one segment can address",
+            vectors.len()
+        ))
+    })?;
+    let live = (0..num_rows)
         .filter(|row| vectors.is_valid(*row as usize))
         .collect::<Vec<_>>();
     if live.is_empty() {
@@ -428,11 +464,30 @@ async fn read_vectors(
         )));
     }
     if live.len() == vectors.len() {
-        return Ok((row_ids, vectors.clone()));
+        return reject_item_nulls(column, vectors.clone()).map(|vectors| (row_ids, vectors));
     }
     let kept_row_ids = live.iter().map(|row| row_ids[*row as usize]).collect();
-    let kept = gather(vectors, &live)?;
+    let kept = reject_item_nulls(column, gather(vectors, &live)?)?;
     Ok((kept_row_ids, kept))
+}
+
+/// Refuse vectors with a null *inside* them, as opposed to a null vector.
+///
+/// A list-level null is a row with nothing to index and is skipped above. A null
+/// coordinate is a row whose vector is partly unknown, and `Partition::try_new`
+/// refuses it - but only under L2. A cosine build normalises first, and
+/// `normalize_fsl` rebuilds the child through `from_iter_values`, which keeps the
+/// list-level nulls and drops the item-level ones. The same column would then be
+/// an error under one metric and silently indexed with whatever byte sat under
+/// the null - usually `0.0` - as a coordinate under the other.
+fn reject_item_nulls(column: &str, vectors: FixedSizeListArray) -> Result<FixedSizeListArray> {
+    if vectors.values().null_count() != 0 {
+        return Err(Error::invalid_input(format!(
+            "column '{column}' has nulls inside its vectors; a partly null vector has no \
+             position to index and the byte under a null is not a coordinate"
+        )));
+    }
+    Ok(vectors)
 }
 
 fn train_router(
@@ -500,7 +555,12 @@ fn train_router(
     Ok(IvfModel::new(centroids, Some(kmeans.loss)))
 }
 
-fn assign(ivf: &IvfModel, vectors: &FixedSizeListArray, params: &IndexParams) -> Result<Vec<u32>> {
+fn assign(
+    ivf: &IvfModel,
+    vectors: &FixedSizeListArray,
+    row_ids: &[u64],
+    params: &IndexParams,
+) -> Result<Vec<u32>> {
     let centroids = ivf
         .centroids
         .as_ref()
@@ -515,9 +575,13 @@ fn assign(ivf: &IvfModel, vectors: &FixedSizeListArray, params: &IndexParams) ->
         .enumerate()
         .map(|(row, partition)| {
             partition.ok_or_else(|| {
+                // Named by row id, not by position: the position is into the
+                // array left after null vectors were dropped, which nothing the
+                // caller has can be matched against.
                 Error::invalid_input(format!(
-                    "Vamana could not assign row {row} to a partition; \
-                     the vector is most likely not finite"
+                    "Vamana could not assign row {} to a partition; \
+                     the vector is most likely not finite",
+                    row_ids.get(row).copied().unwrap_or_default()
                 ))
             })
         })

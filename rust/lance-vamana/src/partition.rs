@@ -100,13 +100,24 @@ impl PartitionGraph {
     }
 
     /// Out-edges of `local_id`, with the padding trimmed off.
-    pub fn neighbors(&self, local_id: u32) -> &[u32] {
-        let slots = self.slots(local_id);
+    ///
+    /// Fallible for the same reason [`Partition::vector`] is: local ids arrive
+    /// from `__neighbors`, which is read off disk, so an id past the end is a
+    /// corrupt file rather than a caller's mistake and must not be an index out
+    /// of bounds. `Result` rather than `Option` because every caller of this one
+    /// wants the same message, where `vector`'s callers decide for themselves.
+    pub fn neighbors(&self, local_id: u32) -> Result<&[u32]> {
+        let slots = self.slots(local_id).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Vamana vertex {local_id} is outside a partition of {} vertices",
+                self.len()
+            ))
+        })?;
         let degree = slots
             .iter()
             .position(|neighbor| *neighbor == NO_NEIGHBOR)
             .unwrap_or(slots.len());
-        &slots[..degree]
+        Ok(&slots[..degree])
     }
 
     /// Replace the out-edges of `local_id`.
@@ -129,10 +140,10 @@ impl PartitionGraph {
         Ok(())
     }
 
-    fn slots(&self, local_id: u32) -> &[u32] {
+    fn slots(&self, local_id: u32) -> Option<&[u32]> {
         let width = self.max_degree as usize;
-        let start = local_id as usize * width;
-        &self.neighbors[start..start + width]
+        let start = (local_id as usize).checked_mul(width)?;
+        self.neighbors.get(start..start.checked_add(width)?)
     }
 }
 
@@ -542,10 +553,10 @@ mod tests {
     #[test]
     fn neighbours_are_trimmed_at_the_padding() {
         let graph = sample_graph(4);
-        assert_eq!(graph.neighbors(0), &[1, 2]);
-        assert_eq!(graph.neighbors(1), &[0]);
-        assert_eq!(graph.neighbors(2), &[0, 1, 3]);
-        assert_eq!(graph.neighbors(3), &[] as &[u32]);
+        assert_eq!(graph.neighbors(0).unwrap(), &[1, 2]);
+        assert_eq!(graph.neighbors(1).unwrap(), &[0]);
+        assert_eq!(graph.neighbors(2).unwrap(), &[0, 1, 3]);
+        assert_eq!(graph.neighbors(3).unwrap(), &[] as &[u32]);
     }
 
     #[test]
@@ -553,9 +564,9 @@ mod tests {
         let graph =
             PartitionGraph::try_new(2, vec![7, 8, 9], vec![vec![1, 2], vec![2, 0], vec![0, 1]])
                 .unwrap();
-        assert_eq!(graph.neighbors(0), &[1, 2]);
-        assert_eq!(graph.neighbors(1), &[2, 0]);
-        assert_eq!(graph.neighbors(2), &[0, 1]);
+        assert_eq!(graph.neighbors(0).unwrap(), &[1, 2]);
+        assert_eq!(graph.neighbors(1).unwrap(), &[2, 0]);
+        assert_eq!(graph.neighbors(2).unwrap(), &[0, 1]);
     }
 
     /// The only mutator the builder has. Its whole contract is that a shortened
@@ -563,17 +574,17 @@ mod tests {
     #[test]
     fn set_neighbors_rewrites_one_vertex_and_repads_it() {
         let mut graph = sample_graph(4);
-        let untouched = graph.neighbors(2).to_vec();
+        let untouched = graph.neighbors(2).unwrap().to_vec();
 
         graph.set_neighbors(0, &[3, 1, 2]).unwrap();
-        assert_eq!(graph.neighbors(0), &[3, 1, 2]);
+        assert_eq!(graph.neighbors(0).unwrap(), &[3, 1, 2]);
         graph.set_neighbors(0, &[1]).unwrap();
         assert_eq!(
-            graph.neighbors(0),
+            graph.neighbors(0).unwrap(),
             &[1],
             "the tail of a shortened list was not re-padded, so a stale edge survived"
         );
-        assert_eq!(graph.neighbors(2), untouched.as_slice());
+        assert_eq!(graph.neighbors(2).unwrap(), untouched.as_slice());
     }
 
     #[test]
@@ -615,13 +626,17 @@ mod tests {
     }
 
     /// Local ids come out of `__neighbors`, so one past the end is a corrupt
-    /// file arriving at a public method, not a caller slipping.
+    /// file arriving at a public method, not a caller slipping. Neither the
+    /// vector nor the edges of such an id may be an index out of bounds.
     #[test]
-    fn a_vertex_beyond_the_partition_has_no_vector() {
+    fn a_vertex_beyond_the_partition_has_neither_vector_nor_edges() {
         let partition = sample_partition(4);
         assert_eq!(partition.len(), 4);
-        assert!(partition.vector(4).is_none());
-        assert!(partition.vector(u32::MAX).is_none());
+        for local_id in [4, u32::MAX] {
+            assert!(partition.vector(local_id).is_none());
+            let error = partition.graph().neighbors(local_id).unwrap_err();
+            assert!(error.to_string().contains("outside a partition"), "{error}");
+        }
     }
 
     /// Rebuild a partition's batch with one adjacency slot overwritten.
@@ -679,7 +694,7 @@ mod tests {
         assert!(error.to_string().contains("after its padding"), "{error}");
 
         let restored = Partition::try_from_batch(&with_slot(&partition, 10, NO_NEIGHBOR)).unwrap();
-        assert_eq!(restored.graph().neighbors(2), &[0, 1]);
+        assert_eq!(restored.graph().neighbors(2).unwrap(), &[0, 1]);
     }
 
     /// `try_new` refuses a self-edge, so the read path has to as well - the two
