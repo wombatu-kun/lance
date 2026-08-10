@@ -166,10 +166,20 @@ pub fn random_vectors(count: usize, seed: u64) -> Vec<Vec<f32>> {
 }
 
 /// The fraction of `truth` that `found` recovered.
+///
+/// The two arguments are not interchangeable, and with equal-length inputs the
+/// arithmetic cannot tell them apart - so the lengths are asserted rather than
+/// assumed. A `found` shorter than `truth` is a real result and would otherwise
+/// be scored as if the missing answers had simply not been asked for.
 pub fn recall(found: &[u64], truth: &[u64]) -> f64 {
-    let truth_set = found
+    assert_eq!(
+        found.len(),
+        truth.len(),
+        "recall compares a k-long answer against a k-long ground truth"
+    );
+    let found_set = found
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
-    truth.iter().filter(|row| truth_set.contains(row)).count() as f64 / truth.len() as f64
+    truth.iter().filter(|row| found_set.contains(row)).count() as f64 / truth.len() as f64
 }

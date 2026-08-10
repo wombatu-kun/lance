@@ -258,6 +258,15 @@ async fn partition_round_trips_through_a_file() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("segment table lists"), "{error}");
+
+    // Zero is not a partition. The format gives an empty partition no file and
+    // no row in the table, so nothing on the read path should be able to ask for
+    // one - and a caller who does gets an error rather than a partition
+    // conjured out of the file's schema.
+    let error = read_partition(&reader, 0).await.unwrap_err();
+    assert!(error.to_string().contains("segment table lists"), "{error}");
+    let error = read_rows(&reader, 0..0).await.unwrap_err();
+    assert!(error.to_string().contains("selects nothing"), "{error}");
 }
 
 /// The size a caller declares is the size the reader uses. That is what lets a

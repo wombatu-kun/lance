@@ -207,6 +207,127 @@ async fn top_k_matches_lance_brute_force() {
     );
 }
 
+/// Search parameters that describe no search at all. Each of these guards was
+/// removable without any test noticing.
+#[tokio::test]
+async fn search_parameters_that_describe_nothing_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = indexed_dataset(uri, &small_fixture()).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let query = random_vectors(1, 7)[0].clone();
+
+    for (params, expected) in [
+        (SearchParams::new(0), "k must be greater than zero"),
+        (SearchParams::new(K).with_nprobes(0), "nprobes must be"),
+        (
+            SearchParams::new(K).with_search_list_size(K - 1),
+            "smaller than k",
+        ),
+        (
+            SearchParams::new(K).with_search_list_size(0),
+            "smaller than k",
+        ),
+    ] {
+        let error = index.search(&query, &params).await.unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
+/// The partition file and the segment table are two files, and only one of them
+/// is read to decide how a walk is laid out. A partition whose width disagrees
+/// with the table would be searched with a query of the wrong length against a
+/// store that takes its dimension from the array - silently wrong distances
+/// rather than an error - so the reader checks the pair on the way back in.
+#[tokio::test]
+async fn a_partition_disagreeing_with_its_segment_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = small_fixture().write(uri).await;
+
+    let covered = (0..dataset.get_fragments().len() as u32).collect::<Vec<_>>();
+    let uuid = Uuid::new_v4();
+    let store = dataset.object_store(None).await.unwrap();
+    let segment_dir = dataset.indices_dir().join(uuid.to_string());
+    let centroids =
+        <FixedSizeListArray as lance_arrow::FixedSizeListArrayExt>::try_new_from_values(
+            Float32Array::from(vec![0.5f32; VECTOR_DIM as usize]),
+            VECTOR_DIM,
+        )
+        .unwrap();
+    let mut writer = SegmentWriter::new(
+        store.clone(),
+        segment_dir.clone(),
+        IndexMetadata {
+            format_version: FORMAT_VERSION,
+            max_degree: 16,
+            alpha: 1.2,
+            dimension: VECTOR_DIM as u32,
+            distance_type: DistanceType::L2,
+            row_id_mode: RowIdMode::Address,
+            fragments: covered.clone(),
+        },
+        lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
+    );
+    let declared = sample_partition(16, 8, VECTOR_DIM as u32);
+    writer.write_partition(0, 0, &declared).await.unwrap();
+    let manifest = writer.finish().await.unwrap();
+
+    // Same vertices, same row ids, one slot wider - and written before the
+    // commit, so the file sizes Lance records are the real ones and the reader
+    // reaches the width check rather than a truncated footer.
+    let (graph, vectors) = declared.into_parts();
+    let widened = lance_vamana::partition::PartitionGraph::try_new(
+        graph.max_degree() + 1,
+        graph.row_ids().to_vec(),
+        (0..graph.len())
+            .map(|vertex| graph.neighbors(vertex as u32).unwrap().to_vec())
+            .collect(),
+    )
+    .unwrap();
+    lance_vamana::io::write_partition(
+        &store,
+        &segment_dir.join(manifest.partitions()[0].file.as_str()),
+        &lance_vamana::partition::Partition::try_new(widened, vectors).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let details = prost_types::Any {
+        type_url: INDEX_DETAILS_TYPE_URL.to_string(),
+        value: Vec::new(),
+    };
+    dataset
+        .commit_existing_index_segments(
+            INDEX_NAME,
+            VECTOR_COLUMN,
+            vec![IndexSegment::new(
+                uuid,
+                covered,
+                [dataset.schema().field(VECTOR_COLUMN).unwrap().id],
+                Arc::new(details),
+                FORMAT_VERSION as i32,
+                dataset.manifest.version,
+            )],
+        )
+        .await
+        .unwrap();
+
+    // The segment itself is well formed, so `open` has nothing to object to.
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let error = index
+        .search(
+            &random_vectors(1, 7)[0],
+            &SearchParams::new(K).with_search_list_size(BEAM),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("its segment declares"),
+        "{error}"
+    );
+}
+
 /// A query nothing can be measured from must be refused, not answered.
 ///
 /// Every distance against a non-finite query is NaN, every ordering on this path
@@ -310,6 +431,51 @@ async fn a_cosine_index_matches_lance_cosine_brute_force() {
             .collect::<Vec<_>>();
         total += recall(&found, &exact);
         comparisons += result.comparisons;
+
+        // Ranking alone cannot tell cosine from L2 here: the builder stores unit
+        // vectors, and for `‖u‖ = 1` the value `‖u − q‖²` is monotone in `u · q`,
+        // so both metrics produce the same order and the same recall. Only the
+        // distance *value* separates them - checked against the definition,
+        // recomputed from the row the answer names.
+        let taken = dataset
+            .take_rows(
+                &found,
+                ProjectionRequest::from_columns(
+                    [VECTOR_COLUMN, lance_core::ROW_ID],
+                    dataset.schema(),
+                ),
+            )
+            .await
+            .unwrap();
+        let row_ids = taken[lance_core::ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        let vectors = taken[VECTOR_COLUMN].as_fixed_size_list();
+        let dim = vectors.value_length() as usize;
+        let values = vectors.values().as_primitive::<Float32Type>().values();
+        let query_norm = query.iter().map(|value| value * value).sum::<f32>().sqrt();
+
+        for neighbor in &result.neighbors {
+            let row = row_ids
+                .iter()
+                .position(|id| *id == neighbor.row_id)
+                .expect("the answer named a row the dataset does not have");
+            let stored = &values[row * dim..(row + 1) * dim];
+            let dot = stored
+                .iter()
+                .zip(query)
+                .map(|(left, right)| left * right)
+                .sum::<f32>();
+            let norm = stored.iter().map(|value| value * value).sum::<f32>().sqrt();
+            let expected = 1.0 - dot / (norm * query_norm);
+            assert!(
+                (neighbor.distance - expected).abs() < 1e-5,
+                "row {} came back at distance {} but its cosine distance is {expected}",
+                neighbor.row_id,
+                neighbor.distance
+            );
+        }
     }
     let recall = total / queries.len() as f64;
     let comparisons = comparisons as f64 / queries.len() as f64;
@@ -387,6 +553,16 @@ async fn a_narrow_probe_costs_recall_and_buys_work() {
         narrow.recall,
         wide.recall
     );
+    // Without a floor this test cannot tell routing from a coin toss. With four
+    // partitions, an assignment that ignored the vectors would put a quarter of
+    // each query's true neighbours in the one partition read, so a broken router
+    // scores about 0.25 here. The measured value is 0.5725.
+    assert!(
+        narrow.recall >= 0.45,
+        "one probe recovered {:.4}, which is what an assignment that ignored the \
+         vectors would score; the router is not routing",
+        narrow.recall
+    );
     assert!(
         narrow.comparisons < wide.comparisons / 2.0,
         "a narrow probe must actually save work: {:.0} against {:.0}",
@@ -442,6 +618,22 @@ async fn routing_is_charged_for_every_centroid_not_every_probe() {
         "a query paid {} comparisons, but routing alone measures {CENTROIDS} centroids",
         result.comparisons
     );
+    // And a ceiling, because a floor alone makes over-counting free: doubling
+    // every charge would still clear it. One walk of a partition this small
+    // cannot add more than its own vertices on top of the routing.
+    let partition_rows = u64::from(
+        VamanaIndex::open(&dataset, INDEX_NAME)
+            .await
+            .unwrap()
+            .metadata()
+            .max_degree,
+    ) + small_fixture().rows() as u64 / u64::from(CENTROIDS);
+    assert!(
+        result.comparisons <= u64::from(CENTROIDS) + partition_rows,
+        "a query paid {} comparisons, more than routing {CENTROIDS} plus everything \
+         one small partition could hold",
+        result.comparisons
+    );
 }
 
 /// The row ids we return must fetch the vectors we claimed distances for. This
@@ -464,6 +656,11 @@ async fn every_answer_resolves_to_the_row_it_names() {
             .iter()
             .map(|neighbor| neighbor.row_id)
             .collect::<Vec<_>>();
+        assert_eq!(
+            row_ids.len(),
+            K,
+            "an index that answered nothing would satisfy every check below"
+        );
         assert_eq!(
             row_ids.iter().collect::<HashSet<_>>().len(),
             row_ids.len(),
@@ -1069,12 +1266,22 @@ async fn segments_that_disagree_about_their_vectors_are_refused() {
     let uri = dir.path().to_str().unwrap();
     let mut dataset = small_fixture().write(uri).await;
 
+    // Different in more than the field under test - a wider graph and a
+    // different pruning slack too - because degree and alpha are *allowed* to
+    // differ between segments and the check must not be reading those.
     let (left, _) = build_index_segment(&dataset, &params(), &[0])
         .await
         .unwrap();
     let (right, _) = build_index_segment(
         &dataset,
-        &params().with_distance_type(DistanceType::Cosine),
+        &params()
+            .with_distance_type(DistanceType::Cosine)
+            .with_graph_params(BuildParams {
+                max_degree: 24,
+                search_list_size: 64,
+                alpha: 1.4,
+                ..Default::default()
+            }),
         &[1],
     )
     .await

@@ -214,6 +214,23 @@ async fn the_writer_rejects_a_partition_of_the_wrong_degree() {
     assert!(error.to_string().contains("max_degree 64"), "{error}");
 }
 
+/// The entry point is a local id, so it has to be one. A medoid past the end of
+/// the partition would be read back and handed straight to `greedy_search`,
+/// which refuses it - one query at a time, forever, on a segment that was
+/// already written.
+#[tokio::test]
+async fn the_writer_rejects_a_medoid_outside_the_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let mut writer = SegmentWriter::new(store, path, index_metadata(), ivf_model());
+
+    let error = writer
+        .write_partition(0, 4, &sample_partition(MAX_DEGREE, 4, DIMENSION))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("medoid 4"), "{error}");
+}
+
 /// So is the dimension: the routing model and every other partition assume it.
 #[tokio::test]
 async fn the_writer_rejects_a_partition_of_the_wrong_dimension() {

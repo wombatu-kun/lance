@@ -87,6 +87,25 @@ fn vector_at(vectors: &FixedSizeListArray, row: usize) -> &[f32] {
     &vectors.values().as_primitive::<Float32Type>().values()[row * dim..(row + 1) * dim]
 }
 
+/// Summed squared distance from one vertex to every vertex of its partition -
+/// the quantity `build::medoid` minimises, recomputed the long way.
+fn summed_distance(partition: &Partition, local_id: usize) -> f32 {
+    let from = partition
+        .vector(local_id as u32)
+        .expect("a vertex of this partition");
+    (0..partition.len())
+        .map(|other| {
+            let to = partition
+                .vector(other as u32)
+                .expect("a vertex of this partition");
+            from.iter()
+                .zip(to)
+                .map(|(left, right)| (left - right) * (left - right))
+                .sum::<f32>()
+        })
+        .sum()
+}
+
 #[tokio::test]
 async fn a_built_index_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -127,6 +146,10 @@ async fn a_built_index_survives_reopen() {
     assert!(files.iter().all(|f| f.size_bytes > 0));
 
     let (manifest, _) = read_committed(&reopened).await;
+    assert!(
+        !manifest.partitions().is_empty(),
+        "with no partitions the file count below is 1 == 0 + 1, which proves nothing"
+    );
     assert_eq!(files.len(), manifest.partitions().len() + 1);
 
     // A query takes each partition's size from here rather than probing storage
@@ -157,6 +180,11 @@ async fn the_index_stores_the_dataset_rows_it_names() {
         .unwrap();
 
     let (_, partitions) = read_committed(&dataset).await;
+    assert!(
+        !partitions.is_empty(),
+        "an index of no partitions would satisfy every loop below without \
+         checking a single row"
+    );
     for (partition_id, partition) in &partitions {
         let row_ids = partition.graph().row_ids().to_vec();
         let taken = dataset
@@ -233,7 +261,28 @@ async fn every_indexed_row_lands_in_exactly_one_partition() {
     for entry in manifest.partitions() {
         let partition = &partitions[&entry.partition_id];
         assert_eq!(entry.num_rows as usize, partition.len());
-        assert!((entry.medoid as usize) < partition.len());
+        // Recomputed, not merely bounded: `medoid < len` follows from the line
+        // above plus what `try_new` already refuses, so it cannot fail, and the
+        // entry point a real build chose was checked nowhere at all. Every
+        // partition here is smaller than `medoid_sample_size`, so the build
+        // scored the whole partition and this recomputation is the same
+        // arithmetic rather than an approximation of it.
+        assert!(
+            partition.len() < IndexParams::new(VECTOR_COLUMN, 1).graph.medoid_sample_size,
+            "partition {} is larger than the medoid sample, so the build only \
+             sampled it and this check would be comparing different things",
+            entry.partition_id
+        );
+        let central = (0..partition.len())
+            .min_by(|left, right| {
+                summed_distance(partition, *left).total_cmp(&summed_distance(partition, *right))
+            })
+            .expect("a listed partition has vertices");
+        assert_eq!(
+            entry.medoid as usize, central,
+            "partition {} starts its walks somewhere other than its most central vertex",
+            entry.partition_id
+        );
     }
     assert!(
         manifest.partitions().len() > 1,
@@ -530,6 +579,13 @@ async fn a_committed_index_shadows_lances_own_vector_paths() {
     assert!(error.to_string().contains("Index Metadata not found"));
     let error = dataset.index_statistics(INDEX_NAME).await.unwrap_err();
     assert!(error.to_string().contains("Index Metadata not found"));
+
+    // Three failures matching one string could all be some fourth thing going
+    // wrong. Dropping the index and watching every one of them recover is what
+    // makes the Vamana segment the cause rather than a coincidence.
+    dataset.drop_index(INDEX_NAME).await.unwrap();
+    assert_eq!(nearest(&dataset, true).await.unwrap().num_rows(), 5);
+    dataset.optimize_indices(&Default::default()).await.unwrap();
 
     // Everything that does not go looking for a vector index is unaffected.
     let mut scanner = dataset.scan();

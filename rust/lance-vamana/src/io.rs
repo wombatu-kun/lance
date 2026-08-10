@@ -10,8 +10,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use arrow_array::RecordBatch;
 use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
@@ -32,10 +31,10 @@ use object_store::path::Path;
 use prost::Message;
 
 use crate::format::{
-    INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, NEIGHBORS_COLUMN,
-    VECTOR_COLUMN, index_schema, partition_file_name,
+    INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, index_schema,
+    partition_file_name,
 };
-use crate::partition::{Partition, PartitionGraph};
+use crate::partition::Partition;
 use crate::segment::{PartitionEntry, SegmentManifest};
 
 /// The file format every file in a segment is written in.
@@ -178,47 +177,11 @@ pub async fn read_partition(reader: &FileReader, expected_rows: u32) -> Result<P
             ),
         ));
     }
-    let num_rows = expected_rows as usize;
-    if num_rows == 0 {
-        // An IVF partition may legitimately hold no vectors, and then there is no
-        // batch to take a schema from - so both widths come from the file itself.
-        let graph = PartitionGraph::try_new(max_degree(reader)?, Vec::new(), Vec::new())?;
-        let vectors = FixedSizeListArray::try_new(
-            Arc::new(Field::new("item", DataType::Float32, false)),
-            list_width(reader, VECTOR_COLUMN)?,
-            Arc::new(Float32Array::from(Vec::<f32>::new())),
-            None,
-        )?;
-        return Partition::try_new(graph, vectors);
-    }
-    Partition::try_from_batch(&read_rows(reader, 0..num_rows).await?)
-}
-
-/// The `max_degree` a partition file was written with.
-pub fn max_degree(reader: &FileReader) -> Result<u32> {
-    let width = list_width(reader, NEIGHBORS_COLUMN)?;
-    if width <= 0 {
-        return Err(Error::corrupt_file_named(
-            NEIGHBORS_COLUMN,
-            format!("Vamana {NEIGHBORS_COLUMN} column has width {width}, which must be positive"),
-        ));
-    }
-    Ok(width as u32)
-}
-
-fn list_width(reader: &FileReader, column: &str) -> Result<i32> {
-    let schema: ArrowSchema = reader.schema().as_ref().into();
-    let field = schema.field_with_name(column)?;
-    let DataType::FixedSizeList(_, width) = field.data_type() else {
-        return Err(Error::corrupt_file_named(
-            column,
-            format!(
-                "Vamana {column} column has type {}, expected a fixed size list",
-                field.data_type()
-            ),
-        ));
-    };
-    Ok(*width)
+    // No empty-partition branch: an empty partition is written no file and given
+    // no row in the segment table, so `expected_rows` is never zero on any path
+    // that reaches here, and a caller who passes zero anyway gets the empty-range
+    // error from `read_rows` rather than a partition invented from a schema.
+    Partition::try_from_batch(&read_rows(reader, 0..expected_rows as usize).await?)
 }
 
 /// Writes a segment directory one partition at a time.

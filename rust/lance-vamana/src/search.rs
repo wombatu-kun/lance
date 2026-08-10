@@ -297,20 +297,69 @@ mod tests {
     }
 
     #[test]
-    fn the_search_list_never_grows_past_its_bound() {
-        let graph = path_graph(64);
+    fn the_search_list_comes_back_exactly_as_wide_as_it_may_be() {
+        const VERTICES: usize = 64;
+        let graph = path_graph(VERTICES);
         for search_list_size in [1, 2, 7, 64, 128] {
-            let (result, _) = search(&graph, &line_storage(64), 63, 0, search_list_size);
-            assert!(
-                result.candidates.len() <= search_list_size,
-                "list of {} exceeds the bound {search_list_size}",
-                result.candidates.len()
+            let (result, _) = search(&graph, &line_storage(VERTICES), 63, 0, search_list_size);
+            // Equality, not a ceiling. Every vertex of this path is reached, so
+            // the list is full whenever `L` allows it, and an upper bound alone
+            // would pass for a walk that kept one candidate at any `L`.
+            assert_eq!(
+                result.candidates.len(),
+                search_list_size.min(VERTICES),
+                "at L = {search_list_size}"
             );
             assert!(
                 result.candidates.windows(2).all(|pair| pair[0] <= pair[1]),
                 "the search list came back unsorted at L = {search_list_size}"
             );
         }
+    }
+
+    /// A graph with a trap, because a path graph cannot show what `L` is for:
+    /// every vertex along a path is strictly closer than the last, so one slot
+    /// walks it exactly like a hundred and the whole beam is inert.
+    ///
+    /// Vertices sit on a line at 0, 50, 40, 20, 99 and the query is vertex 4, at
+    /// 99. Expanding the entry point offers vertex 1 (at 50) and vertex 2 (at
+    /// 40). With `L = 1` only the nearer of them survives, its own neighbour is
+    /// worse still, and the walk ends having never seen the answer. With `L = 2`
+    /// vertex 2 stays in the list, and the answer hangs off it.
+    fn trap_graph() -> (PartitionGraph, FlatFloatStorage) {
+        let positions = [0.0f32, 50.0, 40.0, 20.0, 99.0];
+        let storage = FlatFloatStorage::new(
+            arrow_array::FixedSizeListArray::try_new_from_values(
+                Float32Array::from(positions.to_vec()),
+                1,
+            )
+            .unwrap(),
+            DistanceType::L2,
+        );
+        let graph = PartitionGraph::try_new(
+            2,
+            (0..positions.len() as u64).collect(),
+            vec![vec![1, 2], vec![3], vec![4], vec![], vec![]],
+        )
+        .unwrap();
+        (graph, storage)
+    }
+
+    #[test]
+    fn a_wider_search_list_escapes_a_local_minimum() {
+        let (graph, storage) = trap_graph();
+
+        let (narrow, _) = search(&graph, &storage, 4, 0, 1);
+        assert_eq!(
+            narrow.candidates[0].id, 1,
+            "a one-slot list must fall into the trap, or the fixture is not a trap"
+        );
+
+        let (wide, _) = search(&graph, &storage, 4, 0, 2);
+        assert_eq!(
+            wide.candidates[0].id, 4,
+            "a two-slot list must find the answer"
+        );
     }
 
     /// A vertex in another component is unreachable however good its distance.
