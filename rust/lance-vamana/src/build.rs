@@ -391,10 +391,12 @@ pub fn robust_prune<S: VectorStore>(
     // them right rather than a fallback: they point in no new direction, but they
     // are distinct rows a query has to be able to enumerate.
     //
-    // What is *not* settled is whether the leftover slots would be better spent
-    // on candidates the alpha rule occluded at a non-zero separation, which are
-    // genuinely elsewhere. That is a change to the graph, so it belongs behind a
-    // measurement on SIFT rather than behind an argument.
+    // Spending the leftover slots on the candidates the alpha rule occluded at a
+    // *non-zero* separation was measured on SIFT1M and rejected. Filling every
+    // slot that way (69% -> 100% at R=64) costs 3-5% more distances per query at
+    // equal recall from 0.97 up, and 7x the distances to build - 78G against 11G.
+    // The extra edges buy recall per beam, which is not the same thing as recall
+    // per distance, and a denser graph makes every build-time search pay for them.
     if selected.len() < max_degree {
         coincident.sort_unstable_by(|a, b| a.dist.cmp(&b.dist).then(a.id.cmp(&b.id)));
         for candidate in coincident {
