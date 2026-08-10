@@ -50,6 +50,7 @@ use lance::Dataset;
 use lance::index::DatasetIndexExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, Result};
 use lance_index::vector::storage::VectorStore;
 use lance_io::scheduler::ScanScheduler;
@@ -142,7 +143,11 @@ pub struct VamanaIndex {
     /// have since been deleted, and nothing rewrites them, so the only way to
     /// tell a live vertex from a dead one is to ask the dataset - once, here,
     /// rather than on every query.
-    deleted: RoaringTreemap,
+    ///
+    /// Shared rather than owned because each partition's walk runs on the CPU
+    /// pool, which takes `'static` work, and the filter has to be applied inside
+    /// the walk's own result - before `take(k)`, so that `k` means k live rows.
+    deleted: Arc<RoaringTreemap>,
 }
 
 #[derive(Debug)]
@@ -158,13 +163,20 @@ struct Segment {
     file_sizes: HashMap<String, u64>,
 }
 
+/// What one partition's walk produced, and what it cost.
+struct Walked {
+    neighbors: Vec<Neighbor>,
+    comparisons: u64,
+}
+
 /// One partition a query has decided to read, and all of what reading it needs.
 ///
-/// Owned rather than borrowed out of the segment. A `Probe<'a>` would make the
-/// closure that turns probes into reads higher-ranked over `'a`, and the search
-/// future built from it stops being `Send` - which takes `tokio::spawn` away
-/// from every caller. The clones are one small string and two numbers per
-/// partition actually read.
+/// Owned rather than borrowed out of the segment, because the probes outlive the
+/// borrow: they are collected by `route`, which returns them, and then consumed
+/// by a stream that reads them concurrently. Borrowing would tie every read to
+/// the segment vector for as long as the stream lives and leave the shape of
+/// `route` fighting the borrow checker for nothing - the clones are one small
+/// string and two numbers per partition actually read.
 #[derive(Debug)]
 struct Probe {
     path: Path,
@@ -178,11 +190,18 @@ struct Probe {
 /// How many partition reads a query keeps in flight.
 ///
 /// The bound is on memory: a partition is read whole, so this is the working set
-/// in partitions however many a query probes. Four rather than one because a
-/// walk cannot start until a read finishes and a store with any latency would
-/// then sit idle through every walk; four rather than `nprobes` because that is
-/// not a bound at all. What the number should be on a high-latency store is a
+/// in partitions however many a query probes. It is also the *only* such bound -
+/// the scheduler's byte budget does not apply to these reads, for the reason
+/// [`crate::io::scan_scheduler`] spells out. Four rather than one because a walk
+/// cannot start until a read finishes and a store with any latency would then
+/// sit idle through every walk; four rather than `nprobes` because that is not a
+/// bound at all. What the number should be on a high-latency store is a
 /// measurement nobody has taken, so it is deliberately on the small side.
+///
+/// Dropping a search future abandons these reads but does not cancel them: the
+/// io tasks already in the scheduler's queue still run to completion and their
+/// bytes are read and thrown away. A caller that times a query out and retries
+/// pays for both attempts.
 const PARTITIONS_IN_FLIGHT: usize = 4;
 
 impl VamanaIndex {
@@ -213,7 +232,10 @@ impl VamanaIndex {
             .collect::<Vec<_>>();
         let scheduler = scan_scheduler(&dataset.object_store(None).await?);
 
-        let mut segments = Vec::with_capacity(indices.len());
+        // Everything a segment can be refused for without reading it, first:
+        // the round trips below are the expensive part of opening an index, and
+        // a refusal should not pay for them.
+        let mut planned = Vec::with_capacity(indices.len());
         for index in indices.iter() {
             // Checked here as well as in the segment's own metadata, because the
             // two are separate records in separate files and either can be the
@@ -280,8 +302,27 @@ impl VamanaIndex {
                 .flatten()
                 .map(|file| (file.path.clone(), file.size_bytes))
                 .collect::<HashMap<_, _>>();
-            let manifest =
-                read_segment(&scheduler, &dir, file_sizes.get(INDEX_FILE_NAME).copied()).await?;
+            planned.push((index, dir, file_sizes));
+        }
+
+        // One round trip per segment, and they wait on each other rather than in
+        // turn: an index of forty segments is the ordinary state of anything
+        // appended to, and on a store with 30ms of latency reading them one at a
+        // time is more than a second before the first query can start.
+        let store = dataset.object_store(None).await?;
+        let manifests = stream::iter(planned.iter().map(|(_, dir, file_sizes)| {
+            read_segment(&scheduler, dir, file_sizes.get(INDEX_FILE_NAME).copied())
+        }))
+        .buffered(store.io_parallelism())
+        .try_collect::<Vec<_>>()
+        .await?;
+
+        let mut segments = Vec::with_capacity(planned.len());
+        for ((index, dir, file_sizes), manifest) in planned.into_iter().zip(manifests) {
+            let declared = index
+                .fragment_bitmap
+                .as_ref()
+                .expect("checked above, before any file was read");
 
             // The check above asks whether the dataset still has the fragments.
             // This one asks whether the dataset still credits the segment with
@@ -378,7 +419,8 @@ impl VamanaIndex {
             .iter()
             .flat_map(|segment| segment.manifest.metadata().fragments.iter().copied())
             .collect::<RoaringBitmap>();
-        let deleted = deleted_row_addresses(dataset, &covered).await?;
+        let deleted =
+            Arc::new(deleted_row_addresses(dataset, &covered, store.io_parallelism()).await?);
 
         Ok(Self {
             scheduler,
@@ -467,54 +509,23 @@ impl VamanaIndex {
             .sum::<usize>();
         let mut found = Vec::with_capacity(capacity);
         let mut partitions_read = 0usize;
+        // Unordered, because the merge sorts everything anyway: ordering would
+        // only make a finished partition wait for a slower one that was started
+        // earlier, and `buffered` holds those finished results in memory while
+        // they wait.
         let mut reads = std::pin::pin!(
             stream::iter(probes)
                 .map(|probe| self.read_probe(probe))
-                .buffered(PARTITIONS_IN_FLIGHT)
+                .buffer_unordered(PARTITIONS_IN_FLIGHT)
         );
 
         while let Some((partition, medoid)) = reads.try_next().await? {
             partitions_read += 1;
-            // Created and dropped inside one iteration, never held across the
-            // await above: `Comparisons` holds a `Cell`, and a reference to one
-            // alive across an await point makes this whole future `!Send`, which
-            // would take `tokio::spawn` away from every caller.
-            let walked = Comparisons::default();
-            let vectors = flat_storage(
-                partition.graph().row_ids(),
-                partition.vectors(),
-                self.metadata.distance_type,
-            )?;
-            let calculator = vectors.dist_calculator(query.clone(), 0.0);
-            let mut scratch = SearchScratch::new(partition.len());
-            let walk = greedy_search(
-                partition.graph(),
-                &calculator,
-                medoid,
-                params.search_list_size,
-                &mut scratch,
-                &walked,
-            )?;
-            // Local ids are per partition, so they become row ids *before* the
-            // merge: every partition has a vertex 0, and they are different rows.
-            //
-            // Deleted vertices are dropped here and not earlier. They are still
-            // walked, because they carry the out-edges that keep the graph
-            // connected - removing them from the traversal would strand whatever
-            // they were the only route to. Filtering before `take` rather than
-            // after is what makes `k` mean "k live rows" instead of "k rows, some
-            // of which the caller will find missing".
-            found.extend(
-                walk.candidates
-                    .iter()
-                    .map(|node| Neighbor {
-                        row_id: partition.graph().row_ids()[node.id as usize],
-                        distance: node.dist.0,
-                    })
-                    .filter(|neighbor| !self.deleted.contains(neighbor.row_id))
-                    .take(params.k),
-            );
-            comparisons = comparisons.saturating_add(walked.get());
+            let walked = self
+                .walk_partition(partition, medoid, query.clone(), params)
+                .await?;
+            found.extend(walked.neighbors);
+            comparisons = comparisons.saturating_add(walked.comparisons);
         }
 
         Ok(QueryResult {
@@ -541,8 +552,17 @@ impl VamanaIndex {
             // Every centroid is ranked, not just `nprobes` of them, because a
             // centroid with nothing assigned to it is still a centroid: it can be
             // the nearest one, and a probe spent on it would read no vectors at
-            // all. Ranking them all costs nothing extra - `find_partitions`
-            // measures the query against every centroid either way.
+            // all - so a budget of `nprobes` centroids would silently return
+            // fewer partitions than asked for.
+            //
+            // The distances are free, since `find_partitions` measures the query
+            // against every centroid whichever bound it is given. The ordering is
+            // not: asking for all of them turns a bounded selection into a full
+            // `O(P log P)` sort plus a `take` that builds a `P`-element array
+            // this driver discards. At the partition counts a graph index wants -
+            // hundreds, not tens of thousands - that is far below the cost of one
+            // partition read, and buying it back would mean tracking which
+            // centroids are empty separately from the segment table.
             let (partitions, _) = segment.manifest.ivf().find_partitions(
                 routing_query.as_ref(),
                 segment.manifest.ivf().num_partitions(),
@@ -572,6 +592,75 @@ impl VamanaIndex {
             }
         }
         Ok((probes, routing))
+    }
+
+    /// Walk one partition, on the CPU pool rather than on this runtime.
+    ///
+    /// A walk is milliseconds of uninterrupted arithmetic - at `L = 100`,
+    /// `R = 64` and 768 dimensions it is on the order of ten million flops - with
+    /// no await inside it to yield at. Left here it would run on the same
+    /// runtime as the scheduler's io loop and every decode task, so on a
+    /// single-threaded runtime, which is what an ordinary `#[tokio::test]`
+    /// gives, the reads this method is supposed to overlap with would not
+    /// advance at all and `PARTITIONS_IN_FLIGHT` would buy nothing.
+    ///
+    /// Everything the closure needs is moved into it because the pool takes
+    /// `'static` work: the partition is owned already, the query is an `Arc`
+    /// clone and the delete list is shared. Nothing in it waits on anything,
+    /// which is what the pool requires.
+    async fn walk_partition(
+        &self,
+        partition: Partition,
+        medoid: u32,
+        query: ArrayRef,
+        params: &SearchParams,
+    ) -> Result<Walked> {
+        let distance_type = self.metadata.distance_type;
+        let deleted = self.deleted.clone();
+        let search_list_size = params.search_list_size;
+        let k = params.k;
+        spawn_cpu(move || {
+            let walked = Comparisons::default();
+            let vectors = flat_storage(
+                partition.graph().row_ids(),
+                partition.vectors(),
+                distance_type,
+            )?;
+            let calculator = vectors.dist_calculator(query, 0.0);
+            let mut scratch = SearchScratch::new(partition.len());
+            let walk = greedy_search(
+                partition.graph(),
+                &calculator,
+                medoid,
+                search_list_size,
+                &mut scratch,
+                &walked,
+            )?;
+            // Local ids are per partition, so they become row ids *before* the
+            // merge: every partition has a vertex 0, and they are different rows.
+            //
+            // Deleted vertices are dropped here and not earlier. They are still
+            // walked, because they carry the out-edges that keep the graph
+            // connected - removing them from the traversal would strand whatever
+            // they were the only route to. Filtering before `take` rather than
+            // after is what makes `k` mean "k live rows" instead of "k rows, some
+            // of which the caller will find missing".
+            let neighbors = walk
+                .candidates
+                .iter()
+                .map(|node| Neighbor {
+                    row_id: partition.graph().row_ids()[node.id as usize],
+                    distance: node.dist.0,
+                })
+                .filter(|neighbor| !deleted.contains(neighbor.row_id))
+                .take(k)
+                .collect();
+            Ok(Walked {
+                neighbors,
+                comparisons: walked.get(),
+            })
+        })
+        .await
     }
 
     /// Read one probed partition whole.
@@ -683,14 +772,28 @@ fn merge(mut found: Vec<Neighbor>, k: usize) -> Vec<Neighbor> {
 async fn deleted_row_addresses(
     dataset: &Dataset,
     covered: &RoaringBitmap,
+    io_parallelism: usize,
 ) -> Result<RoaringTreemap> {
+    // One read per covered fragment, in flight against each other: five hundred
+    // covered fragments read in turn is the difference between opening an index
+    // in a second and opening it in fifteen.
+    let vectors = stream::iter(
+        dataset
+            .get_fragments()
+            .into_iter()
+            .filter(|fragment| covered.contains(fragment.id() as u32))
+            .map(|fragment| async move {
+                let fragment_id = fragment.id() as u32;
+                Ok::<_, Error>((fragment_id, fragment.get_deletion_vector().await?))
+            }),
+    )
+    .buffered(io_parallelism)
+    .try_collect::<Vec<_>>()
+    .await?;
+
     let mut deleted = RoaringTreemap::new();
-    for fragment in dataset.get_fragments() {
-        let fragment_id = fragment.id() as u32;
-        if !covered.contains(fragment_id) {
-            continue;
-        }
-        let Some(deletion_vector) = fragment.get_deletion_vector().await? else {
+    for (fragment_id, deletion_vector) in vectors {
+        let Some(deletion_vector) = deletion_vector else {
             continue;
         };
         for row_offset in deletion_vector.iter() {

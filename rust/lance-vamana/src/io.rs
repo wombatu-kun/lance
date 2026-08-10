@@ -72,10 +72,19 @@ pub async fn write_partition(
 
 /// The one scheduler an index reads through.
 ///
-/// One per index open, never one per file. A scheduler spawns a background task
-/// and declares an I/O budget of `32 MiB * io_parallelism`, so a query that made
-/// its own per partition would declare `nprobes * segments` budgets and mean
-/// none of them. This is what Lance's own vector index does, once, at open.
+/// One per index open, never one per file, which is what Lance's own vector
+/// index does. A scheduler spawns a background task, so one per partition read
+/// would be one background task per partition read.
+///
+/// It is *not* what keeps the working set bounded, despite declaring a byte
+/// budget of `32 MiB * io_parallelism`. Every file here is opened at base
+/// priority 0, and a task's priority is `(base << 64) | top_level_row`, so the
+/// first page of every partition of every segment has priority exactly 0.
+/// `can_deliver_without_warning` admits a task unconditionally when its priority
+/// is at or below the minimum in flight, which zero always is, so the
+/// byte-budget branch is never reached and `bytes_avail` simply goes negative
+/// with a `log::debug!`. What actually bounds a query's working set is
+/// `PARTITIONS_IN_FLIGHT`.
 pub fn scan_scheduler(store: &Arc<ObjectStore>) -> Arc<ScanScheduler> {
     ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(store))
 }
