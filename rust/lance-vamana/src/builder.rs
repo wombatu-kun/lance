@@ -48,6 +48,15 @@ use crate::segment::SegmentManifest;
 /// *silently* when the dataset is reopened. An unresolvable one is kept as is.
 /// The payload is empty because the segment's own `index.idx` is the only
 /// source of truth about its contents.
+///
+/// "Kept as is" rests on one upstream line: `retain_supported_indices` resolves
+/// an unknown url to a maximum supported version of `i32::MAX`, under a comment
+/// reading "If we don't know how to read the index, it isn't supported". The
+/// fail-open is what keeps this crate's segments visible to their own driver -
+/// and if it is ever tightened, `load_indices` will drop the segment with a
+/// warning, `VamanaIndex::open` will report that no such index exists, and a
+/// rebuild will add a *second* segment beside the invisible first rather than
+/// replacing it.
 pub const INDEX_DETAILS_TYPE_URL: &str = "type.googleapis.com/lance.vamana.VamanaIndexDetails";
 
 /// How to build one Vamana index segment.
@@ -56,6 +65,14 @@ pub struct IndexParams {
     /// Vector column to index. Must be `FixedSizeList<Float32, dim>`.
     pub column: String,
     /// Number of IVF partitions, i.e. how many k-means centroids to train.
+    ///
+    /// This is also a cost the *dataset* carries, not only the index. Every
+    /// non-empty partition is its own file, and Lance records one `IndexFile`
+    /// entry per file of a committed index in the manifest - which is then
+    /// re-serialised into every manifest written afterwards. At 4096 partitions
+    /// that is 4097 entries paid for by each later append, delete or update and
+    /// by every `Dataset::open`. Lance's own IVF indices are one or two files, so
+    /// nothing upstream is sized for a per-partition list.
     pub num_partitions: u32,
     pub distance_type: DistanceType,
     /// Graph parameters, applied to every partition.
@@ -190,6 +207,15 @@ pub fn live_fragments(dataset: &Dataset) -> Vec<u32> {
 /// Separate from [`create_index`] because a segment is the unit of maintenance:
 /// coverage has to be chosen by the caller, and a segment naming a subset of the
 /// fragments is how new data is indexed without rewriting what is already there.
+///
+/// Commit it promptly. A segment records the dataset version it was built at,
+/// and `prune_stale_segment_coverage` runs over any segment older than the
+/// manifest it is committed against: it checks out that version - which fails
+/// outright once `cleanup_old_versions` has removed it - and silently drops from
+/// the coverage any fragment whose data file has been rewritten since. The
+/// commit then succeeds with a narrower bitmap than the segment was built over,
+/// and [`crate::query::VamanaIndex::open`] refuses the result, because that is
+/// exactly the shape of an index whose data moved underneath it.
 pub async fn build_index_segment(
     dataset: &Dataset,
     params: &IndexParams,
@@ -526,12 +552,24 @@ fn train_router(
     // clustering is switched off for the same reason: above k = 256 it takes over
     // the training and reproducibility would silently stop holding.
     //
-    // One hole remains and is not ours to close: whenever an iteration leaves a
-    // cluster empty, Lance splits it using an RNG it seeds from the OS as well.
-    // So a build is reproducible while every centroid keeps at least one member,
-    // which is the normal case but not a guarantee - Lance itself warns about
-    // the data shapes that break it. An A/B at high partition counts should
-    // check that the trained centroids match before trusting the comparison.
+    // Two holes remain and neither is ours to close. Whenever an iteration
+    // leaves a cluster empty, Lance splits it using an RNG it seeds from the OS
+    // as well, so a build is reproducible while every centroid keeps at least
+    // one member - the normal case, but not a guarantee, and Lance itself warns
+    // about the data shapes that break it.
+    //
+    // The second is size-dependent and therefore easy to miss in a small test:
+    // every k-means iteration calls `SimpleIndex::may_train_index`, which
+    // switches assignment from exhaustive to an *approximate* HNSW search over
+    // the centroids once the flattened centroid array reaches a million values -
+    // `num_partitions * dimension`, so 4096 partitions of 256 dimensions is
+    // exactly at it - or at any size when `LANCE_USE_HNSW_SPEEDUP_INDEXING` is
+    // set. That HNSW is built in parallel into shared state, so its answers
+    // depend on thread interleaving.
+    //
+    // Both bite at the scale an A/B is worth running at, so an A/B at high
+    // partition counts should check that the trained centroids match before
+    // trusting anything downstream of them.
     let init = gather(
         &training,
         &rand::seq::index::sample(rng, training.len(), k)

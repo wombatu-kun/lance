@@ -359,10 +359,26 @@ async fn a_build_reports_what_it_cost() {
     );
 
     assert_eq!(stats.vectors, fixture.rows());
+    // Both sides are incremented in the same loop, so this can only catch a
+    // partition written without a table row or the reverse - which is what the
+    // count is for. The independent check is against the directory: Lance lists
+    // it at commit time, and `files` is what it found.
     assert_eq!(
         stats.partitions,
         manifest.partitions().len(),
         "the build counted partitions the segment does not list"
+    );
+    let files = dataset.load_indices_by_name(INDEX_NAME).await.unwrap()[0]
+        .files
+        .as_ref()
+        .expect("the commit records its files")
+        .len();
+    assert_eq!(
+        stats.partitions + 1,
+        files,
+        "the build reports {} partitions but the segment directory holds {files} files \
+         including index.idx",
+        stats.partitions
     );
     // Pinned to the measured value, not merely to "greater than zero": the whole
     // point is to notice a build that got three times more expensive.

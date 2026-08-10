@@ -210,6 +210,14 @@ fn randomize(graph: &mut PartitionGraph, rng: &mut SmallRng) -> Result<()> {
 /// at build time. A uniform sample is scored against itself instead, which is
 /// enough for an entry point: the walk only has to start somewhere unbiased.
 ///
+/// "Central" is also approximate in a second way, and the name overstates it.
+/// Lance's `L2` is the *squared* euclidean distance, so this minimises a sum of
+/// squares and lands on the sampled point nearest the centroid rather than on
+/// the medoid proper - one far outlier pulls it, where the true medoid would not
+/// move. The reference DiskANN implementation does the same thing, and for an
+/// entry point the distinction has never mattered; it is recorded because the
+/// word does not mean what it says.
+///
 /// "Central" holds for the metrics this crate builds under, where the distance
 /// grows with dissimilarity. It does not hold in general, and this function is
 /// public and generic over the store: under Lance's `Dot`, spelled `1 - dot`,
@@ -371,8 +379,22 @@ pub fn robust_prune<S: VectorStore>(
     }
 
     // Only reachable when the pool ran out before the slots did *and* something
-    // was occluded at zero separation, so data without exact duplicates never
-    // takes this path and the graph it builds is unchanged.
+    // was occluded at zero separation.
+    //
+    // "Zero separation" is not the same set of rows under every metric, and the
+    // difference is worth naming. Under L2 it is exact duplicates, so ordinary
+    // data never takes this path at all. Under cosine the builder stores unit
+    // vectors, so it is rows that were *proportional* before normalisation - and
+    // then a little more, because `1 - dot` in f32 rounds to exactly 0.0 once the
+    // inner product is within about 6e-8 of one. Those are still the same point
+    // in the space the index measures, which is what makes filling the slots with
+    // them right rather than a fallback: they point in no new direction, but they
+    // are distinct rows a query has to be able to enumerate.
+    //
+    // What is *not* settled is whether the leftover slots would be better spent
+    // on candidates the alpha rule occluded at a non-zero separation, which are
+    // genuinely elsewhere. That is a change to the graph, so it belongs behind a
+    // measurement on SIFT rather than behind an argument.
     if selected.len() < max_degree {
         coincident.sort_unstable_by(|a, b| a.dist.cmp(&b.dist).then(a.id.cmp(&b.id)));
         for candidate in coincident {
@@ -850,7 +872,16 @@ mod tests {
             assert_eq!(built.graph.len(), vertices);
             assert_eq!(reachable(&built.graph, built.medoid), vertices);
             for vertex in 0..vertices as u32 {
-                assert!(built.graph.neighbors(vertex).unwrap().len() < vertices);
+                // Not `< vertices`, which is structural - self-edges and
+                // duplicates are refused, so a shorter list is the only kind
+                // there is. What is worth asserting is that no vertex was pruned
+                // into a dead end. Saturation is *not* the bar even here: at
+                // three vertices the diversity rule already occludes one of the
+                // two candidates, so the middle vertex keeps a single edge.
+                assert!(
+                    !built.graph.neighbors(vertex).unwrap().is_empty() || vertices == 1,
+                    "vertex {vertex} of a {vertices}-vertex partition was left with no edges"
+                );
             }
         }
     }

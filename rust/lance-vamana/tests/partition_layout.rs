@@ -416,11 +416,17 @@ async fn a_projection_pays_only_for_the_columns_it_names() {
         NEIGHBOR_STRIDE + VECTOR_STRIDE,
         "reading both columns must cost both strides and nothing else"
     );
+    // `both > neighbors` follows from the marginal costs above and so cannot
+    // fail. What the single-vertex numbers can still show is the *size* of the
+    // gap: adding the vector column must cost at least one vector and at most
+    // what fetching that column on its own costs, or the projection is reading
+    // something other than the column it was asked for.
     assert!(
-        both.single > neighbors.single,
-        "projecting one column must fetch fewer bytes than projecting two: \
-         {} B for the edges alone against {} B for both",
+        (neighbors.single + u64::from(DIMENSION * 4)..=neighbors.single + vector.single)
+            .contains(&both.single),
+        "one vertex costs {} B for edges and {} B for the vector, but {} B for both",
         neighbors.single,
+        vector.single,
         both.single
     );
 }
@@ -465,7 +471,29 @@ async fn vertices_are_addressed_independently_across_partitions() {
     for partition_id in 0..3usize {
         let path = Path::from_absolute_path(dir.path().join(format!("part_{partition_id:05}.idx")))
             .unwrap();
-        let partition = sample_partition(64, 40 + partition_id * 7, DIMENSION);
+        // Row ids that name their own partition. `sample_partition` is a pure
+        // function of its arguments, so without this every partition holds the
+        // same row ids and the same vectors at the same offsets - and the middle
+        // slice below would read the same bytes out of any of the three files.
+        let (graph, vectors) = sample_partition(64, 40 + partition_id * 7, DIMENSION).into_parts();
+        let adjacency = (0..graph.len())
+            .map(|vertex| graph.neighbors(vertex as u32).unwrap().to_vec())
+            .collect::<Vec<_>>();
+        let row_ids = graph
+            .row_ids()
+            .iter()
+            .map(|row_id| row_id + ((partition_id as u64) << 32))
+            .collect::<Vec<_>>();
+        let partition = lance_vamana::partition::Partition::try_new(
+            lance_vamana::partition::PartitionGraph::try_new(
+                graph.max_degree(),
+                row_ids,
+                adjacency,
+            )
+            .unwrap(),
+            vectors,
+        )
+        .unwrap();
         lance_vamana::io::write_partition(&store, &path, &partition)
             .await
             .unwrap();

@@ -331,9 +331,16 @@ impl VamanaIndex {
             // and never touches the segment's own files. An in-place column
             // update removes the rewritten fragments from the bitmap while the
             // fragment ids and every row address survive, so the fragments are
-            // all still live and the vectors stored here are all stale. A pure
-            // row rewrite goes the other way and credits us with a fragment we
-            // never read. Equality catches both; a subset test catches neither.
+            // all still live and the vectors stored here are all stale.
+            //
+            // Equality rather than a subset test, so that coverage which has
+            // *grown* is refused too. Lance widens a bitmap in
+            // `register_pure_rewrite_rows_update_frags_in_indices` and in the
+            // pruning path of a deferred commit; the first is gated on stable row
+            // ids, which the builder refuses outright, so today only the second
+            // can produce it - but a bitmap naming a fragment this segment never
+            // read is unanswerable either way, and which upstream path widened it
+            // is not something a reader can tell.
             let built_over = manifest
                 .metadata()
                 .fragments
