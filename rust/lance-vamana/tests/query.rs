@@ -712,6 +712,37 @@ async fn an_index_whose_vectors_an_overlay_replaced_is_refused() {
     );
 }
 
+/// A shallow clone inherits every index by reference, stamping a base id onto it
+/// so the files resolve against the *source* dataset's root. This driver computes
+/// the directory itself, from the clone's root, because the helpers that resolve
+/// a base id are `pub(crate)` - so it would read a path that does not exist while
+/// the recorded file sizes still described the real ones.
+#[tokio::test]
+async fn an_index_inherited_by_a_shallow_clone_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_dataset(uri, &small_fixture()).await;
+
+    let clone_dir = tempfile::tempdir().unwrap();
+    let clone_uri = clone_dir.path().to_str().unwrap();
+    let version = dataset.version().version;
+    let clone = dataset
+        .shallow_clone(clone_uri, version, None)
+        .await
+        .unwrap();
+
+    let inherited = clone.load_indices_by_name(INDEX_NAME).await.unwrap();
+    assert!(
+        inherited[0].base_id.is_some(),
+        "the clone did not stamp a base id, so this test is not exercising one"
+    );
+
+    let error = VamanaIndex::open(&clone, INDEX_NAME)
+        .await
+        .expect_err("an index whose files live under another dataset's root must not open");
+    assert!(error.to_string().contains("base path"), "{error}");
+}
+
 /// The other side of the version gate: an overlay committed *before* the index
 /// was built is already in the vectors the segment holds, because the build read
 /// the column through the ordinary scanner. Refusing here would make the index

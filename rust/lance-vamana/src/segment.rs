@@ -12,7 +12,8 @@ use lance_core::{Error, Result};
 use lance_index::vector::ivf::storage::IvfModel;
 
 use crate::format::{
-    FILE_COLUMN, IndexMetadata, MEDOID_COLUMN, NUM_ROWS_COLUMN, PARTITION_ID_COLUMN, index_schema,
+    FILE_COLUMN, FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, MAX_PARTITION_ROWS, MEDOID_COLUMN,
+    NUM_ROWS_COLUMN, PARTITION_ID_COLUMN, index_schema,
 };
 
 /// One non-empty partition of a segment.
@@ -51,6 +52,37 @@ impl SegmentManifest {
         ivf: IvfModel,
         partitions: Vec<PartitionEntry>,
     ) -> Result<Self> {
+        // The metadata is checked as well as the table, and on the way out as
+        // well as in: `SegmentWriter` is public, so without this a caller could
+        // write an `index.idx` whose JSON declares one format version while the
+        // dataset manifest records another - two records of one number, kept
+        // apart on purpose, made to disagree at the source.
+        if metadata.format_version != FORMAT_VERSION {
+            return Err(Error::invalid_input(format!(
+                "Vamana segment declares format version {} but this build reads and writes \
+                 version {FORMAT_VERSION}",
+                metadata.format_version
+            )));
+        }
+        if metadata.max_degree == 0 {
+            return Err(Error::invalid_input(
+                "Vamana segment declares max_degree 0, so its vertices could hold no edges"
+                    .to_string(),
+            ));
+        }
+        // Not a formality: a centroid tensor of zero width passes
+        // `validate_ivf_model`, which checks offsets, lengths and data type but
+        // never the shape, and then matches a zero `dimension` here because
+        // `0 == 0`. A query of zero length would clear the dimension guard and
+        // reach `l2_distance_batch(&[], &[], 0)`, whose `to.len() % dimension`
+        // divides by zero and takes the process down.
+        if metadata.dimension == 0 {
+            return Err(Error::invalid_input(
+                "Vamana segment declares dimension 0, which no query could be measured against"
+                    .to_string(),
+            ));
+        }
+
         // Lance packs every partition into one file, so its own `IvfModel`
         // doubles as a row-count table. Ours does not: the partition table is
         // the only record of what a partition holds, and a model arriving with
@@ -108,7 +140,17 @@ impl SegmentManifest {
                     entry.partition_id, entry.medoid, entry.num_rows
                 )));
             }
-            if entry.file.is_empty() || entry.file.contains('/') {
+            // `NO_NEIGHBOR` takes the top local id, so a partition that claimed
+            // every id would have a vertex whose id reads back as padding. The
+            // partition file is checked against this count on read, so refusing
+            // the claim here is what keeps that check meaningful.
+            if entry.num_rows > MAX_PARTITION_ROWS {
+                return Err(Error::invalid_input(format!(
+                    "Vamana partition {} claims {} rows, exceeding the addressable maximum {}",
+                    entry.partition_id, entry.num_rows, MAX_PARTITION_ROWS
+                )));
+            }
+            if !is_plain_file_name(&entry.file) {
                 return Err(Error::invalid_input(format!(
                     "Vamana partition {} names file {:?}, which is not a plain file name",
                     entry.partition_id, entry.file
@@ -224,6 +266,27 @@ impl SegmentManifest {
             .collect();
         Self::try_new(metadata, ivf, partitions)
     }
+}
+
+/// A name a segment may give one of its partition files.
+///
+/// An allow-list rather than a list of things to reject. The name is joined onto
+/// the segment directory and handed to the object store, so the question is not
+/// "does it contain a slash" - `..`, `.`, a NUL byte and percent-escapes all
+/// answer no while still being something other than a file of this segment.
+/// Today the join is made safe by `object_store::path::PathPart` sanitising each
+/// segment, which is an implementation detail of a dependency and pins nothing.
+///
+/// [`INDEX_FILE_NAME`] is excluded because it is the segment's own manifest: a
+/// partition claiming it would have the reader open the table as a graph.
+fn is_plain_file_name(name: &str) -> bool {
+    name != INDEX_FILE_NAME
+        && !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 fn missing_column(name: &str) -> Error {
@@ -354,14 +417,6 @@ mod tests {
     }
 
     #[test]
-    fn a_file_name_that_escapes_the_segment_is_rejected() {
-        let mut broken = entry(0, 4);
-        broken.file = "../other/part_00000.idx".to_string();
-        let error = SegmentManifest::try_new(metadata(4), ivf(8, 4), vec![broken]).unwrap_err();
-        assert!(error.to_string().contains("plain file name"), "{error}");
-    }
-
-    #[test]
     fn a_partition_beyond_the_ivf_model_is_rejected() {
         let error =
             SegmentManifest::try_new(metadata(4), ivf(8, 4), vec![entry(8, 3)]).unwrap_err();
@@ -436,6 +491,89 @@ mod tests {
                 "{column}: {error}"
             );
         }
+    }
+
+    /// The metadata is the other half of what a segment says about itself, and
+    /// `SegmentWriter` will write whatever it is handed. A zero dimension is the
+    /// one that costs a crash rather than a wrong answer: a zero-width centroid
+    /// tensor clears every cross-check by matching it, and the query that
+    /// follows divides by it.
+    #[test]
+    fn segment_metadata_that_describes_nothing_is_rejected() {
+        // Each expectation is a phrase only the guard under test produces. A
+        // zero dimension also trips the centroid cross-check one line below, and
+        // its message says "dimension 0" too - so matching on that would pass
+        // with the guard removed.
+        for (metadata, expected) in [
+            (
+                IndexMetadata {
+                    format_version: FORMAT_VERSION + 1,
+                    ..metadata(4)
+                },
+                "this build reads and writes",
+            ),
+            (
+                IndexMetadata {
+                    max_degree: 0,
+                    ..metadata(4)
+                },
+                "vertices could hold no edges",
+            ),
+            (
+                IndexMetadata {
+                    dimension: 0,
+                    ..metadata(4)
+                },
+                "no query could be measured against",
+            ),
+        ] {
+            let error =
+                SegmentManifest::try_new(metadata, ivf(8, 4), vec![entry(0, 4)]).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    /// The file name is joined onto the segment directory and handed to the
+    /// object store, so "no slash" is not the question. Every name here reaches
+    /// something other than a file of this segment - including `index.idx`,
+    /// which would have the reader open the partition table as a graph.
+    #[test]
+    fn a_file_name_that_is_not_a_plain_name_is_rejected() {
+        for name in [
+            "..",
+            ".",
+            "",
+            "%2E%2E",
+            "a/b",
+            "a\\b",
+            "a\0b",
+            INDEX_FILE_NAME,
+        ] {
+            let mut broken = entry(0, 4);
+            broken.file = name.to_string();
+            let error = SegmentManifest::try_new(metadata(4), ivf(8, 4), vec![broken]).unwrap_err();
+            assert!(
+                error.to_string().contains("plain file name"),
+                "{name:?} was accepted: {error}"
+            );
+        }
+        for name in ["part_00000.idx", "p-1_2.bin"] {
+            let mut entry = entry(0, 4);
+            entry.file = name.to_string();
+            SegmentManifest::try_new(metadata(4), ivf(8, 4), vec![entry])
+                .unwrap_or_else(|error| panic!("{name:?} was refused: {error}"));
+        }
+    }
+
+    /// `NO_NEIGHBOR` owns the top local id, so a partition of `u32::MAX` rows
+    /// would have a vertex whose id reads back as padding.
+    #[test]
+    fn a_partition_claiming_more_rows_than_are_addressable_is_rejected() {
+        let mut broken = entry(0, 4);
+        broken.num_rows = u32::MAX;
+        let error = SegmentManifest::try_new(metadata(4), ivf(8, 4), vec![broken]).unwrap_err();
+        assert!(error.to_string().contains("addressable maximum"), "{error}");
     }
 
     #[test]

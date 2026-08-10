@@ -256,6 +256,21 @@ impl VamanaIndex {
                     declared.len() - still_live.len()
                 )));
             }
+            // A base id says the segment's files live under some other dataset's
+            // root, which a shallow clone stamps onto every index it inherits.
+            // Resolving one needs `Dataset::indice_files_dir` and
+            // `object_store_for_index`, both `pub(crate)`, so the directory
+            // computed below would be the wrong one - while `files` would still
+            // report the right sizes, making the mismatch look like corruption
+            // rather than a path this build cannot follow.
+            if index.base_id.is_some() {
+                return Err(Error::not_supported(format!(
+                    "index '{index_name}' segment {} was inherited from another dataset and its \
+                     files live under a base path this crate cannot resolve; rebuild the index in \
+                     this dataset",
+                    index.uuid
+                )));
+            }
             let dir = dataset.indices_dir().join(index.uuid.to_string());
             let file_sizes = index
                 .files
