@@ -17,7 +17,7 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt64Type};
 use arrow_array::{
-    FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
     UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
@@ -1485,68 +1485,250 @@ async fn probing_past_the_end_of_the_table_is_clamped() {
     );
 }
 
+/// Every row of the dataset, with the address it lives at.
+async fn rows_with_vectors(dataset: &Dataset) -> (Vec<u64>, FixedSizeListArray) {
+    let mut scanner = dataset.scan();
+    scanner.project(&[VECTOR_COLUMN]).unwrap().with_row_id();
+    let batch = scanner.try_into_batch().await.unwrap();
+    (
+        batch[lance_core::ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec(),
+        batch[VECTOR_COLUMN].as_fixed_size_list().clone(),
+    )
+}
+
+/// The rows at `positions`, as a column of their own.
+fn gather_rows(vectors: &FixedSizeListArray, positions: &[usize]) -> FixedSizeListArray {
+    FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        positions
+            .iter()
+            .map(|row| {
+                Some(
+                    vectors
+                        .value(*row)
+                        .as_primitive::<Float32Type>()
+                        .values()
+                        .iter()
+                        .map(|value| Some(*value))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        VECTOR_DIM,
+    )
+}
+
 /// An empty partition has no row in the segment table and no file of its own,
-/// but routing can still name it. Stepping over it is the normal case.
+/// but routing can still name it. Stepping over it is the normal case, and it
+/// must not cost the probe budget either.
 ///
-/// Forced rather than hoped for: 256 rows drawn from 8 distinct vectors cannot
-/// fill 64 centroids, and the test says so if the fixture stops producing any.
+/// The segment is written by hand rather than built. `create_index` can only be
+/// made to leave a partition empty by handing k-means more centroids than there
+/// are distinct vectors, and that fixture pays for it twice: the empty clusters
+/// are split by an **OS-seeded** RNG, so the build is the one thing in this
+/// suite that does not reproduce, and every partition becomes a bag of exact
+/// duplicates, so no assertion can tell which *vertex* came back.
 #[tokio::test]
 async fn a_probed_partition_that_holds_nothing_is_skipped() {
-    const MANY: u32 = 64;
+    const CENTROIDS: u32 = 4;
+    const POPULATED: [u32; 2] = [1, 3];
+    const BEAM_OVER_PARTITION: usize = 64;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut dataset = DatasetFixture {
         fragments: 2,
-        rows_per_fragment: 128,
-        distinct_vectors: Some(8),
+        rows_per_fragment: 64,
         ..Default::default()
     }
     .write(uri)
     .await;
-    create_index(
-        &mut dataset,
-        INDEX_NAME,
-        &IndexParams::new(VECTOR_COLUMN, MANY).with_graph_params(BuildParams {
-            max_degree: 16,
-            search_list_size: 64,
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
+    let (row_ids, vectors) = rows_with_vectors(&dataset).await;
 
-    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
-    let result = index
-        .search(
-            &random_vectors(1, 5)[0],
-            &SearchParams::new(K)
-                .with_nprobes(MANY as usize)
-                .with_search_list_size(BEAM),
+    // The two populated centroids differ from each other in one coordinate only,
+    // so "which centroid is nearest" and "which side of 0.5 the first coordinate
+    // falls on" are the same question - the split the segment is written to is
+    // the split routing will make. The other two sit far outside a dataset drawn
+    // from the unit cube, so nothing is ever assigned to them and no ordinary
+    // query routes to them first.
+    let mut centroid_values = vec![0.0f32; CENTROIDS as usize * VECTOR_DIM as usize];
+    let dimension = VECTOR_DIM as usize;
+    centroid_values[..dimension].fill(5.0);
+    centroid_values[dimension..2 * dimension].fill(0.5);
+    centroid_values[dimension] = 0.25;
+    centroid_values[2 * dimension..3 * dimension].fill(-5.0);
+    centroid_values[3 * dimension..].fill(0.5);
+    centroid_values[3 * dimension] = 0.75;
+    let centroids =
+        <FixedSizeListArray as lance_arrow::FixedSizeListArrayExt>::try_new_from_values(
+            Float32Array::from(centroid_values),
+            VECTOR_DIM,
+        )
+        .unwrap();
+
+    let mut members: HashMap<u32, Vec<usize>> = HashMap::new();
+    for row in 0..vectors.len() {
+        let first = vectors.value(row).as_primitive::<Float32Type>().value(0);
+        let partition = if first < 0.5 {
+            POPULATED[0]
+        } else {
+            POPULATED[1]
+        };
+        members.entry(partition).or_default().push(row);
+    }
+    for partition in POPULATED {
+        assert!(
+            members[&partition].len() >= K,
+            "partition {partition} holds too few rows to answer a k of {K}"
+        );
+    }
+
+    let covered = (0..dataset.get_fragments().len() as u32).collect::<Vec<_>>();
+    let uuid = Uuid::new_v4();
+    let store = dataset.object_store(None).await.unwrap();
+    let segment_dir = dataset.indices_dir().join(uuid.to_string());
+    let mut writer = SegmentWriter::new(
+        store,
+        segment_dir,
+        IndexMetadata {
+            format_version: FORMAT_VERSION,
+            max_degree: 16,
+            alpha: 1.2,
+            dimension: VECTOR_DIM as u32,
+            distance_type: DistanceType::L2,
+            row_id_mode: RowIdMode::Address,
+            fragments: covered.clone(),
+        },
+        lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
+    );
+    // Ascending, because the writer refuses a partition id below the last one it
+    // wrote - the segment table is what a probe is looked up in.
+    for partition in POPULATED {
+        let positions = &members[&partition];
+        let taken = gather_rows(&vectors, positions);
+        let member_row_ids = positions
+            .iter()
+            .map(|row| row_ids[*row])
+            .collect::<Vec<_>>();
+        let store =
+            lance_vamana::search::flat_storage(&member_row_ids, &taken, DistanceType::L2).unwrap();
+        let built = lance_vamana::build::build_partition(
+            &store,
+            &BuildParams {
+                max_degree: 16,
+                search_list_size: BEAM_OVER_PARTITION,
+                ..Default::default()
+            },
+            &lance_vamana::search::Comparisons::default(),
+        )
+        .unwrap();
+        let graph = lance_vamana::partition::Partition::try_new(built.graph, taken).unwrap();
+        writer
+            .write_partition(partition, built.medoid, &graph)
+            .await
+            .unwrap();
+    }
+    writer.finish().await.unwrap();
+
+    let details = prost_types::Any {
+        type_url: INDEX_DETAILS_TYPE_URL.to_string(),
+        value: Vec::new(),
+    };
+    dataset
+        .commit_existing_index_segments(
+            INDEX_NAME,
+            VECTOR_COLUMN,
+            vec![IndexSegment::new(
+                uuid,
+                covered,
+                [dataset.schema().field(VECTOR_COLUMN).unwrap().id],
+                Arc::new(details),
+                FORMAT_VERSION as i32,
+                dataset.manifest.version,
+            )],
         )
         .await
         .unwrap();
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
-    assert!(
-        result.partitions_read < MANY as usize,
-        "every partition holds rows, so this test proves nothing about skipping"
+    // Asking for every centroid reads the two that hold something. The index
+    // still covers the whole dataset, so the answer is the exhaustive one.
+    let query = random_vectors(1, 5)[0].clone();
+    let result = index
+        .search(
+            &query,
+            &SearchParams::new(K)
+                .with_nprobes(CENTROIDS as usize)
+                .with_search_list_size(BEAM_OVER_PARTITION),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.partitions_read,
+        POPULATED.len(),
+        "an empty partition was read, or a populated one was not"
     );
-    assert_eq!(result.neighbors.len(), K);
+    let found = result
+        .neighbors
+        .iter()
+        .map(|neighbor| neighbor.row_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recall(&found, &brute_force(&dataset, &query, K).await),
+        1.0,
+        "stepping over the empty partitions cost part of the answer"
+    );
 
-    // The populated partition ids are sparse here, so a lookup that used a
-    // partition's *position* in the table instead of its id would open somebody
-    // else's file and never notice. With one probe the answer has to be exact:
-    // the routed partition holds the query's nearest vector, and no other does.
-    let single = SearchParams::new(1)
-        .with_nprobes(1)
-        .with_search_list_size(BEAM);
-    for query in random_vectors(8, 31) {
-        let found = index.search(&query, &single).await.unwrap();
-        let exact = brute_force_best_distance(&dataset, &query).await;
-        assert!(
-            (found.neighbors[0].distance - exact).abs() < 1e-4,
-            "one probe returned {} where the nearest vector is at {exact}",
-            found.neighbors[0].distance
-        );
+    // A centroid with nothing behind it must not spend the probe budget: this
+    // query is nearest to one, and one probe still has to reach a partition
+    // that holds rows.
+    let onto_empty = vec![5.0f32; dimension];
+    let result = index
+        .search(
+            &onto_empty,
+            &SearchParams::new(K)
+                .with_nprobes(1)
+                .with_search_list_size(BEAM_OVER_PARTITION),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.partitions_read, 1);
+    assert_eq!(
+        result.neighbors.len(),
+        K,
+        "the probe was spent on a centroid that holds nothing"
+    );
+
+    // The populated ids are sparse, so a lookup that used a partition's
+    // *position* in the table instead of its id would open somebody else's file
+    // and answer from it. Each single probe is checked against the rows that
+    // partition actually holds, which is what makes the swap visible.
+    for (partition, first) in POPULATED.into_iter().zip([0.1f32, 0.9]) {
+        let mut query = vec![0.5f32; dimension];
+        query[0] = first;
+        let result = index
+            .search(
+                &query,
+                &SearchParams::new(K)
+                    .with_nprobes(1)
+                    .with_search_list_size(BEAM_OVER_PARTITION),
+            )
+            .await
+            .unwrap();
+        let held = members[&partition]
+            .iter()
+            .map(|row| row_ids[*row])
+            .collect::<HashSet<_>>();
+        assert_eq!(result.neighbors.len(), K);
+        for neighbor in &result.neighbors {
+            assert!(
+                held.contains(&neighbor.row_id),
+                "a probe routed to partition {partition} answered with row {}, which lives \
+                 somewhere else",
+                neighbor.row_id
+            );
+        }
     }
 }

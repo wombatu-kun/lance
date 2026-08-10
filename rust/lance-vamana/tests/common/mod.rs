@@ -72,9 +72,6 @@ pub struct DatasetFixture {
     pub stable_row_ids: bool,
     /// Make every n-th vector null, to exercise the skip path.
     pub null_every: Option<usize>,
-    /// Draw the vectors from this many distinct values instead of all-distinct.
-    /// A handful of values with many centroids leaves most partitions empty.
-    pub distinct_vectors: Option<usize>,
     pub seed: u64,
 }
 
@@ -85,7 +82,6 @@ impl Default for DatasetFixture {
             rows_per_fragment: 512,
             stable_row_ids: false,
             null_every: None,
-            distinct_vectors: None,
             seed: 11,
         }
     }
@@ -122,7 +118,7 @@ impl DatasetFixture {
         )]));
 
         let mut rng = SmallRng::seed_from_u64(self.seed);
-        let pool = (0..self.distinct_vectors.unwrap_or(self.rows()))
+        let pool = (0..self.rows())
             .map(|_| {
                 (0..VECTOR_DIM)
                     .map(|_| Some(rng.random::<f32>()))
@@ -133,7 +129,7 @@ impl DatasetFixture {
             (0..self.rows())
                 .map(|row| match self.null_every {
                     Some(every) if row % every == 0 => None,
-                    _ => Some(pool[row % pool.len()].clone()),
+                    _ => Some(pool[row].clone()),
                 })
                 .collect::<Vec<_>>(),
             VECTOR_DIM,
