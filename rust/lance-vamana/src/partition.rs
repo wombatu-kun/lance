@@ -61,28 +61,9 @@ impl PartitionGraph {
         let width = max_degree as usize;
         let mut neighbors = vec![NO_NEIGHBOR; num_rows * width];
         for (local_id, out_edges) in adjacency.iter().enumerate() {
-            if out_edges.len() > width {
-                return Err(Error::invalid_input(format!(
-                    "Vamana vertex {local_id} has degree {} which exceeds max_degree {max_degree}",
-                    out_edges.len()
-                )));
-            }
-            for (slot, neighbor) in out_edges.iter().enumerate() {
-                if *neighbor as usize >= num_rows {
-                    return Err(Error::invalid_input(format!(
-                        "Vamana vertex {local_id} points at local id {neighbor}, \
-                         but the partition holds only {num_rows} vertices"
-                    )));
-                }
-                // `set_neighbors` refuses these, so this constructor has to as
-                // well; otherwise the two ways of building a graph disagree.
-                if *neighbor as usize == local_id {
-                    return Err(Error::invalid_input(format!(
-                        "Vamana vertex {local_id} points at itself"
-                    )));
-                }
-                neighbors[local_id * width + slot] = *neighbor;
-            }
+            check_adjacency(local_id as u32, out_edges, num_rows, max_degree)?;
+            neighbors[local_id * width..local_id * width + out_edges.len()]
+                .copy_from_slice(out_edges);
         }
 
         Ok(Self {
@@ -139,34 +120,7 @@ impl PartitionGraph {
                 "Vamana vertex {local_id} is outside a partition of {num_rows} vertices"
             )));
         }
-        if neighbors.len() > self.max_degree as usize {
-            return Err(Error::invalid_input(format!(
-                "Vamana vertex {local_id} was given degree {} which exceeds max_degree {}",
-                neighbors.len(),
-                self.max_degree
-            )));
-        }
-        for neighbor in neighbors {
-            if *neighbor as usize >= num_rows {
-                return Err(Error::invalid_input(format!(
-                    "Vamana vertex {local_id} points at local id {neighbor}, \
-                     but the partition holds only {num_rows} vertices"
-                )));
-            }
-            if *neighbor == local_id {
-                return Err(Error::invalid_input(format!(
-                    "Vamana vertex {local_id} points at itself"
-                )));
-            }
-        }
-        debug_assert!(
-            {
-                let mut sorted = neighbors.to_vec();
-                sorted.sort_unstable();
-                sorted.windows(2).all(|pair| pair[0] != pair[1])
-            },
-            "vertex {local_id} was given a duplicate out-edge: {neighbors:?}"
-        );
+        check_adjacency(local_id, neighbors, num_rows, self.max_degree)?;
 
         let width = self.max_degree as usize;
         let start = local_id as usize * width;
@@ -180,6 +134,47 @@ impl PartitionGraph {
         let start = local_id as usize * width;
         &self.neighbors[start..start + width]
     }
+}
+
+/// What one vertex's trimmed out-edge list must satisfy, for every constructor.
+///
+/// Shared so that the two ways of building a graph cannot disagree: whichever
+/// one a caller reaches, an edge that leaves the partition, points at its own
+/// vertex or repeats is refused.
+fn check_adjacency(
+    local_id: u32,
+    neighbors: &[u32],
+    num_rows: usize,
+    max_degree: u32,
+) -> Result<()> {
+    if neighbors.len() > max_degree as usize {
+        return Err(Error::invalid_input(format!(
+            "Vamana vertex {local_id} has degree {} which exceeds max_degree {max_degree}",
+            neighbors.len()
+        )));
+    }
+    for (position, neighbor) in neighbors.iter().enumerate() {
+        if *neighbor as usize >= num_rows {
+            return Err(Error::invalid_input(format!(
+                "Vamana vertex {local_id} points at local id {neighbor}, \
+                 but the partition holds only {num_rows} vertices"
+            )));
+        }
+        if *neighbor == local_id {
+            return Err(Error::invalid_input(format!(
+                "Vamana vertex {local_id} points at itself"
+            )));
+        }
+        // Quadratic rather than sorted: `max_degree` is tens of slots, and this
+        // runs beside a prune that spends `pool * max_degree` distances on the
+        // same vertex, so the scan is free where the sort's allocation is not.
+        if neighbors[..position].contains(neighbor) {
+            return Err(Error::invalid_input(format!(
+                "Vamana vertex {local_id} has a duplicate out-edge {neighbor}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// One partition exactly as it is stored: the graph plus the vectors it walks.
@@ -316,14 +311,25 @@ impl Partition {
 }
 
 fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
-    let row_ids = batch
-        .column_by_name(ROW_ID_COLUMN)
-        .ok_or_else(|| {
-            Error::corrupt_file_named(
-                ROW_ID_COLUMN,
-                "Vamana partition file is missing the row id column".to_string(),
-            )
-        })?
+    let column = batch.column_by_name(ROW_ID_COLUMN).ok_or_else(|| {
+        Error::corrupt_file_named(
+            ROW_ID_COLUMN,
+            "Vamana partition file is missing the row id column".to_string(),
+        )
+    })?;
+    // `values()` reads through the null mask, and this is the one column of a
+    // partition file that reaches the caller's answer: a null slot would come
+    // back as row address 0, a real live row of fragment 0, indistinguishable
+    // from a correct answer. The segment table guards its own columns the same
+    // way, and the file's schema is never checked against `partition_schema`,
+    // so declaring the field non-nullable on write buys nothing here.
+    if column.null_count() != 0 {
+        return Err(Error::corrupt_file_named(
+            ROW_ID_COLUMN,
+            format!("Vamana partition column {ROW_ID_COLUMN} holds nulls"),
+        ));
+    }
+    let row_ids = column
         .as_primitive_opt::<UInt64Type>()
         .ok_or_else(|| {
             Error::corrupt_file_named(ROW_ID_COLUMN, "Vamana row id column is not UInt64")
@@ -383,6 +389,19 @@ fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
     // a partition file panics the process instead of being reported.
     let num_rows = row_ids.len();
     let width = max_degree as usize;
+    // `NO_NEIGHBOR` is the top id, so a partition that reached it would have a
+    // vertex whose id reads back as padding. Unreachable through this crate's
+    // own writer - the segment table counts rows in a `u32` and is checked
+    // against this file - but `try_from_batch` is public and takes a batch.
+    if num_rows as u64 > MAX_PARTITION_ROWS as u64 {
+        return Err(Error::corrupt_file_named(
+            ROW_ID_COLUMN,
+            format!(
+                "Vamana partition file holds {num_rows} rows, exceeding the addressable \
+                 maximum {MAX_PARTITION_ROWS}"
+            ),
+        ));
+    }
     // Arrow already guarantees `values.len() == len * size`, but the slicing
     // below is what keeps the search in bounds, so it is checked rather than
     // assumed.
@@ -402,18 +421,47 @@ fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
             ),
         ));
     }
-    for (slot, neighbor) in slots.iter().enumerate() {
-        if *neighbor != NO_NEIGHBOR && *neighbor as usize >= num_rows {
-            return Err(Error::corrupt_file_named(
-                NEIGHBORS_COLUMN,
-                format!(
-                    "Vamana vertex {} points at local id {neighbor}, but the partition holds \
-                     only {num_rows} vertices",
-                    slot / width
-                ),
-            ));
+    for (local_id, out_edges) in slots.chunks_exact(width).enumerate() {
+        let mut padded = false;
+        for neighbor in out_edges {
+            if *neighbor == NO_NEIGHBOR {
+                padded = true;
+                continue;
+            }
+            // The padding is a suffix, because a vertex's degree is the index of
+            // its first sentinel. An id sitting after one is not read at all:
+            // the vertex silently becomes a dead end, and a dead-end medoid
+            // reduces its whole partition to a single answer.
+            if padded {
+                return Err(Error::corrupt_file_named(
+                    NEIGHBORS_COLUMN,
+                    format!(
+                        "Vamana vertex {local_id} holds neighbour {neighbor} after its padding, \
+                         so its degree cannot be read"
+                    ),
+                ));
+            }
+            if *neighbor as usize >= num_rows {
+                return Err(Error::corrupt_file_named(
+                    NEIGHBORS_COLUMN,
+                    format!(
+                        "Vamana vertex {local_id} points at local id {neighbor}, but the \
+                         partition holds only {num_rows} vertices"
+                    ),
+                ));
+            }
+            if *neighbor as usize == local_id {
+                return Err(Error::corrupt_file_named(
+                    NEIGHBORS_COLUMN,
+                    format!("Vamana vertex {local_id} points at itself"),
+                ));
+            }
         }
     }
+    // Duplicate out-edges are deliberately not checked here, unlike on the write
+    // path. A repeat is harmless to a walk - `SearchScratch` marks a vertex the
+    // first time and skips the second - while the check would cost
+    // `max_degree^2` per vertex on every partition of every query.
 
     Ok(PartitionGraph {
         max_degree,
@@ -459,6 +507,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{Float32Array, Float64Array};
+    use arrow_schema::Schema as ArrowSchema;
 
     const DIMENSION: i32 = 3;
 
@@ -614,12 +663,91 @@ mod tests {
         assert!(error.to_string().contains("local id 99"), "{error}");
     }
 
-    /// The sentinel is not an id and must stay legal wherever it appears.
+    /// The sentinel is legal, but only as a suffix: a degree is the index of the
+    /// first sentinel, so an id behind one is never read. The vertex becomes a
+    /// silent dead end, and a dead-end medoid answers its whole partition with
+    /// one row.
+    ///
+    /// Vertex 0 holds `[1, 2, pad, pad]`, so blanking its first slot leaves the
+    /// edge to vertex 2 stranded behind the padding; shortening vertex 2's list
+    /// from three edges to two is the same edit made legally.
     #[test]
-    fn padding_read_back_is_not_mistaken_for_an_edge() {
+    fn an_edge_behind_the_padding_is_rejected() {
         let partition = sample_partition(4);
-        let restored = Partition::try_from_batch(&with_slot(&partition, 0, NO_NEIGHBOR)).unwrap();
-        assert_eq!(restored.graph().neighbors(0), &[] as &[u32]);
+        let error = Partition::try_from_batch(&with_slot(&partition, 0, NO_NEIGHBOR)).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("after its padding"), "{error}");
+
+        let restored = Partition::try_from_batch(&with_slot(&partition, 10, NO_NEIGHBOR)).unwrap();
+        assert_eq!(restored.graph().neighbors(2), &[0, 1]);
+    }
+
+    /// `try_new` refuses a self-edge, so the read path has to as well - the two
+    /// constructors describing different graphs is the whole class of bug the
+    /// checks in `graph_from_batch` exist for.
+    #[test]
+    fn a_self_edge_read_back_is_rejected() {
+        let partition = sample_partition(4);
+        let error = Partition::try_from_batch(&with_slot(&partition, 0, 0)).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("points at itself"), "{error}");
+    }
+
+    /// The row id column is the only one that reaches the caller's answer, and
+    /// `values()` reads straight through the null mask. A null slot holds 0,
+    /// which is a perfectly resolvable address - row 0 of fragment 0 - so the
+    /// answer would name a real, live, wrong row.
+    #[test]
+    fn a_null_row_id_read_back_is_rejected() {
+        let partition = sample_partition(4);
+        let batch = partition.to_batch().unwrap();
+        let mut row_ids = batch[ROW_ID_COLUMN]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .map(Some)
+            .collect::<Vec<_>>();
+        row_ids[1] = None;
+        let fields = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == ROW_ID_COLUMN {
+                    Arc::new(Field::new(ROW_ID_COLUMN, DataType::UInt64, true))
+                } else {
+                    field.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let holed = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(fields)),
+            vec![
+                Arc::new(UInt64Array::from(row_ids)),
+                batch.column(1).clone(),
+                batch.column(2).clone(),
+            ],
+        )
+        .unwrap();
+
+        let error = Partition::try_from_batch(&holed).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("holds nulls"), "{error}");
+    }
+
+    /// A repeated out-edge was only a `debug_assert`, so a release build took
+    /// it, and both constructors then reported a degree the walk cannot deliver.
+    #[test]
+    fn duplicate_out_edges_are_rejected() {
+        let error = PartitionGraph::try_new(4, vec![1, 2, 3], vec![vec![2, 2], vec![], vec![]])
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("duplicate out-edge"), "{error}");
+
+        let mut graph = sample_graph(4);
+        let error = graph.set_neighbors(0, &[1, 2, 1]).unwrap_err();
+        assert!(error.to_string().contains("duplicate out-edge"), "{error}");
     }
 
     #[test]
