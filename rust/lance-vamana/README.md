@@ -39,11 +39,14 @@ Measured on a freshly indexed dataset (`a_committed_index_shadows_lances_own_vec
 | `index_statistics(name)` | works | **errors** |
 | plain `scan()` | works | works |
 
-The mechanism: Lance's scanner picks a vector index by field id alone, with no
-type check, so it selects the Vamana segment and then fails to read it as one of
-its own. `optimize_indices` classifies an index as a vector index by the presence
-of `index.idx` - the file name this format is obliged to use - and propagates the
-failure out of the loop over every index.
+The mechanism, in both cases, is that Lance decides what an index *is* from the
+column it sits on rather than from anything the index says about itself. The
+scanner picks a vector index by field id alone, with no type check, so it selects
+the Vamana segment and then fails to read it as one of its own. `optimize_indices`
+groups indices the same way - `index_group_is_scalar` asks
+`is_vector_field(field.data_type())` - and propagates the failure out of the loop
+over every index. Renaming `index.idx` would change neither: the file name
+decides nothing here.
 
 Consequences to plan around:
 
@@ -54,6 +57,19 @@ Consequences to plan around:
   maintenance of unrelated scalar indices - will fail while a Vamana index
   exists. Drop the index, maintain, rebuild.
 - `use_index(false)` is the escape hatch for Lance-side vector queries.
+
+A fourth path is broken for a different reason, and it is the only one that
+breaks **writing**. When the manifest a commit starts from predates Lance 0.8.15
+- whose fragment bitmaps could be wrong - or records no writer at all,
+`migrate_indices` recalculates every index's fragment coverage, and it does that
+by *opening* the index. Lance cannot open this format, so the commit fails
+outright. `build_index_segment` therefore refuses such a dataset up front rather
+than after the graph has been built, and names the remedy: one commit by any
+current Lance build rewrites the manifest with a current writer version, and the
+recalculation is gated on the manifest rather than on the age of the data.
+Pinned by `a_dataset_older_than_lances_bitmap_fix_is_refused_before_the_build`
+against the checked-in `test_data/v0.8.14` fixture; without the refusal that test
+fails with `Index with id ... does not exist` after a full build.
 
 ## What the query path does not do
 

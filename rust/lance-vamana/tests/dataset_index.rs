@@ -23,6 +23,7 @@ use lance_vamana::builder::{
 use lance_vamana::format::INDEX_FILE_NAME;
 use lance_vamana::io::{open_file, read_partition, read_segment, scan_scheduler};
 use lance_vamana::partition::Partition;
+use lance_vamana::query::VamanaIndex;
 use lance_vamana::segment::SegmentManifest;
 use object_store::path::Path;
 
@@ -531,4 +532,72 @@ async fn a_committed_index_shadows_lances_own_vector_paths() {
         scanner.try_into_batch().await.unwrap().num_rows(),
         fixture.rows()
     );
+}
+
+/// Copy a checked-in dataset fixture into a temporary directory.
+///
+/// Lance's own `copy_test_data_to_tmp` is `pub(crate)`, so this repeats it. The
+/// only place this crate reaches out of its own directory: a standalone copy
+/// would have to bring `test_data/v0.8.14` along or drop the test with it.
+fn copy_fixture(name: &str) -> tempfile::TempDir {
+    fn copy_dir(source: &std::path::Path, target: &std::path::Path) {
+        std::fs::create_dir_all(target).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test_data")
+        .join(name);
+    let target = tempfile::tempdir().unwrap();
+    copy_dir(&source, target.path());
+    target
+}
+
+/// The fourth Lance path a Vamana index collides with, and the only one that
+/// breaks *writing* rather than reading.
+///
+/// When the manifest a commit starts from was written before Lance 0.8.15, whose
+/// fragment bitmaps could be wrong, `migrate_indices` recalculates the coverage
+/// of every index - by *opening* it, with `?` and no fallback. Lance cannot open
+/// this format, so the commit fails, and it fails only after the whole graph has
+/// been built. This crate refuses up front and names the remedy, which is one
+/// commit by any current build: the check is on the manifest, not on the data.
+#[tokio::test]
+async fn a_dataset_older_than_lances_bitmap_fix_is_refused_before_the_build() {
+    let fixture = copy_fixture("v0.8.14/corrupt_index");
+    let uri = fixture.path().to_str().unwrap();
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    assert!(
+        dataset
+            .manifest()
+            .writer_version
+            .as_ref()
+            .and_then(|writer| writer.lance_lib_version())
+            .is_some_and(|parsed| (parsed.major, parsed.minor, parsed.patch) < (0, 8, 15)),
+        "the fixture is no longer older than the bitmap fix, so this proves nothing"
+    );
+
+    let params = IndexParams::new("vector", 4);
+    let error = create_index(&mut dataset, INDEX_NAME, &params)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("lance 0.8.14"), "{error}");
+
+    // A commit that changes nothing still rewrites the manifest with a current
+    // writer version, which is all the recalculation is gated on.
+    dataset.delete("false").await.unwrap();
+    create_index(&mut dataset, INDEX_NAME, &params)
+        .await
+        .unwrap();
+    VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect("the index built after the manifest was refreshed must open");
 }

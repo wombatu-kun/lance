@@ -190,6 +190,22 @@ pub async fn build_index_segment(
     params: &IndexParams,
     fragments: &[u32],
 ) -> Result<(IndexSegment, BuildStats)> {
+    // Refused before the graph is built rather than discovered on the commit
+    // that follows it: Lance would open this index while committing, and cannot.
+    if writer_predates_bitmap_recalculation(dataset) {
+        return Err(Error::not_supported(format!(
+            "Vamana cannot index a dataset whose manifest was written by {}: Lance recalculates \
+             every index's fragment coverage on the next commit, and it does that by opening the \
+             index, which fails for this format. Commit any change with a current Lance build \
+             first - an append or a compaction rewrites the manifest with a current writer \
+             version - and then build the index",
+            dataset.manifest().writer_version.as_ref().map_or(
+                "no recorded writer".to_string(),
+                |version| format!("{} {}", version.library, version.version)
+            )
+        )));
+    }
+
     let field = dataset.schema().field(&params.column).ok_or_else(|| {
         Error::invalid_input(format!(
             "column '{}' does not exist in the dataset",
@@ -222,6 +238,30 @@ pub async fn build_index_segment(
         ),
         stats,
     ))
+}
+
+/// Whether Lance will recompute every index's fragment coverage on the next
+/// commit of this dataset.
+///
+/// It does that by *opening* each index - `migrate_indices` ->
+/// `open_generic_index`, propagated with `?` and no fallback - so for this
+/// crate's segments the commit fails outright. The condition mirrors Lance's own
+/// `must_recalculate_fragment_bitmap`: a manifest with no recorded writer, or
+/// one written by a Lance older than 0.8.15, whose fragment bitmaps could be
+/// corrupt. A manifest written by any other library is left alone by Lance and
+/// so is left alone here.
+///
+/// The version compared is the one on the manifest the commit *starts from*, so
+/// a single commit by a current Lance build clears it permanently.
+fn writer_predates_bitmap_recalculation(dataset: &Dataset) -> bool {
+    match dataset.manifest().writer_version.as_ref() {
+        None => true,
+        Some(version) if version.library != "lance" => false,
+        // Unparseable counts as old, which is what Lance concludes too.
+        Some(version) => version
+            .lance_lib_version()
+            .is_none_or(|parsed| (parsed.major, parsed.minor, parsed.patch) < (0, 8, 15)),
+    }
 }
 
 /// Build one segment into `dir` without committing it.
