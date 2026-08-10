@@ -24,6 +24,7 @@ lance-file = { path = "../lance-file" }
 lance-index = { path = "../lance-index" }
 lance-io = { path = "../lance-io" }
 lance-linalg = { path = "../lance-linalg" }
+lance-table = { path = "../lance-table" }
 
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"

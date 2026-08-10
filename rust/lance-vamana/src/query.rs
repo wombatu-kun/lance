@@ -33,10 +33,10 @@
 //!
 //! [`VamanaIndex::open`] refuses outright, rather than answering from what is
 //! left, when the fragments have been compacted away, when the dataset has
-//! edited the index's coverage underneath it, when the manifest records a format
-//! version this build does not read, or when the segments disagree about the
-//! vectors they hold. Each refusal names what to do about it, which is always to
-//! rebuild.
+//! edited the index's coverage underneath it, when an overlay has replaced the
+//! indexed values under it, when the manifest records a format version this
+//! build does not read, or when the segments disagree about the vectors they
+//! hold. Each refusal names what to do about it, which is always to rebuild.
 //!
 //! Committing an index also breaks Lance's own vector search on that column -
 //! see the crate README, and the test that pins it.
@@ -48,12 +48,14 @@ use arrow_array::{ArrayRef, Float32Array};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::index::DatasetIndexExt;
+use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_index::vector::storage::VectorStore;
 use lance_io::scheduler::ScanScheduler;
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
+use lance_table::format::overlay::DataOverlayFile;
 use object_store::path::Path;
 use roaring::{RoaringBitmap, RoaringTreemap};
 
@@ -194,11 +196,19 @@ impl VamanaIndex {
             )));
         }
 
-        let live = dataset
-            .get_fragments()
+        let fragments = dataset.get_fragments();
+        let live = fragments
             .iter()
             .map(|fragment| fragment.id() as u32)
             .collect::<RoaringBitmap>();
+        // Overlays are rare, so this is empty on the common path and the check
+        // below costs nothing. Collected once rather than per segment: an index
+        // of forty segments would otherwise walk every fragment forty times.
+        let overlaid = fragments
+            .iter()
+            .filter(|fragment| !fragment.metadata().overlays.is_empty())
+            .map(|fragment| (fragment.id() as u32, fragment.metadata()))
+            .collect::<Vec<_>>();
         let scheduler = scan_scheduler(&dataset.object_store(None).await?);
 
         let mut segments = Vec::with_capacity(indices.len());
@@ -280,6 +290,30 @@ impl VamanaIndex {
                     index.uuid,
                     built_over.len(),
                     declared.len()
+                )));
+            }
+            // The two checks above ask what the *manifest* says about this
+            // segment's coverage. An overlay changes neither: `Operation::
+            // DataOverlay` rewrites fragment metadata and leaves every index
+            // entry alone, so the fragment ids, the bitmap and this segment's
+            // own record of what it read all still agree - while the values at
+            // those addresses have been replaced. Ranking would run on the
+            // pre-overlay vectors and `take_rows` would return the post-overlay
+            // ones, with nothing in the answer to show for it.
+            if let Some((fragment_id, _)) = overlaid.iter().find(|(fragment_id, fragment)| {
+                declared.contains(*fragment_id)
+                    && overlay_supersedes_segment(
+                        &fragment.overlays,
+                        &index.fields,
+                        index.dataset_version,
+                        dataset.schema(),
+                    )
+            }) {
+                return Err(Error::index(format!(
+                    "index '{index_name}' segment {} was built at dataset version {} and fragment \
+                     {fragment_id} has since had its indexed values replaced by an overlay, so the \
+                     vectors it ranks are not the ones the rows now hold; rebuild the index",
+                    index.uuid, index.dataset_version
                 )));
             }
             segments.push(Segment {
@@ -522,6 +556,48 @@ impl VamanaIndex {
     }
 }
 
+/// Whether an overlay has replaced indexed values under a segment built at
+/// `dataset_version`.
+///
+/// Lance answers the same question for its own indices and answers it more
+/// finely: `Scanner::overlay_stale_vector_rows` excludes the affected *rows* and
+/// re-evaluates them on the flat path, so the index stays usable. That machinery
+/// is `pub(crate)` and reaches into the scan plan, which this driver bypasses
+/// entirely, so the question here is the coarse one - is any covered row stale -
+/// and the answer is a refusal. The remedy is the same either way: rebuild.
+///
+/// Both halves of Lance's test are kept. The version gate: an overlay committed
+/// at or before the segment's dataset version is already in the vectors it
+/// holds. The field test in both directions: an overlay of a parent struct
+/// replaces the leaf an index reads, and an overlay of a leaf replaces part of a
+/// parent an index was built over.
+fn overlay_supersedes_segment(
+    overlays: &[DataOverlayFile],
+    indexed_fields: &[i32],
+    dataset_version: u64,
+    schema: &Schema,
+) -> bool {
+    overlays
+        .iter()
+        .filter(|overlay| overlay.committed_version > dataset_version)
+        .any(|overlay| {
+            overlay.data_file.fields.iter().any(|overlaid| {
+                indexed_fields.iter().any(|indexed| {
+                    indexed == overlaid
+                        || descends_from(schema, *overlaid, *indexed)
+                        || descends_from(schema, *indexed, *overlaid)
+                })
+            })
+        })
+}
+
+/// Whether `field` is `ancestor` itself or sits beneath it in `schema`.
+fn descends_from(schema: &Schema, field: i32, ancestor: i32) -> bool {
+    schema
+        .field_ancestry_by_id(field)
+        .is_some_and(|ancestry| ancestry.iter().any(|step| step.id == ancestor))
+}
+
 /// Every walk's candidates as one answer: nearest first, each row once, `k` long.
 ///
 /// Nothing upstream of here guarantees a row appears once. That rests on Lance
@@ -581,6 +657,11 @@ async fn deleted_row_addresses(
 mod tests {
     use super::*;
 
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_file::version::ConcreteFileVersion;
+    use lance_table::format::DataFile;
+    use lance_table::format::overlay::OverlayCoverage;
+
     fn neighbors(pairs: &[(u64, f32)]) -> Vec<Neighbor> {
         pairs
             .iter()
@@ -615,5 +696,80 @@ mod tests {
             3,
         );
         assert_eq!(pairs(&merged), vec![(1, 0.1), (2, 0.4), (3, 0.5)]);
+    }
+
+    /// A struct column with a vector leaf, so field ids exist on both sides of a
+    /// parent/child relationship and the ancestry tests have something to walk.
+    /// Ids are assigned depth first: `id` 0, `emb` 1, `emb.vec` 2, `emb.vec.item` 3.
+    fn nested_schema() -> Schema {
+        let vector = Field::new(
+            "vec",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 4),
+            false,
+        );
+        let arrow = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("emb", DataType::Struct(vec![vector].into()), false),
+        ]);
+        Schema::try_from(&arrow).unwrap()
+    }
+
+    fn overlay(fields: Vec<i32>, committed_version: u64) -> DataOverlayFile {
+        let mut data_file = DataFile::new_unstarted("overlay.lance", ConcreteFileVersion::V2_1);
+        data_file.fields = fields.into();
+        DataOverlayFile {
+            data_file,
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0u32]))),
+            committed_version,
+        }
+    }
+
+    /// The version gate: an overlay committed at or before the segment's dataset
+    /// version is already baked into the vectors the segment stores. Without the
+    /// gate every index built over a previously overlaid column would refuse to
+    /// open.
+    #[test]
+    fn an_overlay_the_build_already_saw_is_not_stale() {
+        let schema = nested_schema();
+        assert!(!overlay_supersedes_segment(
+            &[overlay(vec![2], 7)],
+            &[2],
+            7,
+            &schema
+        ));
+        assert!(overlay_supersedes_segment(
+            &[overlay(vec![2], 8)],
+            &[2],
+            7,
+            &schema
+        ));
+    }
+
+    /// The field test, in both directions and with a negative arm: an overlay of
+    /// the parent struct replaces the leaf this index reads, an overlay of the
+    /// leaf replaces part of a parent it was built over, and an overlay of an
+    /// unrelated column replaces nothing this index ranks by.
+    #[test]
+    fn only_an_overlay_of_the_indexed_field_is_stale() {
+        let schema = nested_schema();
+        let version = 1;
+        for (overlaid, indexed, expected, what) in [
+            (vec![2], 2, true, "the indexed leaf itself"),
+            (vec![1], 2, true, "the parent of the indexed leaf"),
+            (vec![2], 1, true, "a leaf under the indexed parent"),
+            (vec![0], 2, false, "an unrelated column"),
+            (vec![0, 1], 2, true, "an unrelated column and the parent"),
+        ] {
+            assert_eq!(
+                overlay_supersedes_segment(
+                    &[overlay(overlaid, version + 1)],
+                    &[indexed],
+                    version,
+                    &schema
+                ),
+                expected,
+                "{what}"
+            );
+        }
     }
 }

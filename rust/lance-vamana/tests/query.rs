@@ -22,11 +22,19 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
-use lance::dataset::ProjectionRequest;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
-use lance::dataset::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
+use lance::dataset::transaction::{
+    DataOverlayGroup, Operation, UpdateMode, UpdatedFragmentOffsets,
+};
+use lance::dataset::{ProjectionRequest, WriteDestination};
 use lance::index::{DatasetIndexExt, IndexSegment};
+use lance_file::version::ConcreteFileVersion;
+use lance_file::versions::create_writer;
+use lance_file::writer::FileWriterOptions;
+use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::DistanceType;
+use lance_table::format::DataFile;
+use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{
     INDEX_DETAILS_TYPE_URL, IndexParams, build_index_segment, build_segment, create_index,
@@ -34,6 +42,7 @@ use lance_vamana::builder::{
 use lance_vamana::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
 use lance_vamana::io::SegmentWriter;
 use lance_vamana::query::{SearchParams, VamanaIndex};
+use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 mod common;
@@ -574,6 +583,152 @@ async fn an_index_over_a_rewritten_column_is_refused() {
         error.to_string().contains("rewrote data under it"),
         "{error}"
     );
+}
+
+/// Replace one fragment's vectors with an overlay, the way Lance's own overlay
+/// tests do: write a file holding the new values for the indexed field alone,
+/// then commit `Operation::DataOverlay` naming the offsets it covers.
+///
+/// `committed_version` is stamped by the commit, not by this caller, so an
+/// overlay is newer than every index built before it and older than every index
+/// built after it - which is the whole basis of the version gate under test.
+async fn commit_overlay(
+    dataset: Dataset,
+    fragment_id: u64,
+    offsets: &[u32],
+    name: &str,
+) -> Dataset {
+    let read_version = dataset.version().version;
+    let field_id = dataset.schema().field(VECTOR_COLUMN).unwrap().id;
+    let overlay_schema = dataset.schema().project_by_ids(&[field_id], true);
+
+    // A constant vector, so an answer ranked on the pre-overlay values is
+    // distinguishable from one ranked on these.
+    let replacement = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        offsets
+            .iter()
+            .map(|_| Some(vec![Some(9.0f32); VECTOR_DIM as usize]))
+            .collect::<Vec<_>>(),
+        VECTOR_DIM,
+    );
+
+    let file = format!("{name}.lance");
+    let store = dataset.object_store(None).await.unwrap();
+    let mut writer = create_writer(
+        ConcreteFileVersion::V2_1,
+        store
+            .create(&dataset.data_dir().join(file.as_str()))
+            .await
+            .unwrap(),
+        overlay_schema,
+        FileWriterOptions::default(),
+    )
+    .unwrap();
+    writer.write_column(0, Arc::new(replacement)).await.unwrap();
+    let summary = writer.finish().await.unwrap();
+
+    let mut data_file = DataFile::new_unstarted(file, ConcreteFileVersion::V2_1);
+    data_file.fields = writer
+        .field_id_to_column_indices()
+        .iter()
+        .map(|(field_id, _)| *field_id as i32)
+        .collect::<Vec<_>>()
+        .into();
+    data_file.column_indices = writer
+        .field_id_to_column_indices()
+        .iter()
+        .map(|(_, column_index)| *column_index as i32)
+        .collect::<Vec<_>>()
+        .into();
+    data_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
+
+    Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id,
+                overlays: vec![DataOverlayFile {
+                    data_file,
+                    coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter(
+                        offsets.iter().copied(),
+                    ))),
+                    committed_version: 0,
+                }],
+            }],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap()
+}
+
+/// The rewrite that leaves *every* coverage record intact.
+///
+/// `Operation::DataOverlay` touches fragments and never indices: the fragment
+/// ids, the index's `fragment_bitmap` and the segment's own record of what it
+/// read all come through unchanged, so both coverage guards pass while the
+/// values at those addresses have been replaced. Ranking would run on the
+/// pre-overlay vectors and `take_rows` would hand back the post-overlay ones.
+///
+/// Lance keeps its own indices usable here by masking the stale rows per query;
+/// that path is `pub(crate)` and lives in the scanner this driver bypasses.
+#[tokio::test]
+async fn an_index_whose_vectors_an_overlay_replaced_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = indexed_dataset(uri, &small_fixture()).await;
+    VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+
+    let dataset = commit_overlay(dataset, 0, &[0, 1, 2], "stale").await;
+    let index = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+    assert_eq!(
+        index[0].fragment_bitmap.as_ref().map(|b| b.len()),
+        Some(small_fixture().fragments as u64),
+        "the overlay must leave the coverage untouched, or an existing guard \
+         would catch this and the test would prove nothing"
+    );
+    // The guard reads metadata, so the test would pass even if the overlay had
+    // not landed in the data at all. Lance's own scan finding the replacement
+    // vector at distance zero is what makes the refusal necessary rather than
+    // merely triggered.
+    let replacement = vec![9.0f32; VECTOR_DIM as usize];
+    assert_eq!(
+        brute_force_best_distance(&dataset, &replacement).await,
+        0.0,
+        "the overlay never reached the data, so an index answering from the \
+         pre-overlay vectors would still be right and this test proves nothing"
+    );
+
+    let error = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect_err("an index ranking by vectors an overlay replaced must not answer");
+    assert!(
+        error.to_string().contains("replaced by an overlay"),
+        "{error}"
+    );
+}
+
+/// The other side of the version gate: an overlay committed *before* the index
+/// was built is already in the vectors the segment holds, because the build read
+/// the column through the ordinary scanner. Refusing here would make the index
+/// unbuildable on any dataset that had ever been overlaid.
+#[tokio::test]
+async fn an_index_built_over_an_overlay_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = small_fixture().write(uri).await;
+    let mut dataset = commit_overlay(dataset, 0, &[0, 1, 2], "settled").await;
+
+    create_index(&mut dataset, INDEX_NAME, &params())
+        .await
+        .unwrap();
+    VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect("an overlay the build already read is not stale");
 }
 
 async fn live_row_ids(dataset: &Dataset) -> HashSet<u64> {
