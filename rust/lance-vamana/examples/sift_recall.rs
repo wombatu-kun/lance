@@ -339,7 +339,6 @@ fn main() {
         // passes comes off this seed, and its spread is the noise floor any
         // before-and-after comparison of a build has to clear.
         seed: env_usize("SEED", 42) as u64,
-        ..BuildParams::default()
     };
     let building = Comparisons::default();
     let started = Instant::now();

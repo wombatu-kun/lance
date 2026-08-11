@@ -926,7 +926,6 @@ mod tests {
             BuildParams {
                 max_degree: 4,
                 search_list_size: 8,
-                medoid_sample_size: 8,
                 ..Default::default()
             },
         ));

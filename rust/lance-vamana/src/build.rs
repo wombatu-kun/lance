@@ -4,7 +4,11 @@
 //! Building a partition's graph.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::Float32Type;
+use arrow_array::{ArrayRef, Float32Array, RecordBatch};
 use lance_core::{Error, Result};
 use lance_index::vector::graph::{OrderedFloat, OrderedNode};
 use lance_index::vector::storage::{DistCalculator, VectorStore};
@@ -37,9 +41,6 @@ pub struct BuildParams {
     pub search_list_size: usize,
     /// `alpha` for the second pass. The first pass is always `1.0`.
     pub alpha: f32,
-    /// How many vertices the entry point is chosen from. The true medoid costs
-    /// `O(n^2)` distances; a uniform sample of this size costs `O(sample^2)`.
-    pub medoid_sample_size: usize,
     /// Fixed rather than optional so that a build is reproducible by default.
     ///
     /// Lance's own vector index builds are random at half a dozen unseeded
@@ -57,7 +58,6 @@ impl Default for BuildParams {
             max_degree: 64,
             search_list_size: 100,
             alpha: 1.2,
-            medoid_sample_size: 256,
             seed: 42,
         }
     }
@@ -111,11 +111,6 @@ pub fn build_partition<S: VectorStore>(
             "Vamana search list size must be greater than zero".to_string(),
         ));
     }
-    if params.medoid_sample_size == 0 {
-        return Err(Error::invalid_input(
-            "Vamana medoid sample size must be greater than zero".to_string(),
-        ));
-    }
     // Checked here and not left to the second pass: `robust_prune` would reject
     // it, but only after the whole first pass had already run.
     validate_alpha(params.alpha)?;
@@ -129,7 +124,7 @@ pub fn build_partition<S: VectorStore>(
         .collect::<Vec<_>>();
     let mut graph = PartitionGraph::edgeless(params.max_degree, row_ids)?;
     randomize(&mut graph, &mut rng)?;
-    let medoid = medoid(store, params.medoid_sample_size, &mut rng, comparisons)?;
+    let medoid = medoid(store, comparisons)?;
 
     let max_degree = params.max_degree as usize;
     let mut scratch = SearchScratch::new(num_vertices as usize);
@@ -221,73 +216,145 @@ fn randomize(graph: &mut PartitionGraph, rng: &mut SmallRng) -> Result<()> {
     Ok(())
 }
 
-/// The vertex a search should start from: the sampled point most central to the
-/// partition.
+/// The vertex a search should start from: the one nearest the partition's
+/// centroid, which under this crate's metrics is its medoid exactly.
 ///
-/// The true medoid needs every pairwise distance, which no partition can afford
-/// at build time. A uniform sample is scored against itself instead, which is
-/// enough for an entry point: the walk only has to start somewhere unbiased.
+/// The medoid is the point minimising the summed distance to every other point,
+/// and taken literally that is every pairwise distance. It is never computed
+/// that way, because Lance's `L2` is the *squared* euclidean distance and a sum
+/// of squares splits:
 ///
-/// "Central" is also approximate in a second way, and the name overstates it.
-/// Lance's `L2` is the *squared* euclidean distance, so this minimises a sum of
-/// squares and lands on the sampled point nearest the centroid rather than on
-/// the medoid proper - one far outlier pulls it, where the true medoid would not
-/// move. The reference DiskANN implementation does the same thing, and for an
-/// entry point the distinction has never mattered; it is recorded because the
-/// word does not mean what it says.
+/// ```text
+/// sum_j ||x_i - x_j||^2  =  n * ||x_i - c||^2  +  sum_j ||x_j - c||^2
+/// ```
 ///
-/// "Central" holds for the metrics this crate builds under, where the distance
-/// grows with dissimilarity. It does not hold in general, and this function is
-/// public and generic over the store: under Lance's `Dot`, spelled `1 - dot`,
-/// minimising the summed distance maximises the summed inner product, and the
-/// winner is the vector of largest norm - which sits at the edge of the cloud,
-/// not its middle. [`crate::builder::supported_distance_type`] refuses `Dot`
-/// for a related reason.
-pub fn medoid<S: VectorStore>(
-    store: &S,
-    sample_size: usize,
-    rng: &mut SmallRng,
-    comparisons: &Comparisons,
-) -> Result<u32> {
+/// The right-hand term is the same for every `i`, so the vertex minimising the
+/// left-hand side is the vertex nearest the centroid `c`, and the answer costs
+/// `O(n*d)` rather than `O(n^2*d)`. A far outlier moves both sides of that
+/// identity together: it drags the centroid, and it drags the summed distance
+/// with it.
+///
+/// The same holds under `Cosine` for the vectors this crate builds over, because
+/// [`crate::builder`] normalises them first and `1 - dot(x, y)` is
+/// `||x - y||^2 / 2` on unit vectors. It does not hold for un-normalised vectors
+/// under `Cosine`, where this returns the vertex most aligned with the centroid
+/// instead.
+///
+/// It does not hold at all under Lance's `Dot`, spelled `1 - dot`: minimising
+/// the summed distance there maximises the summed inner product, and the winner
+/// is the vector of largest norm - the edge of the cloud, not its middle.
+/// [`crate::builder::supported_distance_type`] refuses `Dot` for a related
+/// reason.
+pub fn medoid<S: VectorStore>(store: &S, comparisons: &Comparisons) -> Result<u32> {
     let num_vertices = addressable_len(store.len())?;
     if num_vertices == 0 {
         return Err(Error::invalid_input(
             "Vamana cannot pick a medoid from an empty partition".to_string(),
         ));
     }
-    if sample_size == 0 {
-        return Err(Error::invalid_input(
-            "Vamana medoid sample size must be greater than zero".to_string(),
-        ));
-    }
-    let sample = if sample_size >= num_vertices as usize {
-        (0..num_vertices).collect::<Vec<_>>()
-    } else {
-        // Drawn rather than shuffled: the default sample is 256 vertices, and
-        // shuffling to take them costs a `u32` per row of the partition and a
-        // swap per row to draw a quarter of a kilobyte. Sorted because a walk
-        // over the vectors in id order reads the storage the way it is laid out.
-        let mut sample = rand::seq::index::sample(rng, num_vertices as usize, sample_size)
-            .into_iter()
-            .map(|drawn| drawn as u32)
-            .collect::<Vec<_>>();
-        sample.sort_unstable();
-        sample
-    };
+    let centroid = centroid(store, num_vertices as usize)?;
+    let from_centroid = store.dist_calculator(Arc::new(centroid) as ArrayRef, 0.0);
+    // The averaging pass above is not charged, only the scan below. It computes
+    // no distances, and counting its `n*d` additions as if it did would move the
+    // build cost this crate publishes for a reason that has nothing to do with
+    // the graph.
+    comparisons.record(num_vertices as u64);
 
-    let mut best = (f32::INFINITY, sample[0]);
-    for candidate in &sample {
-        let from_candidate = store.dist_calculator_from_id(*candidate);
-        comparisons.record(sample.len() as u64);
-        let total = sample
-            .iter()
-            .map(|other| from_candidate.distance(*other))
-            .sum::<f32>();
-        if total < best.0 {
-            best = (total, *candidate);
+    let mut best = (f32::INFINITY, 0);
+    for candidate in 0..num_vertices {
+        let distance = from_centroid.distance(candidate);
+        if distance < best.0 {
+            best = (distance, candidate);
         }
     }
     Ok(best.1)
+}
+
+/// The mean of a store's vectors.
+///
+/// Accumulated in `f64` rather than the `f32` it is made of: a partition holds
+/// up to `MAX_PARTITION_ROWS` vectors, and a naive `f32` sum of a million values
+/// drifts by roughly a millionth of the total - enough to matter to a coordinate
+/// whose spread is smaller than that.
+fn centroid<S: VectorStore>(store: &S, num_vertices: usize) -> Result<Float32Array> {
+    let mut sums: Vec<f64> = Vec::new();
+    let mut counted = 0usize;
+    for batch in store.to_batches()? {
+        let (values, dimension) = vector_column(&batch)?;
+        if dimension == 0 {
+            return Err(Error::invalid_input(
+                "Vamana cannot pick a medoid from vectors of no width".to_string(),
+            ));
+        }
+        if sums.is_empty() {
+            sums = vec![0.0; dimension];
+        } else if sums.len() != dimension {
+            return Err(Error::invalid_input(format!(
+                "Vamana partition mixes vectors of {} and {dimension} dimensions",
+                sums.len()
+            )));
+        }
+        let wanted = batch.num_rows() * dimension;
+        let Some(values) = values.values().get(..wanted) else {
+            return Err(Error::invalid_input(format!(
+                "Vamana partition holds {} values for {} vectors of {dimension} dimensions",
+                values.len(),
+                batch.num_rows()
+            )));
+        };
+        for vector in values.chunks_exact(dimension) {
+            for (sum, value) in sums.iter_mut().zip(vector) {
+                *sum += *value as f64;
+            }
+        }
+        counted += batch.num_rows();
+    }
+    // The store is addressed by local id `0..len` everywhere else, so batches
+    // that do not add up to that length would put the centroid over a different
+    // set of vectors than the scan that follows it.
+    if counted != num_vertices {
+        return Err(Error::invalid_input(format!(
+            "Vamana partition reports {num_vertices} vectors but offers {counted}"
+        )));
+    }
+
+    let scale = 1.0 / counted as f64;
+    Ok(Float32Array::from(
+        sums.iter()
+            .map(|sum| (sum * scale) as f32)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+/// The vectors of one batch of a store, and their width.
+///
+/// Found by type rather than by name because [`medoid`] is generic over the
+/// store, and the column name is the storage implementation's business. The type
+/// is also the check that keeps the centroid honest: a quantized store offers
+/// codes, not vectors, and averaging those would produce a query that
+/// [`VectorStore::dist_calculator`] cannot even accept - it dispatches on the
+/// store's own value type and downcasts the query to it, so a `Float32` centroid
+/// against any other store is a panic inside Arrow.
+fn vector_column(batch: &RecordBatch) -> Result<(&Float32Array, usize)> {
+    let mut columns = batch.columns().iter().filter_map(|column| {
+        let vectors = column.as_fixed_size_list_opt()?;
+        let values = vectors.values().as_primitive_opt::<Float32Type>()?;
+        Some((values, vectors.value_length() as usize))
+    });
+    let Some(found) = columns.next() else {
+        return Err(Error::invalid_input(format!(
+            "Vamana needs a FixedSizeList<Float32> column to average and the store offers {}",
+            batch.schema_ref()
+        )));
+    };
+    if columns.next().is_some() {
+        return Err(Error::invalid_input(format!(
+            "Vamana cannot tell which of several FixedSizeList<Float32> columns holds the \
+             vectors of {}",
+            batch.schema_ref()
+        )));
+    }
+    Ok(found)
 }
 
 /// Refuse a pruning slack the graph, or the manifest, could not survive.
@@ -466,22 +533,39 @@ mod tests {
     /// Deterministic pseudo-random vectors: a fixed multiplicative congruential
     /// sequence, so the cross-check against Lance runs on the same points every
     /// time without pulling in an RNG.
-    fn scattered_storage(num_vertices: usize, dimension: usize) -> FlatFloatStorage {
+    fn scattered_values(count: usize) -> Vec<f32> {
         let mut state = 12345u64;
-        let values = Float32Array::from(
-            (0..num_vertices * dimension)
-                .map(|_| {
-                    state = state
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1442695040888963407);
-                    (state >> 33) as f32 / (1u64 << 31) as f32
-                })
-                .collect::<Vec<_>>(),
-        );
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as f32 / (1u64 << 31) as f32
+            })
+            .collect()
+    }
+
+    fn storage_of(values: Vec<f32>, dimension: usize) -> FlatFloatStorage {
         FlatFloatStorage::new(
-            FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap(),
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension as i32)
+                .unwrap(),
             DistanceType::L2,
         )
+    }
+
+    fn scattered_storage(num_vertices: usize, dimension: usize) -> FlatFloatStorage {
+        storage_of(scattered_values(num_vertices * dimension), dimension)
+    }
+
+    /// The same cloud with one point far outside it, on the diagonal.
+    fn scattered_storage_with_outlier(
+        num_vertices: usize,
+        dimension: usize,
+        coordinate: f32,
+    ) -> FlatFloatStorage {
+        let mut values = scattered_values(num_vertices * dimension);
+        values.extend(std::iter::repeat_n(coordinate, dimension));
+        storage_of(values, dimension)
     }
 
     fn all_candidates(
@@ -702,7 +786,6 @@ mod tests {
             max_degree: 16,
             search_list_size: 32,
             alpha: 1.2,
-            medoid_sample_size: 64,
             seed: 42,
         }
     }
@@ -995,13 +1078,7 @@ mod tests {
     fn the_medoid_of_a_line_is_its_middle() {
         for vertices in [3usize, 11, 64] {
             let storage = line_storage(vertices);
-            let chosen = medoid(
-                &storage,
-                vertices,
-                &mut SmallRng::seed_from_u64(7),
-                &Comparisons::default(),
-            )
-            .unwrap();
+            let chosen = medoid(&storage, &Comparisons::default()).unwrap();
             assert_eq!(
                 chosen as usize,
                 (vertices - 1) / 2,
@@ -1021,14 +1098,46 @@ mod tests {
             DistanceType::L2,
         );
 
-        let chosen = medoid(
-            &storage,
-            100,
-            &mut SmallRng::seed_from_u64(7),
-            &Comparisons::default(),
-        )
-        .unwrap();
+        let chosen = medoid(&storage, &Comparisons::default()).unwrap();
         assert!(chosen < 90, "the entry point landed in the sparse cluster");
+    }
+
+    /// `argmin_i` of the summed distance to every other vertex, by the
+    /// definition of the medoid rather than by any shortcut.
+    fn exhaustive_medoid(storage: &FlatFloatStorage) -> u32 {
+        let summed = |point: u32| {
+            let from = storage.dist_calculator_from_id(point);
+            (0..storage.len() as u32)
+                .map(|other| from.distance(other))
+                .sum::<f32>()
+        };
+        (0..storage.len() as u32)
+            .min_by(|left, right| summed(*left).total_cmp(&summed(*right)))
+            .unwrap()
+    }
+
+    /// The entry point is the vertex nearest the centroid, and the claim that
+    /// makes it the *medoid* is that under a squared metric the two are the same
+    /// vertex. Checked against the definition, on clouds far larger than any
+    /// sample the old implementation would have drawn.
+    ///
+    /// The outlier case is here because the docs used to call it the counter-
+    /// example: a far point was said to drag the centroid where the true medoid
+    /// would not follow. Squared distances do follow, which is why the shortcut
+    /// is exact rather than merely convenient.
+    #[test]
+    fn the_medoid_minimises_the_summed_distance() {
+        for (storage, what) in [
+            (scattered_storage(200, 4), "a scattered cloud"),
+            (line_storage(41), "a line"),
+            (
+                scattered_storage_with_outlier(64, 4, 100.0),
+                "a cloud with one far outlier",
+            ),
+        ] {
+            let chosen = medoid(&storage, &Comparisons::default()).unwrap();
+            assert_eq!(chosen, exhaustive_medoid(&storage), "{what}");
+        }
     }
 
     #[test]
