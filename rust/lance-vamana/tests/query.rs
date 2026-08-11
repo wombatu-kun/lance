@@ -42,6 +42,7 @@ use lance_vamana::builder::{
 };
 use lance_vamana::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
 use lance_vamana::io::{SegmentWriter, read_segment, scan_scheduler};
+use lance_vamana::partition::Partition;
 use lance_vamana::query::{SearchParams, VamanaIndex};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
@@ -240,93 +241,129 @@ async fn search_parameters_that_describe_nothing_are_refused() {
 /// with the table would be searched with a query of the wrong length against a
 /// store that takes its dimension from the array - silently wrong distances
 /// rather than an error - so the reader checks the pair on the way back in.
+///
+/// Both halves of the pair, because they fail differently and the guard is one
+/// `if`: a wider neighbour list shifts every vertex's slot, a wider vector
+/// shifts every coordinate.
 #[tokio::test]
 async fn a_partition_disagreeing_with_its_segment_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut dataset = small_fixture().write(uri).await;
-
-    let covered = (0..dataset.get_fragments().len() as u32).collect::<Vec<_>>();
-    let uuid = Uuid::new_v4();
-    let store = dataset.object_store(None).await.unwrap();
-    let segment_dir = dataset.indices_dir().join(uuid.to_string());
-    let centroids =
-        <FixedSizeListArray as lance_arrow::FixedSizeListArrayExt>::try_new_from_values(
-            Float32Array::from(vec![0.5f32; VECTOR_DIM as usize]),
-            VECTOR_DIM,
+    /// The same vertices and row ids, one neighbour slot wider.
+    fn widen_the_graph(partition: Partition) -> Partition {
+        let (graph, vectors) = partition.into_parts();
+        let widened = lance_vamana::partition::PartitionGraph::try_new(
+            graph.max_degree() + 1,
+            graph.row_ids().to_vec(),
+            (0..graph.len())
+                .map(|vertex| graph.neighbors(vertex as u32).unwrap().to_vec())
+                .collect(),
         )
         .unwrap();
-    let mut writer = SegmentWriter::new(
-        store.clone(),
-        segment_dir.clone(),
-        IndexMetadata {
-            format_version: FORMAT_VERSION,
-            max_degree: 16,
-            alpha: 1.2,
-            dimension: VECTOR_DIM as u32,
-            distance_type: DistanceType::L2,
-            row_id_mode: RowIdMode::Address,
-            fragments: covered.clone(),
-        },
-        lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
-    );
-    let declared = sample_partition(16, 8, VECTOR_DIM as u32);
-    writer.write_partition(0, 0, &declared).await.unwrap();
-    let manifest = writer.finish().await.unwrap();
+        Partition::try_new(widened, vectors).unwrap()
+    }
 
-    // Same vertices, same row ids, one slot wider - and written before the
-    // commit, so the file sizes Lance records are the real ones and the reader
-    // reaches the width check rather than a truncated footer.
-    let (graph, vectors) = declared.into_parts();
-    let widened = lance_vamana::partition::PartitionGraph::try_new(
-        graph.max_degree() + 1,
-        graph.row_ids().to_vec(),
-        (0..graph.len())
-            .map(|vertex| graph.neighbors(vertex as u32).unwrap().to_vec())
-            .collect(),
-    )
-    .unwrap();
-    lance_vamana::io::write_partition(
-        &store,
-        &segment_dir.join(manifest.partitions()[0].file.as_str()),
-        &lance_vamana::partition::Partition::try_new(widened, vectors).unwrap(),
-    )
-    .await
-    .unwrap();
+    /// The same graph over vectors of one more coordinate.
+    fn widen_the_vectors(partition: Partition) -> Partition {
+        let (graph, vectors) = partition.into_parts();
+        let dimension = vectors.value_length() as usize;
+        let values = vectors.values().as_primitive::<Float32Type>().values();
+        let wider = (0..vectors.len())
+            .flat_map(|row| {
+                values[row * dimension..(row + 1) * dimension]
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(0.0))
+            })
+            .collect::<Vec<_>>();
+        Partition::try_new(
+            graph,
+            <FixedSizeListArray as lance_arrow::FixedSizeListArrayExt>::try_new_from_values(
+                Float32Array::from(wider),
+                dimension as i32 + 1,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
 
-    let details = prost_types::Any {
-        type_url: INDEX_DETAILS_TYPE_URL.to_string(),
-        value: Vec::new(),
-    };
-    dataset
-        .commit_existing_index_segments(
-            INDEX_NAME,
-            VECTOR_COLUMN,
-            vec![IndexSegment::new(
-                uuid,
-                covered,
-                [dataset.schema().field(VECTOR_COLUMN).unwrap().id],
-                Arc::new(details),
-                FORMAT_VERSION as i32,
-                dataset.manifest.version,
-            )],
+    for (what, doctor) in [
+        (
+            "a slot wider",
+            widen_the_graph as fn(Partition) -> Partition,
+        ),
+        (
+            "a coordinate wider",
+            widen_the_vectors as fn(Partition) -> Partition,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut dataset = small_fixture().write(uri).await;
+
+        let covered = (0..dataset.get_fragments().len() as u32).collect::<Vec<_>>();
+        let uuid = Uuid::new_v4();
+        let store = dataset.object_store(None).await.unwrap();
+        let segment_dir = dataset.indices_dir().join(uuid.to_string());
+        let centroids =
+            <FixedSizeListArray as lance_arrow::FixedSizeListArrayExt>::try_new_from_values(
+                Float32Array::from(vec![0.5f32; VECTOR_DIM as usize]),
+                VECTOR_DIM,
+            )
+            .unwrap();
+        let mut writer = SegmentWriter::new(
+            store.clone(),
+            segment_dir.clone(),
+            declaring(covered.clone()),
+            lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
+        );
+        let declared = sample_partition(16, 8, VECTOR_DIM as u32);
+        writer.write_partition(0, 0, &declared).await.unwrap();
+        let manifest = writer.finish().await.unwrap();
+
+        // Written over the file the segment already holds, and before the
+        // commit, so the file sizes Lance records are the real ones and the
+        // reader reaches the check rather than a truncated footer.
+        lance_vamana::io::write_partition(
+            &store,
+            &segment_dir.join(manifest.partitions()[0].file.as_str()),
+            &doctor(declared),
         )
         .await
         .unwrap();
 
-    // The segment itself is well formed, so `open` has nothing to object to.
-    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
-    let error = index
-        .search(
-            &random_vectors(1, 7)[0],
-            &SearchParams::new(K).with_search_list_size(BEAM),
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("its segment declares"),
-        "{error}"
-    );
+        let details = prost_types::Any {
+            type_url: INDEX_DETAILS_TYPE_URL.to_string(),
+            value: Vec::new(),
+        };
+        dataset
+            .commit_existing_index_segments(
+                INDEX_NAME,
+                VECTOR_COLUMN,
+                vec![IndexSegment::new(
+                    uuid,
+                    covered,
+                    [dataset.schema().field(VECTOR_COLUMN).unwrap().id],
+                    Arc::new(details),
+                    FORMAT_VERSION as i32,
+                    dataset.manifest.version,
+                )],
+            )
+            .await
+            .unwrap();
+
+        // The segment itself is well formed, so `open` has nothing to object to.
+        let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+        let error = index
+            .search(
+                &random_vectors(1, 7)[0],
+                &SearchParams::new(K).with_search_list_size(BEAM),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("its segment declares"),
+            "a partition {what} than its segment was searched anyway: {error}"
+        );
+    }
 }
 
 /// A query nothing can be measured from must be refused, not answered.
@@ -1936,7 +1973,7 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
             &lance_vamana::search::Comparisons::default(),
         )
         .unwrap();
-        let graph = lance_vamana::partition::Partition::try_new(built.graph, taken).unwrap();
+        let graph = Partition::try_new(built.graph, taken).unwrap();
         writer
             .write_partition(partition, built.medoid, &graph)
             .await
@@ -2105,7 +2142,7 @@ async fn a_partition_holding_a_non_finite_vector_is_reported_as_corrupt() {
                 VECTOR_DIM,
             )
             .unwrap();
-        let partition = lance_vamana::partition::Partition::try_new(built.graph, poisoned).unwrap();
+        let partition = Partition::try_new(built.graph, poisoned).unwrap();
 
         let centroids =
             <FixedSizeListArray as lance_arrow::FixedSizeListArrayExt>::try_new_from_values(
