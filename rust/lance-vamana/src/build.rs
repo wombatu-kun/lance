@@ -263,9 +263,14 @@ pub fn medoid<S: VectorStore>(
     let sample = if sample_size >= num_vertices as usize {
         (0..num_vertices).collect::<Vec<_>>()
     } else {
-        let mut sample = (0..num_vertices).collect::<Vec<_>>();
-        sample.shuffle(rng);
-        sample.truncate(sample_size);
+        // Drawn rather than shuffled: the default sample is 256 vertices, and
+        // shuffling to take them costs a `u32` per row of the partition and a
+        // swap per row to draw a quarter of a kilobyte. Sorted because a walk
+        // over the vectors in id order reads the storage the way it is laid out.
+        let mut sample = rand::seq::index::sample(rng, num_vertices as usize, sample_size)
+            .into_iter()
+            .map(|drawn| drawn as u32)
+            .collect::<Vec<_>>();
         sample.sort_unstable();
         sample
     };
