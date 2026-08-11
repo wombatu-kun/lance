@@ -47,11 +47,20 @@ pub struct Consolidated {
 /// N_out(p) <- RobustPrune(p, C \ D, alpha, R)   when |C| > R, else C itself
 /// ```
 ///
-/// The inheritance is one hop and not transitive, which is the paper's choice
-/// and worth knowing: a dead vertex whose own out-edges are all dead passes on
-/// nothing, and a live vertex reachable only through such a chain can be left
-/// unreachable. What the algorithm guarantees is that no *edge* dangles, not
-/// that connectivity is preserved.
+/// The inheritance is one hop and not transitive, which is the paper's choice.
+/// What it guarantees is that no *edge* dangles - not that the graph stays in
+/// one piece, and the difference is not theoretical. Measured on a 1000-vertex
+/// build at `R=16`: removing rows evenly leaves every survivor reachable up to
+/// 50% deleted, 298 of 300 at 70%, and **2 of 100** at 90%. Removing a whole
+/// region of the space at once, which sounds worse, costs nothing at any
+/// fraction - the survivors outside it keep their neighbourhoods, and only the
+/// boundary needs repair.
+///
+/// So this is a bound on how *late* consolidation may run, not on how much it
+/// can take. The same rows removed a third at a time, consolidating after each,
+/// leave the graph whole: each round re-prunes from a graph that is still
+/// connected, rebuilding the long edges as they are lost rather than inheriting
+/// them from vertices that are themselves gone.
 ///
 /// `dead` names local ids, not row addresses. The delete list this ultimately
 /// comes from is in address space, and translating it is the caller's job on
@@ -173,6 +182,7 @@ pub fn consolidate_partition(
 mod tests {
     use arrow_array::{FixedSizeListArray, Float32Array};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::flat::storage::FlatFloatStorage;
 
     use super::*;
     use crate::build::{BuildParams, build_partition};
@@ -316,38 +326,39 @@ mod tests {
         }
     }
 
-    /// A real build, consolidated: the fixture above is a line and cannot show
-    /// that the prune is reached at all. Here the inherited candidate sets are
-    /// wider than `max_degree` and have to be pruned back.
-    #[test]
-    fn a_built_graph_survives_losing_half_its_rows() {
-        const VERTICES: usize = 400;
+    /// Deterministic pseudo-random vectors, built into a real graph.
+    ///
+    /// The line fixture cannot reach the prune at all - its candidate sets are
+    /// never wider than `max_degree`. This one is scattered, so the inherited
+    /// sets overflow and have to be pruned back.
+    fn scattered_partition(vertices: usize, dimension: usize, params: &BuildParams) -> Partition {
         let values = Float32Array::from(
-            (0..VERTICES * 4)
+            (0..vertices * dimension)
                 .map(|i| ((i * 2654435761) % 1000) as f32 / 1000.0)
                 .collect::<Vec<_>>(),
         );
-        let storage = lance_index::vector::flat::storage::FlatFloatStorage::new(
-            FixedSizeListArray::try_new_from_values(values, 4).unwrap(),
-            DistanceType::L2,
-        );
-        let params = BuildParams {
+        let vectors = FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap();
+        let storage = FlatFloatStorage::new(vectors.clone(), DistanceType::L2);
+        let built = build_partition(&storage, params, &Comparisons::default()).unwrap();
+        Partition::try_new(built.graph, vectors).unwrap()
+    }
+
+    fn small_params() -> BuildParams {
+        BuildParams {
             max_degree: 16,
             search_list_size: 32,
             alpha: 1.2,
             seed: 42,
-        };
-        let built = build_partition(&storage, &params, &Comparisons::default()).unwrap();
-        let vectors = FixedSizeListArray::try_new_from_values(
-            Float32Array::from(
-                (0..VERTICES * 4)
-                    .map(|i| ((i * 2654435761) % 1000) as f32 / 1000.0)
-                    .collect::<Vec<_>>(),
-            ),
-            4,
-        )
-        .unwrap();
-        let partition = Partition::try_new(built.graph, vectors).unwrap();
+        }
+    }
+
+    /// A real build, consolidated: the inherited candidate sets are wider than
+    /// `max_degree` here and have to be pruned back.
+    #[test]
+    fn a_built_graph_survives_losing_half_its_rows() {
+        const VERTICES: usize = 400;
+        let params = small_params();
+        let partition = scattered_partition(VERTICES, 4, &params);
 
         let comparisons = Comparisons::default();
         let consolidated = consolidate_partition(
@@ -377,6 +388,119 @@ mod tests {
             reachable(graph, consolidated.medoid),
             VERTICES / 2,
             "the graph came apart"
+        );
+    }
+
+    /// The `count` vertices nearest to `center`, which is what deleting a
+    /// category or a class looks like in the space the index measures.
+    fn nearest_to(partition: &Partition, center: u32, count: usize) -> RoaringBitmap {
+        let store = flat_storage(
+            partition.graph().row_ids(),
+            partition.vectors(),
+            DistanceType::L2,
+        )
+        .unwrap();
+        let from_center = store.dist_calculator_from_id(center);
+        let mut scored = (0..partition.len() as u32)
+            .map(|id| (OrderedFloat(from_center.distance(id)), id))
+            .collect::<Vec<_>>();
+        scored.sort_unstable();
+        scored.into_iter().take(count).map(|(_, id)| id).collect()
+    }
+
+    /// Where the one-hop inheritance stops keeping the graph in one piece.
+    ///
+    /// A characterisation test: it pins measured behaviour, including the part
+    /// that is a defect, so that changing the repair has to come here and say so.
+    ///
+    /// | deleted | spread | clustered |
+    /// |---|---|---|
+    /// | 30% | 700/700 | 700/700 |
+    /// | 50% | 500/500 | 500/500 |
+    /// | 70% | **298/300** | 300/300 |
+    /// | 90% | **2/100** | 100/100 |
+    ///
+    /// The shape that breaks is the one that looks harmless. Deleting a region
+    /// of the space at once leaves everyone outside it with their neighbourhood
+    /// intact, and only the boundary needs repairing. Deleting evenly thins
+    /// *every* neighbourhood at once, and this graph's edges are local by
+    /// construction: at 90% a survivor's sixteen nearest are all dead, and their
+    /// neighbours are 90% dead too, so one hop of inheritance reaches no further
+    /// than the immediate vicinity. What is left is islands.
+    ///
+    /// It is a hazard of consolidating *late*, not of consolidating - see
+    /// [`consolidating_often_keeps_what_consolidating_late_loses`].
+    #[test]
+    fn consolidation_keeps_the_graph_in_one_piece() {
+        const VERTICES: usize = 1000;
+        let params = small_params();
+        let partition = scattered_partition(VERTICES, 4, &params);
+
+        for percent in [30usize, 50, 70, 90] {
+            let count = VERTICES * percent / 100;
+            let spread = dead((0..VERTICES as u32).filter(|id| (*id as usize % 100) < percent));
+            let clustered = nearest_to(&partition, 0, count);
+            for (shape, dead) in [("spread", spread), ("clustered", clustered)] {
+                let consolidated = consolidate_partition(
+                    &partition,
+                    &dead,
+                    DistanceType::L2,
+                    params.alpha,
+                    &Comparisons::default(),
+                )
+                .unwrap();
+                let graph = consolidated.partition.graph();
+                let reached = reachable(graph, consolidated.medoid);
+                println!(
+                    "{percent}% deleted, {shape}: {reached} of {} survivors reachable",
+                    graph.len()
+                );
+                assert_eq!(
+                    reached == graph.len(),
+                    shape == "clustered" || percent <= 50,
+                    "{percent}% deleted, {shape}: {reached} of {} reachable, which is not what \
+                     the table in this test's doc records",
+                    graph.len()
+                );
+            }
+        }
+    }
+
+    /// The mitigation, measured: the same rows removed a third at a time keep
+    /// the graph in one piece where removing them all at once does not.
+    ///
+    /// Six rounds of "delete 30% of what is left" leave 11.8% of the rows, near
+    /// the 10% the one-shot case leaves. Each round re-prunes from a graph that
+    /// is still whole, so the long edges are rebuilt as they are lost instead of
+    /// being inherited from vertices that are themselves gone.
+    #[test]
+    fn consolidating_often_keeps_what_consolidating_late_loses() {
+        const VERTICES: usize = 1000;
+        let params = small_params();
+        let mut partition = scattered_partition(VERTICES, 4, &params);
+        let mut medoid = 0;
+        for round in 0..6 {
+            let living = partition.len() as u32;
+            let consolidated = consolidate_partition(
+                &partition,
+                &dead((0..living).filter(|id| id % 10 < 3)),
+                DistanceType::L2,
+                params.alpha,
+                &Comparisons::default(),
+            )
+            .unwrap();
+            medoid = consolidated.medoid;
+            partition = consolidated.partition;
+            println!(
+                "round {round}: {} left, {} reachable",
+                partition.len(),
+                reachable(partition.graph(), medoid)
+            );
+        }
+        assert_eq!(
+            reachable(partition.graph(), medoid),
+            partition.len(),
+            "consolidating in steps still lost vertices"
         );
     }
 
