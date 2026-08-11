@@ -779,6 +779,72 @@ async fn a_nested_vector_column_is_refused_with_its_reason() {
     assert!(error.to_string().contains("is nested"), "{error}");
 }
 
+/// The column type is asked of the schema, not of the data. `read_vectors`
+/// checks the same thing on the array it decoded, which is the last line of
+/// defence and much too late to be the first: a `FixedSizeList<Float64>` column
+/// of five million rows would be read into memory in full and only then refused.
+/// The message is what says which of the two spoke.
+#[tokio::test]
+async fn a_column_of_the_wrong_type_is_refused_before_it_is_read() {
+    const ROWS: usize = 8;
+
+    for (name, column, values) in [
+        (
+            "float64 vectors",
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float64, true)),
+                    common::VECTOR_DIM,
+                ),
+                true,
+            ),
+            Arc::new(arrow_array::FixedSizeListArray::from_iter_primitive::<
+                arrow_array::types::Float64Type,
+                _,
+                _,
+            >(
+                (0..ROWS)
+                    .map(|row| {
+                        Some(
+                            (0..common::VECTOR_DIM)
+                                .map(move |axis| Some(f64::from(row as i32 + axis)))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                common::VECTOR_DIM,
+            )) as ArrayRef,
+        ),
+        (
+            "not a vector at all",
+            Field::new("vec", DataType::Int32, true),
+            Arc::new(arrow_array::Int32Array::from(
+                (0..ROWS as i32).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![column]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
+        let mut dataset =
+            Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), uri, None)
+                .await
+                .unwrap();
+
+        let error = create_index(&mut dataset, INDEX_NAME, &IndexParams::new("vec", 2))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Vamana indexes FixedSizeList<Float32> only"),
+            "{name}: refused by the reader rather than by the schema check: {error}"
+        );
+    }
+}
+
 /// Copy a checked-in dataset fixture into a temporary directory.
 ///
 /// Lance's own `copy_test_data_to_tmp` is `pub(crate)`, so this repeats it. The

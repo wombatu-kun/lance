@@ -17,6 +17,7 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, FixedSizeListArray, UInt32Array};
+use arrow_schema::DataType;
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
 use futures::TryStreamExt;
@@ -28,7 +29,7 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::{KMeans, KMeansParams, compute_partitions_arrow_array};
 use lance_linalg::distance::DistanceType;
-use lance_linalg::kernels::normalize_fsl;
+use lance_linalg::kernels::normalize_fsl_owned;
 use object_store::path::Path;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
@@ -365,6 +366,25 @@ pub async fn build_segment(
             "Vamana cannot build a segment over no fragments".to_string(),
         ));
     }
+    // Asked of the schema, not of the data. `read_vectors` checks the same thing
+    // on the array it decoded, which is the last line of defence and far too
+    // late to be the first one: a `FixedSizeList<Float64>` column of five
+    // million rows would be read into memory in full and only then refused.
+    let field = dataset.schema().field(&params.column).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "column '{}' does not exist in the dataset",
+            params.column
+        ))
+    })?;
+    match field.data_type() {
+        DataType::FixedSizeList(item, _) if item.data_type() == &DataType::Float32 => {}
+        other => {
+            return Err(Error::not_supported(format!(
+                "column '{}' has type {other}; Vamana indexes FixedSizeList<Float32> only",
+                params.column
+            )));
+        }
+    }
 
     let (row_ids, vectors) = read_vectors(dataset, &params.column, fragments).await?;
     let dimension = u32::try_from(vectors.value_length()).map_err(|_| {
@@ -390,15 +410,20 @@ pub async fn build_segment(
     let row_ids = Arc::new(row_ids);
     let params = Arc::new(params.clone());
     let (vectors, ivf, assignment) = {
-        let vectors = vectors.clone();
         let row_ids = row_ids.clone();
         let params = params.clone();
+        // Moved in rather than cloned, so that the normalisation below has the
+        // only reference to the buffer and can work in place.
         spawn_cpu(move || {
             // Cosine is routed and stored as L2 over unit vectors, exactly as
             // Lance does it. Cosine distance is scale invariant, so the stored
             // answer is unchanged.
+            //
+            // `_owned` and not `normalize_fsl`, which allocates a second copy of
+            // the whole column: this one hands the values to `into_builder`,
+            // which writes through them when the buffer is unshared.
             let vectors = if params.distance_type == DistanceType::Cosine {
-                normalize_fsl(&vectors)?
+                normalize_fsl_owned(vectors)?
             } else {
                 vectors
             };
@@ -508,6 +533,11 @@ async fn read_vectors(
         .ok_or_else(|| Error::invalid_input("the dataset has no rows to index".to_string()))?
         .schema();
     let batch = concat_batches(&schema, batches.iter())?;
+    // The concatenation copied every value out of them, so from here they are a
+    // second copy of the vector column and nothing reads it. A build already
+    // holds the whole column twice at this line; holding it twice for the rest
+    // of the function is what this drop is about.
+    drop(batches);
 
     let row_ids = batch
         .column_by_name(ROW_ID)
@@ -527,7 +557,7 @@ async fn read_vectors(
             vectors.data_type()
         ))
     })?;
-    if vectors.value_type() != arrow_schema::DataType::Float32 {
+    if vectors.value_type() != DataType::Float32 {
         return Err(Error::not_supported(format!(
             "column '{column}' holds {} vectors; Vamana indexes Float32 only",
             vectors.value_type()

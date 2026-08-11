@@ -894,22 +894,27 @@ async fn deleted_row_addresses(
     // One read per covered fragment, in flight against each other: five hundred
     // covered fragments read in turn is the difference between opening an index
     // in a second and opening it in fifteen.
-    let vectors = stream::iter(
-        dataset
-            .get_fragments()
-            .into_iter()
-            .filter(|fragment| covered.contains(fragment.id() as u32))
-            .map(|fragment| async move {
-                let fragment_id = fragment.id() as u32;
-                Ok::<_, Error>((fragment_id, fragment.get_deletion_vector().await?))
-            }),
-    )
-    .buffered(io_parallelism)
-    .try_collect::<Vec<_>>()
-    .await?;
+    //
+    // Folded as they arrive rather than collected first. A deletion vector is a
+    // bitmap over a whole fragment, so collecting them all would hold every
+    // deletion of every covered fragment in two forms at once, where this holds
+    // `io_parallelism` of them beside the treemap they are going into.
+    let mut vectors = std::pin::pin!(
+        stream::iter(
+            dataset
+                .get_fragments()
+                .into_iter()
+                .filter(|fragment| covered.contains(fragment.id() as u32))
+                .map(|fragment| async move {
+                    let fragment_id = fragment.id() as u32;
+                    Ok::<_, Error>((fragment_id, fragment.get_deletion_vector().await?))
+                }),
+        )
+        .buffered(io_parallelism)
+    );
 
     let mut deleted = RoaringTreemap::new();
-    for (fragment_id, deletion_vector) in vectors {
+    while let Some((fragment_id, deletion_vector)) = vectors.try_next().await? {
         let Some(deletion_vector) = deletion_vector else {
             continue;
         };
