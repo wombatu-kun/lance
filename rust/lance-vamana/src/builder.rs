@@ -826,7 +826,7 @@ fn build_one(
     })
 }
 
-fn gather(vectors: &FixedSizeListArray, rows: &[u32]) -> Result<FixedSizeListArray> {
+pub(crate) fn gather(vectors: &FixedSizeListArray, rows: &[u32]) -> Result<FixedSizeListArray> {
     let taken = take(vectors, &UInt32Array::from(rows.to_vec()), None)?;
     Ok(taken.as_fixed_size_list().clone())
 }

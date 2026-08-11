@@ -374,7 +374,7 @@ fn vector_column(batch: &RecordBatch) -> Result<(&Float32Array, usize)> {
 /// writes any non-finite float as `null`, so an infinite alpha serialises
 /// cleanly, commits, and then fails every later `from_json` with "invalid type:
 /// null" - an index that can be written once and never opened again.
-fn validate_alpha(alpha: f32) -> Result<()> {
+pub(crate) fn validate_alpha(alpha: f32) -> Result<()> {
     if !alpha.is_finite() || alpha < 1.0 {
         return Err(Error::invalid_input(format!(
             "Vamana alpha must be a finite value of at least 1.0, got {alpha}"
