@@ -416,14 +416,34 @@ pub async fn build_segment(
         ivf,
     );
 
+    let members_by_partition = group_by_partition(&assignment, params.num_partitions);
+    let stats =
+        write_partitions(&mut writer, members_by_partition, row_ids, vectors, params).await?;
+    Ok((writer.finish().await?, stats))
+}
+
+/// Build the graph of every occupied partition and write it, in id order.
+///
+/// Its own function so that the empty ones can be tested. A partition with
+/// nothing assigned to it is written no file and given no row in the segment
+/// table, and skipping it is what makes the id a partition is written under the
+/// id of its *centroid* rather than its position among the ones that were
+/// written. The two numbers agree in every fixture whose partitions are all
+/// occupied, and whether k-means leaves one empty is decided by an RNG Lance
+/// seeds from the OS - so a build cannot be asked for an empty partition on
+/// purpose, and nothing that goes through one can tell the two apart.
+async fn write_partitions(
+    writer: &mut SegmentWriter,
+    members_by_partition: Vec<Vec<u32>>,
+    row_ids: Arc<Vec<u64>>,
+    vectors: FixedSizeListArray,
+    params: Arc<IndexParams>,
+) -> Result<BuildStats> {
     let mut stats = BuildStats {
         vectors: vectors.len(),
         ..Default::default()
     };
-    for (partition_id, members) in group_by_partition(&assignment, params.num_partitions)
-        .into_iter()
-        .enumerate()
-    {
+    for (partition_id, members) in members_by_partition.into_iter().enumerate() {
         if members.is_empty() {
             continue;
         }
@@ -439,7 +459,7 @@ pub async fn build_segment(
         stats.partitions += 1;
         stats.comparisons = stats.comparisons.saturating_add(built.comparisons);
     }
-    Ok((writer.finish().await?, stats))
+    Ok(stats)
 }
 
 /// Read the vector column and the row id of every row that has a vector.
@@ -701,4 +721,99 @@ fn build_one(
 fn gather(vectors: &FixedSizeListArray, rows: &[u32]) -> Result<FixedSizeListArray> {
     let taken = take(vectors, &UInt32Array::from(rows.to_vec()), None)?;
     Ok(taken.as_fixed_size_list().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::Float32Array;
+    use lance_io::object_store::ObjectStore;
+
+    use super::*;
+    use crate::format::partition_file_name;
+
+    /// A partition whose centroid drew nothing gets no file and no row in the
+    /// segment table, and the partitions after it keep their own ids. Writing
+    /// them under a running count instead would produce a segment that routes a
+    /// query to a centroid and answers it with somebody else's vectors - and
+    /// every fixture that goes through k-means would still pass, because the two
+    /// numbers only differ once a partition has come out empty.
+    #[tokio::test]
+    async fn an_empty_partition_does_not_shift_the_ids_after_it() {
+        const DIMENSION: i32 = 4;
+        const VERTICES: usize = 12;
+        const PARTITIONS: u32 = 3;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(ObjectStore::local());
+        let path = Path::from_absolute_path(dir.path()).unwrap();
+
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..VERTICES * DIMENSION as usize)
+                    .map(|value| value as f32)
+                    .collect::<Vec<_>>(),
+            ),
+            DIMENSION,
+        )
+        .unwrap();
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..PARTITIONS as usize * DIMENSION as usize)
+                    .map(|value| value as f32)
+                    .collect::<Vec<_>>(),
+            ),
+            DIMENSION,
+        )
+        .unwrap();
+        let params = Arc::new(IndexParams::new("vector", PARTITIONS).with_graph_params(
+            BuildParams {
+                max_degree: 4,
+                search_list_size: 8,
+                medoid_sample_size: 8,
+                ..Default::default()
+            },
+        ));
+        let metadata = IndexMetadata {
+            format_version: FORMAT_VERSION,
+            max_degree: params.graph.max_degree,
+            alpha: params.graph.alpha,
+            dimension: DIMENSION as u32,
+            distance_type: params.distance_type,
+            row_id_mode: RowIdMode::Address,
+            fragments: vec![0],
+        };
+        let mut writer =
+            SegmentWriter::new(store, path, metadata, IvfModel::new(centroids, Some(0.0)));
+
+        // The first centroid drew nothing, the other two split the rows.
+        let stats = write_partitions(
+            &mut writer,
+            vec![Vec::new(), (0..6).collect(), (6..12).collect()],
+            Arc::new((0..VERTICES as u64).collect()),
+            vectors,
+            params,
+        )
+        .await
+        .unwrap();
+        let manifest = writer.finish().await.unwrap();
+
+        assert_eq!(stats.partitions, 2, "two partitions had rows to write");
+        assert_eq!(stats.vectors, VERTICES);
+        assert_eq!(
+            manifest
+                .partitions()
+                .iter()
+                .map(|entry| (entry.partition_id, entry.file.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, partition_file_name(1).as_str()),
+                (2, partition_file_name(2).as_str())
+            ],
+            "the occupied partitions were written under the wrong ids"
+        );
+        assert!(
+            manifest.partition(0).is_none(),
+            "the empty partition was given a row in the segment table"
+        );
+    }
 }
