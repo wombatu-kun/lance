@@ -195,6 +195,14 @@ pub fn routing_distance_type(distance_type: DistanceType) -> DistanceType {
 }
 
 /// Build a Vamana index over every live fragment of `dataset` and commit it.
+///
+/// The fragment list is taken once, before a build that can run for minutes, and
+/// a compaction landing in between is not a commit conflict: `(CreateIndex,
+/// Rewrite)` do not conflict in Lance's table, so the index commits over
+/// fragments the dataset no longer has. That costs coverage rather than
+/// correctness - [`crate::query::VamanaIndex::open`] narrows the index to the
+/// fragments that survived, and the rows of the rest are the caller's to scan
+/// until the index is rebuilt.
 pub async fn create_index(
     dataset: &mut Dataset,
     index_name: &str,
@@ -226,10 +234,12 @@ pub fn live_fragments(dataset: &Dataset) -> Vec<u32> {
 /// and `prune_stale_segment_coverage` runs over any segment older than the
 /// manifest it is committed against: it checks out that version - which fails
 /// outright once `cleanup_old_versions` has removed it - and silently drops from
-/// the coverage any fragment whose data file has been rewritten since. The
-/// commit then succeeds with a narrower bitmap than the segment was built over,
-/// and [`crate::query::VamanaIndex::open`] refuses the result, because that is
-/// exactly the shape of an index whose data moved underneath it.
+/// the coverage every fragment that has since been rewritten or has gone
+/// altogether. The commit then succeeds with a narrower bitmap than the segment
+/// was built over, and [`crate::query::VamanaIndex::open`] takes those two apart:
+/// a fragment that is gone narrows the index and is logged, while one that is
+/// still there and was rewritten is refused, because that is the shape of an
+/// index whose data moved underneath it.
 pub async fn build_index_segment(
     dataset: &Dataset,
     params: &IndexParams,

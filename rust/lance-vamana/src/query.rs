@@ -233,6 +233,10 @@ struct Probe {
 /// bound at all. What the number should be on a high-latency store is a
 /// measurement nobody has taken, so it is deliberately on the small side.
 ///
+/// Per search call, and there is nothing above it: a server answering `n`
+/// queries at once holds up to `n` times this many partitions, so an index whose
+/// partitions are large enough to matter has to be bounded by its caller.
+///
 /// Dropping a search future abandons these reads but does not cancel them: the
 /// io tasks already in the scheduler's queue still run to completion and their
 /// bytes are read and thrown away. A caller that times a query out and retries
@@ -241,6 +245,13 @@ const PARTITIONS_IN_FLIGHT: usize = 4;
 
 impl VamanaIndex {
     /// Open every segment of `index_name`.
+    ///
+    /// The index reads through one scheduler for its whole life, and a scheduler
+    /// is an io loop spawned on whichever runtime this call is awaited in - for
+    /// every store but `file+uring`, which is served without one. The index is
+    /// therefore bound to that runtime: opened inside a `Runtime` that is later
+    /// dropped, its reads are queued to a loop that no longer runs and nothing
+    /// ever pops them, so a search hangs rather than failing.
     pub async fn open(dataset: &Dataset, index_name: &str) -> Result<Self> {
         // `load_indices_by_name` and not `load_index_by_name`: the latter errors
         // out as soon as an index has more than one segment, which is the normal
@@ -700,6 +711,12 @@ impl VamanaIndex {
     /// `'static` work: the partition is owned already, the query is an `Arc`
     /// clone and the delete list is shared. Nothing in it waits on anything,
     /// which is what the pool requires.
+    ///
+    /// The pool takes work, not futures, so dropping a search abandons the
+    /// walk's result and not the walk: it runs to the end on a pool thread. Same
+    /// bargain as the reads [`PARTITIONS_IN_FLIGHT`] describes, and the reason a
+    /// query that is timed out and retried goes on spending CPU on the attempt
+    /// its caller has already given up on.
     async fn walk_partition(
         &self,
         partition: Partition,
