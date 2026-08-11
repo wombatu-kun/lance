@@ -60,6 +60,21 @@ pub const NO_NEIGHBOR: u32 = u32::MAX;
 /// Highest partition-local id addressable, given [`NO_NEIGHBOR`] takes the top.
 pub const MAX_PARTITION_ROWS: u32 = u32::MAX - 1;
 
+/// Widest neighbour list a partition may be built with.
+///
+/// Not a property of the format, which stores the width as a `u32` and would
+/// take any of them, but a bound on what a typo can cost. The width is the
+/// stride of `__neighbors`, so it is both `4 * max_degree` bytes per vertex on
+/// disk and `4 * max_degree * rows` bytes allocated up front by
+/// [`crate::partition::PartitionGraph`] - a `100_000` typed where `100` was
+/// meant asks the allocator for 400 GB over a million-row partition and aborts
+/// the process instead of returning an error.
+///
+/// `1024` puts one vertex's list at 4 KiB, a page, which is already far past
+/// anything the literature builds: DiskANN's `R` is tens, and this crate's own
+/// measured working point is 64.
+pub const MAX_DEGREE: u32 = 1024;
+
 /// The one version number of this format.
 ///
 /// Written twice, to two independently corruptible places - the dataset

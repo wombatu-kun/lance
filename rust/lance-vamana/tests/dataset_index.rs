@@ -716,21 +716,25 @@ async fn a_vector_that_cannot_be_assigned_is_named_by_its_row_id() {
     );
 }
 
-/// Zero draws an empty training set, and sampling centroids from nothing panics
-/// inside `rand`. The field is public and has no default of its own.
+/// Both k-means parameters are public, both have no default of their own once a
+/// caller starts setting them, and zero means something different and equally
+/// silent in each: no training set at all, which panics inside `rand` when the
+/// centroids are sampled, and no iterations at all, which leaves the router
+/// routing by the k rows the initialisation happened to draw.
 #[tokio::test]
-async fn a_zero_kmeans_sample_rate_is_refused() {
+async fn a_zero_kmeans_parameter_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut dataset = DatasetFixture::default().write(uri).await;
-    let error = create_index(
-        &mut dataset,
-        INDEX_NAME,
-        &params().with_kmeans_sample_rate(0),
-    )
-    .await
-    .unwrap_err();
-    assert!(error.to_string().contains("kmeans_sample_rate"), "{error}");
+    for (params, named) in [
+        (params().with_kmeans_sample_rate(0), "kmeans_sample_rate"),
+        (params().with_kmeans_max_iters(0), "kmeans_max_iters"),
+    ] {
+        let error = create_index(&mut dataset, INDEX_NAME, &params)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(named), "{error}");
+    }
 }
 
 /// `Schema::field` resolves a dotted path, so a nested leaf passes the column

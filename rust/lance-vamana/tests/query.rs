@@ -377,13 +377,28 @@ async fn a_query_that_no_distance_can_be_measured_from_is_refused() {
     .unwrap();
     let cosine = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
     let error = cosine.search(&zero, &search).await.unwrap_err();
-    assert!(error.to_string().contains("zero length"), "{error}");
+    assert!(error.to_string().contains("squared length of 0"), "{error}");
 
-    // Underflow reaches the same zero norm from finite components, which a
-    // component-wise check would wave through.
-    let tiny = vec![1e-30f32; VECTOR_DIM as usize];
-    let error = cosine.search(&tiny, &search).await.unwrap_err();
-    assert!(error.to_string().contains("zero length"), "{error}");
+    // Both ends of the range reach a norm that cannot be divided by, from
+    // components a component-wise check waves through. Underflow gives a norm of
+    // exactly zero and then a NaN; overflow gives an infinite one, and dividing
+    // by that yields a query of *zeroes*, which under cosine sits at distance
+    // exactly 1.0 from every vertex in the index - `k` arbitrary rows with a
+    // plausible distance and no error anywhere.
+    for (query, what) in [
+        (vec![1e-30f32; VECTOR_DIM as usize], "underflow"),
+        (vec![1e20f32; VECTOR_DIM as usize], "overflow"),
+    ] {
+        assert!(
+            query.iter().all(|value| value.is_finite()),
+            "{what}: the components must be finite, or the guard above catches this instead"
+        );
+        let error = cosine.search(&query, &search).await.unwrap_err();
+        assert!(
+            error.to_string().contains("squared length of"),
+            "{what}: {error}"
+        );
+    }
 }
 
 /// Cosine is stored differently from every other metric - the builder normalises
@@ -1902,5 +1917,131 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
                 neighbor.row_id
             );
         }
+    }
+}
+
+/// A stored vector that is not finite makes every distance measured against it
+/// NaN, and a NaN goes wherever `total_cmp` puts it - which depends on its sign.
+/// A negative one sorts ahead of every real answer: it survives the merge and
+/// comes back as the nearest neighbour, at a distance a caller comparing against
+/// a threshold accepts. A positive one sorts behind every real answer and is
+/// dropped by the beam, so it is only ever returned by a query with fewer live
+/// rows than it asked for. Which sign comes out of `(a - NaN)^2` is the
+/// hardware's business, so the partition here is smaller than the beam and every
+/// vertex is in the walk's candidates whichever way the sign falls.
+///
+/// The graph is built over finite vectors and only the payload written to the
+/// file is poisoned, which is the shape corruption takes: an adjacency that
+/// still walks, over values that are no longer numbers. Nothing on the read path
+/// sweeps the column for it, deliberately - that is `rows * dimension` per
+/// partition on the hot path of every query, more work than the walk it would be
+/// protecting - so the walk's own candidates are what gets checked.
+#[tokio::test]
+async fn a_partition_holding_a_non_finite_vector_is_reported_as_corrupt() {
+    const ROWS: usize = 16;
+    const POISONED: usize = 5;
+    const BEAM: usize = 32;
+
+    for poison in [f32::NAN, -f32::NAN, f32::INFINITY] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut dataset = DatasetFixture {
+            fragments: 1,
+            rows_per_fragment: ROWS,
+            ..Default::default()
+        }
+        .write(uri)
+        .await;
+        let (row_ids, vectors) = rows_with_vectors(&dataset).await;
+
+        let graph_params = BuildParams {
+            max_degree: 8,
+            search_list_size: BEAM,
+            ..Default::default()
+        };
+        let store =
+            lance_vamana::search::flat_storage(&row_ids, &vectors, DistanceType::L2).unwrap();
+        let built = lance_vamana::build::build_partition(
+            &store,
+            &graph_params,
+            &lance_vamana::search::Comparisons::default(),
+        )
+        .unwrap();
+
+        let mut values = vectors
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        values[POISONED * VECTOR_DIM as usize] = poison;
+        let poisoned =
+            <FixedSizeListArray as lance_arrow::FixedSizeListArrayExt>::try_new_from_values(
+                Float32Array::from(values),
+                VECTOR_DIM,
+            )
+            .unwrap();
+        let partition = lance_vamana::partition::Partition::try_new(built.graph, poisoned).unwrap();
+
+        let centroids =
+            <FixedSizeListArray as lance_arrow::FixedSizeListArrayExt>::try_new_from_values(
+                Float32Array::from(vec![0.5f32; VECTOR_DIM as usize]),
+                VECTOR_DIM,
+            )
+            .unwrap();
+        let covered = vec![0u32];
+        let uuid = Uuid::new_v4();
+        let mut writer = SegmentWriter::new(
+            dataset.object_store(None).await.unwrap(),
+            dataset.indices_dir().join(uuid.to_string()),
+            IndexMetadata {
+                format_version: FORMAT_VERSION,
+                max_degree: graph_params.max_degree,
+                alpha: graph_params.alpha,
+                dimension: VECTOR_DIM as u32,
+                distance_type: DistanceType::L2,
+                row_id_mode: RowIdMode::Address,
+                fragments: covered.clone(),
+            },
+            lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
+        );
+        writer
+            .write_partition(0, built.medoid, &partition)
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let details = prost_types::Any {
+            type_url: INDEX_DETAILS_TYPE_URL.to_string(),
+            value: Vec::new(),
+        };
+        dataset
+            .commit_existing_index_segments(
+                INDEX_NAME,
+                VECTOR_COLUMN,
+                vec![IndexSegment::new(
+                    uuid,
+                    covered,
+                    [dataset.schema().field(VECTOR_COLUMN).unwrap().id],
+                    Arc::new(details),
+                    FORMAT_VERSION as i32,
+                    dataset.manifest.version,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+        let error = index
+            .search(
+                &random_vectors(1, 21)[0],
+                &SearchParams::new(ROWS).with_search_list_size(BEAM),
+            )
+            .await
+            .expect_err("a walk that measured a non-finite distance must not answer with it");
+        assert!(error.to_string().contains("is not finite"), "{error}");
+        assert!(
+            error.to_string().contains(&row_ids[POISONED].to_string()),
+            "the error should name the row whose vector is not a number: {error}"
+        );
     }
 }

@@ -563,15 +563,25 @@ impl VamanaIndex {
             )));
         }
         // Cosine reaches the same place by a different road: the query is
-        // normalised before it is routed, and dividing by a zero norm produces
-        // the NaN directly. Underflow counts - a query of values around 1e-30 has
-        // finite components and a norm of exactly zero in f32.
+        // normalised before it is routed, and a norm that is not a positive
+        // finite number turns the whole vector into NaNs or zeroes there.
+        //
+        // Both ends of the range do it, and the guard above catches neither
+        // because it looks at the components rather than at what they add up to.
+        // Underflow: a query of values around 1e-30 has finite components and a
+        // norm of exactly zero in f32, and dividing by it gives NaN. Overflow: a
+        // query of 1e20 is finite componentwise while the sum of squares is
+        // `+inf`, so `normalize_arrow` divides by infinity and hands routing a
+        // vector of *zeroes* - under cosine every vertex is then at distance
+        // exactly 1.0, and the answer is `k` arbitrary rows with a plausible
+        // distance attached and no error anywhere.
         if self.metadata.distance_type == DistanceType::Cosine {
             let norm_squared = query.iter().map(|value| value * value).sum::<f32>();
-            if norm_squared == 0.0 {
-                return Err(Error::invalid_input(
-                    "query has zero length, which cosine distance is not defined for".to_string(),
-                ));
+            if norm_squared == 0.0 || !norm_squared.is_finite() {
+                return Err(Error::invalid_input(format!(
+                    "query has a squared length of {norm_squared}, which cosine distance is not \
+                     defined for"
+                )));
             }
         }
 
@@ -587,14 +597,14 @@ impl VamanaIndex {
         };
 
         let (probes, mut comparisons) = self.route(&routing_query, routing_type, params)?;
-        // Sized from what the partitions can actually yield rather than from
-        // `probes.len() * k`: `k` is the caller's, and the product overflows or
-        // asks the allocator for a terabyte long before the walk would notice.
-        let capacity = probes
-            .iter()
-            .map(|probe| (probe.entry.num_rows as usize).min(params.k))
-            .sum::<usize>();
-        let mut found = Vec::with_capacity(capacity);
+        // Grown as the answers arrive rather than sized up front. Everything
+        // available before the first read is a claim: `k` is the caller's, and
+        // the only bound on a partition's row count is the one its own segment
+        // table states, which nothing has yet been asked to honour - the file it
+        // describes is checked against it in `read_partition`, afterwards. A
+        // `k` of `usize::MAX` against a table claiming `MAX_PARTITION_ROWS` is a
+        // sixty-gigabyte allocation off a number read out of a file.
+        let mut found = Vec::new();
         let mut partitions_read = 0usize;
         // Unordered, because the merge sorts everything anyway: ordering would
         // only make a finished partition wait for a slower one that was started
@@ -723,6 +733,26 @@ impl VamanaIndex {
                 &mut scratch,
                 &walked,
             )?;
+            // A stored vector that is not finite makes every distance measured
+            // against it NaN, and a NaN goes wherever `total_cmp` puts it: a
+            // negative one sorts ahead of every real answer, survives the merge
+            // and comes back as the nearest neighbour, with a caller comparing
+            // it against a threshold accepting it. The vectors column is not
+            // swept for this on the way in - that is `rows * dimension` per
+            // partition on the hot path of every query, more work than the walk
+            // it would be protecting - so it is caught here instead, over the
+            // `search_list_size` candidates the walk actually kept.
+            if let Some(node) = walk.candidates.iter().find(|node| !node.dist.0.is_finite()) {
+                return Err(Error::corrupt_file_named(
+                    "partition",
+                    format!(
+                        "Vamana row {} is at distance {} from a finite query, so the vector \
+                         stored for it is not finite",
+                        partition.graph().row_ids()[node.id as usize],
+                        node.dist.0
+                    ),
+                ));
+            }
             // Local ids are per partition, so they become row ids *before* the
             // merge: every partition has a vertex 0, and they are different rows.
             //

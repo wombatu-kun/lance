@@ -349,6 +349,16 @@ pub async fn build_segment(
                 .to_string(),
         ));
     }
+    // Zero iterations leaves the centroids exactly where the initialisation put
+    // them - k rows drawn at random - so the router would route by a sample
+    // rather than by a clustering, and nothing downstream would look wrong.
+    if params.kmeans_max_iters == 0 {
+        return Err(Error::invalid_input(
+            "Vamana kmeans_max_iters must be greater than zero; at zero the router keeps the \
+             centroids it was initialised with"
+                .to_string(),
+        ));
+    }
     supported_distance_type(params.distance_type)?;
     if fragments.is_empty() {
         return Err(Error::invalid_input(

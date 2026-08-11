@@ -12,7 +12,7 @@ use arrow_schema::{DataType, Field};
 use lance_core::{Error, Result};
 
 use crate::format::{
-    MAX_PARTITION_ROWS, NEIGHBORS_COLUMN, NO_NEIGHBOR, ROW_ID_COLUMN, VECTOR_COLUMN,
+    MAX_DEGREE, MAX_PARTITION_ROWS, NEIGHBORS_COLUMN, NO_NEIGHBOR, ROW_ID_COLUMN, VECTOR_COLUMN,
     partition_schema,
 };
 
@@ -37,10 +37,10 @@ impl PartitionGraph {
     /// later insert or prune change a vertex's degree without moving any other
     /// vertex on disk.
     pub fn try_new(max_degree: u32, row_ids: Vec<u64>, adjacency: Vec<Vec<u32>>) -> Result<Self> {
-        if max_degree == 0 {
-            return Err(Error::invalid_input(
-                "Vamana max_degree must be greater than zero".to_string(),
-            ));
+        if max_degree == 0 || max_degree > MAX_DEGREE {
+            return Err(Error::invalid_input(format!(
+                "Vamana max_degree must be between 1 and {MAX_DEGREE}, got {max_degree}"
+            )));
         }
         if row_ids.len() != adjacency.len() {
             return Err(Error::invalid_input(format!(

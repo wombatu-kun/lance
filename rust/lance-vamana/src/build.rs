@@ -435,6 +435,7 @@ mod tests {
     use lance_linalg::kernels::normalize_fsl;
 
     use super::*;
+    use crate::format::MAX_DEGREE;
     use crate::search::{SearchScratch, greedy_search};
 
     /// Deterministic pseudo-random vectors: a fixed multiplicative congruential
@@ -619,6 +620,32 @@ mod tests {
             "duplicate out-edge: {selected:?}"
         );
         assert!(selected.len() <= 16);
+    }
+
+    /// The width is the stride of the on-disk neighbour list and the size of the
+    /// allocation a build makes before it computes anything, so a `100_000`
+    /// typed where `100` was meant is an allocator abort rather than an error -
+    /// on a million-row partition, a request for 400 GB. Refused at the
+    /// boundary, which is what the repository's own rule asks for.
+    #[test]
+    fn a_degree_past_the_ceiling_is_rejected() {
+        let storage = scattered_storage(8, 2);
+        let params = BuildParams {
+            max_degree: MAX_DEGREE + 1,
+            ..small_params()
+        };
+        let error = build_partition(&storage, &params, &Comparisons::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("must be between 1 and"),
+            "{error}"
+        );
+
+        // The ceiling itself is allowed, so the bound is not off by one.
+        let params = BuildParams {
+            max_degree: MAX_DEGREE,
+            ..small_params()
+        };
+        build_partition(&storage, &params, &Comparisons::default()).unwrap();
     }
 
     #[test]
