@@ -15,6 +15,7 @@ use std::sync::Arc;
 use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::create_writer;
 use lance_file::writer::FileWriterOptions;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -426,6 +427,8 @@ async fn write_hand_made_index(
     dir: &Path,
     metadata: &[(&str, String)],
     global_buffer: Option<Vec<u8>>,
+    version: ConcreteFileVersion,
+    rows: usize,
 ) {
     let schema = Arc::new(ArrowSchema::new(vec![Field::new(
         "id",
@@ -434,11 +437,13 @@ async fn write_hand_made_index(
     )]));
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(UInt32Array::from(vec![1u32]))],
+        vec![Arc::new(UInt32Array::from(
+            (0..rows as u32).collect::<Vec<_>>(),
+        ))],
     )
     .unwrap();
     let mut writer = create_writer(
-        SEGMENT_FILE_VERSION,
+        version,
         store
             .create(&dir.clone().join(INDEX_FILE_NAME))
             .await
@@ -453,7 +458,11 @@ async fn write_hand_made_index(
     for (key, value) in metadata {
         writer.add_schema_metadata(*key, value.clone());
     }
-    writer.write_batch(&batch).await.unwrap();
+    // An empty batch would be written as a column of no values, which is not
+    // the same file as one with no batch at all.
+    if rows > 0 {
+        writer.write_batch(&batch).await.unwrap();
+    }
     writer.finish().await.unwrap();
 }
 
@@ -470,6 +479,8 @@ async fn a_segment_pointing_at_the_descriptor_buffer_is_rejected() {
             (IVF_POSITION_KEY, "0".to_string()),
         ],
         None,
+        SEGMENT_FILE_VERSION,
+        1,
     )
     .await;
 
@@ -512,6 +523,8 @@ async fn read_segment_carrying(
             (IVF_POSITION_KEY, "1".to_string()),
         ],
         Some(prost::Message::encode_to_vec(&ivf)),
+        SEGMENT_FILE_VERSION,
+        1,
     )
     .await;
     read_segment(&scan_scheduler(&store), dir, None)
@@ -606,4 +619,82 @@ async fn the_free_writer_refuses_an_empty_partition() {
     .await
     .unwrap_err();
     assert!(error.to_string().contains("empty partition"), "{error}");
+}
+
+/// A segment that breaks a rule of the format is a corrupt file, not a caller's
+/// bad input. The distinction is not cosmetic: the same constructor serves the
+/// writer, where the caller *is* the one who got it wrong, so the two have to be
+/// told apart by where the value came from rather than by what was wrong with
+/// it.
+///
+/// Reached with a table of no rows, so the columns are beyond reproach and the
+/// refusal comes from the parameters - which is the half of the constructor that
+/// still reported bad input.
+#[tokio::test]
+async fn a_segment_breaking_a_rule_of_the_format_is_reported_as_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let broken = IndexMetadata {
+        max_degree: 0,
+        ..index_metadata()
+    };
+    write_hand_made_index(
+        &store,
+        &path,
+        &[
+            (INDEX_METADATA_KEY, broken.to_json().unwrap()),
+            (IVF_POSITION_KEY, "1".to_string()),
+        ],
+        Some(prost::Message::encode_to_vec(
+            &lance_index::pb::Ivf::try_from(&ivf_model()).unwrap(),
+        )),
+        SEGMENT_FILE_VERSION,
+        0,
+    )
+    .await;
+
+    let error = read_segment(&scan_scheduler(&store), &path, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, lance_core::Error::CorruptFile { .. }),
+        "a value that arrived out of a file was reported as bad input: {error:?}"
+    );
+    assert!(error.to_string().contains("max_degree 0"), "{error}");
+}
+
+/// The writer pins the file version, so the reader has to check it. A projection
+/// is computed against the structural grammar of one version, and a file written
+/// under another lays its columns out differently: the read would come back with
+/// the wrong bytes rather than fail.
+#[tokio::test]
+async fn a_segment_file_of_another_lance_version_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    write_hand_made_index(
+        &store,
+        &path,
+        &[
+            (INDEX_METADATA_KEY, index_metadata().to_json().unwrap()),
+            (IVF_POSITION_KEY, "1".to_string()),
+        ],
+        Some(prost::Message::encode_to_vec(
+            &lance_index::pb::Ivf::try_from(&ivf_model()).unwrap(),
+        )),
+        ConcreteFileVersion::V2_0,
+        1,
+    )
+    .await;
+
+    let error = read_segment(&scan_scheduler(&store), &path, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, lance_core::Error::CorruptFile { .. }),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("2.0") && error.to_string().contains("2.1"),
+        "the error should name both versions: {error}"
+    );
 }

@@ -106,12 +106,19 @@ impl PartitionGraph {
     /// corrupt file rather than a caller's mistake and must not be an index out
     /// of bounds. `Result` rather than `Option` because every caller of this one
     /// wants the same message, where `vector`'s callers decide for themselves.
+    ///
+    /// Reported as such, and not as bad input: the one caller that passes an id
+    /// of its own rather than one read out of the file is a build, whose ids are
+    /// its own loop bounds.
     pub fn neighbors(&self, local_id: u32) -> Result<&[u32]> {
         let slots = self.slots(local_id).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Vamana vertex {local_id} is outside a partition of {} vertices",
-                self.len()
-            ))
+            Error::corrupt_file_named(
+                NEIGHBORS_COLUMN,
+                format!(
+                    "Vamana vertex {local_id} is outside a partition of {} vertices",
+                    self.len()
+                ),
+            )
         })?;
         let degree = slots
             .iter()

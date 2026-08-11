@@ -57,7 +57,17 @@ pub const VECTOR_COLUMN: &str = "__vector";
 /// has a fixed stride.
 pub const NO_NEIGHBOR: u32 = u32::MAX;
 
-/// Highest partition-local id addressable, given [`NO_NEIGHBOR`] takes the top.
+/// Most rows one partition may hold.
+///
+/// A *count*, and every use of it is a count - not, despite the arithmetic
+/// looking the same, the highest local id. The ids of an `n`-row partition run
+/// to `n - 1`, so the widest partition whose ids all stay clear of
+/// [`NO_NEIGHBOR`] holds `u32::MAX` rows, and this is one below that: the check
+/// errs on the safe side by a single row, deliberately, so that no arithmetic
+/// anywhere has to be exact about the boundary.
+///
+/// Do not read a maximum local id out of it. That number is `MAX_PARTITION_ROWS
+/// - 1`, and using this constant as one would put a vertex on the sentinel.
 pub const MAX_PARTITION_ROWS: u32 = u32::MAX - 1;
 
 /// Widest neighbour list a partition may be built with.

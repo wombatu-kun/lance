@@ -112,6 +112,21 @@ pub async fn open_file(
         options.clone(),
     )
     .await?;
+    // The version is pinned on the way out and therefore has to be checked on
+    // the way in. It is not a formality: the projection below is computed
+    // against the structural grammar of [`SEGMENT_FILE_VERSION`], and a file
+    // written under another one lays its columns out differently - the read
+    // would succeed and return the wrong bytes rather than fail.
+    if reader.metadata().version() != SEGMENT_FILE_VERSION {
+        return Err(Error::corrupt_file_named(
+            path.filename().unwrap_or(INDEX_FILE_NAME),
+            format!(
+                "Vamana segment file is a Lance {} file, and this crate writes and reads {}",
+                reader.metadata().version(),
+                SEGMENT_FILE_VERSION
+            ),
+        ));
+    }
 
     let Some(columns) = columns else {
         return Ok(reader);
@@ -366,7 +381,17 @@ pub async fn read_segment(
     } else {
         read_rows(&reader, 0..num_rows).await?
     };
-    SegmentManifest::try_from_batch(metadata, ivf, &batch)
+    // Everything the constructor refuses it refuses as `invalid_input`, because
+    // a *writer* goes through the same constructor and there the caller is the
+    // one who got it wrong. Reaching it from here means the same values arrived
+    // out of a file, and the repository's rule sorts errors by where the bad
+    // value came from rather than by what was wrong with it.
+    SegmentManifest::try_from_batch(metadata, ivf, &batch).map_err(|error| match error {
+        Error::InvalidInput { source, .. } => {
+            Error::corrupt_file_named(INDEX_FILE_NAME, source.to_string())
+        }
+        other => other,
+    })
 }
 
 /// Reject an IVF buffer that [`IvfModel::try_from`] would crash on.

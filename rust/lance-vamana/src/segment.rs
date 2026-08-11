@@ -140,10 +140,12 @@ impl SegmentManifest {
                     entry.partition_id, entry.medoid, entry.num_rows
                 )));
             }
-            // `NO_NEIGHBOR` takes the top local id, so a partition that claimed
-            // every id would have a vertex whose id reads back as padding. The
-            // partition file is checked against this count on read, so refusing
-            // the claim here is what keeps that check meaningful.
+            // `NO_NEIGHBOR` takes the top local id, and the bound keeps a
+            // partition's ids clear of it with one row to spare - the ids of an
+            // `n`-row partition stop at `n - 1`, so this refuses one count
+            // earlier than it strictly has to. The partition file is checked
+            // against this claim on read, so refusing an unmeetable claim here
+            // is what keeps that check meaningful.
             if entry.num_rows > MAX_PARTITION_ROWS {
                 return Err(Error::invalid_input(format!(
                     "Vamana partition {} claims {} rows, exceeding the addressable maximum {}",
