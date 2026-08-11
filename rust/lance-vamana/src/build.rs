@@ -12,6 +12,7 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 
+use crate::format::MAX_PARTITION_ROWS;
 use crate::partition::PartitionGraph;
 use crate::search::{Comparisons, SearchScratch, greedy_search};
 
@@ -69,6 +70,23 @@ pub struct BuiltPartition {
     pub medoid: u32,
 }
 
+/// How many vertices a store holds, as the id space they will be addressed in.
+///
+/// A local id is a `u32` while `VectorStore::len` is a `usize`, and casting the
+/// one to the other is the single place where a partition too large to address
+/// turns into a partition of `len % 2^32` vertices instead of an error.
+fn addressable_len(num_vertices: usize) -> Result<u32> {
+    u32::try_from(num_vertices)
+        .ok()
+        .filter(|len| *len <= MAX_PARTITION_ROWS)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Vamana cannot build over {num_vertices} vectors, exceeding the addressable \
+                 maximum {MAX_PARTITION_ROWS}"
+            ))
+        })
+}
+
 /// Build one partition's graph, in memory.
 ///
 /// Algorithm 3 of the DiskANN paper: start from a random `R`-regular graph, then
@@ -82,7 +100,7 @@ pub fn build_partition<S: VectorStore>(
     params: &BuildParams,
     comparisons: &Comparisons,
 ) -> Result<BuiltPartition> {
-    let num_vertices = store.len();
+    let num_vertices = addressable_len(store.len())?;
     if num_vertices == 0 {
         return Err(Error::invalid_input(
             "Vamana cannot build a graph over an empty partition".to_string(),
@@ -106,7 +124,7 @@ pub fn build_partition<S: VectorStore>(
     // Indexed rather than iterated: a vertex's local id is its position here, so
     // this mapping is what turns a graph result back into a dataset row, and
     // `VectorStore` nowhere promises that `row_ids()` yields them in id order.
-    let row_ids = (0..num_vertices as u32)
+    let row_ids = (0..num_vertices)
         .map(|id| store.row_id(id))
         .collect::<Vec<_>>();
     let mut graph = PartitionGraph::edgeless(params.max_degree, row_ids)?;
@@ -114,8 +132,8 @@ pub fn build_partition<S: VectorStore>(
     let medoid = medoid(store, params.medoid_sample_size, &mut rng, comparisons)?;
 
     let max_degree = params.max_degree as usize;
-    let mut scratch = SearchScratch::new(num_vertices);
-    let mut order = (0..num_vertices as u32).collect::<Vec<_>>();
+    let mut scratch = SearchScratch::new(num_vertices as usize);
+    let mut order = (0..num_vertices).collect::<Vec<_>>();
     let mut existing = Vec::with_capacity(max_degree + 1);
 
     for alpha in [1.0, params.alpha] {
@@ -231,7 +249,7 @@ pub fn medoid<S: VectorStore>(
     rng: &mut SmallRng,
     comparisons: &Comparisons,
 ) -> Result<u32> {
-    let num_vertices = store.len();
+    let num_vertices = addressable_len(store.len())?;
     if num_vertices == 0 {
         return Err(Error::invalid_input(
             "Vamana cannot pick a medoid from an empty partition".to_string(),
@@ -242,10 +260,10 @@ pub fn medoid<S: VectorStore>(
             "Vamana medoid sample size must be greater than zero".to_string(),
         ));
     }
-    let sample = if sample_size >= num_vertices {
-        (0..num_vertices as u32).collect::<Vec<_>>()
+    let sample = if sample_size >= num_vertices as usize {
+        (0..num_vertices).collect::<Vec<_>>()
     } else {
-        let mut sample = (0..num_vertices as u32).collect::<Vec<_>>();
+        let mut sample = (0..num_vertices).collect::<Vec<_>>();
         sample.shuffle(rng);
         sample.truncate(sample_size);
         sample.sort_unstable();
@@ -1014,6 +1032,28 @@ mod tests {
         let error =
             build_partition(&storage, &small_params(), &Comparisons::default()).unwrap_err();
         assert!(error.to_string().contains("empty partition"), "{error}");
+    }
+
+    /// Checked as arithmetic because the store it protects against cannot be
+    /// built in a test: the first count that overflows a `u32` is 16GB of
+    /// vectors. Left to the cast, that store builds a graph over
+    /// `len % 2^32` vertices, and at exactly `2^32` it takes the medoid of an
+    /// empty sample and panics.
+    #[test]
+    fn a_partition_larger_than_the_id_space_is_refused() {
+        assert_eq!(addressable_len(0).unwrap(), 0);
+        assert_eq!(
+            addressable_len(MAX_PARTITION_ROWS as usize).unwrap(),
+            MAX_PARTITION_ROWS
+        );
+        for num_vertices in [MAX_PARTITION_ROWS as usize + 1, u32::MAX as usize + 1] {
+            let error = addressable_len(num_vertices).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error.to_string().contains(&num_vertices.to_string()),
+                "{error}"
+            );
+        }
     }
 
     /// A NaN alpha would make every prune test false and silently keep the
