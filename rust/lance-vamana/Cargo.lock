@@ -3577,6 +3577,7 @@ dependencies = [
  "prost-types",
  "rand 0.9.5",
  "roaring",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

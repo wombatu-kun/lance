@@ -27,7 +27,8 @@ use lance::index::DatasetIndexExt;
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{
-    INDEX_DETAILS_TYPE_URL, IndexParams, build_segment, create_index, live_fragments,
+    INDEX_DETAILS_TYPE_URL, IndexParams, MAX_KMEANS_SAMPLE_RATE, build_segment, create_index,
+    live_fragments,
 };
 use lance_vamana::format::INDEX_FILE_NAME;
 use lance_vamana::io::{open_file, read_partition, read_segment, scan_scheduler};
@@ -729,6 +730,13 @@ async fn a_zero_kmeans_parameter_is_refused() {
     for (params, named) in [
         (params().with_kmeans_sample_rate(0), "kmeans_sample_rate"),
         (params().with_kmeans_max_iters(0), "kmeans_max_iters"),
+        // And the other end of the sample rate, which is not a matter of taste:
+        // above it Lance trains on the front of the training set rather than on
+        // a sample of it.
+        (
+            params().with_kmeans_sample_rate(MAX_KMEANS_SAMPLE_RATE + 1),
+            "kmeans_sample_rate",
+        ),
     ] {
         let error = create_index(&mut dataset, INDEX_NAME, &params)
             .await
@@ -777,6 +785,23 @@ async fn a_nested_vector_column_is_refused_with_its_reason() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("is nested"), "{error}");
+}
+
+/// A fragment named twice would have its rows read twice and indexed twice, and
+/// the coverage bitmap would collapse the duplicate on the way into the manifest
+/// - so the segment would look ordinary while holding two copies of everything
+/// that fragment carries.
+#[tokio::test]
+async fn a_fragment_named_twice_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = DatasetFixture::default().write(uri).await;
+    let segment_dir = dataset.indices_dir().join("doubled");
+
+    let error = build_segment(&dataset, &params(), &segment_dir, &[0, 1, 0])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("distinct"), "{error}");
 }
 
 /// The column type is asked of the schema, not of the data. `read_vectors`
@@ -839,7 +864,7 @@ async fn a_column_of_the_wrong_type_is_refused_before_it_is_read() {
         assert!(
             error
                 .to_string()
-                .contains("Vamana indexes FixedSizeList<Float32> only"),
+                .contains("Vamana indexes FixedSizeList<Float32>"),
             "{name}: refused by the reader rather than by the schema check: {error}"
         );
     }

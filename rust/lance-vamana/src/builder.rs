@@ -30,6 +30,7 @@ use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::{KMeans, KMeansParams, compute_partitions_arrow_array};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_fsl_owned;
+use lance_table::format::WriterVersion;
 use object_store::path::Path;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
@@ -61,6 +62,15 @@ use crate::segment::SegmentManifest;
 /// replacing it.
 pub const INDEX_DETAILS_TYPE_URL: &str = "type.googleapis.com/lance.vamana.VamanaIndexDetails";
 
+/// Most vectors per centroid the router's k-means will actually train on.
+///
+/// Lance's own ceiling, applied here so that a caller learns about it: at
+/// `data.len() >= k * 512` its k-means slices the training set down with
+/// `data.slice(0, k * 512)`. A prefix, not a sample - so above this the
+/// randomness of our own sampling would be spent and the router would be trained
+/// on the front of the dataset.
+pub const MAX_KMEANS_SAMPLE_RATE: usize = 512;
+
 /// How to build one Vamana index segment.
 #[derive(Debug, Clone)]
 pub struct IndexParams {
@@ -83,8 +93,10 @@ pub struct IndexParams {
     pub kmeans_max_iters: u32,
     /// Vectors sampled per centroid when training the router.
     ///
-    /// Capped at 512 by Lance, which re-slices the training set to `512 * k`
-    /// before it starts, so anything above that has no effect.
+    /// At most [`MAX_KMEANS_SAMPLE_RATE`], and refused above it rather than
+    /// clamped: Lance re-slices the training set to `512 * k` before it starts,
+    /// and it takes the *front* of it, so a larger rate would quietly stop being
+    /// a random sample of the dataset.
     pub kmeans_sample_rate: usize,
 }
 
@@ -303,13 +315,26 @@ pub async fn build_index_segment(
 /// The version compared is the one on the manifest the commit *starts from*, so
 /// a single commit by a current Lance build clears it permanently.
 fn writer_predates_bitmap_recalculation(dataset: &Dataset) -> bool {
-    match dataset.manifest().writer_version.as_ref() {
+    predates_bitmap_recalculation(dataset.manifest().writer_version.as_ref())
+}
+
+/// The comparison itself, over the value rather than over a dataset, because a
+/// manifest carrying a prerelease writer is not something this crate's fixtures
+/// can produce and the ordering is exactly where this can go wrong.
+///
+/// `semver::Version` rather than the `(major, minor, patch)` triple: semver
+/// orders a prerelease *below* the release it leads to, so `0.8.15-beta.1` is
+/// old to Lance and would be new to a triple comparison - and this crate would
+/// then build an index over a manifest whose next commit recalculates every
+/// fragment bitmap by opening it.
+fn predates_bitmap_recalculation(version: Option<&WriterVersion>) -> bool {
+    match version {
         None => true,
         Some(version) if version.library != "lance" => false,
         // Unparseable counts as old, which is what Lance concludes too.
         Some(version) => version
             .lance_lib_version()
-            .is_none_or(|parsed| (parsed.major, parsed.minor, parsed.patch) < (0, 8, 15)),
+            .is_none_or(|parsed| parsed < semver::Version::new(0, 8, 15)),
     }
 }
 
@@ -361,10 +386,34 @@ pub async fn build_segment(
         ));
     }
     supported_distance_type(params.distance_type)?;
+    if params.kmeans_sample_rate > MAX_KMEANS_SAMPLE_RATE {
+        return Err(Error::invalid_input(format!(
+            "Vamana kmeans_sample_rate must be at most {MAX_KMEANS_SAMPLE_RATE}, got {}; above \
+             that Lance re-slices the training set down to {MAX_KMEANS_SAMPLE_RATE} vectors per \
+             centroid, and it takes a *prefix* - so a larger rate would not train on more data, \
+             it would train on the front of the dataset",
+            params.kmeans_sample_rate
+        )));
+    }
     if fragments.is_empty() {
         return Err(Error::invalid_input(
             "Vamana cannot build a segment over no fragments".to_string(),
         ));
+    }
+    // A fragment named twice would be read twice and indexed twice, and nothing
+    // downstream could tell: the coverage bitmap collapses the duplicate, so the
+    // segment would look ordinary while holding every one of that fragment's
+    // rows in two partitions.
+    let mut seen = fragments.to_vec();
+    seen.sort_unstable();
+    seen.dedup();
+    if seen.len() != fragments.len() {
+        return Err(Error::invalid_input(format!(
+            "Vamana was asked to index {} fragments but only {} of them are distinct; a fragment \
+             named twice would have its rows indexed twice",
+            fragments.len(),
+            seen.len()
+        )));
     }
     // Asked of the schema, not of the data. `read_vectors` checks the same thing
     // on the array it decoded, which is the last line of defence and far too
@@ -377,10 +426,16 @@ pub async fn build_segment(
         ))
     })?;
     match field.data_type() {
-        DataType::FixedSizeList(item, _) if item.data_type() == &DataType::Float32 => {}
+        // Width included, because zero is a type the schema can hold and no
+        // layer below is ready for it: k-means divides by the dimension and
+        // `l2_distance_batch` takes a chunk size of zero, both of which end the
+        // process rather than the call.
+        DataType::FixedSizeList(item, width)
+            if item.data_type() == &DataType::Float32 && width > 0 => {}
         other => {
             return Err(Error::not_supported(format!(
-                "column '{}' has type {other}; Vamana indexes FixedSizeList<Float32> only",
+                "column '{}' has type {other}; Vamana indexes FixedSizeList<Float32> of a \
+                 positive width only",
                 params.column
             )));
         }
@@ -773,6 +828,55 @@ mod tests {
 
     use super::*;
     use crate::format::partition_file_name;
+
+    fn written_by(library: &str, version: &str, prerelease: Option<&str>) -> WriterVersion {
+        WriterVersion {
+            library: library.to_string(),
+            version: version.to_string(),
+            prerelease: prerelease.map(str::to_string),
+            build_metadata: None,
+        }
+    }
+
+    /// The version gate is the one thing standing between a build and a commit
+    /// that fails inside Lance, and the case it can get wrong is the one no
+    /// fixture in this crate can produce: semver puts a prerelease *below* the
+    /// release it leads to, so `0.8.15-beta.1` is old to Lance and would be new
+    /// to a comparison of `(major, minor, patch)`.
+    #[test]
+    fn a_prerelease_writer_counts_as_older_than_its_release() {
+        for (version, prerelease, expected, what) in [
+            ("0.8.14", None, true, "older than the fix"),
+            ("0.8.15", None, false, "the fix itself"),
+            ("0.8.15", Some("beta.1"), true, "a prerelease of the fix"),
+            (
+                "0.9.0",
+                Some("rc.1"),
+                false,
+                "a prerelease of a later release",
+            ),
+            ("1.2.3", None, false, "current"),
+        ] {
+            assert_eq!(
+                predates_bitmap_recalculation(Some(&written_by("lance", version, prerelease))),
+                expected,
+                "{what}"
+            );
+        }
+
+        assert!(
+            predates_bitmap_recalculation(None),
+            "a manifest with no recorded writer has to count as old, as it does upstream"
+        );
+        assert!(
+            !predates_bitmap_recalculation(Some(&written_by("something-else", "0.1.0", None))),
+            "Lance leaves another library's manifest alone, and so does this"
+        );
+        assert!(
+            predates_bitmap_recalculation(Some(&written_by("lance", "not a version", None))),
+            "an unparseable version counts as old, as it does upstream"
+        );
+    }
 
     /// A partition whose centroid drew nothing gets no file and no row in the
     /// segment table, and the partitions after it keep their own ids. Writing
