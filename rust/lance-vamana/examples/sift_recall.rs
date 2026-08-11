@@ -53,6 +53,10 @@ use lance_linalg::distance::DistanceType;
 use lance_vamana::build::{BuildParams, build_partition};
 use lance_vamana::search::{Comparisons, SearchScratch, greedy_search};
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{env_usize, read_fvecs, read_ivecs};
+
 const K: usize = 10;
 const DISTANCE_TYPE: DistanceType = DistanceType::L2;
 
@@ -155,57 +159,11 @@ impl<S: VectorStore + 'static> VectorStore for Counting<S> {
     }
 }
 
-fn read_fvecs(path: &str) -> (Vec<f32>, usize, usize) {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let dim = i32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    let record = 4 + dim * 4;
-    assert_eq!(bytes.len() % record, 0);
-    let count = bytes.len() / record;
-    let mut values = Vec::with_capacity(count * dim);
-    for row in 0..count {
-        let start = row * record + 4;
-        for i in 0..dim {
-            let offset = start + i * 4;
-            values.push(f32::from_le_bytes(
-                bytes[offset..offset + 4].try_into().unwrap(),
-            ));
-        }
-    }
-    (values, dim, count)
-}
-
-fn read_ivecs(path: &str) -> Vec<Vec<u32>> {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let dim = i32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    let record = 4 + dim * 4;
-    assert_eq!(bytes.len() % record, 0);
-    (0..bytes.len() / record)
-        .map(|row| {
-            let start = row * record + 4;
-            (0..dim)
-                .map(|i| {
-                    u32::from_le_bytes(bytes[start + i * 4..start + i * 4 + 4].try_into().unwrap())
-                })
-                .collect()
-        })
-        .collect()
-}
-
 fn storage(values: Vec<f32>, dim: usize) -> FlatFloatStorage {
     FlatFloatStorage::new(
         FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32).unwrap(),
         DISTANCE_TYPE,
     )
-}
-
-fn env_usize(name: &str, fallback: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .map(|raw| {
-            raw.parse()
-                .unwrap_or_else(|_| panic!("{name} must be a number"))
-        })
-        .unwrap_or(fallback)
 }
 
 /// Exact top-`K` by brute force, computed rather than trusted.
