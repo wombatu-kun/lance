@@ -758,6 +758,75 @@ mod tests {
         assert!(error.to_string().contains("holds nulls"), "{error}");
     }
 
+    /// The neighbour column is read through `values()` as well, and a null slot
+    /// reads back as 0 - a perfectly ordinary local id, so a walk would follow
+    /// the edge to vertex 0 of the partition and never know. Nulls are guarded
+    /// on both levels because either one can carry them: the list may be null,
+    /// or a slot inside it may.
+    #[test]
+    fn a_null_neighbour_read_back_is_rejected() {
+        let partition = sample_partition(4);
+        let batch = partition.to_batch().unwrap();
+        let width = partition.graph().max_degree() as i32;
+
+        for (what, list_nulls, slot_nulls) in
+            [("a null slot", false, true), ("a null list", true, false)]
+        {
+            let mut slots = batch[NEIGHBORS_COLUMN]
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<UInt32Type>()
+                .values()
+                .iter()
+                .copied()
+                .map(Some)
+                .collect::<Vec<_>>();
+            if slot_nulls {
+                slots[1] = None;
+            }
+            let lists = if list_nulls {
+                Some(vec![true, false, true, true].into())
+            } else {
+                None
+            };
+            let holed = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    batch.schema().field(0).clone(),
+                    Field::new(
+                        NEIGHBORS_COLUMN,
+                        DataType::FixedSizeList(
+                            Arc::new(Field::new("item", DataType::UInt32, true)),
+                            width,
+                        ),
+                        true,
+                    ),
+                    batch.schema().field(2).clone(),
+                ])),
+                vec![
+                    batch.column(0).clone(),
+                    Arc::new(
+                        FixedSizeListArray::try_new(
+                            Arc::new(Field::new("item", DataType::UInt32, true)),
+                            width,
+                            Arc::new(UInt32Array::from(slots)),
+                            lists,
+                        )
+                        .unwrap(),
+                    ),
+                    batch.column(2).clone(),
+                ],
+            )
+            .unwrap();
+
+            let error = Partition::try_from_batch(&holed).unwrap_err();
+            assert!(
+                matches!(error, Error::CorruptFile { .. }),
+                "{what}: {error}"
+            );
+            assert!(error.to_string().contains("holds nulls"), "{what}: {error}");
+        }
+    }
+
     /// A repeated out-edge was only a `debug_assert`, so a release build took
     /// it, and both constructors then reported a degree the walk cannot deliver.
     #[test]

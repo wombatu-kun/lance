@@ -41,7 +41,7 @@ use lance_vamana::builder::{
     INDEX_DETAILS_TYPE_URL, IndexParams, build_index_segment, build_segment, create_index,
 };
 use lance_vamana::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
-use lance_vamana::io::SegmentWriter;
+use lance_vamana::io::{SegmentWriter, read_segment, scan_scheduler};
 use lance_vamana::query::{SearchParams, VamanaIndex};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
@@ -587,6 +587,21 @@ async fn a_narrow_probe_costs_recall_and_buys_work() {
     );
 }
 
+/// How many rows the biggest partition of the committed index holds.
+async fn largest_partition(dataset: &Dataset) -> u64 {
+    let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+    let store = dataset.object_store(None).await.unwrap();
+    let dir = dataset.indices_dir().join(indices[0].uuid.to_string());
+    read_segment(&scan_scheduler(&store), &dir, None)
+        .await
+        .unwrap()
+        .partitions()
+        .iter()
+        .map(|entry| u64::from(entry.num_rows))
+        .max()
+        .expect("the index committed no partitions")
+}
+
 /// Routing measures the query against *every* centroid a segment holds, and
 /// pays for it whether or not a probe lands there. So a query that walks one
 /// four-vertex partition of a 256-partition index costs at least 256
@@ -635,15 +650,15 @@ async fn routing_is_charged_for_every_centroid_not_every_probe() {
         result.comparisons
     );
     // And a ceiling, because a floor alone makes over-counting free: doubling
-    // every charge would still clear it. One walk of a partition this small
-    // cannot add more than its own vertices on top of the routing.
-    let partition_rows = u64::from(
-        VamanaIndex::open(&dataset, INDEX_NAME)
-            .await
-            .unwrap()
-            .metadata()
-            .max_degree,
-    ) + small_fixture().rows() as u64 / u64::from(CENTROIDS);
+    // every charge would still clear it. The walk is charged once per vertex it
+    // measures and `SearchScratch` keeps it from measuring one twice, so a walk
+    // cannot cost more than its partition holds.
+    //
+    // Taken from the largest partition that was actually written rather than
+    // from the average one: k-means does not divide evenly, and a ceiling built
+    // on `rows / centroids` would fail the day a probe landed on a big cell -
+    // on CI, without a line of this crate having changed.
+    let partition_rows = largest_partition(&dataset).await;
     assert!(
         result.comparisons <= u64::from(CENTROIDS) + partition_rows,
         "a query paid {} comparisons, more than routing {CENTROIDS} plus everything \
@@ -1379,6 +1394,45 @@ async fn an_index_credited_with_a_fragment_it_never_read_is_refused() {
     assert!(error.to_string().contains("credits it with 2"), "{error}");
 }
 
+/// Write a segment that declares exactly `metadata`, and describe it ready to
+/// commit.
+///
+/// The one partition it holds matches the declaration in width and degree, and
+/// the routing model matches its dimension, so the only thing wrong with the
+/// segment is whatever the caller put in the metadata. That is what makes it the
+/// way to test a refusal that no build can produce.
+async fn hand_made_segment(dataset: &Dataset, metadata: IndexMetadata) -> IndexSegment {
+    let uuid = Uuid::new_v4();
+    let covered = metadata.fragments.clone();
+    let centroids =
+        <FixedSizeListArray as lance_arrow::FixedSizeListArrayExt>::try_new_from_values(
+            Float32Array::from(vec![0.5f32; metadata.dimension as usize]),
+            metadata.dimension as i32,
+        )
+        .unwrap();
+    let partition = sample_partition(metadata.max_degree, 8, metadata.dimension);
+    let mut writer = SegmentWriter::new(
+        dataset.object_store(None).await.unwrap(),
+        dataset.indices_dir().join(uuid.to_string()),
+        metadata,
+        lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
+    );
+    writer.write_partition(0, 0, &partition).await.unwrap();
+    writer.finish().await.unwrap();
+
+    IndexSegment::new(
+        uuid,
+        covered,
+        [dataset.schema().field(VECTOR_COLUMN).unwrap().id],
+        Arc::new(prost_types::Any {
+            type_url: INDEX_DETAILS_TYPE_URL.to_string(),
+            value: Vec::new(),
+        }),
+        FORMAT_VERSION as i32,
+        dataset.manifest.version,
+    )
+}
+
 /// A segment claiming stable row ids has to be refused on its own account, not
 /// only through the dataset's setting. The builder will not produce one, so this
 /// half of the check has never run - and the two identifier spaces are not
@@ -1392,46 +1446,14 @@ async fn an_index_built_for_stable_row_ids_is_refused() {
     let mut dataset = small_fixture().write(uri).await;
     let covered = (0..dataset.get_fragments().len() as u32).collect::<Vec<_>>();
 
-    let uuid = Uuid::new_v4();
-    let store = dataset.object_store(None).await.unwrap();
-    let centroids =
-        <FixedSizeListArray as lance_arrow::FixedSizeListArrayExt>::try_new_from_values(
-            Float32Array::from(vec![0.5f32; VECTOR_DIM as usize]),
-            VECTOR_DIM,
-        )
-        .unwrap();
-    let mut writer = SegmentWriter::new(
-        store,
-        dataset.indices_dir().join(uuid.to_string()),
+    let segment = hand_made_segment(
+        &dataset,
         IndexMetadata {
-            format_version: FORMAT_VERSION,
-            max_degree: 16,
-            alpha: 1.2,
-            dimension: VECTOR_DIM as u32,
-            distance_type: DistanceType::L2,
             row_id_mode: RowIdMode::Stable,
-            fragments: covered.clone(),
+            ..declaring(covered)
         },
-        lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
-    );
-    writer
-        .write_partition(0, 0, &sample_partition(16, 8, VECTOR_DIM as u32))
-        .await
-        .unwrap();
-    writer.finish().await.unwrap();
-
-    let details = prost_types::Any {
-        type_url: INDEX_DETAILS_TYPE_URL.to_string(),
-        value: Vec::new(),
-    };
-    let segment = IndexSegment::new(
-        uuid,
-        covered,
-        [dataset.schema().field(VECTOR_COLUMN).unwrap().id],
-        Arc::new(details),
-        FORMAT_VERSION as i32,
-        dataset.manifest.version,
-    );
+    )
+    .await;
     dataset
         .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![segment])
         .await
@@ -1441,6 +1463,49 @@ async fn an_index_built_for_stable_row_ids_is_refused() {
         .await
         .expect_err("a segment in the wrong identifier space must not answer");
     assert!(error.to_string().contains("Stable"), "{error}");
+}
+
+/// What a segment of this fixture ordinarily declares. Every refusal below is
+/// one field of it changed.
+fn declaring(fragments: Vec<u32>) -> IndexMetadata {
+    IndexMetadata {
+        format_version: FORMAT_VERSION,
+        max_degree: 16,
+        alpha: 1.2,
+        dimension: VECTOR_DIM as u32,
+        distance_type: DistanceType::L2,
+        row_id_mode: RowIdMode::Address,
+        fragments,
+    }
+}
+
+/// The metric is refused on open as well as on the build path. The two are
+/// separate doors into the same crate - a segment can be written by an older
+/// build, or by hand - and only the build one was ever tried.
+#[tokio::test]
+async fn an_index_declaring_an_unsupported_metric_is_refused_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = small_fixture().write(uri).await;
+    let covered = (0..dataset.get_fragments().len() as u32).collect::<Vec<_>>();
+
+    let segment = hand_made_segment(
+        &dataset,
+        IndexMetadata {
+            distance_type: DistanceType::Dot,
+            ..declaring(covered)
+        },
+    )
+    .await;
+    dataset
+        .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![segment])
+        .await
+        .unwrap();
+
+    let error = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect_err("a segment built under a metric this crate cannot rank by must not answer");
+    assert!(error.to_string().contains("dot distance"), "{error}");
 }
 
 /// A query mixes the answers of every segment, so the segments have to agree on
@@ -1453,9 +1518,10 @@ async fn segments_that_disagree_about_their_vectors_are_refused() {
     let uri = dir.path().to_str().unwrap();
     let mut dataset = small_fixture().write(uri).await;
 
-    // Different in more than the field under test - a wider graph and a
-    // different pruning slack too - because degree and alpha are *allowed* to
-    // differ between segments and the check must not be reading those.
+    // The metric, through a real build on both sides and different in more than
+    // the field under test - a wider graph and a different pruning slack too -
+    // because degree and alpha are *allowed* to differ between segments and the
+    // check must not be reading those.
     let (left, _) = build_index_segment(&dataset, &params(), &[0])
         .await
         .unwrap();
@@ -1485,6 +1551,65 @@ async fn segments_that_disagree_about_their_vectors_are_refused() {
         error.to_string().contains("disagree about the vectors"),
         "{error}"
     );
+
+    // The other two fields of the same check, which no build can disagree on -
+    // the width comes from the column and the identifier space from the dataset,
+    // so a segment that differs in either has to be written by hand.
+    for (what, doctored) in [
+        (
+            "the width",
+            IndexMetadata {
+                dimension: VECTOR_DIM as u32 + 1,
+                ..declaring(vec![1])
+            },
+        ),
+        (
+            "the identifier space",
+            IndexMetadata {
+                row_id_mode: RowIdMode::Stable,
+                ..declaring(vec![1])
+            },
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut dataset = small_fixture().write(uri).await;
+        let agreeing = hand_made_segment(&dataset, declaring(vec![0])).await;
+        let disagreeing = hand_made_segment(&dataset, doctored).await;
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![agreeing, disagreeing])
+            .await
+            .unwrap();
+
+        let error = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap_err();
+        assert!(
+            error.to_string().contains("disagree about the vectors"),
+            "segments disagreeing about {what} were merged instead: {error}"
+        );
+    }
+
+    // And the pair the check must stay quiet about, so that it is testing the
+    // fields it names rather than "the two segments are not identical".
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = small_fixture().write(uri).await;
+    let left = hand_made_segment(&dataset, declaring(vec![0])).await;
+    let right = hand_made_segment(
+        &dataset,
+        IndexMetadata {
+            max_degree: 24,
+            alpha: 1.4,
+            ..declaring(vec![1])
+        },
+    )
+    .await;
+    dataset
+        .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![left, right])
+        .await
+        .unwrap();
+    VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect("a segment appended with a different graph is allowed to differ");
 }
 
 /// The format version lives in two places - the dataset manifest and the

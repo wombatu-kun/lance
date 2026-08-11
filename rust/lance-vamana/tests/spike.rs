@@ -673,21 +673,26 @@ async fn q0_4_compaction_strands_an_unreadable_index() {
     );
 }
 
-/// Collect every deleted row address by reading the fragments' deletion vectors.
+/// Every deleted row address, over every fragment of the dataset.
 ///
-/// This is the S4 `DeleteList` prototype: cost is proportional to the number of
-/// deleted rows, not to the size of the dataset.
+/// The S4 `DeleteList` question was whether such a list could be built from
+/// outside Lance at all, at a cost proportional to the deletions rather than to
+/// the dataset. It was answered here with a local prototype, which then drifted
+/// away from the code that shipped - it had no coverage filter and read the
+/// fragments one at a time - and left these assertions describing a copy. So the
+/// question is now put to the shipped function.
 async fn deleted_row_addresses(dataset: &Dataset) -> HashSet<u64> {
-    let mut deleted = HashSet::new();
-    for fragment in dataset.get_fragments() {
-        let Some(deletion_vector) = fragment.get_deletion_vector().await.unwrap() else {
-            continue;
-        };
-        for row_offset in deletion_vector.iter() {
-            deleted.insert(RowAddress::new_from_parts(fragment.id() as u32, row_offset).into());
-        }
-    }
-    deleted
+    let covered = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<roaring::RoaringBitmap>();
+    let io_parallelism = dataset.object_store(None).await.unwrap().io_parallelism();
+    lance_vamana::query::deleted_row_addresses(dataset, &covered, io_parallelism)
+        .await
+        .unwrap()
+        .iter()
+        .collect()
 }
 
 async fn scan_row_ids(dataset: &Dataset) -> Vec<u64> {

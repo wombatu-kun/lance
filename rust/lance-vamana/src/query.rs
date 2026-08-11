@@ -879,6 +879,11 @@ fn merge(mut found: Vec<Neighbor>, k: usize) -> Vec<Neighbor> {
 
 /// Row addresses deleted from the fragments an index covers.
 ///
+/// Public because the spike tests measure this exact question - whether a delete
+/// list can be built from outside Lance, at a cost proportional to the deletions
+/// rather than to the dataset - and a private copy of it in a test is a copy
+/// that drifts.
+///
 /// Deletion vectors are per fragment and always in address space, which is why
 /// the index refuses to open over a stable-row-id dataset: there the stored ids
 /// are logical, and a list built here would filter live rows and keep dead ones.
@@ -886,7 +891,7 @@ fn merge(mut found: Vec<Neighbor>, k: usize) -> Vec<Neighbor> {
 /// Only the covered fragments are read. The rest cannot contribute a vertex, so
 /// their deletions are somebody else's problem and their deletion files are a
 /// per-fragment read this query would pay for nothing.
-async fn deleted_row_addresses(
+pub async fn deleted_row_addresses(
     dataset: &Dataset,
     covered: &RoaringBitmap,
     io_parallelism: usize,
