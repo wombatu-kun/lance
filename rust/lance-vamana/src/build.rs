@@ -343,6 +343,22 @@ pub fn robust_prune<S: VectorStore>(
 
     let mut pool = candidates;
     pool.retain(|candidate| candidate.id != point);
+    // Every distance the rule below compares is pinned at zero first. Under L2
+    // that is a no-op, because an L2 distance is a sum of squares; under cosine
+    // it is not, because `1 - dot` in f32 lands a few ULPs either side of zero
+    // for a unit vector against itself - measured below zero for 30-44% of
+    // random vectors, down to -2.4e-7. A negative distance inverts the rule:
+    // multiplying it by `alpha > 1` moves the left-hand side *down*, so
+    // `alpha * separation > candidate.dist` is false and the candidate is
+    // dropped, while `separation == 0.0` misses it on the way out and the fill
+    // below never sees it. A partition of duplicates then collapses into
+    // single-edge vertices - which is the very failure this crate refuses `Dot`
+    // for. Pinning repairs rounding around zero for a metric that is
+    // mathematically non-negative; it is not a licence to take one that is
+    // genuinely signed, and `supported_distance_type` still turns `Dot` away.
+    for candidate in &mut pool {
+        candidate.dist = OrderedFloat(candidate.dist.0.max(0.0));
+    }
     // Deduplicated by id before being ordered by distance: `dedup_by_key` only
     // collapses neighbours, and the same id arriving twice with two different
     // distances would not be adjacent under a distance ordering.
@@ -367,7 +383,7 @@ pub fn robust_prune<S: VectorStore>(
         let from_nearest = store.dist_calculator_from_id(nearest.id);
         comparisons.record(pool.len() as u64);
         pool.retain(|candidate| {
-            let separation = from_nearest.distance(candidate.id);
+            let separation = from_nearest.distance(candidate.id).max(0.0);
             if alpha * separation > candidate.dist.0 {
                 return true;
             }
@@ -385,8 +401,9 @@ pub fn robust_prune<S: VectorStore>(
     // difference is worth naming. Under L2 it is exact duplicates, so ordinary
     // data never takes this path at all. Under cosine the builder stores unit
     // vectors, so it is rows that were *proportional* before normalisation - and
-    // then a little more, because `1 - dot` in f32 rounds to exactly 0.0 once the
-    // inner product is within about 6e-8 of one. Those are still the same point
+    // then a little more, because `1 - dot` in f32 lands at or below zero once the
+    // inner product is within about 6e-8 of one, and the pinning above brings the
+    // below back up to it. Those are still the same point
     // in the space the index measures, which is what makes filling the slots with
     // them right rather than a fallback: they point in no new direction, but they
     // are distinct rows a query has to be able to enumerate.
@@ -415,6 +432,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::flat::storage::FlatFloatStorage;
     use lance_linalg::distance::DistanceType;
+    use lance_linalg::kernels::normalize_fsl;
 
     use super::*;
     use crate::search::{SearchScratch, greedy_search};
@@ -782,6 +800,12 @@ mod tests {
     /// at every alpha. Before the coincident fill each vertex kept a *single*
     /// out-edge and a walk from the medoid over 400 vertices reached four.
     ///
+    /// Under both metrics, because zero separation is only exactly zero under
+    /// L2. Under cosine `d(x, x)` rounds to either side of it, and a negative
+    /// one inverted the alpha rule outright: before the distances were pinned at
+    /// zero, vertex 35 of the two-value case came out of this build with two of
+    /// its sixteen slots filled.
+    ///
     /// Full reachability is neither restored nor the goal: with identical
     /// vectors every answer is equally correct, so what has to hold is that a
     /// walk can still enumerate enough distinct rows to answer a query.
@@ -791,34 +815,53 @@ mod tests {
         const DIMENSION: usize = 8;
         let params = small_params();
 
-        for distinct in [1usize, 2, 4] {
-            let values = Float32Array::from(
-                (0..VERTICES)
-                    .flat_map(|vertex| {
-                        (0..DIMENSION)
-                            .map(move |axis| ((vertex % distinct) * DIMENSION + axis) as f32)
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            let store = FlatFloatStorage::new(
-                FixedSizeListArray::try_new_from_values(values, DIMENSION as i32).unwrap(),
-                DistanceType::L2,
-            );
-            let built = build_partition(&store, &params, &Comparisons::default()).unwrap();
+        // Seven distinct values across the three cases, not one: whether
+        // `d(x, x)` rounds below zero is a property of the vector, so a single
+        // base vector could round the harmless way on another target and take
+        // the cosine arm of this test with it. It stops at four values because
+        // the fill can only spend what the beam collected: these vectors are
+        // collinear, so `alpha * d(1, h) > d(0, h)` is false from the second
+        // group out and every farther group is dropped, which leaves the
+        // coincident copies of the two nearest groups to fill sixteen slots. At
+        // eight values a beam of 32 holds about four copies of each and the
+        // slots legitimately go unfilled - under L2 as much as under cosine.
+        for distance_type in [DistanceType::L2, DistanceType::Cosine] {
+            for distinct in [1usize, 2, 4] {
+                let values = Float32Array::from(
+                    (0..VERTICES)
+                        .flat_map(|vertex| {
+                            (0..DIMENSION)
+                                .map(move |axis| ((vertex % distinct) * DIMENSION + axis) as f32)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let vectors =
+                    FixedSizeListArray::try_new_from_values(values, DIMENSION as i32).unwrap();
+                // A cosine build stores unit vectors, so the duplicates a cosine
+                // graph is built over are the normalised ones.
+                let vectors = if distance_type == DistanceType::Cosine {
+                    normalize_fsl(&vectors).unwrap()
+                } else {
+                    vectors
+                };
+                let store = FlatFloatStorage::new(vectors, distance_type);
+                let built = build_partition(&store, &params, &Comparisons::default()).unwrap();
 
-            for vertex in 0..VERTICES as u32 {
-                assert_eq!(
-                    built.graph.neighbors(vertex).unwrap().len(),
-                    params.max_degree as usize,
-                    "distinct={distinct}: vertex {vertex} was left short of its slots"
+                for vertex in 0..VERTICES as u32 {
+                    assert_eq!(
+                        built.graph.neighbors(vertex).unwrap().len(),
+                        params.max_degree as usize,
+                        "{distance_type}, distinct={distinct}: vertex {vertex} was left short \
+                         of its slots"
+                    );
+                }
+                assert!(
+                    reachable(&built.graph, built.medoid) > params.max_degree as usize,
+                    "{distance_type}, distinct={distinct}: a walk reached {} vertices, so the \
+                     graph closed over the medoid's own neighbourhood",
+                    reachable(&built.graph, built.medoid)
                 );
             }
-            assert!(
-                reachable(&built.graph, built.medoid) > params.max_degree as usize,
-                "distinct={distinct}: a walk reached {} vertices, so the graph closed \
-                 over the medoid's own neighbourhood",
-                reachable(&built.graph, built.medoid)
-            );
         }
     }
 
