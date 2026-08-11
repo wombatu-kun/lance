@@ -245,6 +245,17 @@ fn randomize(graph: &mut PartitionGraph, rng: &mut SmallRng) -> Result<()> {
 /// is the vector of largest norm - the edge of the cloud, not its middle.
 /// [`crate::builder::supported_distance_type`] refuses `Dot` for a related
 /// reason.
+///
+/// What exactness buys at query time is small and shrinks with scale. Against a
+/// sample of 256 at `R=64, L=100`: on SIFT 100k over three seeds it returned
+/// 0.8-2.8% fewer distances per query at equal recall for 3.1% more build; on
+/// SIFT 1M the same comparison landed inside the harness's own run-to-run noise
+/// for 0.9% more build. An entry point is where a walk starts, and the longer
+/// the walk the less of it that is.
+///
+/// What does survive is that the walk stopped starting wherever the dice landed:
+/// at 100k the seed-to-seed spread of query cost fell from 3.8% to 0.1%. Recall
+/// did not move at either scale.
 pub fn medoid<S: VectorStore>(store: &S, comparisons: &Comparisons) -> Result<u32> {
     let num_vertices = addressable_len(store.len())?;
     if num_vertices == 0 {
