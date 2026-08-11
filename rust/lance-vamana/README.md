@@ -13,7 +13,7 @@ let index = VamanaIndex::open(&dataset, "vamana_idx").await?;
 let answer = index.search(&query, &SearchParams::new(10).with_nprobes(8)).await?;
 println!("answered in {} distance computations", answer.comparisons);
 for neighbor in &answer.neighbors {
-    // `neighbor.row_id` is a Lance row address; fetch with `Dataset::take_rows`.
+    // `neighbor.row_addr` is a Lance row address; fetch with `Dataset::take_rows`.
 }
 ```
 

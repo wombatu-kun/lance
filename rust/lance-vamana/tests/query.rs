@@ -152,7 +152,7 @@ async fn measure(
         let found = result
             .neighbors
             .iter()
-            .map(|neighbor| neighbor.row_id)
+            .map(|neighbor| neighbor.row_addr)
             .collect::<Vec<_>>();
         assert_eq!(found.len(), search.k, "a query returned the wrong count");
         total_recall += recall(&found, exact);
@@ -480,7 +480,7 @@ async fn a_cosine_index_matches_lance_cosine_brute_force() {
         let found = result
             .neighbors
             .iter()
-            .map(|neighbor| neighbor.row_id)
+            .map(|neighbor| neighbor.row_addr)
             .collect::<Vec<_>>();
         total += recall(&found, &exact);
         comparisons += result.comparisons;
@@ -512,7 +512,7 @@ async fn a_cosine_index_matches_lance_cosine_brute_force() {
         for neighbor in &result.neighbors {
             let row = row_ids
                 .iter()
-                .position(|id| *id == neighbor.row_id)
+                .position(|id| *id == neighbor.row_addr)
                 .expect("the answer named a row the dataset does not have");
             let stored = &values[row * dim..(row + 1) * dim];
             let dot = stored
@@ -525,7 +525,7 @@ async fn a_cosine_index_matches_lance_cosine_brute_force() {
             assert!(
                 (neighbor.distance - expected).abs() < 1e-5,
                 "row {} came back at distance {} but its cosine distance is {expected}",
-                neighbor.row_id,
+                neighbor.row_addr,
                 neighbor.distance
             );
         }
@@ -722,7 +722,7 @@ async fn every_answer_resolves_to_the_row_it_names() {
         let row_ids = result
             .neighbors
             .iter()
-            .map(|neighbor| neighbor.row_id)
+            .map(|neighbor| neighbor.row_addr)
             .collect::<Vec<_>>();
         assert_eq!(
             row_ids.len(),
@@ -758,7 +758,7 @@ async fn every_answer_resolves_to_the_row_it_names() {
             // positions it dropped.
             let row = fetched
                 .iter()
-                .position(|id| *id == neighbor.row_id)
+                .position(|id| *id == neighbor.row_addr)
                 .expect("a returned row id is not in the dataset");
             let stored = &values[row * dim..(row + 1) * dim];
             let distance = stored
@@ -769,7 +769,7 @@ async fn every_answer_resolves_to_the_row_it_names() {
             assert!(
                 (distance - neighbor.distance).abs() < 1e-4,
                 "row {} was reported at distance {} but is at {distance}",
-                neighbor.row_id,
+                neighbor.row_addr,
                 neighbor.distance
             );
         }
@@ -872,7 +872,7 @@ async fn an_index_over_a_deleted_fragment_answers_from_the_rest() {
         before
             .neighbors
             .iter()
-            .any(|neighbor| RowAddress::from(neighbor.row_id).fragment_id() == 1),
+            .any(|neighbor| RowAddress::from(neighbor.row_addr).fragment_id() == 1),
         "this query never reached fragment 1, so deleting it would prove nothing"
     );
 
@@ -911,7 +911,7 @@ async fn an_index_over_a_deleted_fragment_answers_from_the_rest() {
         after
             .neighbors
             .iter()
-            .all(|neighbor| RowAddress::from(neighbor.row_id).fragment_id() == 0),
+            .all(|neighbor| RowAddress::from(neighbor.row_addr).fragment_id() == 0),
         "an answer came back at an address in the fragment the dataset dropped"
     );
 }
@@ -1072,7 +1072,7 @@ async fn a_rewritten_fragment_that_is_then_deleted_stops_being_a_refusal() {
             && result
                 .neighbors
                 .iter()
-                .all(|neighbor| RowAddress::from(neighbor.row_id).fragment_id() == 1),
+                .all(|neighbor| RowAddress::from(neighbor.row_addr).fragment_id() == 1),
         "the index answered with {} rows, at least one of them in the fragment that is gone",
         result.neighbors.len()
     );
@@ -1302,9 +1302,9 @@ async fn deleted_rows_are_not_returned() {
         let result = index.search(query, &search).await.unwrap();
         for neighbor in &result.neighbors {
             assert!(
-                live.contains(&neighbor.row_id),
+                live.contains(&neighbor.row_addr),
                 "a deleted row was returned: {}",
-                neighbor.row_id
+                neighbor.row_addr
             );
         }
         assert_eq!(
@@ -1315,7 +1315,7 @@ async fn deleted_rows_are_not_returned() {
         let found = result
             .neighbors
             .iter()
-            .map(|neighbor| neighbor.row_id)
+            .map(|neighbor| neighbor.row_addr)
             .collect::<Vec<_>>();
         total_recall += recall(&found, &brute_force(&dataset, query, K).await);
     }
@@ -1346,7 +1346,7 @@ async fn the_delete_list_is_a_snapshot_taken_at_open() {
     let doomed = before
         .neighbors
         .iter()
-        .map(|neighbor| neighbor.row_id.to_string())
+        .map(|neighbor| neighbor.row_addr.to_string())
         .collect::<Vec<_>>()
         .join(", ");
     dataset
@@ -1365,10 +1365,10 @@ async fn the_delete_list_is_a_snapshot_taken_at_open() {
     let gone = before
         .neighbors
         .iter()
-        .map(|neighbor| neighbor.row_id)
+        .map(|neighbor| neighbor.row_addr)
         .collect::<HashSet<_>>();
     assert!(
-        fresh.neighbors.iter().all(|n| !gone.contains(&n.row_id)),
+        fresh.neighbors.iter().all(|n| !gone.contains(&n.row_addr)),
         "reopening must pick up the deletions"
     );
 }
@@ -1736,7 +1736,7 @@ async fn an_index_of_several_segments_answers_from_all_of_them() {
         let ids = result
             .neighbors
             .iter()
-            .map(|neighbor| neighbor.row_id)
+            .map(|neighbor| neighbor.row_addr)
             .collect::<HashSet<_>>();
         assert_eq!(ids.len(), K, "the merge returned a row twice");
     }
@@ -2022,7 +2022,7 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
     let found = result
         .neighbors
         .iter()
-        .map(|neighbor| neighbor.row_id)
+        .map(|neighbor| neighbor.row_addr)
         .collect::<Vec<_>>();
     assert_eq!(
         recall(&found, &brute_force(&dataset, &query, K).await),
@@ -2073,10 +2073,10 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
         assert_eq!(result.neighbors.len(), K);
         for neighbor in &result.neighbors {
             assert!(
-                held.contains(&neighbor.row_id),
+                held.contains(&neighbor.row_addr),
                 "a probe routed to partition {partition} answered with row {}, which lives \
                  somewhere else",
-                neighbor.row_id
+                neighbor.row_addr
             );
         }
     }

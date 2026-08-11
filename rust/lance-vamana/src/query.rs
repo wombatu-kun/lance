@@ -77,10 +77,17 @@ use crate::partition::Partition;
 use crate::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
 use crate::segment::{PartitionEntry, SegmentManifest};
 
-/// One answer: a dataset row id and its distance from the query.
+/// One answer: where the row is, and how far it was from the query.
+///
+/// A row *address* - fragment id in the high 32 bits, offset within it in the
+/// low - because [`RowIdMode::Address`] is the only mode this crate builds and
+/// the only one it opens. A stable row id is a different number for the same
+/// row, and the two are one `u64` as far as a compiler is concerned, so this
+/// name is the only thing standing between a caller and an API that wants the
+/// other one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Neighbor {
-    pub row_id: u64,
+    pub row_addr: u64,
     pub distance: f32,
 }
 
@@ -778,10 +785,10 @@ impl VamanaIndex {
                 .candidates
                 .iter()
                 .map(|node| Neighbor {
-                    row_id: partition.graph().row_ids()[node.id as usize],
+                    row_addr: partition.graph().row_ids()[node.id as usize],
                     distance: node.dist.0,
                 })
-                .filter(|neighbor| !rows.rejects(neighbor.row_id))
+                .filter(|neighbor| !rows.rejects(neighbor.row_addr))
                 .take(k)
                 .collect();
             Ok(Walked {
@@ -868,22 +875,22 @@ fn descends_from(schema: &Schema, field: i32, ancestor: i32) -> bool {
 /// Nothing upstream of here guarantees a row appears once. That rests on Lance
 /// refusing to commit segments whose fragment coverage overlaps, which is
 /// somebody else's invariant, so the merge does not lean on it. Nor does the
-/// dedup ride along with the ordering the caller sees: keyed on the row id in a
+/// dedup ride along with the ordering the caller sees: keyed on the address in a
 /// pass of its own, it collapses two copies of a row whatever their distances,
 /// where a dedup run after a distance sort would only collapse the copies that
 /// agree to the last bit - and the ones that disagree are exactly the ones worth
 /// not returning twice.
 fn merge(mut found: Vec<Neighbor>, k: usize) -> Vec<Neighbor> {
     found.sort_by(|left, right| {
-        left.row_id
-            .cmp(&right.row_id)
+        left.row_addr
+            .cmp(&right.row_addr)
             .then(left.distance.total_cmp(&right.distance))
     });
-    found.dedup_by_key(|neighbor| neighbor.row_id);
+    found.dedup_by_key(|neighbor| neighbor.row_addr);
     found.sort_by(|left, right| {
         left.distance
             .total_cmp(&right.distance)
-            .then(left.row_id.cmp(&right.row_id))
+            .then(left.row_addr.cmp(&right.row_addr))
     });
     found.truncate(k);
     found
@@ -954,8 +961,8 @@ mod tests {
     fn neighbors(pairs: &[(u64, f32)]) -> Vec<Neighbor> {
         pairs
             .iter()
-            .map(|(row_id, distance)| Neighbor {
-                row_id: *row_id,
+            .map(|(row_addr, distance)| Neighbor {
+                row_addr: *row_addr,
                 distance: *distance,
             })
             .collect()
@@ -964,7 +971,7 @@ mod tests {
     fn pairs(neighbors: &[Neighbor]) -> Vec<(u64, f32)> {
         neighbors
             .iter()
-            .map(|neighbor| (neighbor.row_id, neighbor.distance))
+            .map(|neighbor| (neighbor.row_addr, neighbor.distance))
             .collect()
     }
 
