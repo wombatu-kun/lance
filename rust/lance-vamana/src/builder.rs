@@ -500,8 +500,11 @@ async fn write_partitions(
 /// Read the vector column and the row id of every row that has a vector.
 ///
 /// Rows whose vector is null are dropped: they have nothing to index, and Lance's
-/// own vector indices skip them too. The index therefore covers a subset of the
-/// dataset's rows, which is exactly what `fragment_bitmap` already allows for.
+/// own vector indices skip them too. The index therefore holds a subset of the
+/// rows of the fragments it covers, and nothing records which subset - coverage
+/// is per fragment, never per row. That is the same position Lance's own vector
+/// indices are in, and it is why a caller cannot treat "the index covers this
+/// fragment" as "every row of it is in the index".
 async fn read_vectors(
     dataset: &Dataset,
     column: &str,

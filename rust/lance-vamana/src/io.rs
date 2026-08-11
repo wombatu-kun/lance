@@ -150,9 +150,12 @@ pub async fn open_file(
 
 /// Read a contiguous run of rows.
 ///
-/// `Range` rather than the whole file on purpose: this is the call a graph
-/// traversal makes, and the reason `__neighbors` has a fixed stride is that
-/// such a read must fetch `max_degree * 4` bytes per vertex and nothing else.
+/// `Range` rather than the whole file because the layout is built for it: the
+/// reason `__neighbors` has a fixed stride is that reading one vertex must fetch
+/// `max_degree * 4` bytes and nothing else. Nothing does that yet - both callers
+/// read a partition whole - so today the range is always `0..num_rows`. It stays
+/// a range because the lazy traversal that will use it is the point of the
+/// layout, and a whole-file signature would quietly give that up.
 pub async fn read_rows(reader: &FileReader, rows: Range<usize>) -> Result<RecordBatch> {
     if rows.is_empty() {
         return Err(Error::invalid_input(format!(

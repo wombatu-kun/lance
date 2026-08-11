@@ -11,11 +11,20 @@
 //! Environment: `SIFT_DIR` (required), `VECTORS` (default 100000, `0` for all),
 //! `QUERIES` (default 200), `DEGREE` (Vamana `R`, default 32).
 //!
-//! Both indexes are built and queried through the same counting wrapper, so the
-//! distance counts are comparable by construction rather than by trusting two
-//! sets of instrumentation to mean the same thing. The comparison to read is
-//! **distances per query at equal recall**, never at equal beam width: the two
-//! beams are not the same parameter and matching them measures nothing.
+//! Both indexes are *queried* through the same counting wrapper, and an
+//! assertion below pins that the wrapper and this crate's own counter agree, so
+//! the per-query numbers - the ones the comparison rests on - are comparable by
+//! construction rather than by trusting two sets of instrumentation to mean the
+//! same thing.
+//!
+//! The build numbers are not: Vamana's come from its own `Comparisons` and
+//! HNSW's from the wrapper, because Lance's builder takes a metrics argument and
+//! ignores it. They count the same event and are printed side by side, but
+//! nothing here proves they count it the same way.
+//!
+//! The comparison to read is **distances per query at equal recall**, never at
+//! equal beam width: the two beams are not the same parameter and matching them
+//! measures nothing.
 
 use std::any::Any;
 use std::collections::HashSet;

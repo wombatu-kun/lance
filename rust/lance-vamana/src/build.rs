@@ -267,6 +267,21 @@ pub fn medoid<S: VectorStore>(
     Ok(best.1)
 }
 
+/// Refuse a pruning slack the graph, or the manifest, could not survive.
+///
+/// Infinity is refused as well as NaN, and not for the arithmetic: `serde_json`
+/// writes any non-finite float as `null`, so an infinite alpha serialises
+/// cleanly, commits, and then fails every later `from_json` with "invalid type:
+/// null" - an index that can be written once and never opened again.
+fn validate_alpha(alpha: f32) -> Result<()> {
+    if !alpha.is_finite() || alpha < 1.0 {
+        return Err(Error::invalid_input(format!(
+            "Vamana alpha must be a finite value of at least 1.0, got {alpha}"
+        )));
+    }
+    Ok(())
+}
+
 /// Choose up to `max_degree` out-edges for `point` from `candidates`.
 ///
 /// Algorithm 2 of the DiskANN paper. Candidates are taken nearest first, and
@@ -285,19 +300,6 @@ pub fn medoid<S: VectorStore>(
 /// out-edges into that set; here the caller does it, which is what lets the same
 /// function serve both a vertex's own prune and a back-edge that has to fight
 /// for a slot.
-/// Infinity is refused as well as NaN, and not for the arithmetic: `serde_json`
-/// writes any non-finite float as `null`, so an infinite alpha serialises
-/// cleanly, commits, and then fails every later `from_json` with "invalid type:
-/// null" - an index that can be written once and never opened again.
-fn validate_alpha(alpha: f32) -> Result<()> {
-    if !alpha.is_finite() || alpha < 1.0 {
-        return Err(Error::invalid_input(format!(
-            "Vamana alpha must be a finite value of at least 1.0, got {alpha}"
-        )));
-    }
-    Ok(())
-}
-
 pub fn robust_prune<S: VectorStore>(
     store: &S,
     point: u32,
