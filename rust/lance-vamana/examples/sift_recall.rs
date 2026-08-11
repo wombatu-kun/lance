@@ -9,7 +9,14 @@
 //! ```
 //!
 //! Environment: `SIFT_DIR` (required), `VECTORS` (default 100000, `0` for all),
-//! `QUERIES` (default 200), `DEGREE` (Vamana `R`, default 32).
+//! `QUERIES` (default 200), `DEGREE` (Vamana `R`, default 32), `SEARCH_LIST`
+//! (Vamana `L`, default 100), `SEED` (default 42), `HNSW_EDGES` (default
+//! `DEGREE / 2`) and `HNSW_EF_CONSTRUCTION` (default 150).
+//!
+//! `HNSW_EDGES` is what sets the memory the two indexes are compared at, and its
+//! default is not that value: `m` has to be raised until the printed ratio of
+//! HNSW edges to Vamana slots is near 1, and what that takes changes whenever
+//! upstream changes how many edges an `m` buys.
 //!
 //! Both indexes are *queried* through the same counting wrapper, and an
 //! assertion below pins that the wrapper and this crate's own counter agree, so
@@ -327,6 +334,11 @@ fn main() {
         max_degree: degree as u32,
         search_list_size: env_usize("SEARCH_LIST", 100),
         alpha: 1.2,
+        // Exposed so that a build number that has moved can be told apart from
+        // a build number that was drawn differently: the insertion order of both
+        // passes comes off this seed, and its spread is the noise floor any
+        // before-and-after comparison of a build has to clear.
+        seed: env_usize("SEED", 42) as u64,
         ..BuildParams::default()
     };
     let building = Comparisons::default();
