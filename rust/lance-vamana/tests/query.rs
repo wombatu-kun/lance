@@ -28,6 +28,7 @@ use lance::dataset::transaction::{
 };
 use lance::dataset::{ProjectionRequest, WriteDestination};
 use lance::index::{DatasetIndexExt, IndexSegment};
+use lance_core::utils::address::RowAddress;
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::create_writer;
 use lance_file::writer::FileWriterOptions;
@@ -709,18 +710,29 @@ async fn every_answer_resolves_to_the_row_it_names() {
 }
 
 /// A compaction that could not open the index leaves it naming fragments that no
-/// longer exist, and every row address it stored for them is dead. Answering
-/// from what remains would look like a real answer.
+/// longer exist, and every row address it stored for them is dead. It answers
+/// for none of them, and says so.
+///
+/// The rows are not lost with them: a compaction moves them to fragments this
+/// index does not cover, which is the same position as rows appended after the
+/// build. What the index must not do is hand back the addresses they used to be
+/// at - so the query here has to reach the partitions and come back empty,
+/// rather than be short-circuited by an index that knows it covers nothing.
 ///
 /// The compaction is real here, and asserted to be: deleting every row first
 /// would drop the fragments outright and the test would pass without compacting
 /// anything at all.
 #[tokio::test]
-async fn an_index_over_a_rewritten_fragment_is_refused() {
+async fn an_index_over_a_rewritten_fragment_answers_for_none_of_it() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut dataset = indexed_dataset(uri, &small_fixture()).await;
-    VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let built_over = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .unwrap()
+        .covered_fragments()
+        .clone();
+    assert!(!built_over.is_empty(), "the index covered nothing to start");
 
     let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
         .await
@@ -729,11 +741,112 @@ async fn an_index_over_a_rewritten_fragment_is_refused() {
         metrics.fragments_removed > 0,
         "nothing was compacted, so this test proves nothing"
     );
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .all(|fragment| !built_over.contains(fragment.id() as u32)),
+        "the compaction left an indexed fragment behind, so this test proves less than it says"
+    );
 
-    let error = VamanaIndex::open(&dataset, INDEX_NAME)
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert!(
+        index.covered_fragments().is_empty(),
+        "the index still claims {:?} after every fragment it read was rewritten",
+        index.covered_fragments()
+    );
+
+    let search = SearchParams::new(K)
+        .with_nprobes(PARTITIONS as usize)
+        .with_search_list_size(BEAM);
+    let result = index
+        .search(&random_vectors(1, 4242)[0], &search)
         .await
-        .expect_err("an index over retired fragments must not answer queries");
-    assert!(error.to_string().contains("no longer has"), "{error}");
+        .unwrap();
+    assert!(
+        result.partitions_read > 0,
+        "no partition was read, so nothing was filtered and this proves nothing"
+    );
+    assert!(
+        result.neighbors.is_empty(),
+        "the index answered with {} rows from fragments the dataset no longer has",
+        result.neighbors.len()
+    );
+}
+
+/// Retention is an ordinary reason for a fragment to disappear: `DELETE WHERE
+/// date < ...` over data laid out by time empties the early fragments, and Lance
+/// drops a fragment from the manifest once its last row is deleted. The index
+/// has to go on answering from the fragments that are left.
+///
+/// The same query is run before the delete and after it, and the assertions are
+/// the two halves of one claim: rows of the doomed fragment are what this query
+/// used to get back, and none of them comes back once the fragment is gone. The
+/// first half is what keeps the second from passing vacuously - the vertices are
+/// still in the partition files either way, so the filter is the only thing
+/// standing between the walk and a dead address.
+#[tokio::test]
+async fn an_index_over_a_deleted_fragment_answers_from_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_dataset(uri, &small_fixture()).await;
+
+    let query = random_vectors(1, 77)[0].clone();
+    let search = SearchParams::new(K)
+        .with_nprobes(PARTITIONS as usize)
+        .with_search_list_size(BEAM);
+    let before = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .unwrap()
+        .search(&query, &search)
+        .await
+        .unwrap();
+    assert!(
+        before
+            .neighbors
+            .iter()
+            .any(|neighbor| RowAddress::from(neighbor.row_id).fragment_id() == 1),
+        "this query never reached fragment 1, so deleting it would prove nothing"
+    );
+
+    // Every row of fragment 1 and nothing else: an address is
+    // `(fragment << 32) | offset`, so the fragment's rows are a contiguous run
+    // above its first address, and the fixture has no fragment above it.
+    let first_row_of_fragment = u64::from(RowAddress::new_from_parts(1, 0));
+    dataset
+        .delete(&format!("_rowid >= {first_row_of_fragment}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id())
+            .collect::<Vec<_>>(),
+        vec![0],
+        "the delete was meant to take fragment 1 out of the manifest whole"
+    );
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(
+        index.covered_fragments(),
+        &RoaringBitmap::from_iter([0u32]),
+        "the index should cover the fragment that is left, and only it"
+    );
+
+    let after = index.search(&query, &search).await.unwrap();
+    assert_eq!(
+        after.neighbors.len(),
+        K,
+        "the surviving fragment holds 512 rows, so a k of {K} is still answerable"
+    );
+    assert!(
+        after
+            .neighbors
+            .iter()
+            .all(|neighbor| RowAddress::from(neighbor.row_id).fragment_id() == 0),
+        "an answer came back at an address in the fragment the dataset dropped"
+    );
 }
 
 /// Rewrite one fragment's vector column in place, exactly as `update_columns`
@@ -836,6 +949,65 @@ async fn an_index_over_a_rewritten_column_is_refused() {
     assert!(
         error.to_string().contains("rewrote data under it"),
         "{error}"
+    );
+}
+
+/// The two ways coverage narrows, one after the other: Lance takes a fragment
+/// out of the bitmap when its column is rewritten in place, and the fragment
+/// itself goes when its last row is deleted.
+///
+/// While it was live, the narrowed bitmap was the only sign that the vectors
+/// stored for it were stale, and the index refused to open. Once the fragment is
+/// gone there is nothing stale left to serve: no address in it resolves to
+/// anything, so the index goes back to answering from the rest. This is what the
+/// liveness half of that guard is for, and the only way to reach it.
+#[tokio::test]
+async fn a_rewritten_fragment_that_is_then_deleted_stops_being_a_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = indexed_dataset(uri, &small_fixture()).await;
+
+    let mut dataset = rewrite_vector_column_in_place(&dataset, uri, 0).await;
+    VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect_err("a live fragment whose column was rewritten must still be a refusal");
+
+    let first_row_of_fragment = u64::from(RowAddress::new_from_parts(1, 0));
+    dataset
+        .delete(&format!("_rowid < {first_row_of_fragment}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id())
+            .collect::<Vec<_>>(),
+        vec![1],
+        "the delete was meant to take the rewritten fragment out of the manifest whole"
+    );
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(
+        index.covered_fragments(),
+        &RoaringBitmap::from_iter([1u32]),
+        "the index should cover the fragment that was never touched, and only it"
+    );
+    let search = SearchParams::new(K)
+        .with_nprobes(PARTITIONS as usize)
+        .with_search_list_size(BEAM);
+    let result = index
+        .search(&random_vectors(1, 313)[0], &search)
+        .await
+        .unwrap();
+    assert!(
+        !result.neighbors.is_empty()
+            && result
+                .neighbors
+                .iter()
+                .all(|neighbor| RowAddress::from(neighbor.row_id).fragment_id() == 1),
+        "the index answered with {} rows, at least one of them in the fragment that is gone",
+        result.neighbors.len()
     );
 }
 

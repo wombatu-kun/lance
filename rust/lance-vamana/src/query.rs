@@ -23,6 +23,14 @@
 //!   only ever produces `search_list_size` candidates to draw from.
 //! - **Rows added after the build are invisible.** The index answers from the
 //!   fragments it was built over; Lance's scanner would scan the remainder.
+//! - **A fragment the dataset has dropped is answered for by nobody.** A delete
+//!   that empties a fragment, and a compaction that rewrites one, both take it
+//!   out of the dataset, and the vertices stored for it are then unreachable
+//!   rather than wrong. The index narrows itself to what is left and says so
+//!   through [`VamanaIndex::covered_fragments`]. After a compaction the rows
+//!   are still there, at new addresses in fragments this index does not cover -
+//!   which is the same situation as rows appended after the build, and has the
+//!   same remedy.
 //! - **No predicate prefilter and no refine step.** Both live in the scanner.
 //! - **Partitions are read whole, and nothing is cached between queries.** A
 //!   query keeps a few reads going at once, so its working
@@ -32,11 +40,13 @@
 //!   path harder to read.
 //!
 //! [`VamanaIndex::open`] refuses outright, rather than answering from what is
-//! left, when the fragments have been compacted away, when the dataset has
-//! edited the index's coverage underneath it, when an overlay has replaced the
-//! indexed values under it, when the manifest records a format version this
-//! build does not read, or when the segments disagree about the vectors they
-//! hold. Each refusal names what to do about it, which is always to rebuild.
+//! left, when the dataset has edited a segment's coverage while the fragments
+//! themselves are still there, when it credits a segment with a fragment that
+//! segment never read, when an overlay has replaced the indexed values under
+//! one, when the manifest records a format version this build does not read,
+//! when a segment was inherited from another dataset, or when the segments
+//! disagree about the vectors they hold. Each refusal names what to do about
+//! it, which is always to rebuild.
 //!
 //! Committing an index also breaks Lance's own vector search on that column -
 //! see the crate README, and the test that pins it.
@@ -137,17 +147,42 @@ pub struct VamanaIndex {
     scheduler: Arc<ScanScheduler>,
     metadata: IndexMetadata,
     segments: Vec<Segment>,
-    /// Row addresses deleted as of [`VamanaIndex::open`].
-    ///
-    /// A snapshot, not a live view: the graph files hold vertices for rows that
-    /// have since been deleted, and nothing rewrites them, so the only way to
-    /// tell a live vertex from a dead one is to ask the dataset - once, here,
-    /// rather than on every query.
+    /// Fragments this index still answers for: what its segments were built
+    /// over, minus what the dataset has since dropped.
+    covered: RoaringBitmap,
+    /// Which stored vertices must not reach an answer, as of
+    /// [`VamanaIndex::open`].
     ///
     /// Shared rather than owned because each partition's walk runs on the CPU
     /// pool, which takes `'static` work, and the filter has to be applied inside
     /// the walk's own result - before `take(k)`, so that `k` means k live rows.
-    deleted: Arc<RoaringTreemap>,
+    rows: Arc<RowFilter>,
+}
+
+/// The stored vertices a walk must not return.
+///
+/// A snapshot, not a live view: the graph files hold vertices for rows that have
+/// since gone away, and nothing rewrites them, so the only way to tell a live
+/// vertex from a dead one is to ask the dataset - once, at open, rather than on
+/// every query. A row deleted afterwards keeps coming back until the index is
+/// reopened.
+#[derive(Debug)]
+struct RowFilter {
+    /// Rows deleted from a fragment this index still covers.
+    deleted: RoaringTreemap,
+    /// Fragments the dataset no longer has. Every vertex stored for one of them
+    /// is unreachable, and a whole dead fragment is a bitmap entry rather than
+    /// 2^32 addresses in `deleted`: the `roaring` crate has no run containers,
+    /// so a full fragment's worth of addresses would be half a gigabyte.
+    missing_fragments: RoaringBitmap,
+}
+
+impl RowFilter {
+    fn rejects(&self, row_addr: u64) -> bool {
+        self.missing_fragments
+            .contains(RowAddress::from(row_addr).fragment_id())
+            || self.deleted.contains(row_addr)
+    }
 }
 
 #[derive(Debug)]
@@ -250,34 +285,15 @@ impl VamanaIndex {
                 )));
             }
 
-            // A compaction that cannot open an index does not remove it: the
-            // manifest entry survives, still naming the fragments it was built
-            // over. The rows of any fragment that has since been rewritten or
-            // dropped are stored here under row addresses that will never
-            // resolve again, and they would win places in the top-k and then be
-            // silently discarded by the caller's `take_rows`.
-            //
-            // So the test is equality with the *declared* coverage, not merely
-            // a non-empty intersection: a compaction usually retires only the
-            // fragments below its size threshold, which leaves the intersection
-            // non-empty and half the index dangling.
-            //
             // The `None` arm is for manifests older than the field itself:
             // `IndexSegment` carries a plain bitmap, so nothing this crate can
-            // commit reaches it and no test can produce one.
-            let Some(declared) = index.fragment_bitmap.as_ref() else {
+            // commit reaches it and no test can produce one. What the coverage
+            // has to agree with is checked below, once the segment's own record
+            // of it has been read.
+            if index.fragment_bitmap.is_none() {
                 return Err(Error::index(format!(
                     "index '{index_name}' segment {} records no fragment coverage",
                     index.uuid
-                )));
-            };
-            let still_live = declared & &live;
-            if still_live != *declared {
-                return Err(Error::index(format!(
-                    "index '{index_name}' segment {} was built over {} fragments the dataset no \
-                     longer has, so it holds row addresses that cannot resolve; rebuild the index",
-                    index.uuid,
-                    declared.len() - still_live.len()
                 )));
             }
             // A base id says the segment's files live under some other dataset's
@@ -318,47 +334,93 @@ impl VamanaIndex {
         .await?;
 
         let mut segments = Vec::with_capacity(planned.len());
+        let mut covered = RoaringBitmap::new();
+        let mut missing_fragments = RoaringBitmap::new();
         for ((index, dir, file_sizes), manifest) in planned.into_iter().zip(manifests) {
             let declared = index
                 .fragment_bitmap
                 .as_ref()
                 .expect("checked above, before any file was read");
 
-            // The check above asks whether the dataset still has the fragments.
-            // This one asks whether the dataset still credits the segment with
-            // the fragments it was built from, which is a different question
-            // with a different answer: Lance edits an index's coverage in place
-            // and never touches the segment's own files. An in-place column
-            // update removes the rewritten fragments from the bitmap while the
-            // fragment ids and every row address survive, so the fragments are
-            // all still live and the vectors stored here are all stale.
-            //
-            // Equality rather than a subset test, so that coverage which has
-            // *grown* is refused too. Lance widens a bitmap in
-            // `register_pure_rewrite_rows_update_frags_in_indices` and in the
-            // pruning path of a deferred commit; the first is gated on stable row
-            // ids, which the builder refuses outright, so today only the second
-            // can produce it - but a bitmap naming a fragment this segment never
-            // read is unanswerable either way, and which upstream path widened it
-            // is not something a reader can tell.
+            // Three records of one thing, and every disagreement between them
+            // means something different. `built_over` is what the segment wrote
+            // about itself and never changes; `declared` is what the dataset
+            // credits it with, which Lance edits in place and which never touches
+            // the segment's own files; `live` is which fragments the dataset
+            // still has at all.
             let built_over = manifest
                 .metadata()
                 .fragments
                 .iter()
                 .copied()
                 .collect::<RoaringBitmap>();
-            if built_over != *declared {
+
+            // Credited with a fragment it never read. Lance widens a bitmap in
+            // `register_pure_rewrite_rows_update_frags_in_indices` and in the
+            // pruning path of a deferred commit; the first is gated on stable row
+            // ids, which the builder refuses outright, so today only the second
+            // can produce it - but a bitmap naming a fragment this segment never
+            // read is unanswerable either way, and which upstream path widened it
+            // is not something a reader can tell.
+            if !(declared - &built_over).is_empty() {
                 return Err(Error::index(format!(
                     "index '{index_name}' segment {} was built over {} fragments but the dataset \
-                     now credits it with {}, so something rewrote data under it and the vectors it \
-                     holds no longer match the rows at those addresses; rebuild the index",
+                     credits it with {}, so it is expected to answer for rows it never read; \
+                     rebuild the index",
                     index.uuid,
                     built_over.len(),
                     declared.len()
                 )));
             }
-            // The two checks above ask what the *manifest* says about this
-            // segment's coverage. An overlay changes neither: `Operation::
+            // Built over a fragment that is still here, but no longer credited
+            // with it. That is Lance saying the data under those addresses was
+            // rewritten: an in-place column update, or the coverage pruning a
+            // deferred commit runs. The fragment ids and every row address
+            // survive it, so nothing downstream would notice - the vectors this
+            // segment ranks by are simply not the ones the rows now hold.
+            let rewritten = (&built_over - declared) & &live;
+            if !rewritten.is_empty() {
+                return Err(Error::index(format!(
+                    "index '{index_name}' segment {} was built over {} fragments the dataset still \
+                     has but no longer credits it with, so something rewrote data under it and the \
+                     vectors it holds no longer match the rows at those addresses; rebuild the index",
+                    index.uuid,
+                    rewritten.len()
+                )));
+            }
+            // Built over a fragment the dataset no longer has at all. Its rows
+            // are unreachable rather than wrong: fragment ids are a monotonic
+            // high water mark in the manifest (`Manifest::update_max_fragment_id`
+            // keeps it across deletions, and `max_fragment_id` is documented as
+            // not supporting reuse), so no address stored here can ever resolve
+            // to some other dataset row. That makes narrowing the coverage the
+            // honest answer rather than a refusal, and it is the same answer
+            // Lance gives itself: `IndexMetadata::effective_fragment_bitmap` is
+            // `declared & existing`, and the rewrite path of a stable-row-id
+            // commit drops rewritten fragments from an address-domain index's
+            // coverage and leaves the scanner to cover them.
+            //
+            // Which of the two got us here - a delete that emptied the fragment,
+            // or a compaction that moved its rows elsewhere - is not something a
+            // reader can tell, and it does not change what this index can do. It
+            // changes what the *caller* should do, so the narrowing is logged and
+            // `covered_fragments` reports the result.
+            let gone = &built_over - &live;
+            if !gone.is_empty() {
+                log::warn!(
+                    "Vamana index '{index_name}' segment {} was built over {} fragments the \
+                     dataset no longer has; it will answer for the remaining {}, and the rows of \
+                     the rest are the caller's to scan",
+                    index.uuid,
+                    gone.len(),
+                    built_over.len() - gone.len()
+                );
+                missing_fragments |= gone;
+            }
+            covered |= &built_over & &live;
+
+            // The checks above ask what the *manifest* says about this
+            // segment's coverage. An overlay changes none of it: `Operation::
             // DataOverlay` rewrites fragment metadata and leaves every index
             // entry alone, so the fragment ids, the bitmap and this segment's
             // own record of what it read all still agree - while the values at
@@ -422,21 +484,39 @@ impl VamanaIndex {
         }
         supported_distance_type(metadata.distance_type)?;
 
-        let covered = segments
-            .iter()
-            .flat_map(|segment| segment.manifest.metadata().fragments.iter().copied())
-            .collect::<RoaringBitmap>();
-        let deleted =
-            Arc::new(deleted_row_addresses(dataset, &covered, store.io_parallelism()).await?);
+        let deleted = deleted_row_addresses(dataset, &covered, store.io_parallelism()).await?;
 
         Ok(Self {
             scheduler,
             metadata,
             segments,
-            deleted,
+            covered,
+            rows: Arc::new(RowFilter {
+                deleted,
+                missing_fragments,
+            }),
         })
     }
 
+    /// What this index answers for: every fragment its segments were built over
+    /// that the dataset still has.
+    ///
+    /// The number a caller needs to scan the remainder. It is not the same as
+    /// the coverage the segments were built with - a fragment the dataset has
+    /// since dropped is answered for by nobody - and it is not
+    /// `metadata().fragments` either, which is one segment's record.
+    pub fn covered_fragments(&self) -> &RoaringBitmap {
+        &self.covered
+    }
+
+    /// The first segment's metadata.
+    ///
+    /// Everything a query mixes - the width, the metric, the identifier space -
+    /// is checked to agree across the segments on the way in, so reading it off
+    /// the first one is reading it off all of them. Its `fragments` field is the
+    /// exception: coverage is per segment and the segments of an index are
+    /// disjoint, so that field is a *part* of what the index holds. Use
+    /// [`Self::covered_fragments`] for the whole of it.
     pub fn metadata(&self) -> &IndexMetadata {
         &self.metadata
     }
@@ -623,7 +703,7 @@ impl VamanaIndex {
         params: &SearchParams,
     ) -> Result<Walked> {
         let distance_type = self.metadata.distance_type;
-        let deleted = self.deleted.clone();
+        let rows = self.rows.clone();
         let search_list_size = params.search_list_size;
         let k = params.k;
         spawn_cpu(move || {
@@ -646,7 +726,7 @@ impl VamanaIndex {
             // Local ids are per partition, so they become row ids *before* the
             // merge: every partition has a vertex 0, and they are different rows.
             //
-            // Deleted vertices are dropped here and not earlier. They are still
+            // Dead vertices are dropped here and not earlier. They are still
             // walked, because they carry the out-edges that keep the graph
             // connected - removing them from the traversal would strand whatever
             // they were the only route to. Filtering before `take` rather than
@@ -659,7 +739,7 @@ impl VamanaIndex {
                     row_id: partition.graph().row_ids()[node.id as usize],
                     distance: node.dist.0,
                 })
-                .filter(|neighbor| !deleted.contains(neighbor.row_id))
+                .filter(|neighbor| !rows.rejects(neighbor.row_id))
                 .take(k)
                 .collect();
             Ok(Walked {

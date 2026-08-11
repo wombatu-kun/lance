@@ -3571,6 +3571,7 @@ dependencies = [
  "lance-io",
  "lance-linalg",
  "lance-table",
+ "log",
  "object_store",
  "prost",
  "prost-types",

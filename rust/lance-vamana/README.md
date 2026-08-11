@@ -87,6 +87,14 @@ two are meant to say the same thing.
 - **Rows added after the build are invisible.** The index answers from the
   fragments it was built over. Lance's scanner would scan the unindexed
   remainder; this driver does not.
+- **A fragment the dataset has dropped is answered for by nobody.** A delete that
+  empties a fragment, and a compaction that rewrites one, both take it out of the
+  dataset, and every vertex stored for it becomes unreachable rather than wrong -
+  fragment ids are a high water mark in the manifest, so no stored address can
+  ever come to mean another row. The index narrows itself to what is left and
+  reports the result from `VamanaIndex::covered_fragments`, which is what the
+  unindexed remainder should be computed against. After a compaction the rows
+  are all still in the dataset, in fragments this index does not cover.
 - **No predicate prefilter and no refine step.** Both live in Lance's scanner,
   which this driver bypasses.
 - **Partitions are read whole, and nothing is cached between queries.** A query
@@ -96,12 +104,17 @@ two are meant to say the same thing.
 
 An index is **refused** at open, rather than answering from what is left, when:
 
-- its fragments have been compacted away, so the row addresses it stored no
-  longer resolve;
-- the dataset has edited its coverage underneath it - an in-place column update
-  prunes the rewritten fragments out of the index's `fragment_bitmap` while
-  leaving every row address valid, which no liveness check can see;
+- the dataset has edited a segment's coverage while the fragments are still
+  there - an in-place column update prunes the rewritten fragments out of the
+  index's `fragment_bitmap` while leaving every row address valid, which no
+  liveness check can see;
+- the dataset credits a segment with a fragment that segment never read, so it
+  is expected to answer for rows it has never seen;
+- an overlay has replaced the indexed values under a covered fragment, so the
+  vectors ranked are not the ones the rows now hold;
 - the manifest records a format version this build does not read;
+- a segment was inherited from another dataset by a shallow clone, so its files
+  live under a base path this crate cannot resolve;
 - its segments disagree about the dimension, the metric or the identifier space,
   because a query merges their answers.
 
