@@ -290,12 +290,12 @@ impl VamanaIndex {
             // commit reaches it and no test can produce one. What the coverage
             // has to agree with is checked below, once the segment's own record
             // of it has been read.
-            if index.fragment_bitmap.is_none() {
+            let Some(declared) = index.fragment_bitmap.as_ref() else {
                 return Err(Error::index(format!(
                     "index '{index_name}' segment {} records no fragment coverage",
                     index.uuid
                 )));
-            }
+            };
             // A base id says the segment's files live under some other dataset's
             // root, which a shallow clone stamps onto every index it inherits.
             // Resolving one needs `Dataset::indice_files_dir` and
@@ -318,7 +318,7 @@ impl VamanaIndex {
                 .flatten()
                 .map(|file| (file.path.clone(), file.size_bytes))
                 .collect::<HashMap<_, _>>();
-            planned.push((index, dir, file_sizes));
+            planned.push((index, dir, file_sizes, declared));
         }
 
         // One round trip per segment, and they wait on each other rather than in
@@ -326,7 +326,7 @@ impl VamanaIndex {
         // appended to, and on a store with 30ms of latency reading them one at a
         // time is more than a second before the first query can start.
         let store = dataset.object_store(None).await?;
-        let manifests = stream::iter(planned.iter().map(|(_, dir, file_sizes)| {
+        let manifests = stream::iter(planned.iter().map(|(_, dir, file_sizes, _)| {
             read_segment(&scheduler, dir, file_sizes.get(INDEX_FILE_NAME).copied())
         }))
         .buffered(store.io_parallelism())
@@ -336,12 +336,7 @@ impl VamanaIndex {
         let mut segments = Vec::with_capacity(planned.len());
         let mut covered = RoaringBitmap::new();
         let mut missing_fragments = RoaringBitmap::new();
-        for ((index, dir, file_sizes), manifest) in planned.into_iter().zip(manifests) {
-            let declared = index
-                .fragment_bitmap
-                .as_ref()
-                .expect("checked above, before any file was read");
-
+        for ((index, dir, file_sizes, declared), manifest) in planned.into_iter().zip(manifests) {
             // Three records of one thing, and every disagreement between them
             // means something different. `built_over` is what the segment wrote
             // about itself and never changes; `declared` is what the dataset

@@ -290,14 +290,13 @@ impl Partition {
 
     pub fn to_batch(&self) -> Result<RecordBatch> {
         let schema = Arc::new(partition_schema(self.graph.max_degree, self.dimension())?);
-        let DataType::FixedSizeList(item, width) =
-            schema.field_with_name(NEIGHBORS_COLUMN)?.data_type()
-        else {
-            unreachable!("partition_schema always produces a fixed size list");
-        };
+        // Built to the shape `partition_schema` gives `__neighbors` rather than
+        // read back out of it: the values are a `u32` array either way, so
+        // matching the schema would buy nothing but an impossible arm to panic
+        // on. `RecordBatch::try_new` below is what holds the two together.
         let neighbors = FixedSizeListArray::try_new(
-            item.clone(),
-            *width,
+            Arc::new(Field::new("item", DataType::UInt32, false)),
+            self.graph.max_degree as i32,
             Arc::new(UInt32Array::from(self.graph.neighbors.clone())),
             None,
         )?;
