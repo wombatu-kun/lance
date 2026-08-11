@@ -23,6 +23,7 @@ use futures::TryStreamExt;
 use lance::Dataset;
 use lance::index::{DatasetIndexExt, IndexSegment};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::{KMeans, KMeansParams, compute_partitions_arrow_array};
@@ -363,17 +364,41 @@ pub async fn build_segment(
             vectors.value_length()
         ))
     })?;
-    // Cosine is routed and stored as L2 over unit vectors, exactly as Lance does
-    // it. Cosine distance is scale invariant, so the stored answer is unchanged.
-    let vectors = if params.distance_type == DistanceType::Cosine {
-        normalize_fsl(&vectors)?
-    } else {
-        vectors
-    };
 
-    let mut rng = SmallRng::seed_from_u64(params.graph.seed);
-    let ivf = train_router(&vectors, params, &mut rng)?;
-    let assignment = assign(&ivf, &vectors, &row_ids, params)?;
+    // Everything from here to the last partition is arithmetic, and it runs on
+    // the CPU pool rather than here. A build is minutes of it with no await to
+    // yield at, and the runtime it would otherwise hold is the one the scan
+    // scheduler runs its io loop on - so on a runtime with few workers, and on
+    // the single-threaded one an ordinary `#[tokio::test]` gives, reads across
+    // the whole process would stop for the duration. The query side already
+    // moves a walk off for the same reason, and a walk is milliseconds.
+    //
+    // The k-means inside `train_router` parallelises with rayon, which has a
+    // thread pool of its own, so a pool worker parked on it is waiting on
+    // something outside the pool and cannot starve it - the deadlock `spawn_cpu`
+    // warns about needs a closure waiting on the pool it is running in.
+    let row_ids = Arc::new(row_ids);
+    let params = Arc::new(params.clone());
+    let (vectors, ivf, assignment) = {
+        let vectors = vectors.clone();
+        let row_ids = row_ids.clone();
+        let params = params.clone();
+        spawn_cpu(move || {
+            // Cosine is routed and stored as L2 over unit vectors, exactly as
+            // Lance does it. Cosine distance is scale invariant, so the stored
+            // answer is unchanged.
+            let vectors = if params.distance_type == DistanceType::Cosine {
+                normalize_fsl(&vectors)?
+            } else {
+                vectors
+            };
+            let mut rng = SmallRng::seed_from_u64(params.graph.seed);
+            let ivf = train_router(&vectors, &params, &mut rng)?;
+            let assignment = assign(&ivf, &vectors, &row_ids, &params)?;
+            Ok::<_, Error>((vectors, ivf, assignment))
+        })
+        .await?
+    };
 
     let metadata = IndexMetadata {
         format_version: FORMAT_VERSION,
@@ -391,7 +416,6 @@ pub async fn build_segment(
         ivf,
     );
 
-    let comparisons = Comparisons::default();
     let mut stats = BuildStats {
         vectors: vectors.len(),
         ..Default::default()
@@ -403,13 +427,18 @@ pub async fn build_segment(
         if members.is_empty() {
             continue;
         }
-        let (partition, medoid) = build_one(&members, &row_ids, &vectors, params, &comparisons)?;
+        let built = {
+            let vectors = vectors.clone();
+            let row_ids = row_ids.clone();
+            let params = params.clone();
+            spawn_cpu(move || build_one(&members, &row_ids, &vectors, &params)).await?
+        };
         writer
-            .write_partition(partition_id as u32, medoid, &partition)
+            .write_partition(partition_id as u32, built.medoid, &built.partition)
             .await?;
         stats.partitions += 1;
+        stats.comparisons = stats.comparisons.saturating_add(built.comparisons);
     }
-    stats.comparisons = comparisons.get();
     Ok((writer.finish().await?, stats))
 }
 
@@ -634,23 +663,39 @@ fn group_by_partition(assignment: &[u32], num_partitions: u32) -> Vec<Vec<u32>> 
     members
 }
 
+/// One partition's graph, ready to write, and what building it cost.
+struct BuiltOne {
+    partition: Partition,
+    medoid: u32,
+    comparisons: u64,
+}
+
 /// Build the graph of one partition over the rows assigned to it.
+///
+/// The comparison count is returned rather than accumulated into a counter the
+/// caller holds: [`Comparisons`] is a `Cell`, deliberately, because it is
+/// written once per candidate in the innermost loop of the build - and a `Cell`
+/// cannot cross the thread boundary this runs behind.
 fn build_one(
     members: &[u32],
     row_ids: &[u64],
     vectors: &FixedSizeListArray,
     params: &IndexParams,
-    comparisons: &Comparisons,
-) -> Result<(Partition, u32)> {
+) -> Result<BuiltOne> {
     let taken = gather(vectors, members)?;
     let member_row_ids = members
         .iter()
         .map(|row| row_ids[*row as usize])
         .collect::<Vec<_>>();
 
+    let comparisons = Comparisons::default();
     let store = flat_storage(&member_row_ids, &taken, params.distance_type)?;
-    let built = build_partition(&store, &params.graph, comparisons)?;
-    Ok((Partition::try_new(built.graph, taken)?, built.medoid))
+    let built = build_partition(&store, &params.graph, &comparisons)?;
+    Ok(BuiltOne {
+        partition: Partition::try_new(built.graph, taken)?,
+        medoid: built.medoid,
+        comparisons: comparisons.get(),
+    })
 }
 
 fn gather(vectors: &FixedSizeListArray, rows: &[u32]) -> Result<FixedSizeListArray> {

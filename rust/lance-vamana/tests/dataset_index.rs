@@ -11,6 +11,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt64Type};
@@ -23,6 +25,7 @@ use lance::Dataset;
 use lance::dataset::{ProjectionRequest, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_linalg::distance::DistanceType;
+use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{
     INDEX_DETAILS_TYPE_URL, IndexParams, build_segment, create_index, live_fragments,
 };
@@ -838,4 +841,77 @@ async fn a_dataset_older_than_lances_bitmap_fix_is_refused_before_the_build() {
     VamanaIndex::open(&dataset, INDEX_NAME)
         .await
         .expect("the index built after the manifest was refreshed must open");
+}
+
+/// A build is a long stretch of arithmetic with no await anywhere inside it. Run
+/// on the caller's runtime it holds a worker for that whole stretch, and on a
+/// single-threaded runtime - which is what `#[tokio::test]` gives, and what an
+/// embedded caller may well hand this crate - every other task on it stops for
+/// the duration, including the io loop the scan scheduler runs every read
+/// through.
+///
+/// Measured rather than argued: a ticker task asks for 5ms of sleep at a time
+/// and records the longest it was ever kept waiting. With the arithmetic on the
+/// CPU pool the longest wait is a few milliseconds; with it inline the longest
+/// wait is however long one partition takes to build, which on this fixture is
+/// most of the build.
+#[tokio::test(flavor = "current_thread")]
+async fn a_build_leaves_the_calling_runtime_free() {
+    const TICK: Duration = Duration::from_millis(5);
+    // Far above the tick and far below a partition of a thousand vertices.
+    const LONGEST_TOLERATED_GAP: Duration = Duration::from_millis(200);
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = DatasetFixture {
+        fragments: 1,
+        rows_per_fragment: 1024,
+        ..Default::default()
+    }
+    .write(uri)
+    .await;
+
+    let longest_gap_ms = Arc::new(AtomicU64::new(0));
+    let building = Arc::new(AtomicBool::new(true));
+    let ticker = tokio::spawn({
+        let longest_gap_ms = longest_gap_ms.clone();
+        let building = building.clone();
+        async move {
+            let mut last = Instant::now();
+            while building.load(Ordering::Relaxed) {
+                tokio::time::sleep(TICK).await;
+                let now = Instant::now();
+                longest_gap_ms.fetch_max(
+                    now.duration_since(last).as_millis() as u64,
+                    Ordering::Relaxed,
+                );
+                last = now;
+            }
+        }
+    });
+
+    // One partition, so the whole graph is one uninterrupted stretch of work.
+    let params = IndexParams::new(VECTOR_COLUMN, 1).with_graph_params(BuildParams {
+        max_degree: 16,
+        search_list_size: 64,
+        ..Default::default()
+    });
+    let started = Instant::now();
+    create_index(&mut dataset, INDEX_NAME, &params)
+        .await
+        .unwrap();
+    let build = started.elapsed();
+    building.store(false, Ordering::Relaxed);
+    ticker.await.unwrap();
+
+    assert!(
+        build > 4 * LONGEST_TOLERATED_GAP,
+        "the build took {build:?}, which is too little to tell a blocked runtime from a free one"
+    );
+    let longest_gap = Duration::from_millis(longest_gap_ms.load(Ordering::Relaxed));
+    assert!(
+        longest_gap < LONGEST_TOLERATED_GAP,
+        "a task asking for {TICK:?} of sleep waited {longest_gap:?} during a {build:?} build, so \
+         the build is holding the runtime it was called on"
+    );
 }
