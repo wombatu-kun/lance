@@ -1508,6 +1508,7 @@ fn declaring(fragments: Vec<u32>) -> IndexMetadata {
     IndexMetadata {
         format_version: FORMAT_VERSION,
         max_degree: 16,
+        search_list_size: 32,
         alpha: 1.2,
         dimension: VECTOR_DIM as u32,
         distance_type: DistanceType::L2,
@@ -1944,6 +1945,7 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
         IndexMetadata {
             format_version: FORMAT_VERSION,
             max_degree: 16,
+            search_list_size: 32,
             alpha: 1.2,
             dimension: VECTOR_DIM as u32,
             distance_type: DistanceType::L2,
@@ -2158,6 +2160,7 @@ async fn a_partition_holding_a_non_finite_vector_is_reported_as_corrupt() {
             IndexMetadata {
                 format_version: FORMAT_VERSION,
                 max_degree: graph_params.max_degree,
+                search_list_size: graph_params.search_list_size,
                 alpha: graph_params.alpha,
                 dimension: VECTOR_DIM as u32,
                 distance_type: DistanceType::L2,

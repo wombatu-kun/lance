@@ -503,6 +503,7 @@ pub async fn build_segment(
     let metadata = IndexMetadata {
         format_version: FORMAT_VERSION,
         max_degree: params.graph.max_degree,
+        search_list_size: params.graph.search_list_size,
         alpha: params.graph.alpha,
         dimension,
         distance_type: params.distance_type,
@@ -932,6 +933,7 @@ mod tests {
         let metadata = IndexMetadata {
             format_version: FORMAT_VERSION,
             max_degree: params.graph.max_degree,
+            search_list_size: params.graph.search_list_size,
             alpha: params.graph.alpha,
             dimension: DIMENSION as u32,
             distance_type: params.distance_type,

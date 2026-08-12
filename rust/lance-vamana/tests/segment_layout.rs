@@ -46,6 +46,7 @@ fn index_metadata() -> IndexMetadata {
     IndexMetadata {
         format_version: FORMAT_VERSION,
         max_degree: MAX_DEGREE,
+        search_list_size: 100,
         alpha: 1.2,
         dimension: DIMENSION,
         distance_type: DistanceType::Cosine,
