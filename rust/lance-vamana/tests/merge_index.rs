@@ -351,6 +351,32 @@ async fn merging_repairs_a_compaction_where_an_in_place_insert_refuses() {
 
 /// Nothing to do means no commit at all, not an empty one: this is meant to be
 /// safe to call on a schedule.
+/// The plainest thing a merge is asked to do: rows were appended, nothing was
+/// deleted, and there is one segment. Every branch that decides "nothing to do"
+/// has to let this through.
+#[tokio::test]
+async fn merging_indexes_new_rows_when_nothing_was_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    indexed_dataset(uri).await;
+    let mut dataset = with_new_rows(uri, 17).await;
+
+    let stats = merge_index(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(stats.fragments_indexed, 3, "{stats:?}");
+    assert_eq!(stats.vectors_inserted, ROWS, "{stats:?}");
+    assert_eq!(stats.vertices_removed, 0, "nothing was deleted: {stats:?}");
+    assert!(stats.partitions_written > 0, "{stats:?}");
+
+    let (rows, slots) = stored_row_ids(&dataset).await;
+    let live = live_row_ids(&dataset)
+        .await
+        .into_iter()
+        .collect::<HashSet<_>>();
+    assert_eq!((slots, rows.len()), (live.len(), live.len()));
+    assert_eq!(rows, live, "the appended rows are not all in the index");
+    assert!(measured_recall(&dataset).await >= 0.95);
+}
+
 #[tokio::test]
 async fn merging_when_there_is_nothing_to_do_commits_nothing() {
     let dir = tempfile::tempdir().unwrap();
