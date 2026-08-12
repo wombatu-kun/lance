@@ -32,6 +32,18 @@
 //! only, so a new row has no edge to an old one - within a delta the walk is
 //! nearly exhaustive, which is a recall advantage at these sizes and a cost
 //! disadvantage at any scale.
+//!
+//! # And what it costs to undo
+//!
+//! Every grown arm then folds its deltas back into the base with [`merge_index`]
+//! and is measured again, on the same rows at the same addresses, as the row
+//! marked `N -> 1`. That gives the number an index nobody rebuilds actually
+//! needs: not whether folding is cheaper than a rebuild, but **after how many
+//! queries a fold has paid for itself** - the seconds it took, divided by the
+//! latency it takes off every query from then on. Below that many queries a
+//! delta is the cheaper way to hold the rows, above it the fold is, and the
+//! crossover is a property of the shape of the index rather than a threshold
+//! anyone gets to pick.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -54,6 +66,7 @@ use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::inserter::insert_as_segment;
+use lance_vamana::merger::merge_index;
 use lance_vamana::query::{SearchParams, VamanaIndex};
 
 #[path = "common/mod.rs"]
@@ -151,6 +164,10 @@ struct Measured {
     partitions: f64,
     bytes: f64,
     iops: f64,
+    /// The mean rather than the median, because this is the one latency that
+    /// multiplies: what a fold saves over a run of queries is the mean saving
+    /// times the count, and the median would understate a tail the deltas own.
+    mean_micros: f64,
     median_micros: u128,
     p95_micros: u128,
 }
@@ -201,6 +218,7 @@ async fn measure(
         partitions: partitions as f64 / per_query,
         bytes: (after.bytes_read - before.bytes_read) as f64 / per_query,
         iops: (after.iops - before.iops) as f64 / per_query,
+        mean_micros: latencies.iter().sum::<u128>() as f64 / per_query,
         median_micros: latencies[latencies.len() / 2],
         p95_micros: latencies[latencies.len() * 95 / 100],
     }
@@ -360,11 +378,52 @@ impl Bench {
 
         let ids = ids_by_address(&dataset).await;
         assert_eq!(ids.len(), self.rows);
-        let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+        let grown = self
+            .row(&dataset, &segments.to_string(), segments, maintenance, &ids)
+            .await;
+        if segments == 1 {
+            return;
+        }
+
+        // The same rows at the same addresses, with the deltas folded back into
+        // the base: what the fold costs, and what every query stops paying.
+        let started = Instant::now();
+        let merged = merge_index(&mut dataset, INDEX_NAME).await.unwrap();
+        let fold = started.elapsed().as_secs_f64();
+        assert_eq!(
+            merged.vectors_inserted, 0,
+            "the arm left an unindexed fragment behind, so this folds more than the deltas"
+        );
+        let folded = self
+            .row(&dataset, &format!("{segments} -> 1"), 1, fold, &ids)
+            .await;
+
+        let saved = grown.mean_micros - folded.mean_micros;
+        let payback = if saved > 0.0 {
+            format!("paid back after {:.0} queries", fold * 1_000_000.0 / saved)
+        } else {
+            "never paid back at this size".to_string()
+        };
+        println!(
+            "         folded {} vertices in {fold:.1}s, saving {saved:.1} us a query: {payback}",
+            merged.vertices_folded
+        );
+    }
+
+    /// Measure the index as the dataset now has it, and print its row.
+    async fn row(
+        &self,
+        dataset: &Dataset,
+        label: &str,
+        segments: usize,
+        maintenance: f64,
+        ids: &HashMap<u64, u64>,
+    ) -> Measured {
+        let index = VamanaIndex::open(dataset, INDEX_NAME).await.unwrap();
         assert_eq!(
             index.num_segments(),
             segments,
-            "this arm was supposed to end with {segments} segments"
+            "this arm was supposed to leave {segments} segments"
         );
 
         // Warm-up, uncounted: the driver reads a partition per query with no
@@ -375,14 +434,14 @@ impl Bench {
             &index,
             &self.queries[..warm],
             &self.truth[..warm],
-            &ids,
+            ids,
             &self.search,
         )
         .await;
-        let measured = measure(&index, &self.queries, &self.truth, &ids, &self.search).await;
-        let (files, bytes) = index_files(&dataset).await;
+        let measured = measure(&index, &self.queries, &self.truth, ids, &self.search).await;
+        let (files, bytes) = index_files(dataset).await;
         println!(
-            "{segments:>8} {files:>6} {:>10.1} {maintenance:>14.1} {:>10.4} {:>9.1} {:>10.1} \
+            "{label:>8} {files:>6} {:>10.1} {maintenance:>14.1} {:>10.4} {:>9.1} {:>10.1} \
              {:>12.0} {:>9.1} {:>9} {:>9}",
             bytes as f64 / (1024.0 * 1024.0),
             measured.recall,
@@ -393,5 +452,6 @@ impl Bench {
             measured.median_micros,
             measured.p95_micros
         );
+        measured
     }
 }
