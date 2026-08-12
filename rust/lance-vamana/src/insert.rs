@@ -7,7 +7,7 @@
 //! graph as it currently stands for the point being added, prune what the search
 //! visited into the point's out-edges, and give each chosen neighbour an edge
 //! back - re-pruning it when its list was already full. [`crate::build`] calls
-//! [`insert_point`] once per vertex twice over; this module's own
+//! `insert_point` once per vertex twice over; this module's own
 //! [`insert_into_partition`] calls it once per new vertex against a graph that
 //! is already navigable, which is why it needs one pass rather than two.
 //!
@@ -255,7 +255,7 @@ pub fn insert_into_partition(
     let first_new = partition.len() as u32;
     let mut graph = partition.graph().clone();
     graph.extend(row_ids)?;
-    let vectors = concat_vectors(partition.vectors(), vectors)?;
+    let vectors = concat_vectors(&[partition.vectors().clone(), vectors.clone()])?;
     let store = flat_storage(graph.row_ids(), &vectors, distance_type)?;
 
     let mut scratch = InsertScratch::new(graph.len(), graph.max_degree());
@@ -284,12 +284,12 @@ pub fn insert_into_partition(
     })
 }
 
-/// One array holding `left`'s vectors and then `right`'s.
+/// One array holding every part's vectors, in the order they are given.
 ///
 /// Through the value buffers rather than `arrow_select::concat` over the lists,
-/// which insists the two arrays carry identical field metadata down to the item
-/// field's name and nullability - and `right` comes from a dataset scan, where
-/// both are whatever the writer chose.
+/// which insists the arrays carry identical field metadata down to the item
+/// field's name and nullability - and one of them typically comes from a dataset
+/// scan, where both are whatever the writer chose.
 ///
 /// No offset arithmetic, which for a list type is usually the trap here:
 /// `FixedSizeListArray::slice` slices the child buffer rather than moving a
@@ -297,15 +297,30 @@ pub fn insert_into_partition(
 /// already exactly the rows it stands for. Should that ever stop holding, the
 /// result comes out with more vectors than the graph has vertices and
 /// `Partition::try_new` refuses it by the count.
-fn concat_vectors(
-    left: &FixedSizeListArray,
-    right: &FixedSizeListArray,
-) -> Result<FixedSizeListArray> {
-    let values = concat(&[left.values().as_ref(), right.values().as_ref()])?;
+pub(crate) fn concat_vectors(parts: &[FixedSizeListArray]) -> Result<FixedSizeListArray> {
+    let width = parts
+        .first()
+        .map(FixedSizeListArray::value_length)
+        .ok_or_else(|| {
+            Error::internal("Vamana was asked to concatenate no vectors at all".to_string())
+        })?;
+    // Checked rather than assumed: the child buffers concatenate whatever their
+    // widths, and a mismatch would come out as the right number of floats cut
+    // into the wrong number of vectors.
+    if let Some(odd) = parts.iter().find(|part| part.value_length() != width) {
+        return Err(Error::invalid_input(format!(
+            "Vamana cannot concatenate vectors of dimension {} with vectors of dimension {width}",
+            odd.value_length()
+        )));
+    }
+    let values = parts
+        .iter()
+        .map(|part| part.values().as_ref())
+        .collect::<Vec<_>>();
     Ok(FixedSizeListArray::try_new(
         Arc::new(Field::new("item", DataType::Float32, false)),
-        left.value_length(),
-        values,
+        width,
+        concat(&values)?,
         None,
     )?)
 }

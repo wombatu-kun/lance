@@ -95,7 +95,7 @@ use uuid::Uuid;
 use crate::build::BuildParams;
 use crate::builder::{
     INDEX_DETAILS_TYPE_URL, IndexParams, assign, build_index_segment_with_router, build_one,
-    gather, group_by_partition, index_column, live_fragments, read_vectors,
+    gather, group_by_partition, index_column, read_vectors,
 };
 use crate::format::{FORMAT_VERSION, IndexMetadata};
 use crate::insert::insert_into_partition;
@@ -166,12 +166,12 @@ pub struct InsertStats {
 /// pipeline that appends such a batch has to skip this call for it.
 pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Result<InsertStats> {
     let index = VamanaIndex::open(dataset, index_name).await?;
-    let new_fragments = unindexed_fragments(dataset, &index);
+    let new_fragments = index.unindexed_fragments(dataset);
     if new_fragments.is_empty() {
         return Ok(InsertStats::default());
     }
 
-    let base = base_segment(&index)?;
+    let base = index.base_segment()?;
     let column = index_column(dataset, index_name, &base.fields)?;
     let params = inherited_params(&column, base.manifest.metadata(), base.manifest.ivf());
     let (segment, built) = build_index_segment_with_router(
@@ -267,12 +267,12 @@ pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Resul
 /// move at all, which is the whole difference from [`insert_as_segment`].
 pub async fn insert_in_place(dataset: &mut Dataset, index_name: &str) -> Result<InsertStats> {
     let index = VamanaIndex::open(dataset, index_name).await?;
-    let new_fragments = unindexed_fragments(dataset, &index);
+    let new_fragments = index.unindexed_fragments(dataset);
     if new_fragments.is_empty() {
         return Ok(InsertStats::default());
     }
 
-    let target = base_segment(&index)?;
+    let target = index.base_segment()?;
     let built_over = target
         .manifest
         .metadata()
@@ -494,47 +494,16 @@ async fn grow_segment(
     Ok(())
 }
 
-/// Fragments the dataset has and the index does not answer for.
-///
-/// Against `covered_fragments` rather than against any segment's own record,
-/// because the two differ exactly when a fragment has gone: a fragment a segment
-/// was built over and the dataset has dropped is answered for by nobody, and if
-/// a compaction rewrote its rows into a new fragment then that new fragment
-/// belongs in this list.
-fn unindexed_fragments(dataset: &Dataset, index: &VamanaIndex) -> Vec<u32> {
-    live_fragments(dataset)
-        .into_iter()
-        .filter(|fragment| !index.covered_fragments().contains(*fragment))
-        .collect()
-}
-
-/// The segment a further one should be modelled on: the one covering the most
-/// fragments, and on a tie the one the manifest lists first.
-///
-/// The base rather than a delta, which is what "most fragments" means in
-/// practice, so that deltas inherit the routing of the index's largest graph
-/// instead of inheriting each other's. Deterministic on purpose: whose centroids
-/// a segment was written under is not recoverable from the segment afterwards.
-fn base_segment(index: &VamanaIndex) -> Result<&Segment> {
-    index
-        .segments()
-        .iter()
-        .reduce(|base, segment| {
-            if segment.coverage.len() > base.coverage.len() {
-                segment
-            } else {
-                base
-            }
-        })
-        .ok_or_else(|| Error::internal("an opened Vamana index has no segments".to_string()))
-}
-
 /// Build parameters that will produce a segment the base can stand beside.
 ///
 /// The graph half of them is what every maintenance pass works at, seed
 /// included: [`BuildParams::maintenance`]. What this adds is the routing, which
 /// only a driver over a dataset has an opinion about.
-fn inherited_params(column: &str, base: &IndexMetadata, router: &IvfModel) -> IndexParams {
+pub(crate) fn inherited_params(
+    column: &str,
+    base: &IndexMetadata,
+    router: &IvfModel,
+) -> IndexParams {
     IndexParams::new(column, router.num_partitions() as u32)
         .with_distance_type(base.distance_type)
         .with_graph_params(BuildParams::maintenance(base))

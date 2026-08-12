@@ -208,7 +208,7 @@ pub async fn consolidate_index(
 /// on a store with any latency is minutes before the first partition is
 /// rewritten. Nothing but the row ids is fetched, so the whole pass costs eight
 /// bytes a vertex against the 776 the crate's own working point stores.
-async fn dead_by_partition(
+pub(crate) async fn dead_by_partition(
     index: &VamanaIndex,
     segment: &Segment,
     io_parallelism: usize,

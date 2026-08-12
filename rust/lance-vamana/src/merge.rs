@@ -23,21 +23,31 @@
 //! a new file, so the back-edges are applied where they are computed and there
 //! is nothing left to patch.
 //!
-//! # One reachability check, and it is at the end
+//! # The reachability check stays where consolidation put it
 //!
 //! [`crate::consolidate`] measured how the one-hop repair fails: it guarantees
 //! that no edge dangles, not that the graph stays in one piece, and 90% of a
-//! 1000-vertex partition removed evenly leaves 2 of 100 survivors reachable.
-//! Insertion can do it too, though nothing has yet caught it at it - a back-edge
-//! is fought for through a prune, and a neighbour that gives up a slot may have
-//! been the only vertex pointing at whatever occupied it.
+//! 1000-vertex partition removed evenly leaves 2 of 100 survivors reachable. So
+//! a consolidated graph is walked, and one that came apart is built again -
+//! here, over the survivors **and the newcomers together**, which is the one
+//! thing this ordering buys over running the two steps in turn. The two-pass
+//! round rebuilt over the survivors alone and then inserted into the result.
 //!
-//! So the walk runs once, over the graph that is about to be written, and a
-//! partition that came apart is built again over everything it now holds. What
-//! that costs is an insertion nobody will use, in the case where the tearing
-//! happened during the consolidation. What it buys is that a partition leaving
-//! here is whole - which is not something the two steps can promise separately,
-//! however each of them is checked.
+//! Insertion can leave a vertex unreachable too, and it was tempting to walk the
+//! graph once at the very end instead. Measured, that is the wrong trade. A back
+//! edge is fought for through a prune, so a new point whose every chosen
+//! neighbour rejected it ends up with out-edges and no in-edges - and the same
+//! is true of a *build*, which is repeated insertion: 1000 uniform points at
+//! `R=12, L=40` come out of `build_partition` with 999 of them reachable, and
+//! inserting 500 more leaves 1496 of 1500. A check at the end would answer "not
+//! whole" for perfectly ordinary partitions and pay a full rebuild to recover
+//! one vertex in a thousand.
+//!
+//! So an orphaned vertex is left where the algorithm put it: stored, walked
+//! past, and returned only when a query happens to reach it another way. What is
+//! lost is a fraction of a percent of the rows, against a rebuild of everything;
+//! the five-round churn measurement behind [`crate::inserter::insert_in_place`]
+//! is the evidence that it does not accumulate into anything.
 
 use arrow_array::FixedSizeListArray;
 use lance_core::{Error, Result};
@@ -46,7 +56,7 @@ use roaring::RoaringBitmap;
 
 use crate::build::{BuildParams, build_partition};
 use crate::consolidate::consolidate_partition;
-use crate::insert::insert_into_partition;
+use crate::insert::{concat_vectors, insert_into_partition};
 use crate::partition::Partition;
 use crate::search::{Comparisons, flat_storage};
 
@@ -68,16 +78,16 @@ pub struct Merged {
     pub partition: Partition,
     /// Where a search of the result should start.
     pub medoid: u32,
-    /// Whether holding the partition together needed a build from scratch.
+    /// Whether the one-hop repair left the graph in pieces, so that it had to be
+    /// built from scratch over what survived and what was joining it.
     ///
-    /// Not a failure and not a fallback: the graph the repair and the insertion
-    /// produced was in pieces, so every vertex outside the piece the entry point
-    /// sits in would have been stored, read and never returned.
+    /// Not a failure and not a fallback: a graph in pieces is one a search
+    /// reaches one island of, and every vertex outside that island would be
+    /// stored, read and never returned.
     pub rebuilt: bool,
 }
 
-/// Take `dead` out of `base`, put `newcomers` in, and return a graph that is
-/// still in one piece.
+/// Take `dead` out of `base` and put `newcomers` in.
 ///
 /// `entry_point` is where the insertion's searches start, and it is read only
 /// when nothing is dead: consolidation moves every local id and returns the
@@ -106,13 +116,19 @@ pub fn merge_partition(
     let consolidated = if dead.is_empty() {
         None
     } else {
-        Some(consolidate_partition(
-            base,
-            dead,
-            distance_type,
-            params.alpha,
-            comparisons,
-        )?)
+        let consolidated =
+            consolidate_partition(base, dead, distance_type, params.alpha, comparisons)?;
+        let graph = consolidated.partition.graph();
+        if graph.reachable_from(consolidated.medoid)? != graph.len() {
+            return rebuild(
+                consolidated.partition,
+                newcomers,
+                distance_type,
+                params,
+                comparisons,
+            );
+        }
+        Some(consolidated)
     };
 
     let (partition, medoid) = match (consolidated, newcomers) {
@@ -150,18 +166,38 @@ pub fn merge_partition(
         }
     };
 
-    let graph = partition.graph();
-    if graph.reachable_from(medoid)? == graph.len() {
-        return Ok(Merged {
-            partition,
-            medoid,
-            rebuilt: false,
-        });
-    }
+    Ok(Merged {
+        partition,
+        medoid,
+        rebuilt: false,
+    })
+}
 
-    let (graph, vectors) = partition.into_parts();
+/// Build a graph over what a torn partition still holds, plus whatever was
+/// joining it.
+///
+/// One build rather than a build followed by an insertion. The newcomers were
+/// going to be linked into this graph anyway, and a build that has them from the
+/// start sweeps them twice like everything else instead of once into a graph
+/// they had no part in shaping.
+fn rebuild(
+    survivors: Partition,
+    newcomers: Option<Newcomers<'_>>,
+    distance_type: DistanceType,
+    params: &BuildParams,
+    comparisons: &Comparisons,
+) -> Result<Merged> {
+    let (graph, kept) = survivors.into_parts();
+    let mut row_ids = graph.row_ids().to_vec();
+    let vectors = match newcomers {
+        Some(newcomers) => {
+            row_ids.extend_from_slice(newcomers.row_ids);
+            concat_vectors(&[kept, newcomers.vectors.clone()])?
+        }
+        None => kept,
+    };
     let built = {
-        let store = flat_storage(graph.row_ids(), &vectors, distance_type)?;
+        let store = flat_storage(&row_ids, &vectors, distance_type)?;
         build_partition(&store, params, comparisons)?
     };
     Ok(Merged {

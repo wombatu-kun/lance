@@ -72,7 +72,7 @@ use object_store::path::Path;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use uuid::Uuid;
 
-use crate::builder::{routing_distance_type, supported_distance_type};
+use crate::builder::{live_fragments, routing_distance_type, supported_distance_type};
 use crate::format::{FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, RowIdMode};
 use crate::io::{check_partition_shape, open_file, read_partition, read_segment, scan_scheduler};
 use crate::partition::Partition;
@@ -584,6 +584,41 @@ impl VamanaIndex {
 
     pub(crate) fn scheduler(&self) -> &Arc<ScanScheduler> {
         &self.scheduler
+    }
+
+    /// The segment another one should be modelled on: the one covering the most
+    /// fragments, and on a tie the one the manifest lists first.
+    ///
+    /// The base rather than a delta, which is what "most fragments" means in
+    /// practice, so that what maintenance writes inherits the routing of the
+    /// index's largest graph instead of inheriting a delta's. Deterministic on
+    /// purpose: whose centroids a segment was written under is not recoverable
+    /// from the segment afterwards.
+    pub(crate) fn base_segment(&self) -> Result<&Segment> {
+        self.segments
+            .iter()
+            .reduce(|base, segment| {
+                if segment.coverage.len() > base.coverage.len() {
+                    segment
+                } else {
+                    base
+                }
+            })
+            .ok_or_else(|| Error::internal("an opened Vamana index has no segments".to_string()))
+    }
+
+    /// Fragments `dataset` has that this index does not answer for.
+    ///
+    /// Against [`Self::covered_fragments`] rather than against any segment's own
+    /// record, because the two differ exactly when a fragment has gone: one a
+    /// segment was built over and the dataset has since dropped is answered for
+    /// by nobody, and if a compaction rewrote its rows into a new fragment then
+    /// that new fragment belongs in this list.
+    pub(crate) fn unindexed_fragments(&self, dataset: &Dataset) -> Vec<u32> {
+        live_fragments(dataset)
+            .into_iter()
+            .filter(|fragment| !self.covered.contains(*fragment))
+            .collect()
     }
 
     /// Find the `k` nearest row ids to `query`.
