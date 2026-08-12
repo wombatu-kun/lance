@@ -92,7 +92,7 @@ use lance_linalg::kernels::normalize_fsl_owned;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
-use crate::build::{BuildParams, MAINTENANCE_SEED};
+use crate::build::BuildParams;
 use crate::builder::{
     INDEX_DETAILS_TYPE_URL, IndexParams, assign, build_index_segment_with_router, build_one,
     gather, group_by_partition, index_column, live_fragments, read_vectors,
@@ -531,15 +531,11 @@ fn base_segment(index: &VamanaIndex) -> Result<&Segment> {
 
 /// Build parameters that will produce a segment the base can stand beside.
 ///
-/// The seed is the one thing not taken from the base, because the base does not
-/// record it: see [`MAINTENANCE_SEED`].
+/// The graph half of them is what every maintenance pass works at, seed
+/// included: [`BuildParams::maintenance`]. What this adds is the routing, which
+/// only a driver over a dataset has an opinion about.
 fn inherited_params(column: &str, base: &IndexMetadata, router: &IvfModel) -> IndexParams {
     IndexParams::new(column, router.num_partitions() as u32)
         .with_distance_type(base.distance_type)
-        .with_graph_params(BuildParams {
-            max_degree: base.max_degree,
-            search_list_size: base.search_list_size,
-            alpha: base.alpha,
-            seed: MAINTENANCE_SEED,
-        })
+        .with_graph_params(BuildParams::maintenance(base))
 }

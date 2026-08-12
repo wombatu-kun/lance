@@ -16,7 +16,7 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 
-use crate::format::MAX_PARTITION_ROWS;
+use crate::format::{IndexMetadata, MAX_PARTITION_ROWS};
 use crate::insert::{InsertScratch, Linking, insert_point};
 use crate::partition::PartitionGraph;
 use crate::search::Comparisons;
@@ -73,6 +73,25 @@ impl Default for BuildParams {
 /// the crate's own position on it is that varying a seed is a deliberate act -
 /// so maintenance takes the one it is given and stays reproducible.
 pub const MAINTENANCE_SEED: u64 = 42;
+
+impl BuildParams {
+    /// The parameters a maintenance pass must work at, read off the segment it
+    /// is rewriting.
+    ///
+    /// Every graph a rewrite produces sits beside siblings that were built with
+    /// these three numbers, and a partition that disagrees with them disagrees
+    /// with its own segment's table. The seed is the one thing not in the
+    /// metadata, because the metadata deliberately does not record it: see
+    /// [`MAINTENANCE_SEED`].
+    pub fn maintenance(metadata: &IndexMetadata) -> Self {
+        Self {
+            max_degree: metadata.max_degree,
+            search_list_size: metadata.search_list_size,
+            alpha: metadata.alpha,
+            seed: MAINTENANCE_SEED,
+        }
+    }
+}
 
 /// A partition's graph and the vertex a search of it should start from.
 #[derive(Debug)]

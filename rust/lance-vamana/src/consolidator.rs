@@ -50,14 +50,13 @@ use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
-use crate::build::{BuildParams, MAINTENANCE_SEED, build_partition};
+use crate::build::BuildParams;
 use crate::builder::{INDEX_DETAILS_TYPE_URL, index_column};
-use crate::consolidate::{Consolidated, consolidate_partition};
 use crate::format::{FORMAT_VERSION, IndexMetadata, ROW_ID_COLUMN};
 use crate::io::{SegmentWriter, check_partition_shape, open_file, read_partition, read_row_ids};
-use crate::partition::Partition;
+use crate::merge::merge_partition;
 use crate::query::{Segment, VamanaIndex};
-use crate::search::{Comparisons, flat_storage};
+use crate::search::Comparisons;
 
 /// What consolidating an index did, and what it cost.
 ///
@@ -284,17 +283,28 @@ async fn rewrite_segment(
         // `spawn_cpu` requires.
         let dead = dead.clone();
         let metadata = metadata.clone();
-        let repaired =
-            spawn_cpu(move || consolidate_or_rebuild(&partition, &dead, &metadata)).await?;
+        let entry_point = entry.medoid;
+        let (repaired, comparisons) = spawn_cpu(move || {
+            let comparisons = Comparisons::default();
+            // No newcomers: consolidation is the half of a merge that only takes
+            // rows out, and the other half is what `crate::merger` adds.
+            let repaired = merge_partition(
+                &partition,
+                entry_point,
+                &dead,
+                None,
+                metadata.distance_type,
+                &BuildParams::maintenance(&metadata),
+                &comparisons,
+            )?;
+            Ok::<_, Error>((repaired, comparisons.get()))
+        })
+        .await?;
 
         writer
-            .write_partition(
-                entry.partition_id,
-                repaired.consolidated.medoid,
-                &repaired.consolidated.partition,
-            )
+            .write_partition(entry.partition_id, repaired.medoid, &repaired.partition)
             .await?;
-        stats.comparisons = stats.comparisons.saturating_add(repaired.comparisons);
+        stats.comparisons = stats.comparisons.saturating_add(comparisons);
         if repaired.rebuilt {
             stats.partitions_rebuilt += 1;
         } else {
@@ -302,220 +312,4 @@ async fn rewrite_segment(
         }
     }
     Ok(())
-}
-
-/// A consolidated partition, and whether keeping it needed a rebuild.
-struct Repaired {
-    consolidated: Consolidated,
-    rebuilt: bool,
-    comparisons: u64,
-}
-
-/// Repair one partition, and build it again from scratch if the repair left it
-/// in pieces.
-///
-/// The walk is what makes the difference between the two visible at all. A
-/// partition whose graph came apart is not corrupt and not short of edges - it
-/// is a graph a search reaches one island of, and every vertex outside that
-/// island is stored, read and never returned. Writing one out would trade the
-/// bytes consolidation set out to save for recall it was never supposed to
-/// touch.
-fn consolidate_or_rebuild(
-    partition: &Partition,
-    dead: &RoaringBitmap,
-    metadata: &IndexMetadata,
-) -> Result<Repaired> {
-    let comparisons = Comparisons::default();
-    let consolidated = consolidate_partition(
-        partition,
-        dead,
-        metadata.distance_type,
-        metadata.alpha,
-        &comparisons,
-    )?;
-
-    let graph = consolidated.partition.graph();
-    if graph.reachable_from(consolidated.medoid)? == graph.len() {
-        return Ok(Repaired {
-            consolidated,
-            rebuilt: false,
-            comparisons: comparisons.get(),
-        });
-    }
-
-    let vectors = consolidated.partition.vectors().clone();
-    let store = flat_storage(graph.row_ids(), &vectors, metadata.distance_type)?;
-    let built = build_partition(
-        &store,
-        &BuildParams {
-            max_degree: metadata.max_degree,
-            search_list_size: metadata.search_list_size,
-            alpha: metadata.alpha,
-            seed: MAINTENANCE_SEED,
-        },
-        &comparisons,
-    )?;
-    Ok(Repaired {
-        consolidated: Consolidated {
-            partition: Partition::try_new(built.graph, vectors)?,
-            medoid: built.medoid,
-        },
-        rebuilt: true,
-        comparisons: comparisons.get(),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use arrow_array::{FixedSizeListArray, Float32Array};
-    use lance_arrow::FixedSizeListArrayExt;
-    use lance_index::vector::flat::storage::FlatFloatStorage;
-    use lance_index::vector::graph::OrderedFloat;
-    use lance_index::vector::storage::{DistCalculator, VectorStore};
-    use lance_linalg::distance::DistanceType;
-
-    use super::*;
-    use crate::format::RowIdMode;
-
-    const VERTICES: usize = 1000;
-    const MAX_DEGREE: u32 = 16;
-    const DIMENSION: usize = 4;
-
-    fn metadata() -> IndexMetadata {
-        IndexMetadata {
-            format_version: FORMAT_VERSION,
-            max_degree: MAX_DEGREE,
-            search_list_size: 32,
-            alpha: 1.2,
-            dimension: DIMENSION as u32,
-            distance_type: DistanceType::L2,
-            row_id_mode: RowIdMode::Address,
-            fragments: vec![0],
-        }
-    }
-
-    /// The same fixture the graph half is characterised on, so the reachability
-    /// numbers in [`crate::consolidate`] apply here unchanged.
-    fn scattered_partition() -> Partition {
-        let values = Float32Array::from(
-            (0..VERTICES * DIMENSION)
-                .map(|i| ((i * 2654435761) % 1000) as f32 / 1000.0)
-                .collect::<Vec<_>>(),
-        );
-        let vectors = FixedSizeListArray::try_new_from_values(values, DIMENSION as i32).unwrap();
-        let params = BuildParams {
-            max_degree: MAX_DEGREE,
-            search_list_size: 32,
-            alpha: 1.2,
-            seed: 42,
-        };
-        let storage = FlatFloatStorage::new(vectors.clone(), DistanceType::L2);
-        let built = build_partition(&storage, &params, &Comparisons::default()).unwrap();
-        Partition::try_new(built.graph, vectors).unwrap()
-    }
-
-    /// The `count` vertices nearest to vertex 0, which is what deleting a class
-    /// or a category looks like in the space the index measures.
-    fn clustered(partition: &Partition, count: usize) -> RoaringBitmap {
-        let store = flat_storage(
-            partition.graph().row_ids(),
-            partition.vectors(),
-            DistanceType::L2,
-        )
-        .unwrap();
-        let from_center = store.dist_calculator_from_id(0);
-        let mut scored = (0..partition.len() as u32)
-            .map(|id| (OrderedFloat(from_center.distance(id)), id))
-            .collect::<Vec<_>>();
-        scored.sort_unstable();
-        scored.into_iter().take(count).map(|(_, id)| id).collect()
-    }
-
-    /// 90% removed evenly is the case the one-hop repair cannot hold together -
-    /// 2 of 100 survivors reachable, measured in [`crate::consolidate`]. What
-    /// comes out of here is whole, because it was built again rather than
-    /// repaired.
-    #[test]
-    fn a_partition_the_repair_tore_apart_is_rebuilt() {
-        let partition = scattered_partition();
-        let dead = (0..VERTICES as u32).filter(|id| id % 10 != 0).collect();
-
-        let repaired = consolidate_or_rebuild(&partition, &dead, &metadata()).unwrap();
-        assert!(repaired.rebuilt, "the repair held, so nothing was rebuilt");
-
-        let graph = repaired.consolidated.partition.graph();
-        assert_eq!(graph.len(), VERTICES / 10);
-        assert_eq!(
-            graph.reachable_from(repaired.consolidated.medoid).unwrap(),
-            graph.len(),
-            "the rebuild came apart too"
-        );
-        for vertex in 0..graph.len() as u32 {
-            assert!(graph.neighbors(vertex).unwrap().len() <= MAX_DEGREE as usize);
-        }
-    }
-
-    /// The same 90%, removed as a region of the space instead: the survivors
-    /// outside it keep their neighbourhoods, the repair holds, and the rebuild
-    /// must *not* fire. Without this case "rebuild always" would pass the test
-    /// above.
-    #[test]
-    fn a_partition_the_repair_held_together_is_not_rebuilt() {
-        let partition = scattered_partition();
-        let dead = clustered(&partition, VERTICES * 9 / 10);
-
-        let repaired = consolidate_or_rebuild(&partition, &dead, &metadata()).unwrap();
-        assert!(
-            !repaired.rebuilt,
-            "a graph that was whole was rebuilt anyway"
-        );
-
-        let graph = repaired.consolidated.partition.graph();
-        assert_eq!(graph.len(), VERTICES / 10);
-        assert_eq!(
-            graph.reachable_from(repaired.consolidated.medoid).unwrap(),
-            graph.len()
-        );
-    }
-
-    /// A rebuild is a build, so it runs with the parameters the segment records
-    /// rather than with a default of its own: the partition it replaces sits
-    /// beside siblings built with those numbers.
-    ///
-    /// The degree is visible in the graph. The beam is not, so it is pinned
-    /// through what the build spends: a wider one visits more candidates per
-    /// insertion, and a rebuild that ignored the recorded value would cost the
-    /// same either way.
-    #[test]
-    fn a_rebuild_uses_the_parameters_the_segment_records() {
-        let partition = scattered_partition();
-        let dead: RoaringBitmap = (0..VERTICES as u32).filter(|id| id % 10 != 0).collect();
-        let rebuild_with = |metadata: IndexMetadata| {
-            let repaired = consolidate_or_rebuild(&partition, &dead, &metadata).unwrap();
-            assert!(repaired.rebuilt, "this case is supposed to reach a rebuild");
-            repaired
-        };
-
-        let narrow = rebuild_with(IndexMetadata {
-            max_degree: 4,
-            ..metadata()
-        });
-        assert_eq!(
-            narrow.consolidated.partition.graph().max_degree(),
-            4,
-            "the rebuild ignored the degree the segment records"
-        );
-
-        let recorded = rebuild_with(metadata());
-        let wide = rebuild_with(IndexMetadata {
-            search_list_size: 200,
-            ..metadata()
-        });
-        assert!(
-            wide.comparisons > recorded.comparisons,
-            "a beam of 200 cost {} distances and a beam of 32 cost {}",
-            wide.comparisons,
-            recorded.comparisons
-        );
-    }
 }
