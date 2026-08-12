@@ -124,7 +124,7 @@ In every case the answer is to rebuild the index.
 
 ## Maintenance
 
-Three calls, and none of them takes a parameter beyond the dataset and the index
+Four calls, and none of them takes a parameter beyond the dataset and the index
 name. Everything else - the column, the metric, the width, the degree, the beam,
 the pruning slack - is already recorded in the index, and taking it from anywhere
 else would be a second copy of one number for the two to disagree about.
@@ -142,6 +142,17 @@ else would be a second copy of one number for the two to disagree about.
   half a percentage point and returns almost nothing in recall: a tombstone is
   nearly free to search past while the beam is wide next to the reciprocal of
   the live fraction.
+- `merge_index` does all of that in one pass, and folds delta segments back into
+  the base, which is the one thing none of the others can do. A partition is read
+  once from each segment holding a piece of it and written once, whatever had to
+  happen to it, and there is no order to get wrong.
+
+**Which one to call.** Delta segments to be rid of: `merge_index`, because
+nothing else removes them. Only new rows: `insert_as_segment` to make them
+searchable now, `insert_in_place` to keep the read cost flat. Only deletions:
+`consolidate_index`, which is cheaper than merging because it never reads the
+dataset's vector column and never routes. Anything else, or more than one of them
+at once: `merge_index`.
 
 Which insert to use is a question about read operations, not about recall.
 Measured on SIFT 100k over indices covering the same rows and differing only in
@@ -149,25 +160,50 @@ how they came to exist, eight segments against one cost 8x the partition reads,
 8x the files and about 3x the latency, for +10% bytes and **no** loss of recall.
 A delta is nearly free to a query's bandwidth and expensive to its IOPS.
 
-**Order matters: consolidate, then insert.** A delete that empties a fragment
-takes it out of the dataset, and `insert_in_place` refuses a segment built over
-a fragment that is gone - rewriting one would store its vertices under a
-coverage that no longer names them, where nothing would keep them out of an
-answer. Consolidation removes exactly those vertices. The other order works
-until the first fragment empties and then stops working.
+**And a delta is cheap to undo.** Folding eight segments into one costs 4.5s and
+takes 8.47ms off every query, so it pays for itself after **533 queries**; four
+cost 4.3s and pay back after 1345, two cost 3.5s and pay back after 6509. The
+fold leaves an index a query cannot tell from a one-pass build - the same 74 MiB
+in the same 101 files, the same ten partitions and fifty reads per query, at
+recall 0.9782 against 0.9777 - for a third of what rebuilding costs. What it does
+not give back is the 8% more distances per query a grown graph spends: it moves
+the vertices, it does not retrain the router or rebuild the base. That is why
+there is no threshold inside `merge_index` and none is wanted. At 533 queries the
+policy is "fold if anyone reads this index at all".
 
-Run that pipeline and the index survives being replaced outright. Five rounds of
-"delete a fifth, consolidate, append as many rows as were removed, insert them"
-on SIFT 100k leave nothing of the original data and cost **0.14 of a percentage
+**Order matters between the two calls: consolidate, then insert.** A delete that
+empties a fragment takes it out of the dataset, and `insert_in_place` refuses a
+segment built over a fragment that is gone - rewriting one would store its
+vertices under a coverage that no longer names them, where nothing would keep
+them out of an answer. Consolidation removes exactly those vertices. The other
+order works until the first fragment empties and then stops working. There is no
+such order to `merge_index`: the pass that adds the new vertices is the pass that
+drops the ones whose fragment left.
+
+Run either and the index survives being replaced outright. Five rounds of "delete
+a fifth, append as many rows as were removed, bring the index back up to date" on
+SIFT 100k leave nothing of the original data and cost **0.14 of a percentage
 point** of recall, against the roughly one point the FreshVamana paper allows.
 What churn actually costs is arithmetic: the worn graph spends 8.5% more
-distances per query than a rebuild, which also takes the recall back. A round
-costs a third to two thirds of a rebuild.
+distances per query than a rebuild, which also takes the recall back. The cycle
+costs 2.4 rebuilds, a round 0.3 to 0.6 of one.
 
-Between them they also answer compaction, which used to need a rebuild.
-Compaction strands the index over fragments that no longer exist, and the rows
-it moved are then rows this index does not cover - so indexing them again is the
-whole of the repair, and the stranded segment goes with the same commit.
+The two are the same pipeline, and the measurement says so: round for round,
+`merge_index` answers with the same recall and the same distances per query as
+`consolidate_index` followed by `insert_in_place`, to the last digit, in every
+round of that cycle. It runs the same operations over the same data without
+putting the partition on disk in between, so what the one pass saves is one read
+and one write of the index per round - **3%** of the work here, 35.9s against
+37.0s over five rounds. Maintenance is bound by the arithmetic of the graph
+rather than by the disk, which is why fusing the passes is worth having and is
+not where the money is. Where a partition read is a network round trip the same
+two passes are not 3%.
+
+They also answer compaction, which used to need a rebuild. Compaction strands the
+index over fragments that no longer exist, and the rows it moved are then rows
+this index does not cover - so indexing them again is the whole of the repair,
+and the stranded segment goes with the same commit. That is one `merge_index`
+call, or `consolidate_index` and then `insert_in_place`.
 
 ## Building
 

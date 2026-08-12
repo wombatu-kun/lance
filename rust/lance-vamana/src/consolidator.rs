@@ -99,6 +99,12 @@ pub struct ConsolidateStats {
 /// tracked the live fraction the whole way - 73.9 MiB down to 7.5 at 90%
 /// deleted, where the same index left alone stays at 73.9.
 ///
+/// It is the only maintenance call that never reads the dataset's vector column
+/// and never routes: what it needs is the delete list and the graphs it already
+/// holds. When something other than deletions is pending too - a delta segment,
+/// or fragments no segment covers - [`crate::merger::merge_index`] does this and
+/// those in one pass over the same partitions.
+///
 /// The delete list is a snapshot taken when the index is opened, so a row
 /// deleted while this runs is simply left for the next call - it stays filtered
 /// out of every answer in the meantime. A dataset compaction landing in the

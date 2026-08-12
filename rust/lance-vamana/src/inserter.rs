@@ -145,6 +145,12 @@ pub struct InsertStats {
 /// data moved underneath it must not have a delta committed beside it, and that
 /// is not a check worth having a second copy of.
 ///
+/// What the delta costs afterwards is read operations: a query probes `nprobes`
+/// partitions in it as in every other segment. [`crate::merger::merge_index`]
+/// folds it back into the base, and on SIFT 100k that fold has paid for itself
+/// after 533 queries against eight segments - so what a schedule of these is
+/// paired with is a fold, not a rebuild.
+///
 /// A concurrent commit under the same index name is a retryable conflict, and
 /// the retry re-runs this call from the beginning against the manifest that won.
 /// Should another writer have indexed the same fragments in the meantime, its
@@ -247,6 +253,10 @@ pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Resul
 /// the other way round works until the day a fragment empties, and then stops
 /// working - measured, `examples/churn_cycle.rs` in the order insert-then-
 /// consolidate dies at its fourth round.
+///
+/// [`crate::merger::merge_index`] is that round in one call and has no such
+/// order. Over the cycle below it comes out with the same recall and the same
+/// distances per query as this pair in every round, for 3% less time.
 ///
 /// What that pipeline costs, and what it buys, measured over five rounds of
 /// "delete a residue class, consolidate, append as many rows as were removed,
