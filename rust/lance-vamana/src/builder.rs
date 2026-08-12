@@ -224,6 +224,36 @@ pub fn live_fragments(dataset: &Dataset) -> Vec<u32> {
         .collect()
 }
 
+/// The name of the column an index is over, which committing a further segment
+/// of it needs and the segment itself does not record.
+///
+/// Resolved against the dataset's *top-level* fields rather than through
+/// `Schema::field_by_id`, which resolves a nested leaf too and would hand back
+/// the leaf's own name - a column of that name need not exist. This module
+/// refuses a nested column outright, so anything this crate committed resolves
+/// here; anything that does not was committed by something else.
+pub(crate) fn index_column(dataset: &Dataset, index_name: &str, fields: &[i32]) -> Result<String> {
+    let [field_id] = fields else {
+        return Err(Error::invalid_input(format!(
+            "Vamana index '{index_name}' is recorded against {} fields, and a vector index is \
+             over exactly one",
+            fields.len()
+        )));
+    };
+    dataset
+        .schema()
+        .fields
+        .iter()
+        .find(|field| field.id == *field_id)
+        .map(|field| field.name.clone())
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Vamana index '{index_name}' is over field {field_id}, which is not a top-level \
+                 column of this dataset"
+            ))
+        })
+}
+
 /// Build a segment over `fragments` and describe it, ready to commit.
 ///
 /// Separate from [`create_index`] because a segment is the unit of maintenance:
@@ -244,6 +274,21 @@ pub async fn build_index_segment(
     dataset: &Dataset,
     params: &IndexParams,
     fragments: &[u32],
+) -> Result<(IndexSegment, BuildStats)> {
+    build_index_segment_with_router(dataset, params, fragments, None).await
+}
+
+/// [`build_index_segment`], with the option of routing by somebody else's
+/// centroids instead of training a router of this segment's own.
+///
+/// A segment added to an index that already has one inherits the base's model,
+/// which is what keeps every segment of an index on one partition numbering.
+/// See [`crate::inserter`] for why that matters.
+pub(crate) async fn build_index_segment_with_router(
+    dataset: &Dataset,
+    params: &IndexParams,
+    fragments: &[u32],
+    router: Option<IvfModel>,
 ) -> Result<(IndexSegment, BuildStats)> {
     // Refused before the graph is built rather than discovered on the commit
     // that follows it: Lance would open this index while committing, and cannot.
@@ -288,7 +333,7 @@ pub async fn build_index_segment(
 
     let uuid = Uuid::new_v4();
     let dir = dataset.indices_dir().join(uuid.to_string());
-    let (_, stats) = build_segment(dataset, params, &dir, fragments).await?;
+    let (_, stats) = build_segment_with_router(dataset, params, &dir, fragments, router).await?;
 
     let details = prost_types::Any {
         type_url: INDEX_DETAILS_TYPE_URL.to_string(),
@@ -359,6 +404,22 @@ pub async fn build_segment(
     params: &IndexParams,
     dir: &Path,
     fragments: &[u32],
+) -> Result<(SegmentManifest, BuildStats)> {
+    build_segment_with_router(dataset, params, dir, fragments, None).await
+}
+
+/// [`build_segment`], routing by `router` when one is given rather than
+/// training one.
+///
+/// `params.num_partitions` and the two k-means knobs are then unused: how many
+/// buckets there are is a property of the model, and it is read off the model
+/// below rather than off the request.
+pub(crate) async fn build_segment_with_router(
+    dataset: &Dataset,
+    params: &IndexParams,
+    dir: &Path,
+    fragments: &[u32],
+    router: Option<IvfModel>,
 ) -> Result<(SegmentManifest, BuildStats)> {
     if dataset.manifest().uses_stable_row_ids() {
         // The delete list of stage C is derived from deletion vectors, which are
@@ -492,8 +553,13 @@ pub async fn build_segment(
             } else {
                 vectors
             };
-            let mut rng = SmallRng::seed_from_u64(params.graph.seed);
-            let ivf = train_router(&vectors, &params, &mut rng)?;
+            let ivf = match router {
+                Some(inherited) => inherited,
+                None => {
+                    let mut rng = SmallRng::seed_from_u64(params.graph.seed);
+                    train_router(&vectors, &params, &mut rng)?
+                }
+            };
             let assignment = assign(&ivf, &vectors, &row_ids, &params)?;
             Ok::<_, Error>((vectors, ivf, assignment))
         })
@@ -510,6 +576,11 @@ pub async fn build_segment(
         row_id_mode: RowIdMode::Address,
         fragments: fragments.to_vec(),
     };
+    // Off the model rather than off the request, because the two are the same
+    // number only when the model was trained here. An inherited one decides how
+    // many buckets there are, and grouping by a smaller count read from the
+    // request would index out of the bucket list.
+    let num_partitions = ivf.num_partitions() as u32;
     let mut writer = SegmentWriter::new(
         dataset.object_store(None).await?,
         dir.clone(),
@@ -517,7 +588,7 @@ pub async fn build_segment(
         ivf,
     );
 
-    let members_by_partition = group_by_partition(&assignment, params.num_partitions);
+    let members_by_partition = group_by_partition(&assignment, num_partitions);
     let stats =
         write_partitions(&mut writer, members_by_partition, row_ids, vectors, params).await?;
     Ok((writer.finish().await?, stats))

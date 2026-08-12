@@ -188,35 +188,64 @@ pub async fn live_row_ids(dataset: &Dataset) -> Vec<u64> {
         .to_vec()
 }
 
+/// One committed segment as it is on disk: what it says about itself, and every
+/// partition it holds.
+pub struct ReadSegment {
+    pub uuid: uuid::Uuid,
+    pub manifest: SegmentManifest,
+    pub partitions: HashMap<u32, Partition>,
+}
+
+/// Read every committed segment of `index_name` back off disk, in manifest
+/// order.
+pub async fn read_committed_segments(dataset: &Dataset, index_name: &str) -> Vec<ReadSegment> {
+    let indices = dataset.load_indices_by_name(index_name).await.unwrap();
+    let store = dataset.object_store(None).await.unwrap();
+    let scheduler = scan_scheduler(&store);
+
+    let mut segments = Vec::with_capacity(indices.len());
+    for index in indices.iter() {
+        let dir = dataset.indices_dir().join(index.uuid.to_string());
+        let manifest = read_segment(&scheduler, &dir, None).await.unwrap();
+        let mut partitions = HashMap::new();
+        for entry in manifest.partitions() {
+            let reader = open_file(
+                &scheduler,
+                &dir.clone().join(entry.file.as_str()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            partitions.insert(
+                entry.partition_id,
+                read_partition(&reader, entry.num_rows).await.unwrap(),
+            );
+        }
+        segments.push(ReadSegment {
+            uuid: index.uuid,
+            manifest,
+            partitions,
+        });
+    }
+    segments
+}
+
 /// Locate the one committed segment of `index_name` and read every partition of
 /// it back off disk.
 pub async fn read_committed_segment(
     dataset: &Dataset,
     index_name: &str,
 ) -> (SegmentManifest, HashMap<u32, Partition>) {
-    let indices = dataset.load_indices_by_name(index_name).await.unwrap();
-    assert_eq!(indices.len(), 1, "expected exactly one committed segment");
-    let store = dataset.object_store(None).await.unwrap();
-    let dir = dataset.indices_dir().join(indices[0].uuid.to_string());
-
-    let scheduler = scan_scheduler(&store);
-    let manifest = read_segment(&scheduler, &dir, None).await.unwrap();
-    let mut partitions = HashMap::new();
-    for entry in manifest.partitions() {
-        let reader = open_file(
-            &scheduler,
-            &dir.clone().join(entry.file.as_str()),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        partitions.insert(
-            entry.partition_id,
-            read_partition(&reader, entry.num_rows).await.unwrap(),
-        );
-    }
-    (manifest, partitions)
+    let mut segments = read_committed_segments(dataset, index_name).await;
+    assert_eq!(
+        segments.len(),
+        1,
+        "expected exactly one committed segment, found {}",
+        segments.len()
+    );
+    let segment = segments.remove(0);
+    (segment.manifest, segment.partitions)
 }
 
 /// Query vectors drawn the same way as the dataset's, from a different seed.

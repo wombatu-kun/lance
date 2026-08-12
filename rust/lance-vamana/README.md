@@ -84,9 +84,10 @@ two are meant to say the same thing.
   Deleted vertices are still walked - they carry the edges that hold the graph
   together - but they are dropped from the answer, and a walk only produces
   `search_list_size` candidates to draw from.
-- **Rows added after the build are invisible.** The index answers from the
-  fragments it was built over. Lance's scanner would scan the unindexed
-  remainder; this driver does not.
+- **Rows added after the build are invisible** until they are indexed. The index
+  answers from the fragments it was built over. Lance's scanner would scan the
+  unindexed remainder; this driver does not. `insert_as_segment` is how they
+  stop being invisible.
 - **A fragment the dataset has dropped is answered for by nobody.** A delete that
   empties a fragment, and a compaction that rewrites one, both take it out of the
   dataset, and every vertex stored for it becomes unreachable rather than wrong -
@@ -94,7 +95,8 @@ two are meant to say the same thing.
   ever come to mean another row. The index narrows itself to what is left and
   reports the result from `VamanaIndex::covered_fragments`, which is what the
   unindexed remainder should be computed against. After a compaction the rows
-  are all still in the dataset, in fragments this index does not cover.
+  are all still in the dataset, in fragments this index does not cover - which
+  makes them ordinary new rows, and `insert_as_segment` brings them back.
 - **No predicate prefilter and no refine step.** Both live in Lance's scanner,
   which this driver bypasses.
 - **Partitions are read whole, and nothing is cached between queries.** A query
@@ -119,6 +121,28 @@ An index is **refused** at open, rather than answering from what is left, when:
   because a query merges their answers.
 
 In every case the answer is to rebuild the index.
+
+## Maintenance
+
+Two calls, and neither takes a parameter beyond the dataset and the index name.
+Everything else - the column, the metric, the width, the degree, the beam, the
+pruning slack - is already recorded in the index, and taking it from anywhere
+else would be a second copy of one number for the two to disagree about.
+
+- `insert_as_segment` indexes every row the index does not cover yet, as a new
+  segment beside the base. It inherits the base's centroids, so every segment of
+  an index shares one partition numbering. A query probes `nprobes` partitions
+  **per segment**, which is what a delta costs.
+- `consolidate_index` takes the dataset's deleted rows out of the graphs that
+  still hold them. On SIFT 100k it returns the deleted share in bytes to within
+  half a percentage point and returns almost nothing in recall: a tombstone is
+  nearly free to search past while the beam is wide next to the reciprocal of
+  the live fraction.
+
+Between them they also answer compaction, which used to need a rebuild.
+Compaction strands the index over fragments that no longer exist, and the rows
+it moved are then rows this index does not cover - so indexing them again is the
+whole of the repair, and the stranded segment goes with the same commit.
 
 ## Building
 

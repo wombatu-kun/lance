@@ -63,6 +63,16 @@ impl Default for BuildParams {
     }
 }
 
+/// The insertion order maintenance builds in.
+///
+/// Fixed rather than carried in the segment, unlike the degree, the beam and the
+/// pruning slack, which are. Those three decide what the graph *is*, and a
+/// partition a maintenance pass rebuilds or extends has to match its siblings on
+/// them. The seed decides only which of the equally good graphs comes out, and
+/// the crate's own position on it is that varying a seed is a deliberate act -
+/// so maintenance takes the one it is given and stays reproducible.
+pub const MAINTENANCE_SEED: u64 = 42;
+
 /// A partition's graph and the vertex a search of it should start from.
 #[derive(Debug)]
 pub struct BuiltPartition {

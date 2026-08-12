@@ -50,24 +50,14 @@ use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
-use crate::build::{BuildParams, build_partition};
-use crate::builder::INDEX_DETAILS_TYPE_URL;
+use crate::build::{BuildParams, MAINTENANCE_SEED, build_partition};
+use crate::builder::{INDEX_DETAILS_TYPE_URL, index_column};
 use crate::consolidate::{Consolidated, consolidate_partition};
 use crate::format::{FORMAT_VERSION, IndexMetadata, ROW_ID_COLUMN};
 use crate::io::{SegmentWriter, check_partition_shape, open_file, read_partition, read_row_ids};
 use crate::partition::Partition;
 use crate::query::{Segment, VamanaIndex};
 use crate::search::{Comparisons, flat_storage};
-
-/// The insertion order a rebuilt partition is built in.
-///
-/// Fixed rather than carried in the segment, unlike the degree, the beam and the
-/// pruning slack, which are. Those three decide what the graph *is* and a
-/// rebuilt partition has to match its siblings on them. The seed decides only
-/// which of the equally good graphs comes out, and the crate's own position on
-/// it is that varying a seed is a deliberate act - so a repair takes the one it
-/// is given and stays reproducible.
-const REBUILD_SEED: u64 = 42;
 
 /// What consolidating an index did, and what it cost.
 ///
@@ -361,7 +351,7 @@ fn consolidate_or_rebuild(
             max_degree: metadata.max_degree,
             search_list_size: metadata.search_list_size,
             alpha: metadata.alpha,
-            seed: REBUILD_SEED,
+            seed: MAINTENANCE_SEED,
         },
         &comparisons,
     )?;
@@ -373,36 +363,6 @@ fn consolidate_or_rebuild(
         rebuilt: true,
         comparisons: comparisons.get(),
     })
-}
-
-/// The name of the column an index is over, which committing a replacement of
-/// it needs and the segment does not record.
-///
-/// Resolved against the dataset's *top-level* fields rather than through
-/// `Schema::field_by_id`, which resolves a nested leaf too and would hand back
-/// the leaf's own name - a column of that name need not exist. The builder
-/// refuses a nested column outright, so anything this crate committed resolves
-/// here; anything that does not was committed by something else.
-fn index_column(dataset: &Dataset, index_name: &str, fields: &[i32]) -> Result<String> {
-    let [field_id] = fields else {
-        return Err(Error::invalid_input(format!(
-            "Vamana index '{index_name}' is recorded against {} fields, and a vector index is \
-             over exactly one",
-            fields.len()
-        )));
-    };
-    dataset
-        .schema()
-        .fields
-        .iter()
-        .find(|field| field.id == *field_id)
-        .map(|field| field.name.clone())
-        .ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Vamana index '{index_name}' is over field {field_id}, which is not a top-level \
-                 column of this dataset"
-            ))
-        })
 }
 
 #[cfg(test)]

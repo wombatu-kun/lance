@@ -21,8 +21,9 @@
 //!   deleted.** Deleted vertices are still walked - they carry the edges that
 //!   hold the graph together - but they are dropped from the answer, and a walk
 //!   only ever produces `search_list_size` candidates to draw from.
-//! - **Rows added after the build are invisible.** The index answers from the
-//!   fragments it was built over; Lance's scanner would scan the remainder.
+//! - **Rows added after the build are invisible** until they are indexed. The
+//!   index answers from the fragments it was built over; Lance's scanner would
+//!   scan the remainder. [`crate::inserter::insert_as_segment`] is the remedy.
 //! - **A fragment the dataset has dropped is answered for by nobody.** A delete
 //!   that empties a fragment, and a compaction that rewrites one, both take it
 //!   out of the dataset, and the vertices stored for it are then unreachable
