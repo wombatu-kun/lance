@@ -222,22 +222,8 @@ mod tests {
         ids.into_iter().collect()
     }
 
-    /// Every vertex reachable from `entry_point` by following out-edges.
     fn reachable(graph: &PartitionGraph, entry_point: u32) -> usize {
-        let mut seen = vec![false; graph.len()];
-        let mut frontier = vec![entry_point];
-        seen[entry_point as usize] = true;
-        let mut count = 1;
-        while let Some(vertex) = frontier.pop() {
-            for neighbor in graph.neighbors(vertex).unwrap() {
-                if !seen[*neighbor as usize] {
-                    seen[*neighbor as usize] = true;
-                    count += 1;
-                    frontier.push(*neighbor);
-                }
-            }
-        }
-        count
+        graph.reachable_from(entry_point).unwrap()
     }
 
     /// The rows that are gone are gone, the rows that are not are all still

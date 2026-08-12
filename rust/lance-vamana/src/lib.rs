@@ -13,6 +13,7 @@
 pub mod build;
 pub mod builder;
 pub mod consolidate;
+pub mod consolidator;
 pub mod format;
 pub mod io;
 pub mod partition;
@@ -22,6 +23,7 @@ pub mod segment;
 
 pub use builder::{BuildStats, IndexParams, create_index};
 pub use consolidate::{Consolidated, consolidate_partition};
+pub use consolidator::{ConsolidateStats, consolidate_index};
 pub use format::{IndexMetadata, RowIdMode};
 pub use partition::{Partition, PartitionGraph};
 pub use query::{Neighbor, QueryResult, SearchParams, VamanaIndex};

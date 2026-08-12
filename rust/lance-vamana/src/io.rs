@@ -217,6 +217,36 @@ pub async fn read_partition(reader: &FileReader, expected_rows: u32) -> Result<P
     Partition::try_from_batch(&read_rows(reader, 0..expected_rows as usize).await?)
 }
 
+/// Refuse a partition whose shape disagrees with the segment that lists it.
+///
+/// The writer checks both against the segment on the way out; a reader has to
+/// check them on the way back in, and every reader has to, which is why this is
+/// not inlined at one of them. A partition whose width disagrees with the
+/// manifest would be searched with a query of the wrong length against
+/// `flat_storage`, which takes its dimension from the array - silently wrong
+/// distances rather than an error - and consolidation would rewrite it into a
+/// segment that declares the other number.
+pub fn check_partition_shape(
+    partition: &Partition,
+    entry: &PartitionEntry,
+    max_degree: u32,
+    dimension: u32,
+) -> Result<()> {
+    if partition.graph().max_degree() != max_degree || partition.dimension() != dimension {
+        return Err(Error::corrupt_file_named(
+            entry.file.as_str(),
+            format!(
+                "Vamana partition {} holds degree {} and dimension {} but its segment declares \
+                 degree {max_degree} and dimension {dimension}",
+                entry.partition_id,
+                partition.graph().max_degree(),
+                partition.dimension(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Read the row id of every vertex, and nothing else.
 ///
 /// The saving is the point. Deciding whether a partition holds any deleted row

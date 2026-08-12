@@ -147,6 +147,44 @@ impl PartitionGraph {
         Ok(())
     }
 
+    /// How many vertices a walk from `entry_point` can reach along out-edges.
+    ///
+    /// Not a search: no distances and no order, only whether the graph is in one
+    /// piece. Consolidation asks because the one-hop repair it runs guarantees
+    /// that no *edge* dangles and not that the graph stays connected, and a
+    /// partition that came apart can only ever answer from the island holding
+    /// its entry point. Asking costs `len * max_degree` pointer chases against
+    /// the `len * max_degree` *distances* the repair itself spends, so the check
+    /// disappears next to the thing it checks.
+    ///
+    /// Every id in `neighbors` is in range for anything built through this
+    /// type's constructors or read through [`Partition::try_from_batch`], both
+    /// of which refuse one that is not - the same invariant a graph walk
+    /// already indexes the visit marks with.
+    pub fn reachable_from(&self, entry_point: u32) -> Result<usize> {
+        let mut seen = vec![false; self.len()];
+        let Some(start) = seen.get_mut(entry_point as usize) else {
+            return Err(Error::invalid_input(format!(
+                "Vamana cannot walk from vertex {entry_point} of a partition of {} vertices",
+                self.len()
+            )));
+        };
+        *start = true;
+
+        let mut reached = 1;
+        let mut frontier = vec![entry_point];
+        while let Some(vertex) = frontier.pop() {
+            for neighbor in self.neighbors(vertex)? {
+                if !seen[*neighbor as usize] {
+                    seen[*neighbor as usize] = true;
+                    reached += 1;
+                    frontier.push(*neighbor);
+                }
+            }
+        }
+        Ok(reached)
+    }
+
     fn slots(&self, local_id: u32) -> Option<&[u32]> {
         let width = self.max_degree as usize;
         let start = (local_id as usize).checked_mul(width)?;

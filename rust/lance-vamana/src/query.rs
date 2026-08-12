@@ -63,16 +63,17 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, Result};
 use lance_index::vector::storage::VectorStore;
-use lance_io::scheduler::ScanScheduler;
+use lance_io::scheduler::{ScanScheduler, ScanStats};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::overlay::DataOverlayFile;
 use object_store::path::Path;
 use roaring::{RoaringBitmap, RoaringTreemap};
+use uuid::Uuid;
 
 use crate::builder::{routing_distance_type, supported_distance_type};
 use crate::format::{FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, RowIdMode};
-use crate::io::{open_file, read_partition, read_segment, scan_scheduler};
+use crate::io::{check_partition_shape, open_file, read_partition, read_segment, scan_scheduler};
 use crate::partition::Partition;
 use crate::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
 use crate::segment::{PartitionEntry, SegmentManifest};
@@ -174,7 +175,7 @@ pub struct VamanaIndex {
 /// every query. A row deleted afterwards keeps coming back until the index is
 /// reopened.
 #[derive(Debug)]
-struct RowFilter {
+pub(crate) struct RowFilter {
     /// Rows deleted from a fragment this index still covers.
     deleted: RoaringTreemap,
     /// Fragments the dataset no longer has. Every vertex stored for one of them
@@ -185,24 +186,39 @@ struct RowFilter {
 }
 
 impl RowFilter {
-    fn rejects(&self, row_addr: u64) -> bool {
+    pub(crate) fn rejects(&self, row_addr: u64) -> bool {
         self.missing_fragments
             .contains(RowAddress::from(row_addr).fragment_id())
             || self.deleted.contains(row_addr)
     }
+
+    /// Whether this filter rejects nothing, so that every stored vertex is live.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.deleted.is_empty() && self.missing_fragments.is_empty()
+    }
 }
 
 #[derive(Debug)]
-struct Segment {
-    dir: Path,
-    manifest: SegmentManifest,
+pub(crate) struct Segment {
+    pub(crate) uuid: Uuid,
+    pub(crate) dir: Path,
+    pub(crate) manifest: SegmentManifest,
     /// Byte size of each file of this segment, as Lance recorded it at commit.
     ///
     /// Lance fills this by listing the directory, so it is a fact about the
     /// files rather than a second copy of one this crate wrote. Handing it to
     /// the reader is what turns opening a partition into one read rather than a
     /// size probe followed by a read.
-    file_sizes: HashMap<String, u64>,
+    pub(crate) file_sizes: HashMap<String, u64>,
+    /// Schema field ids the dataset credits this segment's index row with.
+    pub(crate) fields: Vec<i32>,
+    /// What this segment was built over that the dataset still has.
+    ///
+    /// Narrower than the segment's own `fragments` exactly when a fragment has
+    /// gone; every vertex stored for one of those is already rejected by
+    /// [`RowFilter`], so this is the coverage a rewrite of this segment would be
+    /// committed with.
+    pub(crate) coverage: RoaringBitmap,
 }
 
 /// What one partition's walk produced, and what it cost.
@@ -430,7 +446,8 @@ impl VamanaIndex {
                 );
                 missing_fragments |= gone;
             }
-            covered |= &built_over & &live;
+            let coverage = &built_over & &live;
+            covered |= &coverage;
 
             // The checks above ask what the *manifest* says about this
             // segment's coverage. An overlay changes none of it: `Operation::
@@ -457,9 +474,12 @@ impl VamanaIndex {
                 )));
             }
             segments.push(Segment {
+                uuid: index.uuid,
                 dir,
                 manifest,
                 file_sizes,
+                fields: index.fields.clone(),
+                coverage,
             });
         }
 
@@ -536,6 +556,33 @@ impl VamanaIndex {
 
     pub fn num_segments(&self) -> usize {
         self.segments.len()
+    }
+
+    /// Every byte this index has read since it was opened.
+    ///
+    /// Taken off the index's own scheduler rather than off a tracker wrapped
+    /// around the store, which under-counts a local read.
+    pub fn io_stats(&self) -> ScanStats {
+        self.scheduler.stats()
+    }
+
+    /// What opening the index established about its segments, for the one
+    /// caller in this crate that rewrites them.
+    ///
+    /// Consolidation needs exactly what a query needs and one thing more - the
+    /// index row's field ids, to commit a replacement under - and it needs the
+    /// same refusals to have run first. Reproducing [`Self::open`] instead would
+    /// be a second copy of nine checks and a delete list.
+    pub(crate) fn segments(&self) -> &[Segment] {
+        &self.segments
+    }
+
+    pub(crate) fn row_filter(&self) -> &RowFilter {
+        &self.rows
+    }
+
+    pub(crate) fn scheduler(&self) -> &Arc<ScanScheduler> {
+        &self.scheduler
     }
 
     /// Find the `k` nearest row ids to `query`.
@@ -803,27 +850,7 @@ impl VamanaIndex {
     async fn read_probe(&self, probe: Probe) -> Result<(Partition, u32)> {
         let reader = open_file(&self.scheduler, &probe.path, None, probe.size_bytes).await?;
         let partition = read_partition(&reader, probe.entry.num_rows).await?;
-        // The writer checks both against the segment on the way out; the reader
-        // has to check them on the way back in. A partition whose width
-        // disagrees with the manifest would be searched with a query of the
-        // wrong length against `flat_storage`, which takes its dimension from
-        // the array - silently wrong distances, not an error.
-        if partition.graph().max_degree() != probe.max_degree
-            || partition.dimension() != probe.dimension
-        {
-            return Err(Error::corrupt_file_named(
-                probe.entry.file.as_str(),
-                format!(
-                    "Vamana partition {} holds degree {} and dimension {} but its segment \
-                     declares degree {} and dimension {}",
-                    probe.entry.partition_id,
-                    partition.graph().max_degree(),
-                    partition.dimension(),
-                    probe.max_degree,
-                    probe.dimension
-                ),
-            ));
-        }
+        check_partition_shape(&partition, &probe.entry, probe.max_degree, probe.dimension)?;
         Ok((partition, probe.entry.medoid))
     }
 }
