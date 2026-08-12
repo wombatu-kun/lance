@@ -7,13 +7,24 @@
 //! datasets. This is the other half: which rows are dead, which partitions that
 //! makes worth rewriting, and how the result is committed.
 //!
-//! What consolidation buys is **bytes, not recall**. Measured on SIFT 100k, a
-//! query costs the same 7492.9 distances whether nothing is deleted or nine rows
-//! in ten are, and recall only falls from 0.9777 to 0.9474: the walk never sees
-//! a tombstone, because deleted vertices keep their out-edges and are walked
-//! through on purpose. What does change is the share of a read that is useful,
-//! which falls tenfold over the same range. So the thing to measure here is live
-//! answers per byte read, and the thing not to expect is a recall repair.
+//! What consolidation buys is **bytes**. Measured on SIFT 100k against the same
+//! index left alone, at 10/30/50/70/90% deleted: bytes read per query and the
+//! index on disk both track the live fraction to within half a percentage point,
+//! where the index left alone holds at 8.1 MB a query and 73.9 MiB on disk
+//! whatever is deleted. Latency follows the bytes - 4.3ms down to 1.6ms at 90% -
+//! because a partition is read whole.
+//!
+//! What it does not buy is recall, which is unchanged to four decimal places up
+//! to 70% deleted. The exception is instructive: at 90% it *gains*, 0.9474 to
+//! 0.9540, because a beam of 100 over a partition of 1000 vertices with 100 live
+//! ones fills with tombstones - they are ranked by distance along with
+//! everything else and only dropped at the end. So a tombstone is nearly free
+//! only while the beam is wide next to the reciprocal of the live fraction.
+//!
+//! Distances per query do fall, 7492.9 to 1140.0 at 90%, but they lag the bytes
+//! badly (84% of the original where bytes are at 70%): the walk is bounded by
+//! the beam, so shrinking a partition saves no arithmetic until the partition
+//! approaches the beam.
 //!
 //! The one way consolidation can make an index *worse* is by running late. The
 //! one-hop repair guarantees that no edge dangles, not that the graph stays in
@@ -91,6 +102,13 @@ pub struct ConsolidateStats {
 }
 
 /// Rewrite every segment of `index_name` that holds a deleted row, and commit.
+///
+/// There is no threshold here, deliberately: asked to consolidate, this
+/// consolidates. *When* to ask is the caller's, and the answer the measurements
+/// give is "often". On SIFT 100k a round costs 0.3 to 3 seconds against 14 for a
+/// build, five rounds of it never once needed a partition rebuilt, and the index
+/// tracked the live fraction the whole way - 73.9 MiB down to 7.5 at 90%
+/// deleted, where the same index left alone stays at 73.9.
 ///
 /// The delete list is a snapshot taken when the index is opened, so a row
 /// deleted while this runs is simply left for the next call - it stays filtered

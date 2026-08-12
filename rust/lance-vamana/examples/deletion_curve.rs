@@ -12,13 +12,22 @@
 //! `QUERIES` (default 2000), `PARTITIONS` (default 100), `NPROBES` (default 10),
 //! `SEARCH_LIST` (query beam, default 100), `ROWS_PER_FRAGMENT` (default 25000).
 //!
-//! Deletion here is Lance's own: the rows go into deletion vectors, and the
-//! index is never rebuilt. Its vertices stay in the graph, are walked through,
-//! and are dropped from the answer at the end - so the question this measures is
-//! how fast a graph rots when its dead are never buried. That is the "before"
-//! point consolidation will be judged against, and it is the reason the table
-//! below reports cost per *live* vector as well as cost per query: the walk does
-//! not get cheaper as the dataset shrinks, so the same work buys less and less.
+//! Deletion here is Lance's own: the rows go into deletion vectors. The curve is
+//! walked twice over two identically built indices, and the pair is the point:
+//!
+//! - **buried** - nothing is ever consolidated. A deleted row's vertex stays in
+//!   the graph, is walked through, and is dropped from the answer at the end, so
+//!   this measures how fast a graph rots when its dead are never buried.
+//! - **consolidated** - [`consolidate_index`] runs after every deletion step,
+//!   which is the operating mode the connectivity measurement in
+//!   `src/consolidate.rs` argues for: often and in small steps, because the
+//!   one-hop repair cannot hold a graph together when it is asked to remove most
+//!   of it at once.
+//!
+//! Row for row, the two tables are the before and after of consolidating at that
+//! fraction. What to read them for is **bytes**: a tombstone costs the walk
+//! nothing, so the whole return on consolidation is in what a query has to read
+//! and what the index takes on disk.
 //!
 //! The rows deleted are chosen by `id % 10`, which spreads them evenly over
 //! fragments and partitions. Deleting a contiguous range instead would empty
@@ -43,12 +52,14 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::WriteParams;
+use lance::index::DatasetIndexExt;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::ROW_ID;
 use lance_index::vector::flat::storage::FlatFloatStorage;
 use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::builder::{IndexParams, create_index};
+use lance_vamana::consolidator::consolidate_index;
 use lance_vamana::query::{SearchParams, VamanaIndex};
 
 #[path = "common/mod.rs"]
@@ -149,8 +160,26 @@ struct Measured {
     /// `k`, the index answers short and no amount of graph quality helps.
     answered: f64,
     comparisons: f64,
+    /// Bytes the index read, per query, over the measured pass only.
+    ///
+    /// Taken off the index's own scheduler and differenced across the pass, so
+    /// the warm-up before it is excluded. This is the number consolidation is
+    /// judged by - a tombstone costs no distances, only bytes.
+    bytes: f64,
     median_micros: u128,
     p95_micros: u128,
+}
+
+/// What the committed index takes on disk, as Lance recorded it at commit.
+async fn index_bytes(dataset: &Dataset) -> u64 {
+    dataset
+        .load_indices_by_name(INDEX_NAME)
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|index| index.files.iter().flatten())
+        .map(|file| file.size_bytes)
+        .sum()
 }
 
 async fn measure(
@@ -166,6 +195,7 @@ async fn measure(
     let mut answered = 0usize;
     let mut comparisons = 0u64;
     let mut latencies = Vec::with_capacity(queries.len());
+    let bytes_before = index.io_stats().bytes_read;
 
     for (query, exact) in queries.iter().zip(truth) {
         let expected = exact
@@ -213,6 +243,7 @@ async fn measure(
         recall: hits as f64 / (queries.len() * K) as f64,
         answered: answered as f64 / queries.len() as f64,
         comparisons: comparisons as f64 / queries.len() as f64,
+        bytes: (index.io_stats().bytes_read - bytes_before) as f64 / queries.len() as f64,
         median_micros: latencies[latencies.len() / 2],
         p95_micros: latencies[latencies.len() * 95 / 100],
     }
@@ -258,76 +289,145 @@ async fn main() {
         started.elapsed().as_secs_f64()
     );
 
-    let temp = tempfile::tempdir().unwrap();
-    let uri = temp.path().to_str().unwrap();
-    let mut dataset = write_dataset(uri, vectors, rows_per_fragment).await;
-    let ids = ids_by_address(&dataset).await;
-    assert_eq!(ids.len(), rows);
+    let bench = Bench {
+        rows,
+        rows_per_fragment,
+        vectors,
+        index: IndexParams::new(VECTOR_COLUMN, partitions).with_distance_type(DISTANCE_TYPE),
+        search: SearchParams::new(K)
+            .with_nprobes(nprobes)
+            .with_search_list_size(search_list_size),
+        queries: query_vectors,
+        truth,
+    };
 
-    let params = IndexParams::new(VECTOR_COLUMN, partitions).with_distance_type(DISTANCE_TYPE);
-    let started = Instant::now();
-    let stats = create_index(&mut dataset, INDEX_NAME, &params)
-        .await
-        .unwrap();
-    println!(
-        "index built in {:.1}s over {} vectors in {} partitions, {}M distances",
-        started.elapsed().as_secs_f64(),
-        stats.vectors,
-        stats.partitions,
-        stats.comparisons / 1_000_000
-    );
+    // A fresh dataset and a fresh build for each curve. Sharing one would make
+    // the second curve's "before" an index the first curve had already
+    // consolidated, and the two columns would stop being comparable.
+    for (label, consolidating) in [("buried", false), ("consolidated", true)] {
+        let temp = tempfile::tempdir().unwrap();
+        bench
+            .curve(temp.path().to_str().unwrap(), label, consolidating)
+            .await;
+    }
+}
 
-    let search = SearchParams::new(K)
-        .with_nprobes(nprobes)
-        .with_search_list_size(search_list_size);
-    println!(
-        "\n{:>8} {:>8} {:>10} {:>9} {:>10} {:>16} {:>11} {:>11}",
-        "deleted",
-        "live",
-        "recall@10",
-        "answered",
-        "dist/query",
-        "dist/live vector",
-        "p50 (us)",
-        "p95 (us)"
-    );
-    for deleted_below in STAGES {
-        if deleted_below > 0 {
-            dataset
-                .delete(&format!("{ID_COLUMN} % 10 < {deleted_below}"))
-                .await
-                .unwrap();
-        }
-        let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
-        let live = ids.values().filter(|id| *id % 10 >= deleted_below).count();
-        assert_eq!(
-            live,
-            dataset.count_rows(None).await.unwrap(),
-            "the dataset and the deletion predicate disagree about what is live"
-        );
-        // Warm-up, uncounted: the driver reads a partition per query with no
-        // cache of its own, so the first pass over a stage is measuring the page
-        // cache filling rather than the index.
-        measure(
-            &index,
-            &query_vectors[..num_queries.min(100)],
-            &truth[..num_queries.min(100)],
-            &ids,
-            deleted_below,
-            &search,
-        )
-        .await;
-        let measured = measure(&index, &query_vectors, &truth, &ids, deleted_below, &search).await;
+/// Everything both curves are run with, so that the only difference between
+/// them is whether consolidation runs.
+struct Bench {
+    rows: usize,
+    rows_per_fragment: usize,
+    vectors: FixedSizeListArray,
+    index: IndexParams,
+    search: SearchParams,
+    queries: Vec<ArrayRef>,
+    truth: Vec<Vec<u64>>,
+}
+
+impl Bench {
+    async fn curve(&self, uri: &str, label: &str, consolidating: bool) {
+        let mut dataset = write_dataset(uri, self.vectors.clone(), self.rows_per_fragment).await;
+        let ids = ids_by_address(&dataset).await;
+        assert_eq!(ids.len(), self.rows);
+
+        let started = Instant::now();
+        let stats = create_index(&mut dataset, INDEX_NAME, &self.index)
+            .await
+            .unwrap();
         println!(
-            "{:>7}% {:>8} {:>10.4} {:>9.2} {:>10.1} {:>15.4}% {:>11} {:>11}",
-            deleted_below * 10,
-            live,
-            measured.recall,
-            measured.answered,
-            measured.comparisons,
-            100.0 * measured.comparisons / live as f64,
-            measured.median_micros,
-            measured.p95_micros
+            "\n=== {label} ===\nindex built in {:.1}s over {} vectors in {} partitions, \
+             {}M distances",
+            started.elapsed().as_secs_f64(),
+            stats.vectors,
+            stats.partitions,
+            stats.comparisons / 1_000_000
         );
+        println!(
+            "\n{:>8} {:>8} {:>10} {:>9} {:>10} {:>16} {:>12} {:>10} {:>9} {:>9}",
+            "deleted",
+            "live",
+            "recall@10",
+            "answered",
+            "dist/query",
+            "dist/live vector",
+            "bytes/query",
+            "index MiB",
+            "p50 (us)",
+            "p95 (us)"
+        );
+
+        for deleted_below in STAGES {
+            if deleted_below > 0 {
+                dataset
+                    .delete(&format!("{ID_COLUMN} % 10 < {deleted_below}"))
+                    .await
+                    .unwrap();
+                if consolidating {
+                    self.consolidate(&mut dataset).await;
+                }
+            }
+            let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+            let live = ids.values().filter(|id| *id % 10 >= deleted_below).count();
+            assert_eq!(
+                live,
+                dataset.count_rows(None).await.unwrap(),
+                "the dataset and the deletion predicate disagree about what is live"
+            );
+            // Warm-up, uncounted: the driver reads a partition per query with no
+            // cache of its own, so the first pass over a stage is measuring the
+            // page cache filling rather than the index.
+            let warm = self.queries.len().min(100);
+            self.measure(&index, &ids, deleted_below, warm).await;
+            let measured = self
+                .measure(&index, &ids, deleted_below, self.queries.len())
+                .await;
+            println!(
+                "{:>7}% {:>8} {:>10.4} {:>9.2} {:>10.1} {:>15.4}% {:>12.0} {:>10.1} {:>9} {:>9}",
+                deleted_below * 10,
+                live,
+                measured.recall,
+                measured.answered,
+                measured.comparisons,
+                100.0 * measured.comparisons / live as f64,
+                measured.bytes,
+                index_bytes(&dataset).await as f64 / (1024.0 * 1024.0),
+                measured.median_micros,
+                measured.p95_micros
+            );
+        }
+    }
+
+    async fn consolidate(&self, dataset: &mut Dataset) {
+        let started = Instant::now();
+        let stats = consolidate_index(dataset, INDEX_NAME).await.unwrap();
+        println!(
+            "  consolidated in {:>5.1}s: {} repaired, {} rebuilt, {} copied, {} dropped, \
+             {} vertices removed, {}M distances",
+            started.elapsed().as_secs_f64(),
+            stats.partitions_consolidated,
+            stats.partitions_rebuilt,
+            stats.partitions_copied,
+            stats.partitions_dropped,
+            stats.vertices_removed,
+            stats.comparisons / 1_000_000
+        );
+    }
+
+    async fn measure(
+        &self,
+        index: &VamanaIndex,
+        ids: &HashMap<u64, u64>,
+        deleted_below: u64,
+        queries: usize,
+    ) -> Measured {
+        measure(
+            index,
+            &self.queries[..queries],
+            &self.truth[..queries],
+            ids,
+            deleted_below,
+            &self.search,
+        )
+        .await
     }
 }

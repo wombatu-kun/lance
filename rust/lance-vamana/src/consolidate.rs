@@ -11,9 +11,11 @@
 //!
 //! Measured on SIFT 100k, deletion alone costs a query nothing: the same 7492.9
 //! distances at every fraction from 0% to 90% deleted, and recall down from
-//! 0.9777 only to 0.9474. So this is not a repair of search quality. It is a
-//! repair of what a partition costs to keep: bytes, and the share of a read that
-//! is useful.
+//! 0.9777 only to 0.9474. So this is mostly not a repair of search quality. It
+//! is a repair of what a partition costs to keep: bytes, and the share of a read
+//! that is useful. "Mostly" because the small recall loss above is real and
+//! consolidation does take it back - see [`crate::consolidator`], which measured
+//! both sides of the same deletion curve.
 
 use lance_core::{Error, Result};
 use lance_index::vector::graph::{OrderedFloat, OrderedNode};
