@@ -19,6 +19,36 @@
 //! and it is the price the FreshDiskANN paper pays too: its RW-Temp index is a
 //! second index searched alongside the long-term one.
 //!
+//! # What that price actually is
+//!
+//! Measured on SIFT 100k, over four indices covering **the same rows in the same
+//! fragments** and differing only in whether they were built once or grown, at
+//! one, two, four and eight segments:
+//!
+//! | segments | files | recall@10 | partitions/query | bytes/query | iops/query | p50 |
+//! |---|---|---|---|---|---|---|
+//! | 1 | 101 | 0.9777 | 10 | 8.11 MB | 50 | 4.4 ms |
+//! | 2 | 202 | 0.9781 | 20 | 8.67 MB | 100 | 5.4 ms |
+//! | 4 | 404 | 0.9782 | 40 | 8.75 MB | 200 | 7.8 ms |
+//! | 8 | 807 | 0.9782 | 80 | 8.92 MB | 400 | 13.1 ms |
+//!
+//! **Eight times the partitions, ten percent the bytes.** A partition is read
+//! whole and a delta's partitions are proportionally smaller, so the rows read
+//! per query barely move; the ten percent is per-file overhead, and nearly all
+//! of it arrives with the second segment. **Recall does not fall, it rises** -
+//! a partition of seventy vertices under a beam of a hundred is searched
+//! exhaustively, which is also why distances per query rise by half.
+//!
+//! What a delta really costs is **read operations, latency and files**: 400
+//! reads against 50, three times the latency, and 807 manifest entries against
+//! 101 - and Lance copies that list into every manifest the dataset writes
+//! afterwards. Against that, growing the index took 9.0 seconds where building
+//! it once took 14.3.
+//!
+//! So the case for putting new rows into the base's own graphs instead is not
+//! bytes and not recall. It is that a query stays on one segment's worth of
+//! reads.
+//!
 //! # Why the delta inherits the base's centroids
 //!
 //! It could train a router of its own, and the read path would not notice -
@@ -39,9 +69,8 @@
 //!
 //! What it costs is files. A delta writes one file per partition that drew a
 //! row, so a 500-row delta against a 4096-partition base writes up to 500 tiny
-//! files, and Lance carries one manifest entry per file of a committed index
-//! into every manifest written afterwards. That number is worth watching, and it
-//! is the reason the delta cannot be the only answer forever.
+//! files. That is the cost the table above turns into a number, and it is the
+//! reason the delta cannot be the only answer forever.
 //!
 //! # The rows of one fragment go into one segment
 //!
