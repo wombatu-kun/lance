@@ -327,7 +327,12 @@ impl Partition {
     }
 }
 
-fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
+/// Decode [`ROW_ID_COLUMN`], which a batch may carry on its own.
+///
+/// Also reached without the rest of the partition: deciding whether a partition
+/// holds any deleted row needs this column and nothing else, and the schema
+/// keeps the three columns apart so that asking for it alone is a projection.
+pub(crate) fn row_ids_from_batch(batch: &RecordBatch) -> Result<Vec<u64>> {
     let column = batch.column_by_name(ROW_ID_COLUMN).ok_or_else(|| {
         Error::corrupt_file_named(
             ROW_ID_COLUMN,
@@ -346,13 +351,17 @@ fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
             format!("Vamana partition column {ROW_ID_COLUMN} holds nulls"),
         ));
     }
-    let row_ids = column
+    Ok(column
         .as_primitive_opt::<UInt64Type>()
         .ok_or_else(|| {
             Error::corrupt_file_named(ROW_ID_COLUMN, "Vamana row id column is not UInt64")
         })?
         .values()
-        .to_vec();
+        .to_vec())
+}
+
+fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
+    let row_ids = row_ids_from_batch(batch)?;
 
     let neighbors = fixed_size_list(batch, NEIGHBORS_COLUMN)?;
     let max_degree = u32::try_from(neighbors.value_length()).map_err(|_| {
