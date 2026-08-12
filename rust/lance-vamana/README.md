@@ -149,6 +149,21 @@ how they came to exist, eight segments against one cost 8x the partition reads,
 8x the files and about 3x the latency, for +10% bytes and **no** loss of recall.
 A delta is nearly free to a query's bandwidth and expensive to its IOPS.
 
+**Order matters: consolidate, then insert.** A delete that empties a fragment
+takes it out of the dataset, and `insert_in_place` refuses a segment built over
+a fragment that is gone - rewriting one would store its vertices under a
+coverage that no longer names them, where nothing would keep them out of an
+answer. Consolidation removes exactly those vertices. The other order works
+until the first fragment empties and then stops working.
+
+Run that pipeline and the index survives being replaced outright. Five rounds of
+"delete a fifth, consolidate, append as many rows as were removed, insert them"
+on SIFT 100k leave nothing of the original data and cost **0.14 of a percentage
+point** of recall, against the roughly one point the FreshVamana paper allows.
+What churn actually costs is arithmetic: the worn graph spends 8.5% more
+distances per query than a rebuild, which also takes the recall back. A round
+costs a third to two thirds of a rebuild.
+
 Between them they also answer compaction, which used to need a rebuild.
 Compaction strands the index over fragments that no longer exist, and the rows
 it moved are then rows this index does not cover - so indexing them again is the

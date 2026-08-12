@@ -238,6 +238,33 @@ pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Resul
 /// Deleted rows are a different matter and are carried across untouched. Their
 /// vertices stay in the graph as routers, the new segment still declares their
 /// fragments, and the delete list still keeps them out of every answer.
+///
+/// # Where it sits in a maintenance pipeline
+///
+/// **Consolidate first, then insert.** Not a preference: a delete that empties a
+/// fragment takes that fragment out of the dataset, and the refusal above then
+/// stops the insert outright. Consolidation is what clears it. Running the two
+/// the other way round works until the day a fragment empties, and then stops
+/// working - measured, `examples/churn_cycle.rs` in the order insert-then-
+/// consolidate dies at its fourth round.
+///
+/// What that pipeline costs, and what it buys, measured over five rounds of
+/// "delete a residue class, consolidate, append as many rows as were removed,
+/// insert them" on SIFT 100k - a cycle that replaces every row the index was
+/// built over, without ever rebuilding it:
+///
+/// | round | recall@10 | distances/query | files | iops/query | maintenance |
+/// |---|---|---|---|---|---|
+/// | 0 | 0.9778 | 8045 | 101 | 50 | 4.6 s |
+/// | 4 | 0.9764 | 8463 | 101 | 50 | 8.6 s |
+/// | rebuilt | 0.9812 | 7801 | 101 | 50 | 14.3 s |
+///
+/// Recall loses **0.14 of a percentage point** across the whole cycle and stops
+/// falling after the first round, against the roughly one point the FreshVamana
+/// paper allows itself. What churn really costs shows up beside it: the worn
+/// graph spends 8.5% more distances than a rebuilt one for the same answer, and
+/// a rebuild takes the recall back. Files, read operations and index size do not
+/// move at all, which is the whole difference from [`insert_as_segment`].
 pub async fn insert_in_place(dataset: &mut Dataset, index_name: &str) -> Result<InsertStats> {
     let index = VamanaIndex::open(dataset, index_name).await?;
     let new_fragments = unindexed_fragments(dataset, &index);
