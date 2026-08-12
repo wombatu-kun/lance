@@ -137,9 +137,11 @@ pub struct MergeStats {
 /// seconds whatever the count, while what it saves grows with it. At those
 /// numbers a threshold would only be a slower way of saying "fold".
 ///
-/// Nothing is committed when there is nothing to do: one segment, no deleted
-/// rows and no unindexed fragments returns a zero [`MergeStats`] having paid for
-/// one `open`.
+/// Nothing is committed when there is nothing to do, and "nothing to do" is
+/// decided on the vertices rather than on the dataset's delete list, which
+/// outlives them: one segment and no unindexed fragments returns a zero
+/// [`MergeStats`] having paid for one `open` and, if rows have ever been deleted
+/// from these fragments, one pass over the deletion vectors.
 ///
 /// # Against the two calls it replaces
 ///
@@ -252,6 +254,19 @@ pub async fn merge_index(dataset: &mut Dataset, index_name: &str) -> Result<Merg
             vec![RoaringBitmap::new(); segment.manifest.partitions().len()]
         };
         segments.push((segment, dead));
+    }
+    // The dataset's delete list outlives the vertices it condemned: a row taken
+    // out by an earlier round is still in it, so `has_dead` stays true for the
+    // life of the fragment while the graphs hold nothing of it. Deciding on the
+    // vertices instead is what stops a maintenance loop rewriting the whole
+    // index every run, and it is the guard `consolidate_index` makes per segment.
+    if new_fragments.is_empty()
+        && index.num_segments() == 1
+        && segments
+            .iter()
+            .all(|(_, dead)| dead.iter().all(RoaringBitmap::is_empty))
+    {
+        return Ok(MergeStats::default());
     }
 
     let uuid = Uuid::new_v4();

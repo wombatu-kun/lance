@@ -27,7 +27,7 @@ use lance::index::DatasetIndexExt;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
 use lance_vamana::inserter::{insert_as_segment, insert_in_place};
-use lance_vamana::merger::merge_index;
+use lance_vamana::merger::{MergeStats, merge_index};
 use lance_vamana::query::{SearchParams, VamanaIndex};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
@@ -295,6 +295,17 @@ async fn merging_takes_out_the_deleted_and_puts_in_the_new_in_one_call() {
         }
     }
     assert!(measured_recall(&dataset).await >= 0.95);
+
+    // The new segment has to declare the fragments it just indexed, not only the
+    // ones it inherited. It answers for their rows either way - the vertices are
+    // stored - so the miss would not show up here until the next round of
+    // maintenance indexed them a second time.
+    let again = merge_index(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(
+        again,
+        MergeStats::default(),
+        "the merged segment left work behind, so a maintenance loop would repeat it"
+    );
 }
 
 /// The state an in-place insert refuses outright, and the whole reason this call
