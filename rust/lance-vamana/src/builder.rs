@@ -560,7 +560,7 @@ pub(crate) async fn build_segment_with_router(
                     train_router(&vectors, &params, &mut rng)?
                 }
             };
-            let assignment = assign(&ivf, &vectors, &row_ids, &params)?;
+            let assignment = assign(&ivf, &vectors, &row_ids, params.distance_type)?;
             Ok::<_, Error>((vectors, ivf, assignment))
         })
         .await?
@@ -642,7 +642,7 @@ async fn write_partitions(
 /// is per fragment, never per row. That is the same position Lance's own vector
 /// indices are in, and it is why a caller cannot treat "the index covers this
 /// fragment" as "every row of it is in the index".
-async fn read_vectors(
+pub(crate) async fn read_vectors(
     dataset: &Dataset,
     column: &str,
     fragments: &[u32],
@@ -822,21 +822,18 @@ fn train_router(
     Ok(IvfModel::new(centroids, Some(kmeans.loss)))
 }
 
-fn assign(
+pub(crate) fn assign(
     ivf: &IvfModel,
     vectors: &FixedSizeListArray,
     row_ids: &[u64],
-    params: &IndexParams,
+    distance_type: DistanceType,
 ) -> Result<Vec<u32>> {
     let centroids = ivf
         .centroids
         .as_ref()
         .ok_or_else(|| Error::internal("the trained router has no centroids".to_string()))?;
-    let (partitions, _) = compute_partitions_arrow_array(
-        centroids,
-        vectors,
-        routing_distance_type(params.distance_type),
-    )?;
+    let (partitions, _) =
+        compute_partitions_arrow_array(centroids, vectors, routing_distance_type(distance_type))?;
     partitions
         .into_iter()
         .enumerate()
@@ -855,7 +852,7 @@ fn assign(
         .collect()
 }
 
-fn group_by_partition(assignment: &[u32], num_partitions: u32) -> Vec<Vec<u32>> {
+pub(crate) fn group_by_partition(assignment: &[u32], num_partitions: u32) -> Vec<Vec<u32>> {
     let mut members = vec![Vec::new(); num_partitions as usize];
     for (row, partition) in assignment.iter().enumerate() {
         members[*partition as usize].push(row as u32);
@@ -864,10 +861,10 @@ fn group_by_partition(assignment: &[u32], num_partitions: u32) -> Vec<Vec<u32>> 
 }
 
 /// One partition's graph, ready to write, and what building it cost.
-struct BuiltOne {
-    partition: Partition,
-    medoid: u32,
-    comparisons: u64,
+pub(crate) struct BuiltOne {
+    pub(crate) partition: Partition,
+    pub(crate) medoid: u32,
+    pub(crate) comparisons: u64,
 }
 
 /// Build the graph of one partition over the rows assigned to it.
@@ -876,7 +873,7 @@ struct BuiltOne {
 /// caller holds: [`Comparisons`] is a `Cell`, deliberately, because it is
 /// written once per candidate in the innermost loop of the build - and a `Cell`
 /// cannot cross the thread boundary this runs behind.
-fn build_one(
+pub(crate) fn build_one(
     members: &[u32],
     row_ids: &[u64],
     vectors: &FixedSizeListArray,

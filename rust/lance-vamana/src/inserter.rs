@@ -79,17 +79,35 @@
 //! be committed at all. Coverage is per fragment and there is no finer grain to
 //! divide it on.
 
+use std::sync::Arc;
+
+use arrow_array::{Array, FixedSizeListArray};
 use lance::Dataset;
-use lance::index::DatasetIndexExt;
+use lance::index::{DatasetIndexExt, IndexSegment};
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, Result};
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_linalg::distance::DistanceType;
+use lance_linalg::kernels::normalize_fsl_owned;
+use roaring::RoaringBitmap;
+use uuid::Uuid;
 
 use crate::build::{BuildParams, MAINTENANCE_SEED};
-use crate::builder::{IndexParams, build_index_segment_with_router, index_column, live_fragments};
-use crate::format::IndexMetadata;
+use crate::builder::{
+    INDEX_DETAILS_TYPE_URL, IndexParams, assign, build_index_segment_with_router, build_one,
+    gather, group_by_partition, index_column, live_fragments, read_vectors,
+};
+use crate::format::{FORMAT_VERSION, IndexMetadata};
+use crate::insert::insert_into_partition;
+use crate::io::{SegmentWriter, check_partition_shape, open_file, read_partition};
 use crate::query::{Segment, VamanaIndex};
+use crate::search::Comparisons;
 
 /// What indexing a dataset's new rows did, and what it cost.
+///
+/// The three partition counters are exclusive. A delta segment only ever creates
+/// partitions; an in-place insert produces all three, and they add up to the
+/// partitions of the segment it rewrote plus the ones it had to add.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InsertStats {
     /// Fragments the index did not cover before and covers now.
@@ -97,9 +115,16 @@ pub struct InsertStats {
     /// Vectors indexed, which is the rows of those fragments minus the ones
     /// whose vector is null.
     pub vectors: usize,
-    /// Partitions that drew at least one row and were therefore written.
-    pub partitions_written: usize,
-    /// Distance computations spent building the graphs.
+    /// Partitions written from nothing: every partition of a delta segment, and
+    /// the ones an in-place insert found a row for and no file behind.
+    pub partitions_created: usize,
+    /// Partitions that already existed, drew new rows and were rewritten with
+    /// them linked in.
+    pub partitions_grown: usize,
+    /// Partitions that already existed, drew nothing, and crossed into the new
+    /// segment as the bytes they were.
+    pub partitions_copied: usize,
+    /// Distance computations spent building and linking the graphs.
     pub comparisons: u64,
 }
 
@@ -173,9 +198,273 @@ pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Resul
     Ok(InsertStats {
         fragments_indexed: new_fragments.len(),
         vectors: built.vectors,
-        partitions_written: built.partitions,
+        partitions_created: built.partitions,
         comparisons: built.comparisons,
+        ..Default::default()
     })
+}
+
+/// Link every row of `dataset` that `index_name` does not cover into the graphs
+/// of the segment that already holds their neighbours.
+///
+/// The canonical FreshVamana insert, applied a partition at a time because a
+/// partition file is the unit of rewrite. New rows are routed by the target
+/// segment's own centroids, and each partition that drew any of them is read,
+/// grown and written out; the partitions that drew none are copied across
+/// without being decoded, which is what keeps the cost proportional to the batch
+/// rather than to the index.
+///
+/// The whole batch goes into **one** segment, and that is not a choice:
+/// `commit_existing_index_segments` refuses a set of segments whose fragment
+/// coverage overlaps, and coverage is per fragment, so a batch split across two
+/// segments could not be committed at all. The target is the segment covering
+/// the most fragments - the base rather than a delta.
+///
+/// What this buys over [`insert_as_segment`] is not bytes and not recall, both
+/// of which a delta costs almost nothing. It is that a query keeps probing one
+/// segment: measured on SIFT 100k, eight segments cost eight times the read
+/// operations, three times the latency and eight times the files of one, at the
+/// same recall.
+///
+/// # When it refuses
+///
+/// A target segment built over a fragment the dataset no longer has. Rewriting
+/// one means writing its vertices into a segment whose coverage has narrowed to
+/// what survived, and those vertices would then be stored under fragments the
+/// new segment does not declare - so nothing would filter them out and a query
+/// would answer with rows that are gone. [`crate::consolidator::consolidate_index`]
+/// is what clears that state, by removing exactly those vertices.
+///
+/// Deleted rows are a different matter and are carried across untouched. Their
+/// vertices stay in the graph as routers, the new segment still declares their
+/// fragments, and the delete list still keeps them out of every answer.
+pub async fn insert_in_place(dataset: &mut Dataset, index_name: &str) -> Result<InsertStats> {
+    let index = VamanaIndex::open(dataset, index_name).await?;
+    let new_fragments = unindexed_fragments(dataset, &index);
+    if new_fragments.is_empty() {
+        return Ok(InsertStats::default());
+    }
+
+    let target = base_segment(&index)?;
+    let built_over = target
+        .manifest
+        .metadata()
+        .fragments
+        .iter()
+        .copied()
+        .collect::<RoaringBitmap>();
+    if built_over != target.coverage {
+        return Err(Error::invalid_input(format!(
+            "Vamana cannot insert into index '{index_name}' in place: segment {} was built over \
+             {} fragments the dataset no longer has, and rewriting it would store their vertices \
+             under a coverage that no longer names them, where nothing would keep them out of an \
+             answer; consolidate the index first",
+            target.uuid,
+            (&built_over - &target.coverage).len()
+        )));
+    }
+
+    let column = index_column(dataset, index_name, &target.fields)?;
+    let params = Arc::new(inherited_params(
+        &column,
+        target.manifest.metadata(),
+        target.manifest.ivf(),
+    ));
+    let (row_ids, vectors) = read_vectors(dataset, &column, &new_fragments).await?;
+    let row_ids = Arc::new(row_ids);
+
+    // Normalising, routing and grouping are one uninterrupted pass over the
+    // whole batch, which is the same reason the build path hands them to the
+    // pool rather than running them on the runtime the scheduler reads through.
+    let routing_model = target.manifest.ivf().clone();
+    let (vectors, members) = {
+        let params = params.clone();
+        let row_ids = row_ids.clone();
+        spawn_cpu(move || {
+            let vectors = if params.distance_type == DistanceType::Cosine {
+                normalize_fsl_owned(vectors)?
+            } else {
+                vectors
+            };
+            let assignment = assign(&routing_model, &vectors, &row_ids, params.distance_type)?;
+            let members = group_by_partition(&assignment, params.num_partitions);
+            Ok::<_, Error>((vectors, members))
+        })
+        .await?
+    };
+
+    let uuid = Uuid::new_v4();
+    let mut coverage = target.coverage.clone();
+    coverage.extend(new_fragments.iter().copied());
+    let metadata = IndexMetadata {
+        fragments: coverage.iter().collect(),
+        ..target.manifest.metadata().clone()
+    };
+    let mut writer = SegmentWriter::new(
+        dataset.object_store(None).await?,
+        dataset.indices_dir().join(uuid.to_string()),
+        metadata.clone(),
+        target.manifest.ivf().clone(),
+    );
+
+    let mut stats = InsertStats {
+        fragments_indexed: new_fragments.len(),
+        vectors: vectors.len(),
+        ..Default::default()
+    };
+    let growth = Growth {
+        index: &index,
+        target,
+        members,
+        row_ids,
+        vectors: Arc::new(vectors),
+        params,
+        metadata,
+    };
+    grow_segment(&growth, &mut writer, &mut stats).await?;
+    writer.finish().await?;
+
+    let dataset_version = dataset.manifest.version;
+    log::info!(
+        "Vamana index '{index_name}' grew segment {} into {uuid}: {} partitions gained rows, {} \
+         were created, {} were copied",
+        target.uuid,
+        stats.partitions_grown,
+        stats.partitions_created,
+        stats.partitions_copied
+    );
+    dataset
+        .commit_existing_index_segments(
+            index_name,
+            &column,
+            vec![IndexSegment::new(
+                uuid,
+                coverage.iter(),
+                target.fields.iter().copied(),
+                Arc::new(prost_types::Any {
+                    type_url: INDEX_DETAILS_TYPE_URL.to_string(),
+                    value: Vec::new(),
+                }),
+                FORMAT_VERSION as i32,
+                dataset_version,
+            )],
+        )
+        .await?;
+    Ok(stats)
+}
+
+/// Everything the per-partition loop reads, gathered so that the loop's own
+/// signature stays legible.
+struct Growth<'a> {
+    index: &'a VamanaIndex,
+    target: &'a Segment,
+    /// Which rows of [`Self::vectors`] each partition drew, by partition id.
+    members: Vec<Vec<u32>>,
+    row_ids: Arc<Vec<u64>>,
+    vectors: Arc<FixedSizeListArray>,
+    params: Arc<IndexParams>,
+    /// What the segment being written declares, which is the target's own
+    /// metadata with the new fragments folded into the coverage.
+    metadata: IndexMetadata,
+}
+
+/// Write every partition of the grown segment, in ascending id order.
+///
+/// One pass over the whole partition space rather than over the two lists
+/// separately, because the ids of a segment's partitions and the ids that drew a
+/// new row are two sorted sets that have to be merged, and the writer accepts
+/// them in ascending order only. Walking the space costs a lookup per centroid
+/// against a partition read per occupied one.
+///
+/// A partition at a time, as consolidation does it and for the same reason: a
+/// partition is read whole, so overlapping the reads would mean holding as many
+/// of them in memory as are kept in flight.
+async fn grow_segment(
+    growth: &Growth<'_>,
+    writer: &mut SegmentWriter,
+    stats: &mut InsertStats,
+) -> Result<()> {
+    for (partition_id, members) in growth.members.iter().enumerate() {
+        let partition_id = partition_id as u32;
+        match (
+            growth.target.manifest.partition(partition_id),
+            members.is_empty(),
+        ) {
+            // A centroid nothing was ever assigned to. It has no file and no
+            // table row, and it still has none.
+            (None, true) => continue,
+            (Some(_), true) => {
+                writer
+                    .copy_partition(&growth.target.dir, &growth.target.manifest, partition_id)
+                    .await?;
+                stats.partitions_copied += 1;
+            }
+            // A centroid the base drew nothing for and this batch did. Built
+            // rather than inserted into: there is no graph to insert into, and
+            // no entry point to search from.
+            (None, false) => {
+                let members = members.clone();
+                let row_ids = growth.row_ids.clone();
+                let vectors = growth.vectors.clone();
+                let params = growth.params.clone();
+                let built =
+                    spawn_cpu(move || build_one(&members, row_ids.as_slice(), &vectors, &params))
+                        .await?;
+                writer
+                    .write_partition(partition_id, built.medoid, &built.partition)
+                    .await?;
+                stats.comparisons = stats.comparisons.saturating_add(built.comparisons);
+                stats.partitions_created += 1;
+            }
+            (Some(entry), false) => {
+                let reader = open_file(
+                    growth.index.scheduler(),
+                    &growth.target.dir.clone().join(entry.file.as_str()),
+                    None,
+                    growth.target.file_sizes.get(&entry.file).copied(),
+                )
+                .await?;
+                let partition = read_partition(&reader, entry.num_rows).await?;
+                check_partition_shape(
+                    &partition,
+                    entry,
+                    growth.metadata.max_degree,
+                    growth.metadata.dimension,
+                )?;
+
+                let members = members.clone();
+                let row_ids = growth.row_ids.clone();
+                let vectors = growth.vectors.clone();
+                let params = growth.params.clone();
+                let entry_point = entry.medoid;
+                let (inserted, comparisons) = spawn_cpu(move || {
+                    let batch = gather(&vectors, &members)?;
+                    let batch_row_ids = members
+                        .iter()
+                        .map(|row| row_ids[*row as usize])
+                        .collect::<Vec<_>>();
+                    let comparisons = Comparisons::default();
+                    let inserted = insert_into_partition(
+                        &partition,
+                        &batch_row_ids,
+                        &batch,
+                        entry_point,
+                        params.distance_type,
+                        &params.graph,
+                        &comparisons,
+                    )?;
+                    Ok::<_, Error>((inserted, comparisons.get()))
+                })
+                .await?;
+                writer
+                    .write_partition(partition_id, inserted.medoid, &inserted.partition)
+                    .await?;
+                stats.comparisons = stats.comparisons.saturating_add(comparisons);
+                stats.partitions_grown += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Fragments the dataset has and the index does not answer for.

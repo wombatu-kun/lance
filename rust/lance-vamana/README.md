@@ -124,20 +124,30 @@ In every case the answer is to rebuild the index.
 
 ## Maintenance
 
-Two calls, and neither takes a parameter beyond the dataset and the index name.
-Everything else - the column, the metric, the width, the degree, the beam, the
-pruning slack - is already recorded in the index, and taking it from anywhere
+Three calls, and none of them takes a parameter beyond the dataset and the index
+name. Everything else - the column, the metric, the width, the degree, the beam,
+the pruning slack - is already recorded in the index, and taking it from anywhere
 else would be a second copy of one number for the two to disagree about.
 
 - `insert_as_segment` indexes every row the index does not cover yet, as a new
   segment beside the base. It inherits the base's centroids, so every segment of
-  an index shares one partition numbering. A query probes `nprobes` partitions
-  **per segment**, which is what a delta costs.
+  an index shares one partition numbering. Cheap to run and cheap in recall; what
+  it costs is that a query probes `nprobes` partitions **per segment**.
+- `insert_in_place` puts those same rows into the base's own graphs instead:
+  routed by the base's centroids, each partition that drew any of them read,
+  grown and rewritten, and the rest copied across undecoded. One segment stays
+  one segment.
 - `consolidate_index` takes the dataset's deleted rows out of the graphs that
   still hold them. On SIFT 100k it returns the deleted share in bytes to within
   half a percentage point and returns almost nothing in recall: a tombstone is
   nearly free to search past while the beam is wide next to the reciprocal of
   the live fraction.
+
+Which insert to use is a question about read operations, not about recall.
+Measured on SIFT 100k over indices covering the same rows and differing only in
+how they came to exist, eight segments against one cost 8x the partition reads,
+8x the files and about 3x the latency, for +10% bytes and **no** loss of recall.
+A delta is nearly free to a query's bandwidth and expensive to its IOPS.
 
 Between them they also answer compaction, which used to need a rebuild.
 Compaction strands the index over fragments that no longer exist, and the rows

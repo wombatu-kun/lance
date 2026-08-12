@@ -16,20 +16,26 @@
 //! because ties broke differently.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
+use arrow_array::types::Float32Type;
+use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
-use lance_vamana::inserter::{InsertStats, insert_as_segment};
+use lance_vamana::consolidator::consolidate_index;
+use lance_vamana::inserter::{InsertStats, insert_as_segment, insert_in_place};
 use lance_vamana::query::{SearchParams, VamanaIndex};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 mod common;
 use common::{
-    DatasetFixture, VECTOR_COLUMN, brute_force, live_row_ids, random_vectors,
+    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, live_row_ids, random_vectors,
     read_committed_segments, recall,
 };
 
@@ -74,6 +80,35 @@ async fn with_new_rows(uri: &str, seed: u64) -> Dataset {
     }
     .append(uri)
     .await
+}
+
+/// Append the given vectors as new rows, so that a batch can be aimed at a
+/// chosen region of the space instead of drawn at random.
+async fn append_vectors(uri: &str, vectors: &[Vec<f32>]) -> Dataset {
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        VECTOR_COLUMN,
+        DataType::FixedSizeList(item, VECTOR_DIM),
+        true,
+    )]));
+    let array = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        vectors
+            .iter()
+            .map(|vector| Some(vector.iter().map(|value| Some(*value)).collect::<Vec<_>>()))
+            .collect::<Vec<_>>(),
+        VECTOR_DIM,
+    );
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
 }
 
 fn search() -> SearchParams {
@@ -161,7 +196,7 @@ async fn appended_rows_are_answered_for_after_they_are_indexed() {
     assert_eq!(stats.fragments_indexed, 3, "{stats:?}");
     assert_eq!(stats.vectors, 3 * 512, "{stats:?}");
     assert!(
-        stats.partitions_written > 0 && stats.partitions_written <= PARTITIONS as usize,
+        stats.partitions_created > 0 && stats.partitions_created <= PARTITIONS as usize,
         "{stats:?}"
     );
     assert!(stats.comparisons > 0, "{stats:?}");
@@ -452,4 +487,252 @@ async fn a_compacted_dataset_is_repaired_by_indexing_it_again() {
     assert_eq!((slots, rows.len()), (live.len(), live.len()));
     let after = measured_recall(&dataset).await;
     assert!(after >= 0.95, "recall after the repair is {after}");
+}
+
+/// The base is rewritten, not joined: the index keeps one segment, under a new
+/// uuid, covering everything.
+#[tokio::test]
+async fn inserting_in_place_replaces_the_segment_instead_of_adding_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    indexed_dataset(uri).await;
+    let mut dataset = with_new_rows(uri, 99).await;
+    let before = committed_uuids(&dataset).await;
+
+    let stats = insert_in_place(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(stats.fragments_indexed, 3, "{stats:?}");
+    assert_eq!(stats.vectors, 3 * 512, "{stats:?}");
+    assert!(stats.partitions_grown > 0, "{stats:?}");
+
+    let after = committed_uuids(&dataset).await;
+    assert_eq!(after.len(), 1, "an in-place insert added a segment");
+    assert_ne!(after[0], before[0], "the base was left as it was");
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(
+        index.covered_fragments(),
+        &(0..6).collect::<RoaringBitmap>()
+    );
+    let (rows, slots) = stored_row_ids(&dataset).await;
+    let live = live_row_ids(&dataset).await;
+    assert_eq!((slots, rows.len()), (live.len(), live.len()));
+    assert!(measured_recall(&dataset).await >= 0.95);
+}
+
+/// A batch smaller than the partition count leaves most partitions with nothing
+/// to do, and those are copied rather than decoded and re-encoded. Both counters
+/// have to be non-zero in one run, or the branch that fired is not the one under
+/// test.
+#[tokio::test]
+async fn a_partition_that_drew_nothing_is_copied_not_rewritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    indexed_dataset(uri).await;
+    let mut dataset = DatasetFixture {
+        fragments: 1,
+        rows_per_fragment: 4,
+        seed: 77,
+        ..Default::default()
+    }
+    .append(uri)
+    .await;
+
+    let stats = insert_in_place(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(stats.vectors, 4, "{stats:?}");
+    assert!(stats.partitions_grown > 0, "{stats:?}");
+    assert!(stats.partitions_copied > 0, "{stats:?}");
+    assert_eq!(
+        stats.partitions_grown + stats.partitions_copied + stats.partitions_created,
+        PARTITIONS as usize,
+        "the counters do not add up to the partitions of the segment: {stats:?}"
+    );
+    let (rows, slots) = stored_row_ids(&dataset).await;
+    assert_eq!((slots, rows.len()), (3 * 512 + 4, 3 * 512 + 4));
+}
+
+/// A partition consolidation dropped comes back when a row routes to its
+/// centroid again.
+///
+/// The only way this crate can produce a hole in the partition numbering, and
+/// therefore the only way to reach the branch that builds a partition from
+/// nothing. The rows appended are the very vectors that were deleted, so they
+/// route to the same centroid by construction rather than by luck.
+#[tokio::test]
+async fn a_partition_consolidation_dropped_is_created_again_by_an_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_dataset(uri).await;
+
+    let segments = read_committed_segments(&dataset, INDEX_NAME).await;
+    let (emptied, partition) = segments[0]
+        .partitions
+        .iter()
+        .min_by_key(|(_, partition)| partition.len())
+        .unwrap();
+    let doomed = partition.graph().row_ids().to_vec();
+    let vectors = (0..partition.len() as u32)
+        .map(|local| partition.vector(local).unwrap().to_vec())
+        .collect::<Vec<_>>();
+    let emptied = *emptied;
+
+    dataset
+        .delete(&format!(
+            "_rowid IN ({})",
+            doomed
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .await
+        .unwrap();
+    let consolidated = consolidate_index(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(
+        consolidated.partitions_dropped, 1,
+        "the partition was supposed to be emptied: {consolidated:?}"
+    );
+    assert!(
+        !read_committed_segments(&dataset, INDEX_NAME).await[0]
+            .partitions
+            .contains_key(&emptied),
+        "partition {emptied} is still in the segment"
+    );
+
+    let mut dataset = append_vectors(uri, &vectors).await;
+    let stats = insert_in_place(&mut dataset, INDEX_NAME).await.unwrap();
+    assert!(
+        stats.partitions_created > 0,
+        "the dropped partition was not created again: {stats:?}"
+    );
+    let segments = read_committed_segments(&dataset, INDEX_NAME).await;
+    assert!(
+        segments[0].partitions.contains_key(&emptied),
+        "partition {emptied} did not come back"
+    );
+    assert!(measured_recall(&dataset).await >= 0.95);
+}
+
+/// The invariant the fixed-width layout is, checked against the files rather
+/// than against what was in memory when they were written.
+#[tokio::test]
+async fn every_partition_read_back_respects_the_degree() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    indexed_dataset(uri).await;
+    let mut dataset = with_new_rows(uri, 99).await;
+    insert_in_place(&mut dataset, INDEX_NAME).await.unwrap();
+
+    for segment in read_committed_segments(&dataset, INDEX_NAME).await {
+        for (partition_id, partition) in &segment.partitions {
+            let graph = partition.graph();
+            assert_eq!(graph.max_degree(), base_graph().max_degree);
+            for vertex in 0..graph.len() as u32 {
+                let neighbors = graph.neighbors(vertex).unwrap();
+                assert!(
+                    neighbors.len() <= base_graph().max_degree as usize,
+                    "partition {partition_id} vertex {vertex} has degree {}",
+                    neighbors.len()
+                );
+                assert!(
+                    neighbors.iter().all(|id| (*id as usize) < graph.len()),
+                    "partition {partition_id} vertex {vertex} points outside the partition"
+                );
+            }
+        }
+    }
+}
+
+/// A disjoint delta is not named in the commit and survives it.
+#[tokio::test]
+async fn a_delta_segment_is_left_alone_by_an_in_place_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    indexed_dataset(uri).await;
+    let mut dataset = with_new_rows(uri, 99).await;
+    insert_as_segment(&mut dataset, INDEX_NAME).await.unwrap();
+    let delta = committed_uuids(&dataset).await[1];
+
+    let mut dataset = with_new_rows(uri, 1234).await;
+    insert_in_place(&mut dataset, INDEX_NAME).await.unwrap();
+
+    let uuids = committed_uuids(&dataset).await;
+    assert_eq!(uuids.len(), 2, "the delta was folded in or dropped");
+    assert!(
+        uuids.contains(&delta),
+        "the delta did not survive the commit"
+    );
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(
+        index.covered_fragments(),
+        &(0..9).collect::<RoaringBitmap>()
+    );
+    assert!(measured_recall(&dataset).await >= 0.95);
+}
+
+/// Deletion and insertion compose: the tombstones the base carries are still
+/// tombstones after it has been grown, and the new rows are answerable.
+#[tokio::test]
+async fn deleting_and_inserting_compose() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_dataset(uri).await;
+    dataset.delete("_rowid % 5 == 0").await.unwrap();
+
+    let mut dataset = with_new_rows(uri, 99).await;
+    let stats = insert_in_place(&mut dataset, INDEX_NAME).await.unwrap();
+    assert!(stats.partitions_grown > 0, "{stats:?}");
+
+    // The deleted rows are still stored - they are routers - and still absent
+    // from every answer.
+    let (rows, _) = stored_row_ids(&dataset).await;
+    let live = live_row_ids(&dataset)
+        .await
+        .into_iter()
+        .collect::<HashSet<_>>();
+    assert!(
+        rows.len() > live.len(),
+        "the tombstones were quietly dropped"
+    );
+    assert!(live.is_subset(&rows), "a live row is not in the index");
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    for query in random_vectors(8, 31) {
+        for neighbor in index.search(&query, &search()).await.unwrap().neighbors {
+            assert!(
+                live.contains(&neighbor.row_addr),
+                "a deleted row came back after the insert"
+            );
+        }
+    }
+    assert!(measured_recall(&dataset).await >= 0.95);
+
+    // And consolidation still clears them afterwards.
+    let consolidated = consolidate_index(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(consolidated.segments_rewritten, 1, "{consolidated:?}");
+    let (rows, slots) = stored_row_ids(&dataset).await;
+    assert_eq!((slots, rows.len()), (live.len(), live.len()));
+}
+
+/// Rewriting a segment whose fragments are gone would store their vertices under
+/// a coverage that no longer names them, where nothing keeps them out of an
+/// answer. Refused, with the remedy named.
+#[tokio::test]
+async fn inserting_in_place_refuses_a_segment_whose_fragments_are_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_dataset(uri).await;
+    let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert!(metrics.fragments_removed > 0, "{metrics:?}");
+
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    let error = insert_in_place(&mut dataset, INDEX_NAME)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("consolidate the index first"),
+        "the refusal does not name the remedy: {error}"
+    );
 }
