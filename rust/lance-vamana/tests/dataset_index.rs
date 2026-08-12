@@ -31,14 +31,14 @@ use lance_vamana::builder::{
     live_fragments,
 };
 use lance_vamana::format::INDEX_FILE_NAME;
-use lance_vamana::io::{open_file, read_partition, read_segment, scan_scheduler};
+use lance_vamana::io::{open_file, read_partition, scan_scheduler};
 use lance_vamana::partition::Partition;
 use lance_vamana::query::VamanaIndex;
 use lance_vamana::segment::SegmentManifest;
 use object_store::path::Path;
 
 mod common;
-use common::{DatasetFixture, VECTOR_COLUMN};
+use common::{DatasetFixture, VECTOR_COLUMN, live_row_ids, read_committed_segment};
 
 const INDEX_NAME: &str = "vamana_idx";
 const PARTITIONS: u32 = 8;
@@ -47,45 +47,11 @@ fn params() -> IndexParams {
     IndexParams::new(VECTOR_COLUMN, PARTITIONS)
 }
 
-/// Locate the committed segment and read every partition back off disk.
 async fn read_committed(dataset: &Dataset) -> (SegmentManifest, HashMap<u32, Partition>) {
-    let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
-    assert_eq!(indices.len(), 1, "expected exactly one committed segment");
-    let store = dataset.object_store(None).await.unwrap();
-    let dir = dataset.indices_dir().join(indices[0].uuid.to_string());
-
-    let scheduler = scan_scheduler(&store);
-    let manifest = read_segment(&scheduler, &dir, None).await.unwrap();
-    let mut partitions = HashMap::new();
-    for entry in manifest.partitions() {
-        let reader = open_file(
-            &scheduler,
-            &dir.clone().join(entry.file.as_str()),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        partitions.insert(
-            entry.partition_id,
-            read_partition(&reader, entry.num_rows).await.unwrap(),
-        );
-    }
-    (manifest, partitions)
+    read_committed_segment(dataset, INDEX_NAME).await
 }
 
 /// Every `_rowid` in the dataset, in scan order.
-async fn live_row_ids(dataset: &Dataset) -> Vec<u64> {
-    let mut scanner = dataset.scan();
-    scanner.with_row_id();
-    scanner.project::<&str>(&[]).unwrap();
-    let batch = scanner.try_into_batch().await.unwrap();
-    batch[lance_core::ROW_ID]
-        .as_primitive::<UInt64Type>()
-        .values()
-        .to_vec()
-}
-
 fn vector_at(vectors: &FixedSizeListArray, row: usize) -> &[f32] {
     let dim = vectors.value_length() as usize;
     &vectors.values().as_primitive::<Float32Type>().values()[row * dim..(row + 1) * dim]
