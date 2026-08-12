@@ -83,6 +83,33 @@ impl PartitionGraph {
         Self::try_new(max_degree, row_ids, adjacency)
     }
 
+    /// Append vertices with no out-edges yet, leaving every existing vertex and
+    /// its local id exactly where it was.
+    ///
+    /// What insertion starts from. The existing ids have to survive because the
+    /// edges already in the graph are written in them: renumbering here would
+    /// mean rewriting every neighbour list in the partition to say the same
+    /// thing.
+    pub fn extend(&mut self, row_ids: &[u64]) -> Result<()> {
+        let total = self
+            .row_ids
+            .len()
+            .checked_add(row_ids.len())
+            .filter(|total| *total <= MAX_PARTITION_ROWS as usize)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Vamana cannot add {} vertices to a partition of {}, exceeding the \
+                     addressable maximum {MAX_PARTITION_ROWS}",
+                    row_ids.len(),
+                    self.row_ids.len()
+                ))
+            })?;
+        self.row_ids.extend_from_slice(row_ids);
+        self.neighbors
+            .resize(total * self.max_degree as usize, NO_NEIGHBOR);
+        Ok(())
+    }
+
     pub fn max_degree(&self) -> u32 {
         self.max_degree
     }
