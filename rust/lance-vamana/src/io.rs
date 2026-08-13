@@ -14,6 +14,7 @@ use arrow_array::RecordBatch;
 use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
@@ -261,6 +262,32 @@ pub fn check_partition_shape(
 pub async fn read_row_ids(reader: &FileReader, expected_rows: u32) -> Result<Vec<u64>> {
     check_row_count(reader, expected_rows)?;
     row_ids_from_batch(&read_rows(reader, 0..expected_rows as usize).await?)
+}
+
+/// How many partitions a pass that writes a segment prepares at once.
+///
+/// Every such pass - build, consolidation, insertion, merge - reads and rebuilds
+/// partitions concurrently up to this many, then hands the results to
+/// [`SegmentWriter`] one at a time in ascending id order, because
+/// [`SegmentWriter::write_partition`] accepts them in no other order. So the
+/// arithmetic overlaps and the writing does not, which is the whole of what this
+/// bounds. The same number is what Lance's own index builder gives the
+/// equivalent stage (`lance/src/index/vector/builder.rs`), and a round of graph
+/// maintenance is processor-bound by measurement, so the bound that matters is
+/// the pool's width rather than the store's.
+///
+/// It costs memory: a pass holds this many partitions' vectors and edges at
+/// once, and a partition being rebuilt holds both what was read and what came
+/// out of it. That is not the guarantee the query path's `PARTITIONS_IN_FLIGHT`
+/// makes - that one is a ceiling a caller can quote, this one is a throughput
+/// knob on a batch operation - but it is set by the same lever, `num_partitions`.
+///
+/// Never zero, which matters because `buffered(0)` admits nothing and waits
+/// forever rather than failing: the count falls back to one core on a machine
+/// with fewer cores than Lance reserves for io, and the environment variable that
+/// overrides it refuses a value below one.
+pub(crate) fn partitions_in_flight() -> usize {
+    get_num_compute_intensive_cpus()
 }
 
 /// Writes a segment directory one partition at a time.

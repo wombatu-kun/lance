@@ -53,10 +53,14 @@ use uuid::Uuid;
 use crate::build::BuildParams;
 use crate::builder::{INDEX_DETAILS_TYPE_URL, index_column};
 use crate::format::{FORMAT_VERSION, IndexMetadata, ROW_ID_COLUMN};
-use crate::io::{SegmentWriter, check_partition_shape, open_file, read_partition, read_row_ids};
-use crate::merge::merge_partition;
+use crate::io::{
+    SegmentWriter, check_partition_shape, open_file, partitions_in_flight, read_partition,
+    read_row_ids,
+};
+use crate::merge::{Merged, merge_partition};
 use crate::query::{Segment, VamanaIndex};
 use crate::search::Comparisons;
+use crate::segment::PartitionEntry;
 
 /// What consolidating an index did, and what it cost.
 ///
@@ -242,12 +246,86 @@ pub(crate) async fn dead_by_partition(
     .await
 }
 
+/// Read one partition of `segment` and take `dead` out of it.
+///
+/// Everything a rewrite does that does not touch the writer, so that a segment's
+/// partitions can be through it several at a time while they are still written
+/// one at a time.
+async fn repair_partition(
+    index: &VamanaIndex,
+    segment: &Segment,
+    entry: &PartitionEntry,
+    dead: &RoaringBitmap,
+    metadata: &IndexMetadata,
+) -> Result<Rewritten> {
+    if dead.is_empty() {
+        return Ok(Rewritten::Copied);
+    }
+    if dead.len() == entry.num_rows as u64 {
+        return Ok(Rewritten::Dropped);
+    }
+
+    let reader = open_file(
+        index.scheduler(),
+        &segment.dir.clone().join(entry.file.as_str()),
+        None,
+        segment.file_sizes.get(&entry.file).copied(),
+    )
+    .await?;
+    let partition = read_partition(&reader, entry.num_rows).await?;
+    check_partition_shape(&partition, entry, metadata.max_degree, metadata.dimension)?;
+
+    // Minutes of arithmetic over a whole segment, and not one await in it, so it
+    // runs on the CPU pool rather than on the runtime the scheduler reads
+    // through. Nothing inside waits on anything, which is what `spawn_cpu`
+    // requires.
+    let dead = dead.clone();
+    let metadata = metadata.clone();
+    let entry_point = entry.medoid;
+    let (repaired, comparisons) = spawn_cpu(move || {
+        let comparisons = Comparisons::default();
+        // No newcomers: consolidation is the half of a merge that only takes
+        // rows out, and the other half is what `crate::merger` adds.
+        let repaired = merge_partition(
+            &partition,
+            entry_point,
+            &dead,
+            None,
+            metadata.distance_type,
+            &BuildParams::maintenance(&metadata),
+            &comparisons,
+        )?;
+        Ok::<_, Error>((repaired, comparisons.get()))
+    })
+    .await?;
+    Ok(Rewritten::Repaired {
+        repaired,
+        comparisons,
+    })
+}
+
+/// What one partition of the segment being rewritten turned into.
+enum Rewritten {
+    /// Nothing in it is deleted, so its bytes cross over without being decoded.
+    Copied,
+    /// Every vertex of it is deleted: no file and no table row.
+    /// `consolidate_partition` refuses a partition of nothing rather than
+    /// returning one, so that dropping it is a decision taken here and not a
+    /// shape written to disk.
+    Dropped,
+    Repaired {
+        repaired: Merged,
+        comparisons: u64,
+    },
+}
+
 /// Write every partition of `segment` into `writer`, repairing what needs it.
 ///
-/// One partition at a time, and deliberately: a partition is read whole, so a
-/// pipeline here would be a working set of however many partitions it kept in
-/// flight. That is the same shape - and the same open question about overlapping
-/// the reads with the arithmetic - as the build path's `write_partitions`.
+/// [`partitions_in_flight`] partitions are read and repaired at once and written
+/// one at a time, in the ascending order the writer demands. That is a working
+/// set of that many partitions rather than one, which is the price of keeping the
+/// pool busy: a round is processor-bound, and read whole a partition at a time
+/// left every core but one idle.
 async fn rewrite_segment(
     index: &VamanaIndex,
     segment: &Segment,
@@ -256,65 +334,38 @@ async fn rewrite_segment(
     writer: &mut SegmentWriter,
     stats: &mut ConsolidateStats,
 ) -> Result<()> {
-    for (entry, dead) in segment.manifest.partitions().iter().zip(dead) {
-        stats.vertices_removed += dead.len() as usize;
-        if dead.is_empty() {
-            writer
-                .copy_partition(&segment.dir, &segment.manifest, entry.partition_id)
-                .await?;
-            stats.partitions_copied += 1;
-            continue;
-        }
-        if dead.len() == entry.num_rows as u64 {
-            // No file and no table row. `consolidate_partition` refuses a
-            // partition of nothing rather than returning one, so that dropping
-            // it is a decision taken here and not a shape written to disk.
-            stats.partitions_dropped += 1;
-            continue;
-        }
-
-        let reader = open_file(
-            index.scheduler(),
-            &segment.dir.clone().join(entry.file.as_str()),
-            None,
-            segment.file_sizes.get(&entry.file).copied(),
-        )
-        .await?;
-        let partition = read_partition(&reader, entry.num_rows).await?;
-        check_partition_shape(&partition, entry, metadata.max_degree, metadata.dimension)?;
-
-        // Minutes of arithmetic over a whole segment, and not one await in it,
-        // so it runs on the CPU pool rather than on the runtime the scheduler
-        // reads through. Nothing inside waits on anything, which is what
-        // `spawn_cpu` requires.
-        let dead = dead.clone();
-        let metadata = metadata.clone();
-        let entry_point = entry.medoid;
-        let (repaired, comparisons) = spawn_cpu(move || {
-            let comparisons = Comparisons::default();
-            // No newcomers: consolidation is the half of a merge that only takes
-            // rows out, and the other half is what `crate::merger` adds.
-            let repaired = merge_partition(
-                &partition,
-                entry_point,
-                &dead,
-                None,
-                metadata.distance_type,
-                &BuildParams::maintenance(&metadata),
-                &comparisons,
-            )?;
-            Ok::<_, Error>((repaired, comparisons.get()))
-        })
-        .await?;
-
-        writer
-            .write_partition(entry.partition_id, repaired.medoid, &repaired.partition)
-            .await?;
-        stats.comparisons = stats.comparisons.saturating_add(comparisons);
-        if repaired.rebuilt {
-            stats.partitions_rebuilt += 1;
-        } else {
-            stats.partitions_consolidated += 1;
+    let mut rewritten = stream::iter(segment.manifest.partitions().iter().zip(dead).map(
+        |(entry, dead)| async move {
+            repair_partition(index, segment, entry, dead, metadata)
+                .await
+                .map(|outcome| (entry, dead.len() as usize, outcome))
+        },
+    ))
+    .buffered(partitions_in_flight());
+    while let Some((entry, removed, outcome)) = rewritten.try_next().await? {
+        stats.vertices_removed += removed;
+        match outcome {
+            Rewritten::Copied => {
+                writer
+                    .copy_partition(&segment.dir, &segment.manifest, entry.partition_id)
+                    .await?;
+                stats.partitions_copied += 1;
+            }
+            Rewritten::Dropped => stats.partitions_dropped += 1,
+            Rewritten::Repaired {
+                repaired,
+                comparisons,
+            } => {
+                writer
+                    .write_partition(entry.partition_id, repaired.medoid, &repaired.partition)
+                    .await?;
+                stats.comparisons = stats.comparisons.saturating_add(comparisons);
+                if repaired.rebuilt {
+                    stats.partitions_rebuilt += 1;
+                } else {
+                    stats.partitions_consolidated += 1;
+                }
+            }
         }
     }
     Ok(())

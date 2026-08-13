@@ -219,6 +219,10 @@ call, or `consolidate_index` and then `insert_in_place`.
 - The whole vector column is held in memory for the duration of a build - twice
   over, briefly, while the batches are concatenated. A build is a builder-side
   cost; a query reads one partition at a time.
+- Building and every maintenance call work on as many partitions at once as Lance
+  gives the compute pool cores, and write them one at a time in id order. That is
+  a fivefold saving on twelve cores and a working set of that many partitions:
+  `num_partitions` sets both. A query's own bound is separate and unchanged.
 - `L2` and `Cosine` only. Cosine normalises the vectors it stores, so what the
   index holds is not bit-identical to the dataset's column. `Dot` is refused: see
   `supported_distance_type` for why.

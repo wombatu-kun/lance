@@ -8,9 +8,11 @@
 //! finished segment is committed with `commit_existing_index_segments`. No patch
 //! to Lance is involved anywhere, which is the point of this stage.
 //!
-//! The whole vector column is held in memory for the duration of a build. That
-//! is a property of the builder, not of the index: a query reads one partition
-//! at a time. Streaming the build is a later concern.
+//! The whole vector column is held in memory for the duration of a build, and on
+//! top of it the graphs of as many partitions as are built at once - see
+//! `io::partitions_in_flight`. That is a property of the builder, not of the
+//! index: a query reads one partition at a time. Streaming the build is a later
+//! concern.
 
 use std::sync::Arc;
 
@@ -20,7 +22,7 @@ use arrow_array::{Array, FixedSizeListArray, UInt32Array};
 use arrow_schema::DataType;
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt, stream};
 use lance::Dataset;
 use lance::index::{DatasetIndexExt, IndexSegment};
 use lance_arrow::FixedSizeListArrayExt;
@@ -38,7 +40,7 @@ use uuid::Uuid;
 
 use crate::build::{BuildParams, build_partition};
 use crate::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
-use crate::io::SegmentWriter;
+use crate::io::{SegmentWriter, partitions_in_flight};
 use crate::partition::Partition;
 use crate::search::{Comparisons, flat_storage};
 use crate::segment::SegmentManifest;
@@ -604,6 +606,11 @@ pub(crate) async fn build_segment_with_router(
 /// occupied, and whether k-means leaves one empty is decided by an RNG Lance
 /// seeds from the OS - so a build cannot be asked for an empty partition on
 /// purpose, and nothing that goes through one can tell the two apart.
+///
+/// Graphs are built [`partitions_in_flight`] at a time and written one at a
+/// time. `buffered` and not `buffer_unordered`: the writer takes ids in
+/// ascending order only, and holding a finished graph back until its turn costs
+/// nothing next to building it.
 async fn write_partitions(
     writer: &mut SegmentWriter,
     members_by_partition: Vec<Vec<u32>>,
@@ -615,18 +622,26 @@ async fn write_partitions(
         vectors: vectors.len(),
         ..Default::default()
     };
-    for (partition_id, members) in members_by_partition.into_iter().enumerate() {
-        if members.is_empty() {
-            continue;
-        }
-        let built = {
-            let vectors = vectors.clone();
-            let row_ids = row_ids.clone();
-            let params = params.clone();
-            spawn_cpu(move || build_one(&members, &row_ids, &vectors, &params)).await?
-        };
+    let mut built = stream::iter(
+        members_by_partition
+            .into_iter()
+            .enumerate()
+            .filter(|(_, members)| !members.is_empty())
+            .map(|(partition_id, members)| {
+                let vectors = vectors.clone();
+                let row_ids = row_ids.clone();
+                let params = params.clone();
+                async move {
+                    let built =
+                        spawn_cpu(move || build_one(&members, &row_ids, &vectors, &params)).await?;
+                    Ok::<_, Error>((partition_id as u32, built))
+                }
+            }),
+    )
+    .buffered(partitions_in_flight());
+    while let Some((partition_id, built)) = built.try_next().await? {
         writer
-            .write_partition(partition_id as u32, built.medoid, &built.partition)
+            .write_partition(partition_id, built.medoid, &built.partition)
             .await?;
         stats.partitions += 1;
         stats.comparisons = stats.comparisons.saturating_add(built.comparisons);
@@ -1040,6 +1055,115 @@ mod tests {
         assert!(
             manifest.partition(0).is_none(),
             "the empty partition was given a row in the segment table"
+        );
+    }
+
+    /// More partitions than the pass keeps in flight, and the small ones last.
+    ///
+    /// Both halves matter. Fewer partitions than [`partitions_in_flight`] and
+    /// every graph is finished before the next is asked for, so nothing is ever
+    /// held back; and with the small partitions last, the ones submitted late
+    /// finish first, which is precisely when an unordered pipeline would offer
+    /// them to a writer that takes ids in ascending order only. On a machine
+    /// whose pool is one worker wide there is nothing to reorder and this only
+    /// asserts the serial path.
+    #[tokio::test]
+    async fn a_finished_graph_waits_for_its_turn_to_be_written() {
+        const DIMENSION: i32 = 4;
+
+        let partitions = partitions_in_flight() as u32 + 4;
+        // Descending, so submission order and completion order disagree, and
+        // never empty after the first: the empty one is what proves the ids are
+        // not a running count.
+        let members_by_partition = (0..partitions)
+            .map(|partition_id| {
+                if partition_id == 0 {
+                    0
+                } else {
+                    6 + 4 * (partitions - partition_id) as usize
+                }
+            })
+            .scan(0u32, |next, size| {
+                let members = (*next..*next + size as u32).collect::<Vec<_>>();
+                *next += size as u32;
+                Some(members)
+            })
+            .collect::<Vec<_>>();
+        let vertices = members_by_partition
+            .iter()
+            .map(|members| members.len())
+            .sum::<usize>();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(ObjectStore::local());
+        let path = Path::from_absolute_path(dir.path()).unwrap();
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..vertices * DIMENSION as usize)
+                    .map(|value| value as f32)
+                    .collect::<Vec<_>>(),
+            ),
+            DIMENSION,
+        )
+        .unwrap();
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..partitions as usize * DIMENSION as usize)
+                    .map(|value| value as f32)
+                    .collect::<Vec<_>>(),
+            ),
+            DIMENSION,
+        )
+        .unwrap();
+        let params = Arc::new(IndexParams::new("vector", partitions).with_graph_params(
+            BuildParams {
+                max_degree: 4,
+                search_list_size: 8,
+                ..Default::default()
+            },
+        ));
+        let metadata = IndexMetadata {
+            format_version: FORMAT_VERSION,
+            max_degree: params.graph.max_degree,
+            search_list_size: params.graph.search_list_size,
+            alpha: params.graph.alpha,
+            dimension: DIMENSION as u32,
+            distance_type: params.distance_type,
+            row_id_mode: RowIdMode::Address,
+            fragments: vec![0],
+        };
+        let mut writer =
+            SegmentWriter::new(store, path, metadata, IvfModel::new(centroids, Some(0.0)));
+
+        let expected = members_by_partition
+            .iter()
+            .enumerate()
+            .filter(|(_, members)| !members.is_empty())
+            .map(|(partition_id, members)| (partition_id as u32, members.len() as u32))
+            .collect::<Vec<_>>();
+        let stats = write_partitions(
+            &mut writer,
+            members_by_partition,
+            Arc::new((0..vertices as u64).collect()),
+            vectors,
+            params,
+        )
+        .await
+        .unwrap();
+        let manifest = writer.finish().await.unwrap();
+
+        assert_eq!(stats.partitions, expected.len());
+        assert_eq!(stats.vectors, vertices);
+        // Every occupied partition, under its own id, holding its own rows: an
+        // out-of-order write would have been refused outright, and a dropped or
+        // duplicated one shows up here as a missing or repeated entry.
+        assert_eq!(
+            manifest
+                .partitions()
+                .iter()
+                .map(|entry| (entry.partition_id, entry.num_rows))
+                .collect::<Vec<_>>(),
+            expected
         );
     }
 }
