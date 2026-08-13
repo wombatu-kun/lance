@@ -101,8 +101,13 @@ two are meant to say the same thing.
   which this driver bypasses.
 - **Partitions are read whole, and nothing is cached between queries.** A query
   keeps a few reads in flight, so its working set is a few partitions rather
-  than every partition it probes - but a lazy per-vertex traversal and a cache
-  budget are both still ahead.
+  than every partition it probes. Reading only the vertices a walk touches was
+  measured instead of assumed (`examples/memory_gate.rs`): on its own it halves
+  the pages moved at best and costs *more* CPU at fine granularity, because a
+  walk scores `R` neighbours for every vertex it expands and so touches
+  twenty-five to forty times as many as it expands. It pays with quantised codes
+  resident - a tenth of the pages at 1000 rows a partition, a three-hundredth at
+  65536 - and only while the cache holds a fraction of the index.
 
 An index is **refused** at open, rather than answering from what is left, when:
 

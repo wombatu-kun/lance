@@ -34,11 +34,22 @@
 //!   same remedy.
 //! - **No predicate prefilter and no refine step.** Both live in the scanner.
 //! - **Partitions are read whole, and nothing is cached between queries.** A
-//!   query keeps a few reads going at once, so its working
-//!   set is a few partitions rather than every partition it probes - but the
-//!   lazy per-vertex traversal and the cache budget are both still ahead, and
-//!   putting either in early would make the first honest measurement of this
-//!   path harder to read.
+//!   query keeps a few reads going at once, so its working set is a few
+//!   partitions rather than every partition it probes.
+//!
+//!   Whether reading only what a walk touches would be better is measured rather
+//!   than assumed (`examples/memory_gate.rs`), and on its own it would not be: a
+//!   walk expands a few dozen vertices in a partition and measures a distance
+//!   against twenty-five to forty times as many, because each expanded vertex
+//!   hands it `R` neighbours to score. Fetching exactly that set halves the pages
+//!   moved at best and costs *more* CPU than reading the partition whole at fine
+//!   granularity, because thousands of scattered reads decode slower than a few
+//!   large ones. It pays with quantised codes resident, which leaves only the
+//!   adjacency of the expanded vertices to fetch: a tenth of the pages at 1000
+//!   rows a partition and a three-hundredth at 65536. And it pays only while the
+//!   cache holds a fraction of the index - replaying real probe sequences through
+//!   an LRU that holds all of it serves 25 to 250 queries per load, far past the
+//!   crossover where reading whole is cheaper.
 //!
 //! [`VamanaIndex::open`] refuses outright, rather than answering from what is
 //! left, when the dataset has edited a segment's coverage while the fragments
