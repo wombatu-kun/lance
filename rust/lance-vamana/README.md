@@ -107,7 +107,11 @@ two are meant to say the same thing.
   walk scores `R` neighbours for every vertex it expands and so touches
   twenty-five to forty times as many as it expands. It pays with quantised codes
   resident - a tenth of the pages at 1000 rows a partition, a three-hundredth at
-  65536 - and only while the cache holds a fraction of the index.
+  65536 - and only while the cache holds a fraction of the index. Three bits a
+  dimension is what "codes" has to mean (`examples/coded_walk.rs`): at three the
+  walk expands the same vertices at the same beam as an exact one, at one it needs
+  a beam two to eight times wider, and either way the answer has to be re-scored
+  from the whole candidate list rather than from its nearest `K`.
 
 An index is **refused** at open, rather than answering from what is left, when:
 

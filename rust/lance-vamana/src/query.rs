@@ -51,6 +51,17 @@
 //!   an LRU that holds all of it serves 25 to 250 queries per load, far past the
 //!   crossover where reading whole is cheaper.
 //!
+//!   What "quantised codes" has to mean is measured too
+//!   (`examples/coded_walk.rs`). Walked by RaBitQ distances, the same graph
+//!   expands the same vertices at the same beam and reaches the same recall -
+//!   but from three bits a dimension, 68 bytes a vertex at `d = 128`, not from
+//!   one. A one-bit code needs a beam two to eight times wider, which multiplies
+//!   the very reads it was there to save, and it degrades as partitions coarsen:
+//!   its error stays where it is while the number of neighbours that error can
+//!   reorder grows with the partition. The answer also has to be re-scored from
+//!   the whole candidate list rather than from its nearest `K`, because a coded
+//!   walk's own ordering tops out around 0.95 recall at any code width.
+//!
 //! [`VamanaIndex::open`] refuses outright, rather than answering from what is
 //! left, when the dataset has edited a segment's coverage while the fragments
 //! themselves are still there, when it credits a segment with a fragment that
