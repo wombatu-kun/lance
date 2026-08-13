@@ -42,8 +42,8 @@
 //! What a delta really costs is **read operations, latency and files**: 400
 //! reads against 50, three times the latency, and 807 manifest entries against
 //! 101 - and Lance copies that list into every manifest the dataset writes
-//! afterwards. Against that, growing the index took 9.0 seconds where building
-//! it once took 14.3.
+//! afterwards. Against that, growing the index took 2.7 seconds where building
+//! it once took 3.3.
 //!
 //! So the case for putting new rows into the base's own graphs instead is not
 //! bytes and not recall. It is that a query stays on one segment's worth of
@@ -151,7 +151,7 @@ pub struct InsertStats {
 /// What the delta costs afterwards is read operations: a query probes `nprobes`
 /// partitions in it as in every other segment. [`crate::merger::merge_index`]
 /// folds it back into the base, and on SIFT 100k that fold has paid for itself
-/// after 533 queries against eight segments - so what a schedule of these is
+/// after 123 queries against eight segments - so what a schedule of these is
 /// paired with is a fold, not a rebuild.
 ///
 /// A concurrent commit under the same index name is a retryable conflict, and
@@ -268,9 +268,9 @@ pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Resul
 ///
 /// | round | recall@10 | distances/query | files | iops/query | maintenance |
 /// |---|---|---|---|---|---|
-/// | 0 | 0.9778 | 8045 | 101 | 50 | 4.6 s |
-/// | 4 | 0.9764 | 8463 | 101 | 50 | 8.6 s |
-/// | rebuilt | 0.9812 | 7801 | 101 | 50 | 14.3 s |
+/// | 0 | 0.9778 | 8045 | 101 | 50 | 1.1 s |
+/// | 4 | 0.9764 | 8463 | 101 | 50 | 2.2 s |
+/// | rebuilt | 0.9812 | 7801 | 101 | 50 | 3.4 s |
 ///
 /// Recall loses **0.14 of a percentage point** across the whole cycle and stops
 /// falling after the first round, against the roughly one point the FreshVamana

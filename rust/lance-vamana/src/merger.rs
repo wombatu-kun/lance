@@ -135,8 +135,8 @@ pub struct MergeStats {
 /// merge, this merges. *When* to ask is the caller's, and it is the one question
 /// here that is really about money - a merge costs what it costs once, and a
 /// delta left in place costs `nprobes` extra partition reads on every query
-/// until it is folded. Measured on SIFT 100k, that crossover is **533 queries**
-/// for eight segments, 1345 for four and 6509 for two: the fold costs 3.5 to 4.5
+/// until it is folded. Measured on SIFT 100k, that crossover is **123 queries**
+/// for eight segments, 296 for four and 905 for two: the fold costs 0.8 to 1.2
 /// seconds whatever the count, while what it saves grows with it. At those
 /// numbers a threshold would only be a slower way of saying "fold".
 ///
@@ -165,10 +165,11 @@ pub struct MergeStats {
 /// `examples/churn_cycle.rs` on SIFT 100k this leaves an index with the same
 /// recall and the same distances per query as the pair, to the last digit, in
 /// every round - it runs the same operations over the same data without putting
-/// the partition on disk in between - and costs 35.9 seconds against 37.0. The
-/// missing pass is one read and one write of the index per round, and that is 3%
+/// the partition on disk in between - and costs 8.2 seconds against 8.7. The
+/// missing pass is one read and one write of the index per round, and that is 6%
 /// of a round on local storage: maintenance here is bound by the arithmetic of
-/// the graph. The saving is worth having, and it is not the reason to call this.
+/// the graph, which every core now works on at once. The saving is worth having,
+/// and it is not the reason to call this.
 ///
 /// # When it refuses
 ///
