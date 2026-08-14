@@ -287,14 +287,9 @@ async fn a_scattered_read_returns_the_rows_asked_for_in_order() {
     lance_vamana::io::write_partition(&store, &path, &partition, None)
         .await
         .unwrap();
-    let reader = open_file(
-        &scan_scheduler(&store),
-        &path,
-        Some(&[ROW_ID_COLUMN]),
-        None,
-    )
-    .await
-    .unwrap();
+    let reader = open_file(&scan_scheduler(&store), &path, Some(&[ROW_ID_COLUMN]), None)
+        .await
+        .unwrap();
 
     // Deliberately uneven: two adjacent rows the scheduler will coalesce, and
     // gaps of every size around them.
