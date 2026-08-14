@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
-use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field};
 use lance_core::{Error, Result};
 
@@ -353,8 +353,37 @@ impl Partition {
         (self.graph, self.vectors)
     }
 
-    pub fn to_batch(&self) -> Result<RecordBatch> {
-        let schema = Arc::new(partition_schema(self.graph.max_degree, self.dimension())?);
+    /// The batch this partition is written as.
+    ///
+    /// `codes` is passed in rather than held on the partition because a code is
+    /// a projection of a vector taken at write time: every maintenance pass
+    /// moves vertices between local ids, and none of them has to move a code
+    /// with one when there is no code to move. See [`crate::codes`].
+    pub fn to_batch(&self, codes: Option<&FixedSizeListArray>) -> Result<RecordBatch> {
+        let stride = codes
+            .map(|codes| {
+                u32::try_from(codes.value_length()).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "Vamana codes have a negative stride {}",
+                        codes.value_length()
+                    ))
+                })
+            })
+            .transpose()?;
+        if let Some(codes) = codes
+            && codes.len() != self.len()
+        {
+            return Err(Error::invalid_input(format!(
+                "Vamana partition has {} vertices but {} codes",
+                self.len(),
+                codes.len()
+            )));
+        }
+        let schema = Arc::new(partition_schema(
+            self.graph.max_degree,
+            self.dimension(),
+            stride,
+        )?);
         // Built to the shape `partition_schema` gives `__neighbors` rather than
         // read back out of it: the values are a `u32` array either way, so
         // matching the schema would buy nothing but an impossible arm to panic
@@ -365,14 +394,15 @@ impl Partition {
             Arc::new(UInt32Array::from(self.graph.neighbors.clone())),
             None,
         )?;
-        Ok(RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(UInt64Array::from(self.graph.row_ids.clone())),
-                Arc::new(neighbors),
-                Arc::new(self.vectors.clone()),
-            ],
-        )?)
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(self.graph.row_ids.clone())),
+            Arc::new(neighbors),
+            Arc::new(self.vectors.clone()),
+        ];
+        if let Some(codes) = codes {
+            columns.push(Arc::new(codes.clone()));
+        }
+        Ok(RecordBatch::try_new(schema, columns)?)
     }
 
     pub fn try_from_batch(batch: &RecordBatch) -> Result<Self> {
@@ -693,7 +723,7 @@ mod tests {
     #[test]
     fn batch_round_trip_preserves_the_partition() {
         let partition = sample_partition(4);
-        let restored = Partition::try_from_batch(&partition.to_batch().unwrap()).unwrap();
+        let restored = Partition::try_from_batch(&partition.to_batch(None).unwrap()).unwrap();
         assert_eq!(restored, partition);
     }
 
@@ -721,7 +751,7 @@ mod tests {
 
     /// Rebuild a partition's batch with one adjacency slot overwritten.
     fn with_slot(partition: &Partition, slot: usize, value: u32) -> RecordBatch {
-        let batch = partition.to_batch().unwrap();
+        let batch = partition.to_batch(None).unwrap();
         let neighbors = batch[NEIGHBORS_COLUMN].as_fixed_size_list();
         let mut values = neighbors
             .values()
@@ -795,7 +825,7 @@ mod tests {
     #[test]
     fn a_null_row_id_read_back_is_rejected() {
         let partition = sample_partition(4);
-        let batch = partition.to_batch().unwrap();
+        let batch = partition.to_batch(None).unwrap();
         let mut row_ids = batch[ROW_ID_COLUMN]
             .as_primitive::<UInt64Type>()
             .values()
@@ -839,7 +869,7 @@ mod tests {
     #[test]
     fn a_null_neighbour_read_back_is_rejected() {
         let partition = sample_partition(4);
-        let batch = partition.to_batch().unwrap();
+        let batch = partition.to_batch(None).unwrap();
         let width = partition.graph().max_degree() as i32;
 
         for (what, list_nulls, slot_nulls) in
@@ -968,10 +998,10 @@ mod tests {
     #[test]
     fn the_batch_schema_is_the_partition_schema() {
         let partition = sample_partition(4);
-        let batch = partition.to_batch().unwrap();
+        let batch = partition.to_batch(None).unwrap();
         assert_eq!(
             batch.schema().as_ref(),
-            &partition_schema(4, DIMENSION as u32).unwrap()
+            &partition_schema(4, DIMENSION as u32, None).unwrap()
         );
     }
 

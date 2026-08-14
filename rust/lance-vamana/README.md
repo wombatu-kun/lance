@@ -119,6 +119,16 @@ two are meant to say the same thing.
   has to beat, and so the walk expands more for it - three times more at one bit.
   At equal work a wider beam on plain codes reaches higher recall.
 
+  The codes themselves are here: `IndexParams::with_code_bits(3)` builds a
+  partition file with a `__code` column beside its vectors and its edges, and
+  `SearchParams::with_mode(WalkMode::Coded)` walks by it and re-scores the whole
+  candidate list exactly. **On their own they buy nothing** - the partition is
+  still read whole - and they cost thirteen per cent of the index at `d = 128`
+  and a few per cent more distance computations. They are the half of the lazy
+  read that has to exist first; the read itself does not exist yet. Off by
+  default, and refused rather than skipped for a dimension that is not a multiple
+  of eight, which is what RaBitQ packs a bit a dimension into.
+
 An index is **refused** at open, rather than answering from what is left, when:
 
 - the dataset has edited a segment's coverage while the fragments are still
@@ -132,8 +142,8 @@ An index is **refused** at open, rather than answering from what is left, when:
 - the manifest records a format version this build does not read;
 - a segment was inherited from another dataset by a shallow clone, so its files
   live under a base path this crate cannot resolve;
-- its segments disagree about the dimension, the metric or the identifier space,
-  because a query merges their answers.
+- its segments disagree about the dimension, the metric, the identifier space or
+  the codes, because a query merges their answers.
 
 In every case the answer is to rebuild the index.
 
@@ -234,6 +244,10 @@ call, or `consolidate_index` and then `insert_in_place`.
   `supported_distance_type` for why.
 - Address-style row ids only. A dataset created with `enable_stable_row_ids` is
   refused at build and at open.
+- `with_code_bits` mints one RaBitQ rotation for the whole index and every later
+  segment inherits it, because a partition copied between two segments carries
+  its codes unchanged and a code says nothing about the rotation it was built
+  under. A copy between segments that disagree is refused.
 - A build is reproducible from `BuildParams::seed`, with one hole outside this
   crate's control: Lance re-seeds from the OS when a k-means iteration leaves a
   cluster empty.

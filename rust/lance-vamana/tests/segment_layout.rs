@@ -22,6 +22,7 @@ use lance_index::vector::ivf::storage::IvfModel;
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::DistanceType;
 use lance_vamana::PartitionEntry;
+use lance_vamana::codes::CodeParams;
 use lance_vamana::format::{
     FORMAT_VERSION, INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata,
     ROW_ID_COLUMN, RowIdMode, partition_file_name,
@@ -54,6 +55,7 @@ fn index_metadata() -> IndexMetadata {
         distance_type: DistanceType::Cosine,
         row_id_mode: RowIdMode::Address,
         fragments: vec![0],
+        codes: None,
     }
 }
 
@@ -383,7 +385,7 @@ async fn a_copy_follows_the_source_table_and_writes_the_canonical_name() {
     let source = tempfile::tempdir().unwrap();
     let (store, source_path) = segment_dir(&source);
     let partition = sample_partition(MAX_DEGREE, 12, DIMENSION);
-    write_partition(&store, &source_path.clone().join(RENAMED), &partition)
+    write_partition(&store, &source_path.clone().join(RENAMED), &partition, None)
         .await
         .unwrap();
     let source_manifest = lance_vamana::SegmentManifest::try_new(
@@ -509,6 +511,82 @@ async fn copying_from_a_segment_of_another_shape_is_refused() {
         let mut writer = SegmentWriter::new(store, path.clone(), index_metadata(), ivf_model());
         let error = writer.copy_partition(&path, &source, 0).await.unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
+/// Codes are the third thing a copied partition carries and the segment
+/// declares, and unlike the degree and the dimension a disagreement about them
+/// is unreadable rather than merely wrong.
+///
+/// A copy is byte for byte, so the bytes arrive quantised under the source's
+/// rotation while the destination's `index.idx` names another one - and nothing
+/// downstream reads a rotation back off a partition file, so there is no later
+/// door this could be caught at. Every arm below is a segment that would decode
+/// those bytes into distances that mean nothing.
+#[tokio::test]
+async fn copying_between_segments_whose_codes_disagree_is_refused() {
+    fn manifest_with(codes: Option<CodeParams>) -> lance_vamana::SegmentManifest {
+        lance_vamana::SegmentManifest::try_new(
+            IndexMetadata {
+                codes,
+                ..index_metadata()
+            },
+            ivf_model(),
+            vec![PartitionEntry {
+                partition_id: 0,
+                medoid: 0,
+                num_rows: 4,
+                file: partition_file_name(0),
+            }],
+        )
+        .unwrap()
+    }
+
+    // Written out rather than minted: this fixture's dimension is not one
+    // RaBitQ can pack, and the check under test never looks at a rotation's
+    // shape - only at whether the two segments agree about it.
+    let coded = CodeParams {
+        num_bits: 3,
+        rotation_signs: vec![0xA5, 0x3C],
+    };
+    let elsewhere = CodeParams {
+        rotation_signs: vec![0x5A, 0xC3],
+        ..coded.clone()
+    };
+    let wider = CodeParams {
+        num_bits: 5,
+        ..coded.clone()
+    };
+
+    for (what, mine, theirs) in [
+        ("another rotation", Some(coded.clone()), Some(elsewhere)),
+        ("another width", Some(coded.clone()), Some(wider)),
+        ("no codes at all", Some(coded.clone()), None),
+        ("codes we do not have", None, Some(coded)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, path) = segment_dir(&dir);
+        let mut writer = SegmentWriter::new(
+            store,
+            path.clone(),
+            IndexMetadata {
+                codes: mine,
+                ..index_metadata()
+            },
+            ivf_model(),
+        );
+        let error = writer
+            .copy_partition(&path, &manifest_with(theirs), 0)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{what}"
+        );
+        assert!(
+            error.to_string().contains("codes disagree"),
+            "{what}: {error}"
+        );
     }
 }
 
@@ -867,6 +945,7 @@ async fn the_free_writer_refuses_an_empty_partition() {
         &store,
         &path.clone().join("part_00000.idx"),
         &sample_partition(MAX_DEGREE, 0, DIMENSION),
+        None,
     )
     .await
     .unwrap_err();

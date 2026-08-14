@@ -95,8 +95,9 @@ use uuid::Uuid;
 
 use crate::build::BuildParams;
 use crate::builder::{
-    BuiltOne, INDEX_DETAILS_TYPE_URL, IndexParams, assign, build_index_segment_with_router,
-    build_one, gather, group_by_partition, index_column, read_vectors,
+    BuiltOne, INDEX_DETAILS_TYPE_URL, IndexParams, Inherited, assign,
+    build_index_segment_inheriting, build_one, gather, group_by_partition, index_column,
+    read_vectors,
 };
 use crate::format::{FORMAT_VERSION, IndexMetadata};
 use crate::insert::{Inserted, insert_into_partition};
@@ -183,11 +184,14 @@ pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Resul
     let base = index.base_segment()?;
     let column = index_column(dataset, index_name, &base.fields)?;
     let params = inherited_params(&column, base.manifest.metadata(), base.manifest.ivf());
-    let (segment, built) = build_index_segment_with_router(
+    let (segment, built) = build_index_segment_inheriting(
         dataset,
         &params,
         &new_fragments,
-        Some(base.manifest.ivf().clone()),
+        Some(Inherited {
+            router: base.manifest.ivf().clone(),
+            codes: base.manifest.metadata().codes.clone(),
+        }),
     )
     .await?;
 

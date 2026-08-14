@@ -10,7 +10,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{FixedSizeListArray, RecordBatch};
 use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
@@ -31,6 +31,7 @@ use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use prost::Message;
 
+use crate::codes::encode;
 use crate::format::{
     INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, index_schema,
     partition_file_name,
@@ -50,6 +51,7 @@ pub async fn write_partition(
     store: &ObjectStore,
     path: &Path,
     partition: &Partition,
+    codes: Option<&FixedSizeListArray>,
 ) -> Result<u64> {
     // The format says an empty partition gets no row in `index.idx` and no file.
     // `SegmentWriter` enforces that; this function is public and delegated to, so
@@ -59,7 +61,7 @@ pub async fn write_partition(
             "Vamana will not write a file for an empty partition".to_string(),
         ));
     }
-    let batch = partition.to_batch()?;
+    let batch = partition.to_batch(codes)?;
     let schema = lance_core::datatypes::Schema::try_from(batch.schema().as_ref())?;
     let mut writer = create_writer(
         SEGMENT_FILE_VERSION,
@@ -208,14 +210,24 @@ fn check_row_count(reader: &FileReader, expected_rows: u32) -> Result<()> {
     Ok(())
 }
 
+/// Read a whole partition's file, checked against what the segment table says.
+///
+/// The batch rather than the [`Partition`] because a partition file holds more
+/// than a partition: a query wants the codes out of the same read, and codes are
+/// deliberately not a field of `Partition`.
+///
+/// No empty-partition branch: an empty partition is written no file and given no
+/// row in the segment table, so `expected_rows` is never zero on any path that
+/// reaches here, and a caller who passes zero anyway gets the empty-range error
+/// from [`read_rows`] rather than a partition invented from a schema.
+pub async fn read_partition_batch(reader: &FileReader, expected_rows: u32) -> Result<RecordBatch> {
+    check_row_count(reader, expected_rows)?;
+    read_rows(reader, 0..expected_rows as usize).await
+}
+
 /// Read a whole partition back into memory.
 pub async fn read_partition(reader: &FileReader, expected_rows: u32) -> Result<Partition> {
-    check_row_count(reader, expected_rows)?;
-    // No empty-partition branch: an empty partition is written no file and given
-    // no row in the segment table, so `expected_rows` is never zero on any path
-    // that reaches here, and a caller who passes zero anyway gets the empty-range
-    // error from `read_rows` rather than a partition invented from a schema.
-    Partition::try_from_batch(&read_rows(reader, 0..expected_rows as usize).await?)
+    Partition::try_from_batch(&read_partition_batch(reader, expected_rows).await?)
 }
 
 /// Refuse a partition whose shape disagrees with the segment that lists it.
@@ -351,9 +363,33 @@ impl SegmentWriter {
         }
         self.check_entry(partition_id, medoid, partition.len() as u32)?;
 
+        // Encoded here rather than by the caller, so that no pass that produces a
+        // partition can forget to, and none of them has to keep a code in step
+        // with a vertex it moved. The centroid comes off this segment's own
+        // routing model, which is the one the partition was assigned by.
+        let codes = self
+            .metadata
+            .codes
+            .as_ref()
+            .map(|params| {
+                let centroid = self.ivf.centroid(partition_id as usize).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Vamana partition {partition_id} has no centroid in a routing model of {}",
+                        self.ivf.num_partitions()
+                    ))
+                })?;
+                encode(
+                    params,
+                    self.metadata.distance_type,
+                    partition.vectors(),
+                    &centroid,
+                )
+            })
+            .transpose()?;
+
         let file = partition_file_name(partition_id);
         let path = self.dir.clone().join(file.as_str());
-        let size = write_partition(&self.store, &path, partition).await?;
+        let size = write_partition(&self.store, &path, partition, codes.as_ref()).await?;
         self.partitions.push(PartitionEntry {
             partition_id,
             medoid,
@@ -412,6 +448,18 @@ impl SegmentWriter {
                      {source} into one declaring {mine}"
                 )));
             }
+        }
+        // Codes are bytes quantised under one rotation, and nothing downstream
+        // reads a rotation back off a partition file: copied into a segment
+        // declaring another one, they would be decoded into distances that are
+        // meaningless rather than approximate. Equality of the whole parameters
+        // is the check because the rotation is inside them, and it is what makes
+        // "one rotation per index" enforced rather than merely inherited.
+        if from.metadata().codes != self.metadata.codes {
+            return Err(Error::invalid_input(format!(
+                "Vamana cannot copy partition {partition_id} between segments whose codes \
+                 disagree; the rotation a code was built under is not recoverable from it"
+            )));
         }
         self.check_entry(partition_id, entry.medoid, entry.num_rows)?;
 

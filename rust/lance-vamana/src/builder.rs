@@ -39,6 +39,7 @@ use rand::rngs::SmallRng;
 use uuid::Uuid;
 
 use crate::build::{BuildParams, build_partition};
+use crate::codes::CodeParams;
 use crate::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
 use crate::io::{SegmentWriter, partitions_in_flight};
 use crate::partition::Partition;
@@ -100,6 +101,17 @@ pub struct IndexParams {
     /// and it takes the *front* of it, so a larger rate would quietly stop being
     /// a random sample of the dataset.
     pub kmeans_sample_rate: usize,
+    /// Bits a dimension for the resident code column, or `None` for no codes.
+    ///
+    /// Off by default because codes are not free and, on their own, buy nothing:
+    /// a partition is still read whole, so all they do today is add thirteen per
+    /// cent to the index at `d = 128`. They are what the disk-resident traversal
+    /// will steer by, and the measured working point is **three** - see
+    /// [`crate::codes`].
+    ///
+    /// Refused, not ignored, when the dimension is not a multiple of eight,
+    /// which is what RaBitQ packs a bit a dimension into.
+    pub code_bits: Option<u8>,
 }
 
 impl IndexParams {
@@ -111,6 +123,7 @@ impl IndexParams {
             graph: BuildParams::default(),
             kmeans_max_iters: 50,
             kmeans_sample_rate: 256,
+            code_bits: None,
         }
     }
 
@@ -131,6 +144,11 @@ impl IndexParams {
 
     pub fn with_kmeans_sample_rate(mut self, kmeans_sample_rate: usize) -> Self {
         self.kmeans_sample_rate = kmeans_sample_rate;
+        self
+    }
+
+    pub fn with_code_bits(mut self, code_bits: u8) -> Self {
+        self.code_bits = Some(code_bits);
         self
     }
 }
@@ -277,20 +295,32 @@ pub async fn build_index_segment(
     params: &IndexParams,
     fragments: &[u32],
 ) -> Result<(IndexSegment, BuildStats)> {
-    build_index_segment_with_router(dataset, params, fragments, None).await
+    build_index_segment_inheriting(dataset, params, fragments, None).await
 }
 
-/// [`build_index_segment`], with the option of routing by somebody else's
-/// centroids instead of training a router of this segment's own.
+/// What a segment added to an existing index takes from it rather than choosing.
 ///
-/// A segment added to an index that already has one inherits the base's model,
-/// which is what keeps every segment of an index on one partition numbering.
-/// See [`crate::inserter`] for why that matters.
-pub(crate) async fn build_index_segment_with_router(
+/// Both fields are things that must be one per *index* and not one per segment,
+/// and both fail silently if they are not: two routers would number the
+/// partitions differently, and two rotations would leave a partition copied
+/// between segments decoded under the wrong one.
+pub(crate) struct Inherited {
+    /// The base's centroids. See [`crate::inserter`] for why one numbering.
+    pub router: IvfModel,
+    /// The base's codes, rotation and all.
+    ///
+    /// Taken from here and never from [`IndexParams::code_bits`], which is a
+    /// request for a *fresh* rotation and is therefore not a thing a segment
+    /// joining an index may act on.
+    pub codes: Option<CodeParams>,
+}
+
+/// [`build_index_segment`], for a segment joining an index that already exists.
+pub(crate) async fn build_index_segment_inheriting(
     dataset: &Dataset,
     params: &IndexParams,
     fragments: &[u32],
-    router: Option<IvfModel>,
+    inherited: Option<Inherited>,
 ) -> Result<(IndexSegment, BuildStats)> {
     // Refused before the graph is built rather than discovered on the commit
     // that follows it: Lance would open this index while committing, and cannot.
@@ -335,7 +365,7 @@ pub(crate) async fn build_index_segment_with_router(
 
     let uuid = Uuid::new_v4();
     let dir = dataset.indices_dir().join(uuid.to_string());
-    let (_, stats) = build_segment_with_router(dataset, params, &dir, fragments, router).await?;
+    let (_, stats) = build_segment_inheriting(dataset, params, &dir, fragments, inherited).await?;
 
     let details = prost_types::Any {
         type_url: INDEX_DETAILS_TYPE_URL.to_string(),
@@ -407,21 +437,21 @@ pub async fn build_segment(
     dir: &Path,
     fragments: &[u32],
 ) -> Result<(SegmentManifest, BuildStats)> {
-    build_segment_with_router(dataset, params, dir, fragments, None).await
+    build_segment_inheriting(dataset, params, dir, fragments, None).await
 }
 
-/// [`build_segment`], routing by `router` when one is given rather than
-/// training one.
+/// [`build_segment`], taking the routing and the codes from an index this
+/// segment is joining rather than choosing its own.
 ///
-/// `params.num_partitions` and the two k-means knobs are then unused: how many
-/// buckets there are is a property of the model, and it is read off the model
-/// below rather than off the request.
-pub(crate) async fn build_segment_with_router(
+/// `params.num_partitions`, the two k-means knobs and `params.code_bits` are
+/// then unused: how many buckets there are is a property of the model, and both
+/// the model and the rotation belong to the index rather than to this segment.
+pub(crate) async fn build_segment_inheriting(
     dataset: &Dataset,
     params: &IndexParams,
     dir: &Path,
     fragments: &[u32],
-    router: Option<IvfModel>,
+    inherited: Option<Inherited>,
 ) -> Result<(SegmentManifest, BuildStats)> {
     if dataset.manifest().uses_stable_row_ids() {
         // The delete list of stage C is derived from deletion vectors, which are
@@ -522,6 +552,20 @@ pub(crate) async fn build_segment_with_router(
             vectors.value_length()
         ))
     })?;
+    // A fresh rotation is minted only for an index that has none yet, and it is
+    // then inherited by every segment that index ever grows: a partition copied
+    // between two of them carries its codes unchanged, and a code says nothing
+    // about the rotation it was built under.
+    let (router, codes) = match inherited {
+        Some(Inherited { router, codes }) => (Some(router), codes),
+        None => (
+            None,
+            params
+                .code_bits
+                .map(|num_bits| CodeParams::mint(num_bits, dimension))
+                .transpose()?,
+        ),
+    };
 
     // Everything from here to the last partition is arithmetic, and it runs on
     // the CPU pool rather than here. A build is minutes of it with no await to
@@ -556,7 +600,7 @@ pub(crate) async fn build_segment_with_router(
                 vectors
             };
             let ivf = match router {
-                Some(inherited) => inherited,
+                Some(router) => router,
                 None => {
                     let mut rng = SmallRng::seed_from_u64(params.graph.seed);
                     train_router(&vectors, &params, &mut rng)?
@@ -577,6 +621,7 @@ pub(crate) async fn build_segment_with_router(
         distance_type: params.distance_type,
         row_id_mode: RowIdMode::Address,
         fragments: fragments.to_vec(),
+        codes,
     };
     // Off the model rather than off the request, because the two are the same
     // number only when the model was trained here. An inherited one decides how
@@ -1022,6 +1067,7 @@ mod tests {
             distance_type: params.distance_type,
             row_id_mode: RowIdMode::Address,
             fragments: vec![0],
+            codes: None,
         };
         let mut writer =
             SegmentWriter::new(store, path, metadata, IvfModel::new(centroids, Some(0.0)));
@@ -1131,6 +1177,7 @@ mod tests {
             distance_type: params.distance_type,
             row_id_mode: RowIdMode::Address,
             fragments: vec![0],
+            codes: None,
         };
         let mut writer =
             SegmentWriter::new(store, path, metadata, IvfModel::new(centroids, Some(0.0)));

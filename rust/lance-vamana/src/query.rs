@@ -70,14 +70,20 @@
 //!   walk expands more - eight per cent more at three bits, three times more at
 //!   one. At equal work a wider beam on plain codes reaches higher recall.
 //!
+//!   The codes exist: an index built with [`crate::IndexParams::with_code_bits`]
+//!   carries them, and [`WalkMode::Coded`] walks by them. What does not exist yet
+//!   is the lazy read they are for, so today a coded walk reads the same
+//!   partitions whole *plus* their codes and computes a few per cent more
+//!   distances. See [`crate::codes`].
+//!
 //! [`VamanaIndex::open`] refuses outright, rather than answering from what is
 //! left, when the dataset has edited a segment's coverage while the fragments
 //! themselves are still there, when it credits a segment with a fragment that
 //! segment never read, when an overlay has replaced the indexed values under
 //! one, when the manifest records a format version this build does not read,
 //! when a segment was inherited from another dataset, or when the segments
-//! disagree about the vectors they hold. Each refusal names what to do about
-//! it, which is always to rebuild.
+//! disagree about the vectors they hold or about the codes they were built with.
+//! Each refusal names what to do about it, which is always to rebuild.
 //!
 //! Committing an index also breaks Lance's own vector search on that column -
 //! see the crate README, and the test that pins it.
@@ -85,7 +91,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float32Array};
+use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::index::DatasetIndexExt;
@@ -93,7 +99,7 @@ use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, Result};
-use lance_index::vector::storage::VectorStore;
+use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_io::scheduler::{ScanScheduler, ScanStats};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
@@ -103,8 +109,14 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 use uuid::Uuid;
 
 use crate::builder::{live_fragments, routing_distance_type, supported_distance_type};
-use crate::format::{FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, RowIdMode};
-use crate::io::{check_partition_shape, open_file, read_partition, read_segment, scan_scheduler};
+use crate::codes::{self, CODE_COLUMN, centroid_distance};
+use crate::format::{
+    FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, NEIGHBORS_COLUMN, ROW_ID_COLUMN, RowIdMode,
+    VECTOR_COLUMN,
+};
+use crate::io::{
+    check_partition_shape, open_file, read_partition_batch, read_segment, scan_scheduler,
+};
 use crate::partition::Partition;
 use crate::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
 use crate::segment::{PartitionEntry, SegmentManifest};
@@ -123,6 +135,23 @@ pub struct Neighbor {
     pub distance: f32,
 }
 
+/// What a walk measures its distances against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalkMode {
+    /// The vectors the partition stores.
+    #[default]
+    Exact,
+    /// The partition's resident codes, with the candidate list re-scored
+    /// exactly before it is answered from.
+    ///
+    /// Only for an index built with [`crate::IndexParams::with_code_bits`], and
+    /// refused rather than quietly downgraded for one that was not. It costs a
+    /// few per cent more comparisons and reads no fewer bytes today - what it is
+    /// for is the disk-resident traversal, where the codes are what remains
+    /// resident and the vectors are read only for the re-scoring.
+    Coded,
+}
+
 /// How far a query is allowed to look.
 #[derive(Debug, Clone)]
 pub struct SearchParams {
@@ -136,6 +165,8 @@ pub struct SearchParams {
     pub nprobes: usize,
     /// `L`: how wide a search list each graph walk keeps.
     pub search_list_size: usize,
+    /// What the walk measures its distances against.
+    pub mode: WalkMode,
 }
 
 impl SearchParams {
@@ -146,6 +177,7 @@ impl SearchParams {
             // Saturating because `k` is the caller's number and this is a
             // constructor, not a place to panic on arithmetic.
             search_list_size: k.saturating_add(k / 2),
+            mode: WalkMode::default(),
         }
     }
 
@@ -156,6 +188,11 @@ impl SearchParams {
 
     pub fn with_search_list_size(mut self, search_list_size: usize) -> Self {
         self.search_list_size = search_list_size;
+        self
+    }
+
+    pub fn with_mode(mut self, mode: WalkMode) -> Self {
+        self.mode = mode;
         self
     }
 }
@@ -274,6 +311,27 @@ struct Probe {
     /// What the segment declares, to be checked against what the file holds.
     max_degree: u32,
     dimension: u32,
+    /// `|q - c|^2` against this partition's centroid, for a walk that runs on
+    /// codes; `None` for one that runs on the stored vectors.
+    ///
+    /// RaBitQ's raw-query estimator wants exactly this beside the *raw* query,
+    /// because the centroid is already folded into each vertex's own factors.
+    /// Handing it the residual instead produces distances that are wrong rather
+    /// than approximate, which a recall number reports as bad codes.
+    dist_q_c: Option<f32>,
+}
+
+/// One partition read off disk, and what a walk over it needs.
+struct Probed {
+    partition: Partition,
+    medoid: u32,
+    /// The code column and `|q - c|^2`, for a walk that runs on codes.
+    ///
+    /// The column rather than the batch it was read out of: the batch also holds
+    /// the row ids, the edges and the vectors, all of which `partition` has
+    /// already taken its own copy of, and it would stay alive for the length of
+    /// the walk.
+    coded: Option<(FixedSizeListArray, f32)>,
 }
 
 /// How many partition reads a query keeps in flight.
@@ -518,15 +576,21 @@ impl VamanaIndex {
         for segment in &segments[1..] {
             let other = segment.manifest.metadata();
             // Degree and pruning slack may legitimately differ between a base
-            // segment and one appended later; the identifier space, the metric
-            // and the width may not, because a query mixes their answers.
-            if (other.dimension, other.distance_type, other.row_id_mode)
-                != (
-                    metadata.dimension,
-                    metadata.distance_type,
-                    metadata.row_id_mode,
-                )
-            {
+            // segment and one appended later; the identifier space, the metric,
+            // the width and the codes may not, because a query mixes their
+            // answers - and one segment coded where another is not would make
+            // the walk mode mean two different things in one query.
+            if (
+                other.dimension,
+                other.distance_type,
+                other.row_id_mode,
+                &other.codes,
+            ) != (
+                metadata.dimension,
+                metadata.distance_type,
+                metadata.row_id_mode,
+                &metadata.codes,
+            ) {
                 return Err(Error::index(format!(
                     "index '{index_name}' has segments that disagree about the vectors they hold: \
                      {:?} against {:?}",
@@ -677,6 +741,16 @@ impl VamanaIndex {
                 self.metadata.dimension
             )));
         }
+        // Refused rather than answered exactly. A caller asking for the coded
+        // walk is asking about cost, and quietly giving them a walk that reads
+        // every vector would be an answer to a different question.
+        if params.mode == WalkMode::Coded && self.metadata.codes.is_none() {
+            return Err(Error::invalid_input(
+                "this Vamana index was built without codes, so it cannot be walked by them; \
+                 rebuild it with IndexParams::with_code_bits"
+                    .to_string(),
+            ));
+        }
         // Nothing downstream would report this. Every distance against a
         // non-finite query is NaN, every ordering here goes through `total_cmp`,
         // and a negative NaN sorts *ahead* of negative infinity - so the walk
@@ -742,10 +816,10 @@ impl VamanaIndex {
                 .buffer_unordered(PARTITIONS_IN_FLIGHT)
         );
 
-        while let Some((partition, medoid)) = reads.try_next().await? {
+        while let Some(probed) = reads.try_next().await? {
             partitions_read += 1;
             let walked = self
-                .walk_partition(partition, medoid, query.clone(), params)
+                .walk_partition(probed, query.clone(), routing_query.clone(), params)
                 .await?;
             found.extend(walked.neighbors);
             comparisons = comparisons.saturating_add(walked.comparisons);
@@ -805,12 +879,26 @@ impl VamanaIndex {
                 };
                 probed += 1;
                 let declared = segment.manifest.metadata();
+                // Computed rather than taken from the ranking above, which is a
+                // routing distance whose scale is `find_partitions`' business.
+                // This one is a term of RaBitQ's estimator, so what it has to be
+                // is unambiguous, and `dimension` flops a probed partition is
+                // nothing beside reading one.
+                let dist_q_c = match params.mode {
+                    WalkMode::Exact => None,
+                    WalkMode::Coded => Some(centroid_distance(
+                        segment.manifest.ivf(),
+                        *partition_id,
+                        routing_query,
+                    )?),
+                };
                 probes.push(Probe {
                     path: segment.dir.clone().join(entry.file.as_str()),
                     size_bytes: segment.file_sizes.get(&entry.file).copied(),
                     entry: entry.clone(),
                     max_degree: declared.max_degree,
                     dimension: declared.dimension,
+                    dist_q_c,
                 });
             }
         }
@@ -839,32 +927,86 @@ impl VamanaIndex {
     /// its caller has already given up on.
     async fn walk_partition(
         &self,
-        partition: Partition,
-        medoid: u32,
+        probed: Probed,
         query: ArrayRef,
+        routing_query: ArrayRef,
         params: &SearchParams,
     ) -> Result<Walked> {
         let distance_type = self.metadata.distance_type;
+        let dimension = self.metadata.dimension;
+        let code_params = self.metadata.codes.clone();
         let rows = self.rows.clone();
         let search_list_size = params.search_list_size;
         let k = params.k;
         spawn_cpu(move || {
+            let Probed {
+                partition,
+                medoid,
+                coded,
+            } = probed;
             let walked = Comparisons::default();
             let vectors = flat_storage(
                 partition.graph().row_ids(),
                 partition.vectors(),
                 distance_type,
             )?;
-            let calculator = vectors.dist_calculator(query, 0.0);
+            let exact = vectors.dist_calculator(query, 0.0);
             let mut scratch = SearchScratch::new(partition.len());
-            let walk = greedy_search(
-                partition.graph(),
-                &calculator,
-                medoid,
-                search_list_size,
-                &mut scratch,
-                &walked,
-            )?;
+
+            // Either way the list this comes back as is sorted by an *exact*
+            // distance, which is what the merge and the checks below rest on.
+            let candidates = match coded {
+                None => {
+                    let walk = greedy_search(
+                        partition.graph(),
+                        &exact,
+                        medoid,
+                        search_list_size,
+                        &mut scratch,
+                        &walked,
+                    )?;
+                    walk.candidates
+                        .into_iter()
+                        .map(|node| (node.id, node.dist.0))
+                        .collect::<Vec<_>>()
+                }
+                Some((column, dist_q_c)) => {
+                    let code_params = code_params.ok_or_else(|| {
+                        Error::internal(
+                            "a Vamana coded walk was scheduled for a segment without codes"
+                                .to_string(),
+                        )
+                    })?;
+                    let store = codes::storage(
+                        &code_params,
+                        distance_type,
+                        dimension,
+                        partition.graph().row_ids(),
+                        &column,
+                    )?;
+                    let walk = greedy_search(
+                        partition.graph(),
+                        &store.dist_calculator(routing_query, dist_q_c),
+                        medoid,
+                        search_list_size,
+                        &mut scratch,
+                        &walked,
+                    )?;
+                    // The whole list, not its nearest `k`: a coded walk's own
+                    // ordering tops out around 0.95 recall at any code width, so
+                    // the rows that make up the difference are the ones its
+                    // ordering put behind `k`. Measured in `examples/coded_walk.rs`.
+                    walked.record(walk.candidates.len() as u64);
+                    let mut rescored = walk
+                        .candidates
+                        .into_iter()
+                        .map(|node| (node.id, exact.distance(node.id)))
+                        .collect::<Vec<_>>();
+                    rescored.sort_by(|left, right| left.1.total_cmp(&right.1));
+                    rescored
+                }
+            };
+
             // A stored vector that is not finite makes every distance measured
             // against it NaN, and a NaN goes wherever `total_cmp` puts it: a
             // negative one sorts ahead of every real answer, survives the merge
@@ -874,14 +1016,13 @@ impl VamanaIndex {
             // partition on the hot path of every query, more work than the walk
             // it would be protecting - so it is caught here instead, over the
             // `search_list_size` candidates the walk actually kept.
-            if let Some(node) = walk.candidates.iter().find(|node| !node.dist.0.is_finite()) {
+            if let Some((id, distance)) = candidates.iter().find(|(_, d)| !d.is_finite()) {
                 return Err(Error::corrupt_file_named(
                     "partition",
                     format!(
-                        "Vamana row {} is at distance {} from a finite query, so the vector \
-                         stored for it is not finite",
-                        partition.graph().row_ids()[node.id as usize],
-                        node.dist.0
+                        "Vamana row {} is at distance {distance} from a finite query, so the \
+                         vector stored for it is not finite",
+                        partition.graph().row_ids()[*id as usize],
                     ),
                 ));
             }
@@ -894,12 +1035,11 @@ impl VamanaIndex {
             // they were the only route to. Filtering before `take` rather than
             // after is what makes `k` mean "k live rows" instead of "k rows, some
             // of which the caller will find missing".
-            let neighbors = walk
-                .candidates
-                .iter()
-                .map(|node| Neighbor {
-                    row_addr: partition.graph().row_ids()[node.id as usize],
-                    distance: node.dist.0,
+            let neighbors = candidates
+                .into_iter()
+                .map(|(id, distance)| Neighbor {
+                    row_addr: partition.graph().row_ids()[id as usize],
+                    distance,
                 })
                 .filter(|neighbor| !rows.rejects(neighbor.row_addr))
                 .take(k)
@@ -913,11 +1053,34 @@ impl VamanaIndex {
     }
 
     /// Read one probed partition whole.
-    async fn read_probe(&self, probe: Probe) -> Result<(Partition, u32)> {
-        let reader = open_file(&self.scheduler, &probe.path, None, probe.size_bytes).await?;
-        let partition = read_partition(&reader, probe.entry.num_rows).await?;
+    ///
+    /// Projected on the columns the walk will use, so that an index carrying
+    /// codes does not pay for them on a query that measures against the vectors:
+    /// thirteen per cent of a partition at `d = 128`.
+    async fn read_probe(&self, probe: Probe) -> Result<Probed> {
+        let mut columns = vec![ROW_ID_COLUMN, NEIGHBORS_COLUMN, VECTOR_COLUMN];
+        if probe.dist_q_c.is_some() {
+            columns.push(CODE_COLUMN);
+        }
+        let reader = open_file(
+            &self.scheduler,
+            &probe.path,
+            Some(&columns),
+            probe.size_bytes,
+        )
+        .await?;
+        let batch = read_partition_batch(&reader, probe.entry.num_rows).await?;
+        let partition = Partition::try_from_batch(&batch)?;
         check_partition_shape(&partition, &probe.entry, probe.max_degree, probe.dimension)?;
-        Ok((partition, probe.entry.medoid))
+        let coded = probe
+            .dist_q_c
+            .map(|dist_q_c| Ok::<_, Error>((codes::column(&batch)?, dist_q_c)))
+            .transpose()?;
+        Ok(Probed {
+            partition,
+            medoid: probe.entry.medoid,
+            coded,
+        })
     }
 }
 

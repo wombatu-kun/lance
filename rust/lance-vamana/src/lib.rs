@@ -12,6 +12,7 @@
 
 pub mod build;
 pub mod builder;
+pub mod codes;
 pub mod consolidate;
 pub mod consolidator;
 pub mod format;
@@ -26,6 +27,7 @@ pub mod search;
 pub mod segment;
 
 pub use builder::{BuildStats, IndexParams, create_index};
+pub use codes::CodeParams;
 pub use consolidate::{Consolidated, consolidate_partition};
 pub use consolidator::{ConsolidateStats, consolidate_index};
 pub use format::{IndexMetadata, RowIdMode};
