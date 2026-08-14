@@ -94,7 +94,8 @@ impl SearchScratch {
         }
     }
 
-    fn begin(&mut self) {
+    /// Start a search: every mark from the previous one stops counting.
+    pub(crate) fn begin(&mut self) {
         self.generation = match self.generation.checked_add(1) {
             Some(next) => next,
             // Four billion searches later the stamps stop being unique, so the
@@ -107,7 +108,7 @@ impl SearchScratch {
     }
 
     /// Mark `id` as reached, returning whether this search had not reached it.
-    fn mark(&mut self, id: u32) -> bool {
+    pub(crate) fn mark(&mut self, id: u32) -> bool {
         let slot = &mut self.seen[id as usize];
         if *slot == self.generation {
             false
@@ -123,6 +124,78 @@ impl SearchScratch {
 struct Candidate {
     node: OrderedNode,
     expanded: bool,
+}
+
+/// `L`: the beam a walk keeps, nearest first.
+///
+/// Shared rather than written twice because there are two walks over it and they
+/// have to be the same walk. [`greedy_search`] holds the whole partition and
+/// takes one vertex at a time; the lazy walk in `crate::lazy` fetches the edges
+/// of several at once, because a round trip it can batch is what it is paying
+/// in. Everything else - what gets in, what gets pushed out, what order
+/// the answer comes back in - has to be identical, and the way to know it is
+/// identical is for there to be one copy of it.
+#[derive(Debug)]
+pub struct SearchList {
+    list: Vec<Candidate>,
+    size: usize,
+}
+
+impl SearchList {
+    /// A list of at most `search_list_size` entries over `num_vertices`.
+    ///
+    /// Bounded by the graph as well as by `L`, because the list can never hold
+    /// more than one entry per vertex and `L` comes from a caller who may have
+    /// passed `usize::MAX` - which this would otherwise hand to the allocator.
+    pub fn new(search_list_size: usize, num_vertices: usize) -> Self {
+        Self {
+            list: Vec::with_capacity(search_list_size.min(num_vertices).saturating_add(1)),
+            size: search_list_size,
+        }
+    }
+
+    /// Offer a vertex at `distance`, keeping it if it beats the back of the list.
+    ///
+    /// Nothing here checks whether `id` is already in the list: a caller must
+    /// have marked it in its [`SearchScratch`] first, which is what makes a
+    /// vertex measured once and offered once.
+    pub fn offer(&mut self, id: u32, distance: f32) {
+        let distance = OrderedFloat(distance);
+        let at = self
+            .list
+            .partition_point(|candidate| candidate.node.dist <= distance);
+        if at >= self.size {
+            return;
+        }
+        self.list.insert(
+            at,
+            Candidate {
+                node: OrderedNode::new(id, distance),
+                expanded: false,
+            },
+        );
+        self.list.truncate(self.size);
+    }
+
+    /// The nearest vertex whose out-edges have not been followed, marked as
+    /// followed.
+    ///
+    /// Called `n` times in a row without an [`Self::offer`] between them, it
+    /// yields the `n` nearest unexpanded vertices - which is exactly the
+    /// frontier a lazy hop fetches in one request.
+    pub fn next_unexpanded(&mut self) -> Option<OrderedNode> {
+        let position = self.list.iter().position(|candidate| !candidate.expanded)?;
+        self.list[position].expanded = true;
+        Some(self.list[position].node.clone())
+    }
+
+    /// The list itself, nearest first.
+    pub fn into_candidates(self) -> Vec<OrderedNode> {
+        self.list
+            .into_iter()
+            .map(|candidate| candidate.node)
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -174,19 +247,11 @@ pub fn greedy_search(
     scratch.begin();
     scratch.mark(entry_point);
     comparisons.record(1);
-    // Bounded by the graph as well as by `L`: the list can never hold more than
-    // one entry per vertex, and `L` comes from a caller who may have passed
-    // `usize::MAX`, which this would hand straight to the allocator.
-    let mut list = Vec::with_capacity(search_list_size.min(graph.len()).saturating_add(1));
-    list.push(Candidate {
-        node: OrderedNode::new(entry_point, OrderedFloat(query.distance(entry_point))),
-        expanded: false,
-    });
+    let mut list = SearchList::new(search_list_size, graph.len());
+    list.offer(entry_point, query.distance(entry_point));
     let mut visited = Vec::new();
 
-    while let Some(position) = list.iter().position(|candidate| !candidate.expanded) {
-        list[position].expanded = true;
-        let nearest_unexpanded = list[position].node.clone();
+    while let Some(nearest_unexpanded) = list.next_unexpanded() {
         visited.push(nearest_unexpanded.clone());
 
         for neighbor in graph.neighbors(nearest_unexpanded.id)? {
@@ -194,24 +259,12 @@ pub fn greedy_search(
                 continue;
             }
             comparisons.record(1);
-            let distance = OrderedFloat(query.distance(*neighbor));
-            let at = list.partition_point(|candidate| candidate.node.dist <= distance);
-            if at >= search_list_size {
-                continue;
-            }
-            list.insert(
-                at,
-                Candidate {
-                    node: OrderedNode::new(*neighbor, distance),
-                    expanded: false,
-                },
-            );
-            list.truncate(search_list_size);
+            list.offer(*neighbor, query.distance(*neighbor));
         }
     }
 
     Ok(SearchResult {
-        candidates: list.into_iter().map(|candidate| candidate.node).collect(),
+        candidates: list.into_candidates(),
         visited,
     })
 }

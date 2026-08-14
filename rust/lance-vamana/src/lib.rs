@@ -19,6 +19,7 @@ pub mod format;
 pub mod insert;
 pub mod inserter;
 pub mod io;
+mod lazy;
 pub mod merge;
 pub mod merger;
 pub mod partition;

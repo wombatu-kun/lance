@@ -543,41 +543,7 @@ fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
         ));
     }
     for (local_id, out_edges) in slots.chunks_exact(width).enumerate() {
-        let mut padded = false;
-        for neighbor in out_edges {
-            if *neighbor == NO_NEIGHBOR {
-                padded = true;
-                continue;
-            }
-            // The padding is a suffix, because a vertex's degree is the index of
-            // its first sentinel. An id sitting after one is not read at all:
-            // the vertex silently becomes a dead end, and a dead-end medoid
-            // reduces its whole partition to a single answer.
-            if padded {
-                return Err(Error::corrupt_file_named(
-                    NEIGHBORS_COLUMN,
-                    format!(
-                        "Vamana vertex {local_id} holds neighbour {neighbor} after its padding, \
-                         so its degree cannot be read"
-                    ),
-                ));
-            }
-            if *neighbor as usize >= num_rows {
-                return Err(Error::corrupt_file_named(
-                    NEIGHBORS_COLUMN,
-                    format!(
-                        "Vamana vertex {local_id} points at local id {neighbor}, but the \
-                         partition holds only {num_rows} vertices"
-                    ),
-                ));
-            }
-            if *neighbor as usize == local_id {
-                return Err(Error::corrupt_file_named(
-                    NEIGHBORS_COLUMN,
-                    format!("Vamana vertex {local_id} points at itself"),
-                ));
-            }
-        }
+        checked_neighbors(out_edges, local_id as u32, num_rows)?;
     }
     // Duplicate out-edges are deliberately not checked here, unlike on the write
     // path. A repeat is harmless to a walk - `SearchScratch` marks a vertex the
@@ -589,6 +555,131 @@ fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
         row_ids,
         neighbors: slots.to_vec(),
     })
+}
+
+/// One vertex's adjacency slots, trimmed at the padding and checked.
+///
+/// Shared between the two ways a walk can get at an edge list, because the
+/// checks are what stand between a flipped byte on disk and a panic: an id past
+/// the end of the partition indexes straight into a walk's visit marks. A whole
+/// partition runs this over every vertex on the way in; a lazy walk runs it over
+/// the vertices it fetches, as it fetches them, and no other reader of
+/// [`NEIGHBORS_COLUMN`] exists.
+///
+/// `local_id` is the vertex the slots belong to, which the caller knows and the
+/// slots do not: without it a self-edge is unrecognisable.
+pub(crate) fn checked_neighbors(slots: &[u32], local_id: u32, num_rows: usize) -> Result<&[u32]> {
+    // The padding is a suffix, because a vertex's degree is the index of its
+    // first sentinel. An id sitting after one is not read at all: the vertex
+    // silently becomes a dead end, and a dead-end medoid reduces its whole
+    // partition to a single answer.
+    let mut degree = None;
+    for (position, neighbor) in slots.iter().enumerate() {
+        if *neighbor == NO_NEIGHBOR {
+            degree.get_or_insert(position);
+            continue;
+        }
+        if degree.is_some() {
+            return Err(Error::corrupt_file_named(
+                NEIGHBORS_COLUMN,
+                format!(
+                    "Vamana vertex {local_id} holds neighbour {neighbor} after its padding, so \
+                     its degree cannot be read"
+                ),
+            ));
+        }
+        if *neighbor as usize >= num_rows {
+            return Err(Error::corrupt_file_named(
+                NEIGHBORS_COLUMN,
+                format!(
+                    "Vamana vertex {local_id} points at local id {neighbor}, but the partition \
+                     holds only {num_rows} vertices"
+                ),
+            ));
+        }
+        if *neighbor == local_id {
+            return Err(Error::corrupt_file_named(
+                NEIGHBORS_COLUMN,
+                format!("Vamana vertex {local_id} points at itself"),
+            ));
+        }
+    }
+    Ok(&slots[..degree.unwrap_or(slots.len())])
+}
+
+/// [`NEIGHBORS_COLUMN`] of a batch of rows read on their own, as one flat slice.
+///
+/// `max_degree` comes from the segment rather than from the column, which is the
+/// opposite of what [`graph_from_batch`] does and is the point: a lazy walk
+/// never holds a whole partition, so nothing else is in a position to notice a
+/// file whose stride disagrees with the segment that lists it.
+pub(crate) fn neighbor_slots(batch: &RecordBatch, max_degree: u32) -> Result<&[u32]> {
+    let neighbors = fixed_size_list(batch, NEIGHBORS_COLUMN)?;
+    if neighbors.value_length() != max_degree as i32 {
+        return Err(Error::corrupt_file_named(
+            NEIGHBORS_COLUMN,
+            format!(
+                "Vamana neighbours column is {} slots wide but its segment declares max_degree \
+                 {max_degree}",
+                neighbors.value_length()
+            ),
+        ));
+    }
+    if neighbors.null_count() != 0 || neighbors.values().null_count() != 0 {
+        return Err(Error::corrupt_file_named(
+            NEIGHBORS_COLUMN,
+            "Vamana neighbours column holds nulls".to_string(),
+        ));
+    }
+    let slots = neighbors
+        .values()
+        .as_primitive_opt::<UInt32Type>()
+        .ok_or_else(|| {
+            Error::corrupt_file_named(
+                NEIGHBORS_COLUMN,
+                "Vamana neighbour ids are not UInt32".to_string(),
+            )
+        })?
+        .values();
+    let expected = neighbors.len() * max_degree as usize;
+    if slots.len() != expected {
+        return Err(Error::corrupt_file_named(
+            NEIGHBORS_COLUMN,
+            format!(
+                "Vamana adjacency holds {} ids, expected {expected} for {} vertices of width \
+                 {max_degree}",
+                slots.len(),
+                neighbors.len()
+            ),
+        ));
+    }
+    Ok(slots)
+}
+
+/// [`VECTOR_COLUMN`] of a batch of rows read on their own.
+///
+/// The width against the segment for the same reason as [`neighbor_slots`], and
+/// the nulls because `flat_storage` reads values straight through a validity
+/// mask - a null vector would come back as a distance of zero, the nearest
+/// answer there is.
+pub(crate) fn vectors_of(batch: &RecordBatch, dimension: u32) -> Result<FixedSizeListArray> {
+    let vectors = vectors_from_batch(batch)?;
+    if vectors.value_length() != dimension as i32 {
+        return Err(Error::corrupt_file_named(
+            VECTOR_COLUMN,
+            format!(
+                "Vamana vector column is {} wide but its segment declares dimension {dimension}",
+                vectors.value_length()
+            ),
+        ));
+    }
+    if vectors.null_count() != 0 || vectors.values().null_count() != 0 {
+        return Err(Error::corrupt_file_named(
+            VECTOR_COLUMN,
+            "Vamana vector column holds nulls".to_string(),
+        ));
+    }
+    Ok(vectors)
 }
 
 fn vectors_from_batch(batch: &RecordBatch) -> Result<FixedSizeListArray> {
@@ -942,6 +1033,33 @@ mod tests {
         let mut graph = sample_graph(4);
         let error = graph.set_neighbors(0, &[1, 2, 1]).unwrap_err();
         assert!(error.to_string().contains("duplicate out-edge"), "{error}");
+    }
+
+    /// A lazy walk holds no [`Partition`], so `check_partition_shape` never runs
+    /// for it and these two accessors are the only place a partition file whose
+    /// stride disagrees with its segment can be caught. Without the check the
+    /// walk would read a neighbour list striding by the wrong number of slots
+    /// and follow edges assembled out of two vertices' halves.
+    #[test]
+    fn a_column_disagreeing_with_the_segment_is_rejected() {
+        let partition = sample_partition(4);
+        let batch = partition.to_batch(None).unwrap();
+
+        assert_eq!(
+            neighbor_slots(&batch, 4).unwrap().len(),
+            4 * partition.len()
+        );
+        let error = neighbor_slots(&batch, 8).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("max_degree 8"), "{error}");
+
+        assert_eq!(
+            vectors_of(&batch, DIMENSION as u32).unwrap().len(),
+            partition.len()
+        );
+        let error = vectors_of(&batch, DIMENSION as u32 + 1).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("dimension 4"), "{error}");
     }
 
     #[test]

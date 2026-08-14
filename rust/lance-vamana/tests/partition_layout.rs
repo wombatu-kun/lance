@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::UInt32Type;
+use arrow_array::types::{UInt32Type, UInt64Type};
 use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
 use lance_core::utils::io_stats::IoStatsRecorder;
@@ -27,7 +27,7 @@ use lance_io::object_store::ObjectStore;
 use lance_vamana::codes::{CODE_COLUMN, CodeParams};
 use lance_vamana::format::{NEIGHBORS_COLUMN, ROW_ID_COLUMN, VECTOR_COLUMN, partition_schema};
 use lance_vamana::io::{
-    SEGMENT_FILE_VERSION, open_file, read_partition, read_rows, scan_scheduler,
+    SEGMENT_FILE_VERSION, open_file, read_partition, read_rows, read_scattered, scan_scheduler,
 };
 use lance_vamana::partition::Partition;
 use object_store::path::Path;
@@ -268,6 +268,57 @@ async fn partition_round_trips_through_a_file() {
     assert!(error.to_string().contains("segment table lists"), "{error}");
     let error = read_rows(&reader, 0..0).await.unwrap_err();
     assert!(error.to_string().contains("selects nothing"), "{error}");
+}
+
+/// A scattered read gives back exactly the rows asked for, in the order asked
+/// for.
+///
+/// The contract a lazy walk is built on, and it belongs to Lance rather than to
+/// this crate: the walk reads the edges of `beam_width` vertices in one request
+/// and then attributes each returned row to the vertex at the same position, so
+/// a reader that reordered, deduplicated or coalesced rows away would credit
+/// every edge list to the wrong vertex - and produce a perfectly plausible walk
+/// over a graph that does not exist.
+#[tokio::test]
+async fn a_scattered_read_returns_the_rows_asked_for_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = local_store_and_path(&dir, "part_00000.idx");
+    let partition = sample_partition(MAX_DEGREE, VERTICES, DIMENSION);
+    lance_vamana::io::write_partition(&store, &path, &partition, None)
+        .await
+        .unwrap();
+    let reader = open_file(
+        &scan_scheduler(&store),
+        &path,
+        Some(&[ROW_ID_COLUMN]),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Deliberately uneven: two adjacent rows the scheduler will coalesce, and
+    // gaps of every size around them.
+    let wanted = [0u32, 1, 2, 37, 38, 1000, 2047, 2048, VERTICES as u32 - 1];
+    let batch = read_scattered(&reader, &wanted).await.unwrap();
+    let got = batch[ROW_ID_COLUMN]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    let expected = wanted
+        .iter()
+        .map(|row| partition.graph().row_ids()[*row as usize])
+        .collect::<Vec<_>>();
+    assert_eq!(got, expected);
+
+    // Both halves of the contract the caller owns. The reader coalesces without
+    // sorting, so descending ranges would silently read the wrong rows, and an
+    // empty request would come back as a batch with no schema to concatenate.
+    let error = read_scattered(&reader, &[7, 3]).await.unwrap_err();
+    assert!(error.to_string().contains("strictly ascending"), "{error}");
+    let error = read_scattered(&reader, &[]).await.unwrap_err();
+    assert!(error.to_string().contains("no rows at all"), "{error}");
+    let error = read_scattered(&reader, &[4, 4]).await.unwrap_err();
+    assert!(error.to_string().contains("strictly ascending"), "{error}");
 }
 
 /// The size a caller declares is the size the reader uses. That is what lets a

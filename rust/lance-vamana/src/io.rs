@@ -26,7 +26,7 @@ use lance_index::pb;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use prost::Message;
@@ -92,73 +92,124 @@ pub fn scan_scheduler(store: &Arc<ObjectStore>) -> Arc<ScanScheduler> {
     ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(store))
 }
 
+/// One file of a segment, opened once and projected as often as wanted.
+///
+/// A projection is fixed when a reader is built, and a lazy walk reads three
+/// different sets of columns out of one partition: the codes it steers by, then
+/// the edges of every vertex it expands, then the vectors of what it ended up
+/// with. Opening the file once per projection would re-read the footer for each,
+/// and the footer is a round trip - which is the currency the lazy path is
+/// spending to save bytes, so it must not spend three where one will do.
+pub struct PartitionFile {
+    path: Path,
+    file: FileScheduler,
+    /// The unprojected reader: where the file metadata every projection is built
+    /// from comes from, and the answer when a caller wants every column.
+    reader: FileReader,
+}
+
+impl PartitionFile {
+    /// Open `path`, reading its footer once.
+    ///
+    /// `size_bytes` skips the size probe when the caller already knows the
+    /// answer - Lance records the size of every file of a committed index in the
+    /// dataset manifest, so at query time it always does.
+    pub async fn open(
+        scheduler: &Arc<ScanScheduler>,
+        path: &Path,
+        size_bytes: Option<u64>,
+    ) -> Result<Self> {
+        let size = size_bytes.map_or_else(CachedFileSize::unknown, CachedFileSize::new);
+        let file = scheduler.open_file(path, &size).await?;
+        let reader = FileReader::try_open(
+            file.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await?;
+        // The version is pinned on the way out and therefore has to be checked
+        // on the way in. It is not a formality: a projection is computed against
+        // the structural grammar of [`SEGMENT_FILE_VERSION`], and a file written
+        // under another one lays its columns out differently - the read would
+        // succeed and return the wrong bytes rather than fail.
+        if reader.metadata().version() != SEGMENT_FILE_VERSION {
+            return Err(Error::corrupt_file_named(
+                path.filename().unwrap_or(INDEX_FILE_NAME),
+                format!(
+                    "Vamana segment file is a Lance {} file, and this crate writes and reads {}",
+                    reader.metadata().version(),
+                    SEGMENT_FILE_VERSION
+                ),
+            ));
+        }
+        Ok(Self {
+            path: path.clone(),
+            file,
+            reader,
+        })
+    }
+
+    /// A reader that decodes `columns` and nothing else.
+    ///
+    /// Built from the metadata [`Self::open`] already read rather than from the
+    /// path: a projection changes what is decoded, not what the file says about
+    /// itself, and `try_open` would go back to storage for the footer to be told
+    /// so.
+    pub async fn project(&self, columns: &[&str]) -> Result<FileReader> {
+        let options = FileReaderOptions::default();
+        let projection = reader_projection_from_column_names(
+            SEGMENT_FILE_VERSION,
+            self.reader.schema(),
+            columns,
+        )?;
+        FileReader::try_open_with_file_metadata(
+            Arc::new(
+                LanceEncodingsIo::new(self.file.clone())
+                    .with_read_chunk_size(options.read_chunk_size),
+            ),
+            self.path.clone(),
+            Some(projection),
+            Arc::<DecoderPlugins>::default(),
+            self.reader.metadata().clone(),
+            &LanceCache::no_cache(),
+            options,
+        )
+        .await
+    }
+
+    /// The reader over every column.
+    pub fn whole(self) -> FileReader {
+        self.reader
+    }
+}
+
 /// Open a file of a segment for reading.
 ///
-/// `columns` narrows what is fetched; pass `None` to read every column.
-/// `size_bytes` skips the size probe when the caller already knows the answer -
-/// Lance records the size of every file of a committed index in the dataset
-/// manifest, so at query time it always does.
+/// `columns` narrows what is fetched; pass `None` to read every column. Reach
+/// for [`PartitionFile`] instead when the same file is to be read under more
+/// than one projection.
 pub async fn open_file(
     scheduler: &Arc<ScanScheduler>,
     path: &Path,
     columns: Option<&[&str]>,
     size_bytes: Option<u64>,
 ) -> Result<FileReader> {
-    let options = FileReaderOptions::default();
-    let size = size_bytes.map_or_else(CachedFileSize::unknown, CachedFileSize::new);
-    let file = scheduler.open_file(path, &size).await?;
-    let reader = FileReader::try_open(
-        file.clone(),
-        None,
-        Arc::<DecoderPlugins>::default(),
-        &LanceCache::no_cache(),
-        options.clone(),
-    )
-    .await?;
-    // The version is pinned on the way out and therefore has to be checked on
-    // the way in. It is not a formality: the projection below is computed
-    // against the structural grammar of [`SEGMENT_FILE_VERSION`], and a file
-    // written under another one lays its columns out differently - the read
-    // would succeed and return the wrong bytes rather than fail.
-    if reader.metadata().version() != SEGMENT_FILE_VERSION {
-        return Err(Error::corrupt_file_named(
-            path.filename().unwrap_or(INDEX_FILE_NAME),
-            format!(
-                "Vamana segment file is a Lance {} file, and this crate writes and reads {}",
-                reader.metadata().version(),
-                SEGMENT_FILE_VERSION
-            ),
-        ));
+    let file = PartitionFile::open(scheduler, path, size_bytes).await?;
+    match columns {
+        Some(columns) => file.project(columns).await,
+        None => Ok(file.whole()),
     }
-
-    let Some(columns) = columns else {
-        return Ok(reader);
-    };
-    // Reopened from the metadata the first open already read, not from the path.
-    // A projection changes what is decoded, not what the file says about itself,
-    // and `try_open` would go back to storage for the footer to be told so.
-    let projection =
-        reader_projection_from_column_names(SEGMENT_FILE_VERSION, reader.schema(), columns)?;
-    FileReader::try_open_with_file_metadata(
-        Arc::new(LanceEncodingsIo::new(file).with_read_chunk_size(options.read_chunk_size)),
-        path.clone(),
-        Some(projection),
-        Arc::<DecoderPlugins>::default(),
-        reader.metadata().clone(),
-        &LanceCache::no_cache(),
-        options,
-    )
-    .await
 }
 
 /// Read a contiguous run of rows.
 ///
 /// `Range` rather than the whole file because the layout is built for it: the
-/// reason `__neighbors` has a fixed stride is that reading one vertex must fetch
-/// `max_degree * 4` bytes and nothing else. Nothing does that yet - both callers
-/// read a partition whole - so today the range is always `0..num_rows`. It stays
-/// a range because the lazy traversal that will use it is the point of the
-/// layout, and a whole-file signature would quietly give that up.
+/// reason `__neighbors` has a fixed stride is that reading one vertex fetches
+/// `max_degree * 4` bytes and nothing else. A lazy walk reaches for
+/// [`read_scattered`] instead, which is the same read for a set of rows that are
+/// not adjacent.
 pub async fn read_rows(reader: &FileReader, rows: Range<usize>) -> Result<RecordBatch> {
     if rows.is_empty() {
         return Err(Error::invalid_input(format!(
@@ -188,6 +239,70 @@ pub async fn read_rows(reader: &FileReader, rows: Range<usize>) -> Result<Record
         })?
         .schema();
     Ok(concat_batches(&schema, batches.iter())?)
+}
+
+/// Read a scattered set of single rows as one request.
+///
+/// [`ReadBatchParams::Ranges`] and not a call per row: the scheduler coalesces
+/// adjacent ranges in one pass, which measured half the iops and half the bytes
+/// of issuing them separately, and it is what turns one hop of a lazy walk into
+/// one round trip instead of `beam_width` of them.
+///
+/// `rows` must be strictly ascending, because that coalescing pass does not
+/// sort - and the returned batch is in the order given, so a caller reading a
+/// row back by position depends on it too. Both are internal contracts of the
+/// lazy walk rather than anything a file can violate, hence the plain check.
+pub async fn read_scattered(reader: &FileReader, rows: &[u32]) -> Result<RecordBatch> {
+    if rows.is_empty() {
+        return Err(Error::invalid_input(
+            "Vamana was asked to read no rows at all".to_string(),
+        ));
+    }
+    if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(Error::internal(
+            "Vamana scattered reads must arrive strictly ascending; the scheduler coalesces \
+             ranges without sorting them"
+                .to_string(),
+        ));
+    }
+    let ranges = rows
+        .iter()
+        .map(|row| *row as u64..*row as u64 + 1)
+        .collect::<Vec<Range<u64>>>();
+    let batches = reader
+        .read_stream(
+            ReadBatchParams::Ranges(ranges.into()),
+            u32::MAX,
+            1,
+            FilterExpression::no_filter(),
+        )
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+    let schema = batches
+        .first()
+        .ok_or_else(|| {
+            Error::corrupt_file_named(
+                "partition",
+                format!(
+                    "Vamana read of {} scattered rows returned no data",
+                    rows.len()
+                ),
+            )
+        })?
+        .schema();
+    let batch = concat_batches(&schema, batches.iter())?;
+    if batch.num_rows() != rows.len() {
+        return Err(Error::corrupt_file_named(
+            "partition",
+            format!(
+                "Vamana asked for {} scattered rows and got {}",
+                rows.len(),
+                batch.num_rows()
+            ),
+        ));
+    }
+    Ok(batch)
 }
 
 /// Check a partition file against what `index.idx` says it holds.

@@ -99,35 +99,51 @@ two are meant to say the same thing.
   makes them ordinary new rows, and `insert_as_segment` brings them back.
 - **No predicate prefilter and no refine step.** Both live in Lance's scanner,
   which this driver bypasses.
-- **Partitions are read whole, and nothing is cached between queries.** A query
-  keeps a few reads in flight, so its working set is a few partitions rather
-  than every partition it probes. Reading only the vertices a walk touches was
-  measured instead of assumed (`examples/memory_gate.rs`): on its own it halves
-  the pages moved at best and costs *more* CPU at fine granularity, because a
-  walk scores `R` neighbours for every vertex it expands and so touches
-  twenty-five to forty times as many as it expands. It pays with quantised codes
-  resident - a tenth of the pages at 1000 rows a partition, a three-hundredth at
-  65536 - and only while the cache holds a fraction of the index. Three bits a
-  dimension is what "codes" has to mean (`examples/coded_walk.rs`): at three the
-  walk spends two to thirteen per cent more comparisons than an exact one at equal
-  recall, at one it needs a beam one and a half to three and a half times wider,
-  and either way the answer has to be re-scored from the whole candidate list
-  rather than from its nearest `K`. Reading a vertex's vector as it is expanded -
-  which DiskANN gets free, because one page carries a vertex's edges next to its
-  vector - was measured too, and does not pay: correcting a distance seats that
-  vertex at the back of the list, the back of the list is the bar a new candidate
-  has to beat, and so the walk expands more for it - three times more at one bit.
-  At equal work a wider beam on plain codes reaches higher recall.
+- **Nothing is cached between queries.** A query keeps a few reads in flight, so
+  its working set is a few partitions rather than every partition it probes -
+  and the next query pays for those same partitions again. A caveat for the
+  default walk, and a much larger one for the lazy walk below, whose whole point
+  is a resident set of codes it has nowhere to keep.
+- **A partition is read whole unless the walk is told otherwise.** Reading only
+  the vertices a walk touches was measured instead of assumed
+  (`examples/memory_gate.rs`): on its own it halves the pages moved at best and
+  costs *more* CPU at fine granularity, because a walk scores `R` neighbours for
+  every vertex it expands and so touches twenty-five to forty times as many as it
+  expands. It pays with quantised codes standing in for those vectors, and only
+  while the cache holds a fraction of the index - replaying real probe sequences
+  through an LRU that holds all of it serves 25 to 250 queries per load, far past
+  the crossover where reading whole was cheaper. Three bits a dimension is what
+  "codes" has to mean (`examples/coded_walk.rs`): at three the walk spends two to
+  thirteen per cent more comparisons than an exact one at equal recall, at one it
+  needs a beam one and a half to three and a half times wider, and either way the
+  answer has to be re-scored from the whole candidate list rather than from its
+  nearest `K`. Reading a vertex's vector as it is expanded - which DiskANN gets
+  free, because one page carries a vertex's edges next to its vector - was
+  measured too, and does not pay: correcting a distance seats that vertex at the
+  back of the list, the back of the list is the bar a new candidate has to beat,
+  and so the walk expands more for it - three times more at one bit. At equal
+  work a wider beam on plain codes reaches higher recall.
 
-  The codes themselves are here: `IndexParams::with_code_bits(3)` builds a
-  partition file with a `__code` column beside its vectors and its edges, and
+  Both halves are here. `IndexParams::with_code_bits(3)` builds a partition file
+  with a `__code` column beside its vectors and its edges;
   `SearchParams::with_mode(WalkMode::Coded)` walks by it and re-scores the whole
-  candidate list exactly. **On their own they buy nothing** - the partition is
-  still read whole - and they cost thirteen per cent of the index at `d = 128`
-  and a few per cent more distance computations. They are the half of the lazy
-  read that has to exist first; the read itself does not exist yet. Off by
-  default, and refused rather than skipped for a dimension that is not a multiple
-  of eight, which is what RaBitQ packs a bit a dimension into.
+  candidate list exactly, still reading the partition whole; and
+  `WalkMode::Lazy` keeps the row ids and the codes and fetches the rest as it
+  goes - the out-edges of a vertex when it expands one,
+  `SearchParams::with_beam_width` vertices to a request, then the vectors of the
+  candidate list in one more.
+
+  On SIFT1M at 65536 rows a partition, four probes and equal recall
+  (`examples/lazy_walk.rs`), that is **18.2 MB a query against 198.6 MB** read
+  whole, and **18.5 ms of warm CPU against 129.8 ms** - decoding two hundred
+  megabytes costs more than fetching eighteen, even with every byte already in
+  the page cache. What it pays is round trips: 20 requests become 54, and 28
+  iops become 194. Nine tenths of what is left is the code column, read again by
+  every query because nothing here caches it, so a process that could hold the
+  codes resident would be reading 0.7 MB a query rather than 18.2.
+
+  Codes are off by default, and refused rather than skipped for a dimension that
+  is not a multiple of eight, which is what RaBitQ packs a bit a dimension into.
 
 An index is **refused** at open, rather than answering from what is left, when:
 

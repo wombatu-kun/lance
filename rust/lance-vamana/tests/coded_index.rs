@@ -406,27 +406,35 @@ async fn a_cosine_index_walks_by_codes_too() {
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
     assert_eq!(index.metadata().distance_type, DistanceType::Cosine);
 
-    let mut overlap = 0.0;
+    // The lazy arm rides along, because cosine's detour has a fourth place to go
+    // wrong there: the walk is handed the normalised query for the codes and the
+    // raw one for the re-scoring, and the two are the same array under every
+    // other metric - so a mix-up is invisible everywhere but here.
+    let mut overlap = [0.0, 0.0];
     let queries = random_vectors(QUERIES, 4242);
     for query in &queries {
         let exact = index.search(query, &search(WalkMode::Exact)).await.unwrap();
-        let coded = index.search(query, &search(WalkMode::Coded)).await.unwrap();
         let rows = exact
             .neighbors
             .iter()
             .map(|neighbor| neighbor.row_addr)
             .collect::<Vec<_>>();
-        let found = coded
-            .neighbors
-            .iter()
-            .map(|neighbor| neighbor.row_addr)
-            .collect::<Vec<_>>();
-        overlap += recall(&found, &rows);
+        for (slot, mode) in [WalkMode::Coded, WalkMode::Lazy].into_iter().enumerate() {
+            let result = index.search(query, &search(mode)).await.unwrap();
+            let found = result
+                .neighbors
+                .iter()
+                .map(|neighbor| neighbor.row_addr)
+                .collect::<Vec<_>>();
+            overlap[slot] += recall(&found, &rows);
+        }
     }
-    overlap /= queries.len() as f64;
-    println!("cosine: the coded arm recovered {overlap:.4} of the exact arm's answer");
-    assert!(
-        overlap > 0.9,
-        "the coded arm recovered {overlap:.4} of what the exact arm found under cosine"
-    );
+    for (label, total) in ["coded", "lazy"].into_iter().zip(overlap) {
+        let overlap = total / queries.len() as f64;
+        println!("cosine: the {label} arm recovered {overlap:.4} of the exact arm's answer");
+        assert!(
+            overlap > 0.9,
+            "the {label} arm recovered {overlap:.4} of what the exact arm found under cosine"
+        );
+    }
 }
