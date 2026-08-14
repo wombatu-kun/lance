@@ -13,7 +13,7 @@
 //! `PROBE_PERCENT` (default 20) or `NPROBES` (one per granularity, overriding the
 //! percentage), `BEAMS` (default `10,20,40,80,160,320`), `DEGREE` (default 64),
 //! `RQ_BITS` (default `1,3,5`), `SQ_BITS` (default 8), `TARGET_RECALL` (default
-//! 95), `ROWS_PER_FRAGMENT` (default 10000).
+//! 95), `ROWS_PER_FRAGMENT` (default 10000), `HYBRID` (default 1).
 //!
 //! The phase D gate (`examples/memory_gate.rs`) measured that a traversal reading
 //! only the vertices it touches moves a tenth to a three-hundredth of the pages the
@@ -28,7 +28,7 @@
 //! is the geometry a real segment has and the reason a one-bit code can work at
 //! all. So the arms differ in exactly one thing: what the beam search compares.
 //!
-//! Three answers are scored per arm, because they cost different reads:
+//! Four answers are scored per arm, because they cost different reads:
 //!
 //! - **walk**: the walk's own nearest `K`, in the order the codes put them. No
 //!   vector is read at all, and no re-ranking happens.
@@ -36,7 +36,22 @@
 //!   real vectors. `nprobes * K` vertex reads, which is what the gate charged the
 //!   coded arm for.
 //! - **rerank L**: every candidate the walk kept, re-scored. `nprobes * beam`
-//!   reads, which is what DiskANN does.
+//!   reads.
+//! - **rerank E**: every vertex the walk expanded, re-scored. This is the set
+//!   DiskANN actually answers from, and it is free in their layout: one page
+//!   carries a vertex's vector next to its edges, so a hop that reads the edges
+//!   has the vector in hand. Our columns are separate, so it is one more ranged
+//!   read per expansion - and since a walk only stops when nothing in its list is
+//!   unexpanded, this set *contains* the beam. It runs about a fifth larger at the
+//!   narrow beams a working point uses, and the gap closes as the beam widens,
+//!   because a list long enough to truncate nothing ends up holding everything the
+//!   walk expanded.
+//!
+//! The `+h` arms take the other half of the same trade. They *walk* with the exact
+//! distance of every vertex they expand, so the beam is re-sorted with a true value
+//! wherever one has already been paid for, and the codes steer only the vertices
+//! nothing has been read for yet. Everything else is held equal: same graph, same
+//! codes, same beam, same entry point.
 //!
 //! Recall is compared at equal recall rather than at equal beam: a coded arm that
 //! needs a wider beam to match is not cheaper for having read fewer bytes per
@@ -65,6 +80,7 @@ use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::storage::RabitQuantizationStorage;
 use lance_index::vector::bq::transform::RQTransformer;
 use lance_index::vector::flat::storage::FlatFloatStorage;
+use lance_index::vector::graph::{OrderedFloat, OrderedNode};
 use lance_index::vector::quantizer::{Quantization, QuantizerStorage};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::sq::storage::ScalarQuantizationStorage;
@@ -77,8 +93,8 @@ use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::format::INDEX_FILE_NAME;
 use lance_vamana::io::{open_file, read_partition, read_segment, scan_scheduler};
-use lance_vamana::partition::Partition;
-use lance_vamana::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
+use lance_vamana::partition::{Partition, PartitionGraph};
+use lance_vamana::search::{Comparisons, SearchResult, SearchScratch, flat_storage, greedy_search};
 use lance_vamana::segment::{PartitionEntry, SegmentManifest};
 use object_store::path::Path;
 
@@ -441,25 +457,228 @@ fn calibrate<S: VectorStore>(
     (errors[errors.len() / 2], agreement / queries.len() as f64)
 }
 
+/// A seat in a hybrid walk's search list.
+///
+/// The same shape `greedy_search` keeps privately. This walk is a copy of it rather
+/// than a parameter added to it because the question is whether an exact distance
+/// at expansion changes where a walk goes, and that only means something if the
+/// walk it is compared against stays untouched.
+struct Seat {
+    node: OrderedNode,
+    expanded: bool,
+}
+
+/// A walk that spends one exact distance on every vertex it expands.
+///
+/// The correction happens *at* the expansion and never before it, and that is what
+/// keeps the arm honest rather than flattering: a vertex whose vector is read is a
+/// vertex whose page was fetched, so peeking at a true distance before deciding
+/// whether to expand would charge DiskANN's price for a read DiskANN never makes.
+/// A correction therefore cannot change which vertex is expanded now, only where
+/// the list stands when the next one is chosen - and that is a bigger change than
+/// it sounds. A code that flatters a vertex seats it too near the front; correcting
+/// it at expansion sends it to the back, and the back of a full list is the bar a
+/// new candidate has to beat to be admitted at all. So a hybrid walk keeps letting
+/// candidates in that the same walk on codes alone would have turned away, and it
+/// expands more vertices at the same beam width. That is why the arms are compared
+/// at equal recall and not at equal beam.
+///
+/// With `approximate` and `exact` the same store every correction is a no-op and
+/// this is `greedy_search` exactly, which is what [`verify_hybrid`] checks.
+fn hybrid_search(
+    graph: &PartitionGraph,
+    approximate: &impl DistCalculator,
+    exact: &impl DistCalculator,
+    entry_point: u32,
+    search_list_size: usize,
+    comparisons: &Comparisons,
+    corrections: &Comparisons,
+) -> SearchResult {
+    let mut seen = vec![false; graph.len()];
+    seen[entry_point as usize] = true;
+    comparisons.record(1);
+    let mut list = Vec::with_capacity(search_list_size.min(graph.len()) + 1);
+    list.push(Seat {
+        node: OrderedNode::new(entry_point, OrderedFloat(approximate.distance(entry_point))),
+        expanded: false,
+    });
+    let mut visited = Vec::new();
+
+    while let Some(position) = list.iter().position(|seat| !seat.expanded) {
+        list[position].expanded = true;
+        let id = list[position].node.id;
+        corrections.record(1);
+        let corrected = OrderedFloat(exact.distance(id));
+        if corrected != list[position].node.dist {
+            let mut seat = list.remove(position);
+            seat.node.dist = corrected;
+            // No truncation test, unlike the insertion below: the removal already
+            // freed the seat this is going back into, so a corrected vertex always
+            // has somewhere to land however far back it belongs.
+            let at = list.partition_point(|other| other.node.dist <= corrected);
+            list.insert(at, seat);
+            // The list is scanned by position, so a re-insertion that landed out of
+            // order would not fail - it would quietly change which vertex is
+            // expanded next. Its two neighbours are the whole of the invariant, and
+            // checking them is constant time.
+            assert!(
+                list[..at]
+                    .last()
+                    .is_none_or(|before| before.node.dist <= corrected)
+                    && list[at + 1..]
+                        .first()
+                        .is_none_or(|after| corrected <= after.node.dist),
+                "a corrected vertex was re-seated out of order"
+            );
+        }
+        visited.push(OrderedNode::new(id, corrected));
+
+        for neighbor in graph.neighbors(id).unwrap() {
+            if seen[*neighbor as usize] {
+                continue;
+            }
+            seen[*neighbor as usize] = true;
+            comparisons.record(1);
+            let distance = OrderedFloat(approximate.distance(*neighbor));
+            let at = list.partition_point(|seat| seat.node.dist <= distance);
+            if at >= search_list_size {
+                continue;
+            }
+            list.insert(
+                at,
+                Seat {
+                    node: OrderedNode::new(*neighbor, distance),
+                    expanded: false,
+                },
+            );
+            list.truncate(search_list_size);
+        }
+    }
+
+    SearchResult {
+        candidates: list.into_iter().map(|seat| seat.node).collect(),
+        visited,
+    }
+}
+
+/// Check the hybrid walk against the walk it is a copy of.
+///
+/// Handed one store for both calculators, every correction is a no-op, so the run
+/// has to come back from `greedy_search` bit for bit: same candidates with the same
+/// distances, same vertices expanded in the same order, same comparison count. Any
+/// difference is a difference in the copy - the loop, the truncation, the counting -
+/// rather than a property of the hybrid, and without this the arm would be
+/// measuring its own reimplementation of the thing it is compared against.
+///
+/// Run with the exact store and with a coded one, because the two differ in
+/// something this walk does care about: how many distances tie.
+fn verify_hybrid<S: VectorStore>(
+    probe: &Probe,
+    store: &S,
+    scoring: Scoring,
+    queries: &[ArrayRef],
+    beam: usize,
+) {
+    for query in queries {
+        let (key, dist_q_c) = query_key(probe, query, scoring.centroid_distance);
+        let calculator = store.dist_calculator(key, dist_q_c);
+
+        let expected_comparisons = Comparisons::default();
+        let mut scratch = SearchScratch::new(probe.partition.len());
+        let expected = greedy_search(
+            probe.partition.graph(),
+            &calculator,
+            probe.entry.medoid,
+            beam,
+            &mut scratch,
+            &expected_comparisons,
+        )
+        .unwrap();
+
+        let comparisons = Comparisons::default();
+        let corrections = Comparisons::default();
+        let found = hybrid_search(
+            probe.partition.graph(),
+            &calculator,
+            &calculator,
+            probe.entry.medoid,
+            beam,
+            &comparisons,
+            &corrections,
+        );
+
+        assert_eq!(
+            comparisons.get(),
+            expected_comparisons.get(),
+            "a hybrid walk with nothing to correct spent other comparisons"
+        );
+        assert_eq!(
+            corrections.get() as usize,
+            found.visited.len(),
+            "a hybrid walk must read exactly one vector per vertex it expands"
+        );
+        assert_eq!(
+            found.visited, expected.visited,
+            "a hybrid walk with nothing to correct expanded other vertices"
+        );
+        assert_eq!(
+            found.candidates, expected.candidates,
+            "a hybrid walk with nothing to correct kept other candidates"
+        );
+    }
+}
+
 /// One candidate a walk came back with, scored both ways.
 struct Candidate {
     /// The distance the walk ranked it by, quantised in every arm but the first.
     approx: f32,
     exact: f32,
     position: u64,
-    /// Whether it was among its own partition's nearest `K`, which is the cheaper
-    /// of the two re-ranking reads.
+    /// Whether it was among its own partition's nearest `K`, which is the cheapest
+    /// of the re-ranking reads.
     shortlisted: bool,
+    /// Whether the beam still held it when the walk stopped.
+    in_beam: bool,
+    /// Whether the walk followed its out-edges.
+    expanded: bool,
 }
 
-/// Hits among the nearest `K` by `key`, optionally over the shortlist only.
-fn hits<F>(candidates: &[Candidate], expected: &HashSet<u64>, shortlist_only: bool, key: F) -> usize
+/// Which vertices of a walk an answer may be read from, and so what it costs.
+///
+/// There is no "beam and expanded" between the last two, because a walk stops when
+/// no seat in its list is unexpanded and every expanded vertex is recorded: the beam
+/// it ends with is always a subset of what it expanded. That invariant is asserted
+/// where the two sets are merged rather than stated here, because a column equal to
+/// another column by construction is noise in a measurement.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// The walk's own nearest `K` per partition: `nprobes * K` vector reads.
+    Shortlist,
+    /// Every candidate the beam kept: `nprobes * beam` reads.
+    Beam,
+    /// Every vertex the walk expanded: free where one page carries a vertex's
+    /// vector next to its edges, one extra ranged read per expansion here.
+    Expanded,
+}
+
+impl Answer {
+    fn admits(self, candidate: &Candidate) -> bool {
+        match self {
+            Self::Shortlist => candidate.shortlisted,
+            Self::Beam => candidate.in_beam,
+            Self::Expanded => candidate.expanded,
+        }
+    }
+}
+
+/// Hits among the nearest `K` by `key`, over the vertices `answer` admits.
+fn hits<F>(candidates: &[Candidate], expected: &HashSet<u64>, answer: Answer, key: F) -> usize
 where
     F: Fn(&Candidate) -> f32,
 {
     let mut ranked = candidates
         .iter()
-        .filter(|candidate| !shortlist_only || candidate.shortlisted)
+        .filter(|candidate| answer.admits(candidate))
         .collect::<Vec<_>>();
     ranked.sort_unstable_by(|left, right| key(left).total_cmp(&key(right)));
     ranked
@@ -469,12 +688,46 @@ where
         .count()
 }
 
+/// How an arm scores what its walk sees.
+#[derive(Clone, Copy)]
+struct Scoring {
+    /// Whether the store wants the raw query and `|q - c|^2` rather than the
+    /// residual - see [`query_key`], where getting this wrong is not approximate.
+    centroid_distance: bool,
+    /// Whether a vertex's distance is recomputed exactly when it is expanded.
+    hybrid: bool,
+}
+
+impl Scoring {
+    /// The query as it came.
+    const PLAIN: Self = Self {
+        centroid_distance: false,
+        hybrid: false,
+    };
+    /// The query as it came *and* `|q - c|^2`, which is what RaBitQ's estimator
+    /// wants and what nothing else does.
+    const RABIT: Self = Self {
+        centroid_distance: true,
+        hybrid: false,
+    };
+
+    fn hybrid(self) -> Self {
+        Self {
+            hybrid: true,
+            ..self
+        }
+    }
+}
+
 #[derive(Default)]
 struct Row {
     beam: usize,
     walk: f64,
     rerank_k: f64,
     rerank_all: f64,
+    /// Recall answering from the expanded set, which is what DiskANN does - and
+    /// what a hybrid walk has already paid the reads for.
+    rerank_expanded: f64,
     comparisons: f64,
     visited: f64,
     rescored: f64,
@@ -486,6 +739,17 @@ struct Row {
     micros: u128,
 }
 
+/// One way of forming an answer out of what a walk came back with.
+///
+/// `reads` takes whether the arm walked hybrid because that decides the floor: a
+/// walk that has already read the vector of everything it expanded cannot answer
+/// for less than those reads, whatever set it answers from.
+struct Strategy {
+    name: &'static str,
+    recall: fn(&Row) -> f64,
+    reads: fn(&Row, bool) -> f64,
+}
+
 /// One arm: what it costs resident, how good its distances are, and what it scored.
 struct Arm {
     label: String,
@@ -494,6 +758,10 @@ struct Arm {
     error: f64,
     /// The share of a partition's true nearest `K` its own order keeps.
     agreement: f64,
+    /// Whether its walk read the vector of every vertex it expanded. Those reads
+    /// are already spent by the time the answer is formed, so they set the floor
+    /// under what any answer this arm gives costs.
+    hybrid: bool,
     rows: Vec<Row>,
 }
 
@@ -502,7 +770,7 @@ struct Arm {
 fn measure<S: VectorStore>(
     probes: &HashMap<u32, Probe>,
     stores: &HashMap<u32, S>,
-    centroid_distance: bool,
+    scoring: Scoring,
     queries: &[ArrayRef],
     plans: &[Vec<u32>],
     truth: &[HashSet<u64>],
@@ -520,29 +788,79 @@ fn measure<S: VectorStore>(
         let mut expanded = Vec::new();
         for partition_id in &plans[index] {
             let probe = &probes[partition_id];
-            let (key, dist_q_c) = query_key(probe, query, centroid_distance);
+            let (key, dist_q_c) = query_key(probe, query, scoring.centroid_distance);
             let calculator = stores[partition_id].dist_calculator(key, dist_q_c);
-            let mut scratch = SearchScratch::new(probe.partition.len());
-            let comparisons = Comparisons::default();
-            let walk = greedy_search(
-                probe.partition.graph(),
-                &calculator,
-                probe.entry.medoid,
-                beam,
-                &mut scratch,
-                &comparisons,
-            )
-            .unwrap();
-
             let exact = probe.exact.dist_calculator(query.clone(), 0.0);
+            let comparisons = Comparisons::default();
+            let walk = if scoring.hybrid {
+                let corrections = Comparisons::default();
+                let walk = hybrid_search(
+                    probe.partition.graph(),
+                    &calculator,
+                    &exact,
+                    probe.entry.medoid,
+                    beam,
+                    &comparisons,
+                    &corrections,
+                );
+                assert_eq!(
+                    corrections.get() as usize,
+                    walk.visited.len(),
+                    "the read count of a hybrid arm is its expansion count"
+                );
+                walk
+            } else {
+                let mut scratch = SearchScratch::new(probe.partition.len());
+                greedy_search(
+                    probe.partition.graph(),
+                    &calculator,
+                    probe.entry.medoid,
+                    beam,
+                    &mut scratch,
+                    &comparisons,
+                )
+                .unwrap()
+            };
+
+            // The beam and the expanded set overlap heavily and are held as one set,
+            // because a vertex in both is one vector read, not two.
+            let mut seat_of = HashMap::with_capacity(walk.candidates.len() + walk.visited.len());
             for (rank, node) in walk.candidates.iter().enumerate() {
+                seat_of.insert(node.id, candidates.len());
                 candidates.push(Candidate {
                     approx: node.dist.0,
                     exact: exact.distance(node.id),
                     position: probe.positions[node.id as usize],
                     shortlisted: rank < K,
+                    in_beam: true,
+                    expanded: false,
                 });
             }
+            let mut in_both = 0;
+            for node in &walk.visited {
+                match seat_of.get(&node.id) {
+                    Some(seat) => {
+                        candidates[*seat].expanded = true;
+                        in_both += 1;
+                    }
+                    None => candidates.push(Candidate {
+                        approx: node.dist.0,
+                        exact: exact.distance(node.id),
+                        position: probe.positions[node.id as usize],
+                        shortlisted: false,
+                        in_beam: false,
+                        expanded: true,
+                    }),
+                }
+            }
+            // A walk stops when nothing in its list is unexpanded, so every seat it
+            // ends with was expanded. The read counts rest on it: answering from the
+            // expanded set is a superset read, never a second one.
+            assert_eq!(
+                in_both,
+                walk.candidates.len(),
+                "a walk came back holding a candidate it never expanded"
+            );
             row.comparisons += comparisons.get() as f64;
             row.visited += walk.visited.len() as f64;
             row.rescored += walk.candidates.len() as f64;
@@ -551,9 +869,18 @@ fn measure<S: VectorStore>(
         expanded.sort_unstable();
 
         let expected = &truth[index];
-        row.walk += hits(&candidates, expected, false, |candidate| candidate.approx) as f64;
-        row.rerank_k += hits(&candidates, expected, true, |candidate| candidate.exact) as f64;
-        row.rerank_all += hits(&candidates, expected, false, |candidate| candidate.exact) as f64;
+        row.walk += hits(&candidates, expected, Answer::Beam, |candidate| {
+            candidate.approx
+        }) as f64;
+        row.rerank_k += hits(&candidates, expected, Answer::Shortlist, |candidate| {
+            candidate.exact
+        }) as f64;
+        row.rerank_all += hits(&candidates, expected, Answer::Beam, |candidate| {
+            candidate.exact
+        }) as f64;
+        row.rerank_expanded += hits(&candidates, expected, Answer::Expanded, |candidate| {
+            candidate.exact
+        }) as f64;
         match reference {
             Some(reference) => {
                 let same = reference[index]
@@ -581,6 +908,9 @@ struct Grid {
     probe_percent: usize,
     target_recall: f64,
     rows_per_fragment: usize,
+    /// Whether every coded arm is measured a second time walking with the exact
+    /// distance of each vertex it expands.
+    hybrid: bool,
     /// Scalar bounds over the whole dataset, which is where Lance's own `IVF_SQ`
     /// build takes them from. A per-partition range would flatter the arm.
     bounds: Range<f64>,
@@ -699,6 +1029,31 @@ async fn granularity(
     // of every arm's distances before any of them is asked to walk.
     let sample = *plans[0].first().unwrap();
     let calibration_queries = &queries[..queries.len().min(20)];
+    if grid.hybrid {
+        let widest = grid.beams.iter().max().copied().unwrap();
+        verify_hybrid(
+            &probes[&sample],
+            &exact_stores[&sample],
+            Scoring::PLAIN,
+            calibration_queries,
+            widest,
+        );
+        for (_, stores) in &rabit_stores {
+            verify_hybrid(
+                &probes[&sample],
+                &stores[&sample],
+                Scoring::RABIT,
+                calibration_queries,
+                widest,
+            );
+        }
+        println!(
+            "hybrid walk reproduces greedy_search on {} queries at beam {widest}, \
+             {} stores",
+            calibration_queries.len(),
+            1 + rabit_stores.len()
+        );
+    }
     let mut arms = Vec::with_capacity(2 + rabit_stores.len());
     for (label, bytes, calibration) in [
         (
@@ -727,6 +1082,7 @@ async fn granularity(
             bytes,
             error: calibration.0,
             agreement: calibration.1,
+            hybrid: false,
             rows: Vec::new(),
         });
     }
@@ -742,8 +1098,27 @@ async fn granularity(
             bytes: resident_bytes(&stores[&sample]),
             error,
             agreement,
+            hybrid: false,
             rows: Vec::new(),
         });
+    }
+    // A hybrid arm holds the same codes as its twin and therefore the same resident
+    // bytes and the same calibration: it differs in what it does with them, not in
+    // what it stores. Only the coded arms get one - `sq8` is here to separate "codes
+    // cannot steer" from "one bit cannot steer", and at 128 bytes a vertex it is not
+    // a candidate for what stays resident whatever it scores.
+    if grid.hybrid {
+        for index in 0..rabit_stores.len() {
+            let twin = &arms[2 + index];
+            arms.push(Arm {
+                label: format!("{}+h", twin.label),
+                bytes: twin.bytes,
+                error: twin.error,
+                agreement: twin.agreement,
+                hybrid: true,
+                rows: Vec::new(),
+            });
+        }
     }
     println!(
         "\n  over partition {sample} ({} vertices), {} queries:",
@@ -761,11 +1136,12 @@ async fn granularity(
         );
     }
 
+    let hybrid_base = 2 + rabit_stores.len();
     for beam in &grid.beams {
         let (exact, reference) = measure(
             &probes,
             &exact_stores,
-            false,
+            Scoring::PLAIN,
             queries,
             &plans,
             truth,
@@ -776,7 +1152,7 @@ async fn granularity(
         let (scalar, _) = measure(
             &probes,
             &scalar_stores,
-            false,
+            Scoring::PLAIN,
             queries,
             &plans,
             truth,
@@ -788,7 +1164,7 @@ async fn granularity(
             let (rabit, _) = measure(
                 &probes,
                 stores,
-                true,
+                Scoring::RABIT,
                 queries,
                 &plans,
                 truth,
@@ -796,19 +1172,33 @@ async fn granularity(
                 Some(&reference),
             );
             arms[2 + index].rows.push(rabit);
+            if grid.hybrid {
+                let (hybrid, _) = measure(
+                    &probes,
+                    stores,
+                    Scoring::RABIT.hybrid(),
+                    queries,
+                    &plans,
+                    truth,
+                    *beam,
+                    Some(&reference),
+                );
+                arms[hybrid_base + index].rows.push(hybrid);
+            }
         }
     }
 
     let scale = num_queries as f64;
     let recalls = scale * K as f64;
     println!(
-        "\n  {:<7} {:>9} {:>6} {:>8} {:>9} {:>9} {:>8} {:>8} {:>9} {:>8} {:>7}",
+        "\n  {:<7} {:>9} {:>6} {:>8} {:>9} {:>9} {:>9} {:>8} {:>8} {:>9} {:>8} {:>7}",
         "arm",
         "B/vertex",
         "beam",
         "walk",
         "rerank K",
         "rerank L",
+        "rerank E",
         "cmp/q",
         "exp/q",
         "rescore/q",
@@ -818,13 +1208,15 @@ async fn granularity(
     for arm in &arms {
         for row in &arm.rows {
             println!(
-                "  {:<7} {:>9} {:>6} {:>8.4} {:>9.4} {:>9.4} {:>8.0} {:>8.1} {:>9.1} {:>8.3} {:>7.0}",
+                "  {:<7} {:>9} {:>6} {:>8.4} {:>9.4} {:>9.4} {:>9.4} {:>8.0} {:>8.1} {:>9.1} \
+                 {:>8.3} {:>7.0}",
                 arm.label,
                 arm.bytes,
                 row.beam,
                 row.walk / recalls,
                 row.rerank_k / recalls,
                 row.rerank_all / recalls,
+                row.rerank_expanded / recalls,
                 row.comparisons / scale,
                 row.visited / scale,
                 row.rescored / scale,
@@ -838,48 +1230,76 @@ async fn granularity(
     // it has to spend to reach one recall. An arm that needs a wider beam pays for
     // it in comparisons and in re-ranking reads, and both are printed here rather
     // than left for the reader to reconstruct from the table above.
+    println!("\n  at recall {:.2}:", grid.target_recall);
     println!(
-        "\n  at recall {:.2} after re-ranking every candidate:",
-        grid.target_recall
+        "  {:<10} {:>9} {:>6} {:>9} {:>8} {:>8} {:>13} {:>15}",
+        "arm/answer",
+        "B/vertex",
+        "beam",
+        "recall",
+        "cmp/q",
+        "reads/q",
+        "cmp vs exact",
+        "reads vs exact"
     );
-    println!(
-        "  {:<7} {:>9} {:>6} {:>9} {:>8} {:>9} {:>13}",
-        "arm", "B/vertex", "beam", "recall", "cmp/q", "rescore/q", "cmp vs exact"
-    );
-    let exact_comparisons = arms[0]
+    // A hybrid arm has already read the vector of every vertex it expanded by the
+    // time it answers, so answering from the narrower set costs it nothing less.
+    let strategies = [
+        Strategy {
+            name: "L",
+            recall: |row| row.rerank_all,
+            reads: |row, hybrid| if hybrid { row.visited } else { row.rescored },
+        },
+        Strategy {
+            name: "E",
+            recall: |row| row.rerank_expanded,
+            reads: |row, _| row.visited,
+        },
+    ];
+    let baseline = arms[0]
         .rows
         .iter()
-        .find(|row| row.rerank_all / recalls >= grid.target_recall)
-        .map(|row| row.comparisons / scale);
+        .find(|row| row.rerank_all / recalls >= grid.target_recall);
+    let exact_comparisons = baseline.map(|row| row.comparisons / scale);
+    let exact_reads = baseline.map(|row| row.rescored / scale);
     for arm in &arms {
-        match arm
-            .rows
-            .iter()
-            .find(|row| row.rerank_all / recalls >= grid.target_recall)
-        {
-            Some(row) => println!(
-                "  {:<7} {:>9} {:>6} {:>9.4} {:>8.0} {:>9.1} {:>13}",
-                arm.label,
-                arm.bytes,
-                row.beam,
-                row.rerank_all / recalls,
-                row.comparisons / scale,
-                row.rescored / scale,
-                match exact_comparisons {
-                    Some(exact) => format!("{:.2}x", row.comparisons / scale / exact),
-                    None => "-".to_string(),
-                }
-            ),
-            None => println!(
-                "  {:<7} {:>9} {:>6} {:>9} {:>8} {:>9} {:>13}",
-                arm.label,
-                arm.bytes,
-                format!(">{}", grid.beams.last().copied().unwrap_or_default()),
-                "-",
-                "-",
-                "-",
-                "-"
-            ),
+        for strategy in &strategies {
+            let (recall, reads) = (strategy.recall, strategy.reads);
+            let label = format!("{}/{}", arm.label, strategy.name);
+            match arm
+                .rows
+                .iter()
+                .find(|row| recall(row) / recalls >= grid.target_recall)
+            {
+                Some(row) => println!(
+                    "  {:<10} {:>9} {:>6} {:>9.4} {:>8.0} {:>8.1} {:>13} {:>15}",
+                    label,
+                    arm.bytes,
+                    row.beam,
+                    recall(row) / recalls,
+                    row.comparisons / scale,
+                    reads(row, arm.hybrid) / scale,
+                    match exact_comparisons {
+                        Some(exact) => format!("{:.2}x", row.comparisons / scale / exact),
+                        None => "-".to_string(),
+                    },
+                    match exact_reads {
+                        Some(exact) => format!("{:.2}x", reads(row, arm.hybrid) / scale / exact),
+                        None => "-".to_string(),
+                    }
+                ),
+                None => println!(
+                    "  {:<10} {:>9} {:>6} {:>9} {:>8} {:>8} {:>13} {:>15}",
+                    label,
+                    arm.bytes,
+                    format!(">{}", grid.beams.last().copied().unwrap_or_default()),
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-"
+                ),
+            }
         }
     }
 }
@@ -912,6 +1332,7 @@ async fn main() {
         probe_percent: env_usize("PROBE_PERCENT", 20),
         target_recall: env_usize("TARGET_RECALL", 95) as f64 / 100.0,
         rows_per_fragment: env_usize("ROWS_PER_FRAGMENT", 10_000),
+        hybrid: env_usize("HYBRID", 1) != 0,
         bounds: 0.0..0.0,
     };
 
