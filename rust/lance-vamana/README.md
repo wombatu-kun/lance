@@ -109,9 +109,15 @@ two are meant to say the same thing.
   resident - a tenth of the pages at 1000 rows a partition, a three-hundredth at
   65536 - and only while the cache holds a fraction of the index. Three bits a
   dimension is what "codes" has to mean (`examples/coded_walk.rs`): at three the
-  walk expands the same vertices at the same beam as an exact one, at one it needs
-  a beam two to eight times wider, and either way the answer has to be re-scored
-  from the whole candidate list rather than from its nearest `K`.
+  walk spends two to thirteen per cent more comparisons than an exact one at equal
+  recall, at one it needs a beam one and a half to three and a half times wider,
+  and either way the answer has to be re-scored from the whole candidate list
+  rather than from its nearest `K`. Reading a vertex's vector as it is expanded -
+  which DiskANN gets free, because one page carries a vertex's edges next to its
+  vector - was measured too, and does not pay: correcting a distance seats that
+  vertex at the back of the list, the back of the list is the bar a new candidate
+  has to beat, and so the walk expands more for it - three times more at one bit.
+  At equal work a wider beam on plain codes reaches higher recall.
 
 An index is **refused** at open, rather than answering from what is left, when:
 

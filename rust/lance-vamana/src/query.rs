@@ -53,14 +53,22 @@
 //!
 //!   What "quantised codes" has to mean is measured too
 //!   (`examples/coded_walk.rs`). Walked by RaBitQ distances, the same graph
-//!   expands the same vertices at the same beam and reaches the same recall -
+//!   reaches the same recall for two to thirteen per cent more comparisons -
 //!   but from three bits a dimension, 68 bytes a vertex at `d = 128`, not from
-//!   one. A one-bit code needs a beam two to eight times wider, which multiplies
-//!   the very reads it was there to save, and it degrades as partitions coarsen:
-//!   its error stays where it is while the number of neighbours that error can
-//!   reorder grows with the partition. The answer also has to be re-scored from
-//!   the whole candidate list rather than from its nearest `K`, because a coded
-//!   walk's own ordering tops out around 0.95 recall at any code width.
+//!   one. A one-bit code needs a beam one and a half to three and a half times
+//!   wider, which multiplies the very reads it was there to save, and it degrades
+//!   as partitions coarsen: its error stays where it is while the number of
+//!   neighbours that error can reorder grows with the partition. The answer also
+//!   has to be re-scored from the whole candidate list rather than from its
+//!   nearest `K`, because a coded walk's own ordering tops out around 0.95 recall
+//!   at any code width.
+//!
+//!   What a walk must *not* do is read a vertex's vector as it expands it, the
+//!   way DiskANN gets one free from the page that carries its edges. Correcting a
+//!   distance seats that vertex at the back of the search list, the back of the
+//!   list is the bar the next candidate has to beat to be admitted, and so the
+//!   walk expands more - eight per cent more at three bits, three times more at
+//!   one. At equal work a wider beam on plain codes reaches higher recall.
 //!
 //! [`VamanaIndex::open`] refuses outright, rather than answering from what is
 //! left, when the dataset has edited a segment's coverage while the fragments
