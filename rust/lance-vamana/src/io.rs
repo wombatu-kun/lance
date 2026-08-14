@@ -31,6 +31,7 @@ use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use prost::Message;
 
+use crate::cache::FileKey;
 use crate::codes::encode;
 use crate::format::{
     INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, index_schema,
@@ -119,31 +120,75 @@ impl PartitionFile {
         path: &Path,
         size_bytes: Option<u64>,
     ) -> Result<Self> {
+        Self::open_with(scheduler, path, size_bytes, None).await
+    }
+
+    /// Open `path`, taking its layout from `cache` if a query has read it before.
+    ///
+    /// The footer is a round trip before a single vertex can be fetched, and a
+    /// partition file is immutable - maintenance writes a new segment under a
+    /// new uuid rather than editing one - so a query that probes the same
+    /// partition as an earlier query is re-reading a byte-for-byte identical
+    /// answer.
+    pub async fn open_cached(
+        scheduler: &Arc<ScanScheduler>,
+        path: &Path,
+        size_bytes: Option<u64>,
+        cache: &LanceCache,
+    ) -> Result<Self> {
+        Self::open_with(scheduler, path, size_bytes, Some(cache)).await
+    }
+
+    async fn open_with(
+        scheduler: &Arc<ScanScheduler>,
+        path: &Path,
+        size_bytes: Option<u64>,
+        cache: Option<&LanceCache>,
+    ) -> Result<Self> {
         let size = size_bytes.map_or_else(CachedFileSize::unknown, CachedFileSize::new);
         let file = scheduler.open_file(path, &size).await?;
-        let reader = FileReader::try_open(
-            file.clone(),
-            None,
-            Arc::<DecoderPlugins>::default(),
-            &LanceCache::no_cache(),
-            FileReaderOptions::default(),
-        )
-        .await?;
+        // Only the cached arm goes near a key, because the uncached one is what
+        // every build and maintenance pass takes, and those open a file once
+        // each: hashing a path and weighing the metadata would be pure overhead
+        // there.
+        let metadata = match cache {
+            Some(cache) => {
+                cache
+                    .get_or_insert_with_key(FileKey { path }, || {
+                        FileReader::read_all_metadata(&file)
+                    })
+                    .await?
+            }
+            None => Arc::new(FileReader::read_all_metadata(&file).await?),
+        };
         // The version is pinned on the way out and therefore has to be checked
         // on the way in. It is not a formality: a projection is computed against
         // the structural grammar of [`SEGMENT_FILE_VERSION`], and a file written
         // under another one lays its columns out differently - the read would
         // succeed and return the wrong bytes rather than fail.
-        if reader.metadata().version() != SEGMENT_FILE_VERSION {
+        if metadata.version() != SEGMENT_FILE_VERSION {
             return Err(Error::corrupt_file_named(
                 path.filename().unwrap_or(INDEX_FILE_NAME),
                 format!(
                     "Vamana segment file is a Lance {} file, and this crate writes and reads {}",
-                    reader.metadata().version(),
+                    metadata.version(),
                     SEGMENT_FILE_VERSION
                 ),
             ));
         }
+        let options = FileReaderOptions::default();
+        let reader = FileReader::try_open_with_file_metadata(
+            Arc::new(
+                LanceEncodingsIo::new(file.clone()).with_read_chunk_size(options.read_chunk_size),
+            ),
+            path.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            metadata,
+            &LanceCache::no_cache(),
+            options,
+        )
+        .await?;
         Ok(Self {
             path: path.clone(),
             file,

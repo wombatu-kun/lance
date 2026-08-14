@@ -99,11 +99,25 @@ two are meant to say the same thing.
   makes them ordinary new rows, and `insert_as_segment` brings them back.
 - **No predicate prefilter and no refine step.** Both live in Lance's scanner,
   which this driver bypasses.
-- **Nothing is cached between queries.** A query keeps a few reads in flight, so
-  its working set is a few partitions rather than every partition it probes -
-  and the next query pays for those same partitions again. A caveat for the
-  default walk, and a much larger one for the lazy walk below, whose whole point
-  is a resident set of codes it has nowhere to keep.
+- **Nothing is cached between queries unless the index is given a cache.** A
+  query keeps a few reads in flight, so its working set is a few partitions
+  rather than every partition it probes - and by default the next query pays for
+  those same partitions again. `VamanaIndex::with_cache(LanceCache)` changes
+  that, and holds the part of a partition that does not depend on the query: the
+  layout of its file, and for a lazy walk the codes and row ids it steers by.
+  Nothing needs invalidating, because nothing an entry describes can change -
+  deleting rows edits no index file, and adding rows or consolidating writes a
+  *new* segment under a new uuid.
+
+  The budget is the caller's to set and is in bytes of *resident* form, which is
+  more than the codes weigh on disk: they are stored one contiguous stride a
+  vertex and read back into the seven columns Lance's estimator wants, with the
+  row ids beside them. On SIFT1M that is **89 MB a million rows** against 68 MB
+  on disk, and against 776 bytes a row for the vectors themselves.
+  An index given no cache reads every time - it holds no empty cache, because a
+  cache of capacity zero is not the same thing as none: it admits an entry and
+  reclaims it later, so it serves the occasional hit out of what is meant to be
+  nothing.
 - **A partition is read whole unless the walk is told otherwise.** Reading only
   the vertices a walk touches was measured instead of assumed
   (`examples/memory_gate.rs`): on its own it halves the pages moved at best and
@@ -135,12 +149,26 @@ two are meant to say the same thing.
 
   On SIFT1M at 65536 rows a partition, four probes and equal recall
   (`examples/lazy_walk.rs`), that is **18.2 MB a query against 198.6 MB** read
-  whole, and **18.5 ms of warm CPU against 129.8 ms** - decoding two hundred
+  whole, and **18.6 ms of warm CPU against 131.0 ms** - decoding two hundred
   megabytes costs more than fetching eighteen, even with every byte already in
   the page cache. What it pays is round trips: 20 requests become 54, and 28
-  iops become 194. Nine tenths of what is left is the code column, read again by
-  every query because nothing here caches it, so a process that could hold the
-  codes resident would be reading 0.7 MB a query rather than 18.2.
+  iops become 197.
+
+  Nine tenths of that 18.2 MB is the code column, re-read by every query, so the
+  mode is only half of the design: **with a cache the same query reads 71.9 kB**,
+  0.0004x of reading whole and 254 times less than reading lazily without one,
+  in **3.2 ms** against 131.0, holding 89 MB to do it. What the walk itself
+  chooses to fetch - the out-edges of the vertices it expands, the vectors of the
+  candidates it ends with - is that 71.9 kB and nothing more; the 640 kB between
+  it and the code column is `__row_id`, which is read whole beside the codes and
+  cached with them. The distances are identical with and without the cache, which
+  is the point: it changes what a query reads and nothing else.
+
+  The cache also reverses which granularity is cheaper. Without one, 8192-row
+  partitions read less than 65536-row ones (4.5 MB against 18.2); with one it is
+  the other way round - **71.9 kB against 119.7 kB, and 3.2 ms against 4.9** -
+  because the resident part is paid once while seven probes cost seven entry
+  points, seven sets of edges and seven candidate lists against four.
 
   Codes are off by default, and refused rather than skipped for a dimension that
   is not a multiple of eight, which is what RaBitQ packs a bit a dimension into.

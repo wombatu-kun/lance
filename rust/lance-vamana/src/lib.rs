@@ -12,6 +12,7 @@
 
 pub mod build;
 pub mod builder;
+mod cache;
 pub mod codes;
 pub mod consolidate;
 pub mod consolidator;

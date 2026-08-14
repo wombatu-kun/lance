@@ -30,11 +30,14 @@
 //!   the next candidate has to clear, and so the walk expands more - eight per
 //!   cent more at three bits, three times more at one (`examples/coded_walk.rs`).
 //!
-//! What is *not* here is a cache. The codes of a probed partition are read on
-//! every query that probes it, which leaves the walk paying about a tenth of what
-//! reading whole costs rather than the hundredth that keeping them resident
-//! across queries would. That is a working set to be bounded and evicted, and it
-//! belongs to whoever holds the index rather than to a walk.
+//! What is *not* here is the cache, and the difference between the two is what
+//! this module is bounded by. Everything fetched here is chosen by the query -
+//! which vertices this walk expanded, which candidates it ended with - and is
+//! therefore nobody's to keep. What is worth keeping is what the walk needed
+//! before it could start, and [`crate::cache`] keeps it: a query that has probed
+//! a partition before fetches 71.9 kB on SIFT1M where one that has not fetches
+//! 18.2 MB, and the 18.1 MB between them is the codes and the row ids, read once
+//! rather than by every query.
 
 use arrow_array::ArrayRef;
 use lance_core::{Error, Result};
