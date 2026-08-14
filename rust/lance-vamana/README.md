@@ -170,6 +170,30 @@ two are meant to say the same thing.
   because the resident part is paid once while seven probes cost seven entry
   points, seven sets of edges and seven candidate lists against four.
 
+  What that is worth needs something to compare it against, and the nearest
+  measured one is Lance's own `IVF_HNSW_SQ` over the same vectors at the same
+  recall, counted through `Scanner::scan_stats_callback`: **12.29 MB a query**
+  read cold with its partitions tuned to 8192 rows, and 197.78 MB at the shipped
+  default of one partition to a million rows. At that same 8192 rows this reads
+  4.5 MB cold and 119.7 kB warm. Bytes are all that compares - those numbers
+  come from Lance's scanner and these from this driver, the quantisers differ,
+  eight-bit scalar against three-bit RaBitQ, and what is held equal is the
+  dataset and the recall rather than the index.
+
+  Warm against cold is not the comparison, though, because Lance's reads
+  collapse too once its cache holds the partitions. What each has to hold to get
+  there is: 257 to 297 bytes a row on disk for that index, and more again in
+  Lance's cache, which holds an unpacked form - against 89 bytes a row here,
+  which still reads 71.9 kB a query rather than nothing. The saving is the ratio
+  between those two resident figures, and it only becomes a saving in bytes read
+  when neither budget covers the index.
+
+  Which is what makes the cache load-bearing rather than an optimisation.
+  Without one a lazy walk over 65536-row partitions reads 18.2 MB a query, worse
+  than the tuned baseline it is meant to beat; at 8192 rows it reads 4.5 MB,
+  which is better. Granularity and the cache are chosen together, and neither
+  choice survives the other being changed.
+
   Codes are off by default, and refused rather than skipped for a dimension that
   is not a multiple of eight, which is what RaBitQ packs a bit a dimension into.
 
