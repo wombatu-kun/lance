@@ -39,13 +39,14 @@
 //!   query pays for its own partitions again. [`VamanaIndex::with_cache`] is
 //!   what changes that, and what it keeps is the part of a partition that does
 //!   not depend on the query: the layout of its file, and for a
-//!   [`WalkMode::Lazy`] walk the codes and row ids it steers by, which are nine
-//!   tenths of what such a query reads.
+//!   [`WalkMode::Lazy`] walk or a [`WalkMode::Flat`] scan the codes and row ids
+//!   they measure by, which are nine tenths of what such a query reads.
 //! - **A partition is read whole unless the walk is told not to.**
 //!   [`WalkMode::Lazy`] keeps the row ids and the codes and fetches the rest as
-//!   it turns out to need it. Which of the two is right is a property of the
-//!   deployment rather than of the index, and it was measured rather than
-//!   assumed.
+//!   it turns out to need it; [`WalkMode::Flat`] keeps the same and fetches even
+//!   less, because it scores every vertex instead of following edges to a few of
+//!   them. Which of the three is right is a property of the deployment rather
+//!   than of the index, and it was measured rather than assumed.
 //!
 //!   Reading only what a walk touches does not pay on its own
 //!   (`examples/memory_gate.rs`): a walk expands a few dozen vertices in a
@@ -125,7 +126,7 @@ use crate::format::{
 use crate::io::{
     PartitionFile, check_partition_shape, read_partition_batch, read_segment, scan_scheduler,
 };
-use crate::lazy::LazyWalk;
+use crate::lazy::LazyProbe;
 use crate::partition::Partition;
 use crate::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
 use crate::segment::{PartitionEntry, SegmentManifest};
@@ -179,12 +180,37 @@ pub enum WalkMode {
     ///
     /// Requires codes, same as [`Self::Coded`].
     Lazy,
+    /// Do not use the graph at all: score every vertex of the partition against
+    /// its code, keep the nearest [`SearchParams::search_list_size`], and
+    /// re-score those exactly.
+    ///
+    /// Reads what [`Self::Lazy`] reads minus the edges - the row ids and the
+    /// codes, then the vectors of the candidate list - so `__neighbors` is never
+    /// opened and, at this mode's granularity, need not have been written.
+    ///
+    /// A walk's cost hardly moves with the size of the partition, since its hops
+    /// are set by the beam and the graph's diameter rather than by the vertex
+    /// count, while a scan's is linear in it - so the two cross somewhere, and
+    /// on SIFT1M at equal recall the crossing is between the two granularities
+    /// the rest of this crate quotes (`examples/lazy_walk.rs`). A scan reads
+    /// 52.9 kB a query against a cached lazy walk's 120.0 at 8192 rows a
+    /// partition and 32.0 against 76.9 at 65536, makes one request to a probe
+    /// against the walk's eight, and reaches higher recall at every beam; what
+    /// it pays is CPU, which puts it ahead by 1.9x at 8192 rows and behind by
+    /// 1.6x at 65536.
+    ///
+    /// So the choice is round trips against arithmetic, over one unchanged index
+    /// file: a deployment whose CPU is saturated wants [`Self::Lazy`], one bound
+    /// by a store's latency wants this.
+    ///
+    /// Requires codes, same as [`Self::Coded`].
+    Flat,
 }
 
 impl WalkMode {
-    /// Whether this walk can only run on an index that carries codes.
+    /// Whether this mode can only run on an index that carries codes.
     fn needs_codes(self) -> bool {
-        matches!(self, Self::Coded | Self::Lazy)
+        matches!(self, Self::Coded | Self::Lazy | Self::Flat)
     }
 }
 
@@ -199,7 +225,8 @@ pub struct SearchParams {
     /// whether or not anything was assigned to it, so a budget spent on centroids
     /// rather than on data would let the nearest one silently return nothing.
     pub nprobes: usize,
-    /// `L`: how wide a search list each graph walk keeps.
+    /// `L`: how wide a search list each graph walk keeps, and how many
+    /// candidates a [`WalkMode::Flat`] scan keeps out of the whole partition.
     pub search_list_size: usize,
     /// What the walk measures its distances against.
     pub mode: WalkMode,
@@ -207,7 +234,8 @@ pub struct SearchParams {
     /// therefore how many rows of `__neighbors` it asks for in one request.
     ///
     /// Ignored by the walks that read a partition whole, which have every edge
-    /// already. For the lazy one it is the trade the mode exists to make: the
+    /// already, and by [`WalkMode::Flat`], which reads none. For the lazy one it
+    /// is the trade the mode exists to make: the
     /// chain of dependent round trips divides by it, while a wider hop expands
     /// vertices the strictly greedy order would have skipped. Four is the width
     /// the phase gate modelled and is deliberately on the low side - what it
@@ -944,17 +972,17 @@ impl VamanaIndex {
         // [`PARTITIONS_IN_FLIGHT`] bounds both, and means the same thing in
         // both: how many partitions' worth of resident data a query holds.
         let mut walks = match params.mode {
-            WalkMode::Lazy => stream::iter(probes)
+            WalkMode::Lazy | WalkMode::Flat => stream::iter(probes)
                 .map({
                     let query = query.clone();
                     let routing_query = routing_query.clone();
                     move |probe| {
-                        self.walk_lazily(probe, query.clone(), routing_query.clone(), params)
+                        self.probe_lazily(probe, query.clone(), routing_query.clone(), params)
                     }
                 })
                 .buffer_unordered(PARTITIONS_IN_FLIGHT)
                 .boxed(),
-            _ => stream::iter(probes)
+            WalkMode::Exact | WalkMode::Coded => stream::iter(probes)
                 .map(|probe| self.read_probe(probe))
                 .buffer_unordered(PARTITIONS_IN_FLIGHT)
                 .and_then({
@@ -1163,20 +1191,23 @@ impl VamanaIndex {
         .await
     }
 
-    /// Walk one partition without reading it, on this runtime rather than on the
-    /// CPU pool.
+    /// Answer from one partition without reading it, on this runtime rather than
+    /// on the CPU pool.
     ///
     /// The opposite bargain from [`Self::walk_partition`], and forced rather than
     /// chosen: the pool takes work that never waits, and this waits once a hop.
     /// What it hands the pool instead is nothing at all - a hop is `beam_width`
     /// times `max_degree` coded distances, tens of microseconds, below the size
-    /// at which the pool's own overhead starts to pay.
+    /// at which the pool's own overhead starts to pay. A [`WalkMode::Flat`] scan
+    /// waits twice however large the partition is, and is milliseconds of
+    /// arithmetic in between, so it is the one thing here the pool would suit -
+    /// which is a measurement to take once the mode has earned it.
     ///
     /// The read of the row ids and the codes is the one thing here that is
-    /// proportional to the partition. It is also what makes the walk possible at
-    /// all, and it is a tenth of what reading the partition whole would be at
+    /// proportional to the partition. It is also what makes both modes possible
+    /// at all, and it is a tenth of what reading the partition whole would be at
     /// `d = 128`.
-    async fn walk_lazily(
+    async fn probe_lazily(
         &self,
         probe: Probe,
         query: ArrayRef,
@@ -1198,7 +1229,7 @@ impl VamanaIndex {
         )
         .await?;
 
-        let (candidates, comparisons) = LazyWalk {
+        let probing = LazyProbe {
             file: &file,
             codes: &resident.codes,
             row_ids: &resident.row_ids,
@@ -1208,9 +1239,13 @@ impl VamanaIndex {
             distance_type: self.metadata.distance_type,
             search_list_size: params.search_list_size,
             beam_width: params.beam_width,
-        }
-        .run(routing_query, dist_q_c, query)
-        .await?;
+        };
+        let (candidates, comparisons) = match params.mode {
+            WalkMode::Flat => probing.scan(routing_query, dist_q_c, query).await?,
+            WalkMode::Exact | WalkMode::Coded | WalkMode::Lazy => {
+                probing.walk(routing_query, dist_q_c, query).await?
+            }
+        };
 
         Ok(Walked {
             neighbors: answer(candidates, &resident.row_ids, &self.rows, params.k)?,

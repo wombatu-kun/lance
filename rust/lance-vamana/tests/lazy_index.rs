@@ -333,12 +333,13 @@ async fn a_lazy_walk_refuses_what_it_cannot_do() {
         .unwrap();
     let uncoded = VamanaIndex::open(&uncoded, INDEX_NAME).await.unwrap();
 
-    let error = uncoded
-        .search(query, &search(WalkMode::Lazy))
-        .await
-        .unwrap_err();
-    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
-    assert!(error.to_string().contains("without codes"), "{error}");
+    // Both modes that steer by codes, because the refusal is the mode's and not
+    // the walk's: a scan has no beam to fall back on either.
+    for mode in [WalkMode::Lazy, WalkMode::Flat] {
+        let error = uncoded.search(query, &search(mode)).await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("without codes"), "{error}");
+    }
 }
 
 /// A beam wider than the partition, which is the case the mode is *not* for.
@@ -391,6 +392,185 @@ async fn a_walk_that_reaches_everything_still_answers() {
         "a walk that reached the whole partition answered differently when it read it lazily"
     );
     assert_eq!(answers[1].len(), K);
+}
+
+/// The pin the flat arm rests on, and one no graph walk can offer.
+///
+/// A scan told to keep every vertex of every partition it probes has measured an
+/// exact distance against every indexed row, so its answer is the brute-force
+/// answer - not close to it, equal to it. Each way of getting a scan wrong lands
+/// here as recall below one rather than as a number to argue about: codes read
+/// for the wrong partition, a rank mapped to the wrong local id, a candidate
+/// re-scored at the wrong position in the batch that came back.
+///
+/// The distance count is exact for the same reason. A scan is oblivious - it
+/// measures every vertex whatever the query is - so the only number it can
+/// produce is one per centroid ranked, one per vertex scored and one per
+/// candidate re-scored.
+#[tokio::test]
+async fn a_flat_scan_that_keeps_everything_is_brute_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+
+    let rows = fixture().indexed_rows();
+    let everything = search(WalkMode::Flat).with_search_list_size(rows);
+    for query in random_vectors(8, 1234) {
+        let truth = brute_force(&dataset, &query, K).await;
+        let result = index.search(&query, &everything).await.unwrap();
+        let found = result
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_addr)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recall(&found, &truth),
+            1.0,
+            "a scan that kept every vertex still missed a true neighbour"
+        );
+        assert_eq!(
+            result.comparisons,
+            (PARTITIONS as usize + 2 * rows) as u64,
+            "a scan measured a different number of distances from one per centroid, one per \
+             vertex and one per candidate"
+        );
+    }
+
+    // The selecting half, which the case above never reaches: a list wider than
+    // the partition keeps everything without choosing. Exactly `L` survive each
+    // probe, which is what a list truncated to `k` or ordered the wrong way
+    // round fails - and the recall floor is what a reversed comparator fails,
+    // since it would keep the farthest `L` instead. Both rest on the fixture's
+    // partitions being far wider than the beam, which is what it is for.
+    let narrow = search(WalkMode::Flat);
+    for query in random_vectors(8, 1234) {
+        let truth = brute_force(&dataset, &query, K).await;
+        let result = index.search(&query, &narrow).await.unwrap();
+        let found = result
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_addr)
+            .collect::<Vec<_>>();
+        assert!(
+            recall(&found, &truth) >= 0.9,
+            "a scan keeping the nearest {BEAM} of every partition scored {:.4}",
+            recall(&found, &truth)
+        );
+        assert_eq!(
+            result.comparisons,
+            (PARTITIONS as usize + rows + result.partitions_read * BEAM) as u64,
+            "a scan kept a different number of candidates from {BEAM} a probe"
+        );
+    }
+}
+
+/// The same pin over two segments, which is the ordinary state of an index that
+/// has been appended to.
+///
+/// Worth its own case rather than a wider `nprobes` on the one above, because
+/// what it can catch is different: a scan turns a rank into a local id and a
+/// local id into a row id, and every segment of an index has a partition 0 and a
+/// vertex 0. Codes taken from one segment beside row ids from another produce
+/// plausible answers, and only an exact one shows it.
+#[tokio::test]
+async fn a_flat_scan_over_two_segments_is_brute_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    coded_dataset(uri).await;
+    fixture().append(uri).await;
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    lance_vamana::insert_as_segment(&mut dataset, INDEX_NAME)
+        .await
+        .unwrap();
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let segments = index.num_segments();
+    assert!(segments > 1, "the append wrote no second segment");
+
+    // Every row of both segments, since `nprobes` is per segment and the list is
+    // wider than any partition either of them holds.
+    let rows = segments * fixture().indexed_rows();
+    let everything = search(WalkMode::Flat).with_search_list_size(rows);
+    for query in random_vectors(8, 606) {
+        let truth = brute_force(&dataset, &query, K).await;
+        let result = index.search(&query, &everything).await.unwrap();
+        let found = result
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_addr)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recall(&found, &truth),
+            1.0,
+            "a scan of every vertex of two segments missed a true neighbour"
+        );
+        assert_eq!(
+            result.comparisons,
+            (segments * PARTITIONS as usize + 2 * rows) as u64,
+            "the centroids of both segments and every vertex of both, once each"
+        );
+    }
+}
+
+/// What the mode is for: the same partitions, without their graph.
+///
+/// Neither arm caches, so both pay for the codes of every partition they probe
+/// on every query and what separates them is only what each *chooses* to fetch:
+/// the vectors of the candidate list for both, plus the out-edges of every
+/// vertex the walk expanded. A scan never opens `__neighbors`, so it has to read
+/// strictly less.
+///
+/// The distances go the other way, by a factor the count alone overstates: a
+/// scan's are measured in one batched call over the quantiser's block layout at
+/// 16.8 ns each, a walk's one at a time at 40.0, so the column is a ratio of
+/// work rather than of time (`examples/expansion_gate.rs`).
+#[tokio::test]
+async fn a_flat_scan_reads_no_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let queries = random_vectors(QUERIES, 8888);
+    let truth = ground_truth(&dataset, &queries).await;
+
+    let mut measured = Vec::new();
+    for mode in [WalkMode::Lazy, WalkMode::Flat] {
+        let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+        measured.push(measure(&index, &queries, &truth, &search(mode)).await);
+    }
+    let (lazy, flat) = (&measured[0], &measured[1]);
+    for (label, arm) in [("lazy", lazy), ("flat", flat)] {
+        println!(
+            "{label:<6} recall@{K}={:.4}  {:>8.0} B  {:>6.1} requests  {:>7.0} comparisons",
+            arm.recall, arm.bytes, arm.requests, arm.comparisons
+        );
+    }
+
+    assert!(
+        flat.bytes < lazy.bytes,
+        "a scan read {:.0} bytes against the walk's {:.0}, so it fetched something the walk did \
+         and it should have fetched no edges at all",
+        flat.bytes,
+        lazy.bytes
+    );
+    assert!(
+        flat.comparisons > lazy.comparisons,
+        "a scan measured {:.0} distances against the walk's {:.0}, so it did not score the whole \
+         partition",
+        flat.comparisons,
+        lazy.comparisons
+    );
+    // Not an equality and not a strict improvement either. A scan keeps the `L`
+    // nearest of the partition by coded distance where a walk keeps the `L` it
+    // found, so the walk's list can hold a true neighbour the codes ranked
+    // outside the scan's - rarely, and never often enough to make the scan the
+    // worse arm.
+    assert!(
+        flat.recall > lazy.recall - 0.01,
+        "a scan that considered every vertex scored {:.4} against a walk's {:.4}",
+        flat.recall,
+        lazy.recall
+    );
 }
 
 /// Several segments, which is the ordinary state of an index that has been

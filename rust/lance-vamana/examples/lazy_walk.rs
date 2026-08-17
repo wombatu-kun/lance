@@ -15,7 +15,7 @@
 //! `CACHE_WIDTHS` (default `4`), `CACHE_MB` (default 4096), `TARGET`
 //! (default 95, the recall percentage the arms are compared at).
 //!
-//! Four arms through one index and one binary, which is the only comparison
+//! Five arms through one index and one binary, which is the only comparison
 //! worth making: the same graph, the same routing, the same codes, and a switch.
 //!
 //! - `exact` reads every partition it probes whole and measures against the
@@ -28,6 +28,17 @@
 //! - `cached` is `lazy` with the row ids and the codes kept across queries
 //!   instead of read again by each of them, which is what a process serving
 //!   queries would do and what leaves only the walk's own fetches.
+//! - `flat` throws the graph away: it scores every vertex of the partition
+//!   against its code and keeps the nearest `L`, so it reads what `lazy` reads
+//!   minus the edges and does thirty times the arithmetic. It is here because a
+//!   walk's cost barely moves with the partition's size while a scan's is linear
+//!   in it, and the arithmetic puts the crossing somewhere near the granularity
+//!   the rest of these numbers were taken at.
+//!
+//! `flat` clears a recall target at a beam the walks need a wider one for, so
+//! the interpolation below often reports it at the narrowest beam on the grid.
+//! `L` cannot go below `k`, so that point is not an artefact of the grid: it is
+//! the cheapest the arm can be asked to be.
 //!
 //! **Every arm is warmed with the whole query set before it is measured**, so
 //! `cached` is measured in the state a server reaches rather than in its first
@@ -439,6 +450,21 @@ async fn main() {
         width: *width,
         cache: Some(cache_bytes),
     }));
+    // Both, because the cache is what the comparison against `cached` has to be
+    // made at - and the uncached one is what says how much of a scan's read is
+    // the codes it would be holding anyway.
+    arms.push(Arm {
+        label: "flat".to_string(),
+        mode: WalkMode::Flat,
+        width: 1,
+        cache: None,
+    });
+    arms.push(Arm {
+        label: "flat cached".to_string(),
+        mode: WalkMode::Flat,
+        width: 1,
+        cache: Some(cache_bytes),
+    });
 
     println!(
         "\n{:<12} {:>5} {:>8} {:>12} {:>8} {:>9} {:>10} {:>10} {:>7}",
@@ -552,5 +578,31 @@ async fn main() {
                 );
             }
         }
+    }
+
+    // The question the cache raised and could not answer: whether the graph is
+    // earning the reads and the bytes it costs at this granularity. Both arms
+    // hold the same codes, probe the same partitions and re-score the same way,
+    // so what is left between them is the walk itself.
+    if let (Some(cached), Some(flat)) = (cached, arm_at(&sweeps, "flat cached", target)) {
+        println!(
+            "  a scan of the same partitions with the same cache: {:.0} B against {:.0} ({:.2}x), \
+             {:.1} requests against {:.1}, {:.0} us against {:.0}, {:.0} distances against {:.0}",
+            flat.bytes,
+            cached.bytes,
+            flat.bytes / cached.bytes,
+            flat.requests,
+            cached.requests,
+            flat.micros,
+            cached.micros,
+            flat.comparisons,
+            cached.comparisons,
+        );
+        println!(
+            "  so walking costs {:.2}x what scanning does here, and the graph it walks is {} \
+             bytes a vertex of index that a scan would not have written",
+            cached.micros / flat.micros,
+            degree * 4,
+        );
     }
 }

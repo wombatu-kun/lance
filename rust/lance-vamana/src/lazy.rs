@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Walking a partition without reading it.
+//! Answering from a partition without reading it.
 //!
 //! The whole-partition walk reads `__row_id`, `__neighbors` and `__vector` for
 //! every vertex and then measures against a few hundred of them. This one keeps
@@ -10,6 +10,18 @@
 //! fetches the rest as it turns out to need it: the out-edges of a vertex when it
 //! expands it, and the vectors of the candidate list once there is one to
 //! re-score.
+//!
+//! Two ways of arriving at that candidate list live here, and which of them is
+//! right is a property of the deployment rather than of the index.
+//! [`LazyProbe::walk`] steers by the graph; [`LazyProbe::scan`] ignores it and
+//! scores every vertex of the partition instead - ten to fifty times the
+//! arithmetic, and strictly fewer bytes, because it opens no `__neighbors` at
+//! all. Measured at equal recall, the scan reads 0.42 to 0.44 of what the walk
+//! reads and makes a tenth of the round trips at both granularities, and only
+//! the CPU changes sign: it wins by 1.9x at 8192 rows a partition and loses by
+//! 1.6x at 65536 (`examples/lazy_walk.rs`). What the graph buys is arithmetic,
+//! at fifteen microseconds of it per round trip saved at 8192 rows and a hundred
+//! and nine at 65536.
 //!
 //! Three measurements decide the shape, and none of them is obvious:
 //!
@@ -50,16 +62,19 @@ use crate::io::{PartitionFile, read_scattered};
 use crate::partition::{checked_neighbors, neighbor_slots, vectors_of};
 use crate::search::{Comparisons, SearchList, SearchScratch, flat_storage};
 
-/// One partition, and everything a lazy walk over it needs but the query.
+/// One partition, and everything answering from it lazily needs but the query.
 ///
-/// The codes and the row ids are already in hand - they are the one thing this
-/// walk reads whole, so reading them is the caller's business and reading them
-/// is also what tells it how many vertices there are. Everything else is a
-/// number off the segment, held here so that what comes back off disk can be
-/// checked against what the segment claims: a lazy walk never holds a whole
+/// The codes and the row ids are already in hand - they are the one thing read
+/// whole here, so reading them is the caller's business and reading them is also
+/// what tells it how many vertices there are. Everything else is a number off
+/// the segment, held here so that what comes back off disk can be checked
+/// against what the segment claims: nothing on this path holds a whole
 /// [`crate::Partition`], so nothing else is in a position to notice a partition
 /// file whose stride disagrees with the segment listing it.
-pub(crate) struct LazyWalk<'a> {
+///
+/// [`Self::scan`] leaves `medoid`, `max_degree` and `beam_width` unread: they
+/// describe the graph, and a scan is the arm that does not have one.
+pub(crate) struct LazyProbe<'a> {
     pub(crate) file: &'a PartitionFile,
     pub(crate) codes: &'a RabitQuantizationStorage,
     pub(crate) row_ids: &'a [u64],
@@ -73,12 +88,12 @@ pub(crate) struct LazyWalk<'a> {
     pub(crate) beam_width: usize,
 }
 
-impl LazyWalk<'_> {
+impl LazyProbe<'_> {
     /// Walk, then re-score the candidate list exactly.
     ///
     /// Returns the list as local ids and *exact* distances, nearest first, which
-    /// is the same thing the whole-partition walks return and is what lets the
-    /// three modes share the step that turns a candidate list into an answer.
+    /// is the same thing the whole-partition walks return and is what lets every
+    /// mode share the step that turns a candidate list into an answer.
     ///
     /// `routing_query` and `dist_q_c` are what a coded distance is assembled
     /// from; `query` is the raw one the re-scoring measures against. The two are
@@ -90,7 +105,7 @@ impl LazyWalk<'_> {
     /// this waits once a hop. What it does instead is stay small between the
     /// waits - a hop is `beam_width * R` coded distances, tens of microseconds,
     /// which is under the size at which handing work to the pool starts to pay.
-    pub(crate) async fn run(
+    pub(crate) async fn walk(
         &self,
         routing_query: ArrayRef,
         dist_q_c: f32,
@@ -163,13 +178,87 @@ impl LazyWalk<'_> {
         if candidates.is_empty() {
             return Ok((Vec::new(), comparisons.get()));
         }
-        // Every candidate and not the nearest `k` of them: a coded walk's own
-        // ordering tops out around 0.95 recall at any code width, and the rows
-        // that make up the difference are the ones it put behind `k`. One
-        // request either way, so the whole list costs `L - k` strides more.
         candidates.sort_unstable();
+        let rescored = self.rescore(&candidates, query).await?;
+        comparisons.record(rescored.len() as u64);
+        Ok((rescored, comparisons.get()))
+    }
+
+    /// Score every vertex of the partition, keep the nearest `L`, and re-score
+    /// those exactly.
+    ///
+    /// The graph is never opened: this reads the codes the caller already holds
+    /// and then the vectors of the candidate list, and `__neighbors` - 256 bytes
+    /// a vertex at `R = 64`, more than a quarter of a partition file - does not
+    /// enter into it. What it costs instead is arithmetic, `num_rows` coded
+    /// distances against the few hundred a walk measures, and two vectors the
+    /// length of the partition while it selects, which is the one place this
+    /// mode holds more than a walk does.
+    ///
+    /// Those distances are not the walk's distances at the walk's price. One
+    /// [`DistCalculator::distance_all`] over the quantiser's block layout costs
+    /// 16.8 ns a vertex where [`DistCalculator::distance`] one at a time costs
+    /// 40.0 (`examples/expansion_gate.rs`), and a walk cannot have the cheaper
+    /// one: it does not know which vertices it wants until it has scored the
+    /// ones before them. So the two arms are not comparable by their distance
+    /// counts, only by what they cost and what they read.
+    pub(crate) async fn scan(
+        &self,
+        routing_query: ArrayRef,
+        dist_q_c: f32,
+        query: ArrayRef,
+    ) -> Result<(Vec<(u32, f32)>, u64)> {
+        let num_rows = self.row_ids.len();
+        let comparisons = Comparisons::default();
+        let coded = self.codes.dist_calculator(routing_query, dist_q_c);
+        let distances = coded.distance_all(self.search_list_size);
+        debug_assert_eq!(
+            distances.len(),
+            num_rows,
+            "the code storage and the row ids of a partition disagree about its length"
+        );
+        comparisons.record(distances.len() as u64);
+
+        let mut ranked = distances
+            .into_iter()
+            .enumerate()
+            .map(|(id, distance)| (id as u32, distance))
+            .collect::<Vec<_>>();
+        if self.search_list_size < ranked.len() {
+            ranked.select_nth_unstable_by(self.search_list_size, |left, right| {
+                left.1.total_cmp(&right.1)
+            });
+            ranked.truncate(self.search_list_size);
+        }
+        if ranked.is_empty() {
+            return Ok((Vec::new(), comparisons.get()));
+        }
+        // By id, because that is what the reader coalesces by, and because a
+        // partial sort leaves ties wherever the partition happened to put them.
+        ranked.sort_unstable_by_key(|(id, _)| *id);
+        let candidates = ranked.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        let rescored = self.rescore(&candidates, query).await?;
+        comparisons.record(rescored.len() as u64);
+        Ok((rescored, comparisons.get()))
+    }
+
+    /// Fetch the vectors of a candidate list and put it in exact order.
+    ///
+    /// Every candidate and not the nearest `k` of them: a coded ordering tops
+    /// out around 0.95 recall at any code width, and the rows that make up the
+    /// difference are the ones it put behind `k`. One request either way, so the
+    /// whole list costs `L - k` strides more.
+    ///
+    /// `candidates` arrives ascending, which is the order the reader coalesces
+    /// by, and comes back reordered by an exact distance.
+    ///
+    /// The distances it measures are counted by the caller rather than here. A
+    /// `&Comparisons` held across the awaits below would make this future
+    /// `!Send` - the counter is a `Cell` - and the two callers both have the
+    /// length in hand anyway.
+    async fn rescore(&self, candidates: &[u32], query: ArrayRef) -> Result<Vec<(u32, f32)>> {
         let vectors = self.file.project(&[VECTOR_COLUMN]).await?;
-        let batch = read_scattered(&vectors, &candidates).await?;
+        let batch = read_scattered(&vectors, candidates).await?;
         let values = vectors_of(&batch, self.dimension)?;
         let row_ids = candidates
             .iter()
@@ -177,7 +266,6 @@ impl LazyWalk<'_> {
             .collect::<Vec<_>>();
         let store = flat_storage(&row_ids, &values, self.distance_type)?;
         let exact = store.dist_calculator(query, 0.0);
-        comparisons.record(candidates.len() as u64);
 
         // Positions in what came back, not local ids: the batch holds only the
         // candidates, in the order they were asked for.
@@ -187,6 +275,6 @@ impl LazyWalk<'_> {
             .map(|(position, id)| (*id, exact.distance(position as u32)))
             .collect::<Vec<_>>();
         rescored.sort_by(|left, right| left.1.total_cmp(&right.1));
-        Ok((rescored, comparisons.get()))
+        Ok(rescored)
     }
 }
