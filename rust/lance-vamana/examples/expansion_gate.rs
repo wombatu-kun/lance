@@ -38,6 +38,42 @@
 //! to. That makes this an *upper bound* on what the gate could save: a real walk
 //! meets each vertex earlier, with a looser threshold, and skips fewer.
 //!
+//! # The partition gate, and what it costs to decide
+//!
+//! The first pass found that over half of what the gate could skip is partitions
+//! it skips *entirely*, which needs no gate inside the walk at all - only a check
+//! before a partition is opened. That check is a different problem, and the
+//! second half of this stand measures it.
+//!
+//! It is different because of what it costs. The quantity the first pass
+//! reported is a minimum over a partition's vertices, and a driver that wants it
+//! has to spend a coded distance on every one of them: at 8192 rows and 25
+//! probes that is 204,800 distances to decide something, against the 4,543 a
+//! whole query spends today. So the useful question is not how much the exact
+//! minimum would skip, but how much a *cheap* stand-in for it would, and there
+//! are three worth asking about:
+//!
+//! - **A radius bound.** `|q - v|` is at least `|q - c| - max|v - c|`, so a
+//!   partition whose nearest possible vertex loses to the answer so far cannot
+//!   contribute. It costs nothing: routing has already computed `|q - c|`. Its
+//!   catch is `max`, which one outlying vertex is enough to ruin, so two
+//!   percentiles are measured beside it.
+//! - **A sample.** The minimum over evenly spaced vertices, which bounds nothing
+//!   but costs a hundredth of the scan.
+//! - **The scan itself**, as the reference the other two are judged against.
+//!
+//! Whether the radius is even reachable is its own question, and the answer is
+//! yes: [`recovered_norm_square`] gets `|v - c|^2` back out of two factors every
+//! resident code already carries, so a partition's radius is a pass at load time
+//! rather than a new field in the segment table.
+//!
+//! Two things the first pass left implicit are made explicit here. The threshold
+//! a driver actually has is built from *exact* distances, not coded ones, since
+//! every walk re-scores its candidates before returning them. And a driver that
+//! keeps `PARTITIONS_IN_FLIGHT` probes in flight cannot see the results of the
+//! ones still running, so the threshold lags by that many probes - which is
+//! measured rather than assumed.
+//!
 //! ```text
 //! SIFT_DIR=~/sift cargo run --release-no-lto --example expansion_gate
 //! VECTORS=100000 QUERIES=100 LIST=100 ROWS_PER_PARTITION=8192 ...
@@ -63,7 +99,9 @@ use lance_index::vector::ApproxMode;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::storage::RabitQuantizationStorage;
-use lance_index::vector::bq::transform::{ERROR_FACTORS_COLUMN, RQTransformer};
+use lance_index::vector::bq::transform::{
+    ERROR_FACTORS_COLUMN, RQTransformer, SCALE_FACTORS_COLUMN,
+};
 use lance_index::vector::flat::storage::FlatFloatStorage;
 use lance_index::vector::quantizer::{Quantization, QuantizerStorage};
 use lance_index::vector::storage::{DistCalculator, DistanceCalculatorOptions, VectorStore};
@@ -96,6 +134,56 @@ const DISTANCE_TYPE: DistanceType = DistanceType::L2;
 /// at equal recall. Zero is the degenerate case and exists as a self-check: it
 /// skips exactly the vertices ranked at or below the threshold.
 const LAMBDAS: [f32; 6] = [0.0, 0.125, 0.25, 0.5, 1.0, 2.0];
+
+/// The constant Lance scales a RaBitQ error factor by, mirrored here because it
+/// is private to `bq::transform`.
+///
+/// Mirroring it is what makes [`recovered_norm_square`] possible and is also its
+/// one weakness: the recovery is tied to the exact arithmetic of a module that
+/// owes us no stability. A gate built on it either re-derives the constant from
+/// the data or stores the radius itself.
+const RABIT_ERROR_EPSILON: f32 = 1.9;
+
+/// Vertices a sampling gate measures before deciding, against a partition of
+/// thousands.
+///
+/// Swept rather than fixed because the whole question about a sample is where
+/// it stops being cheap and starts being right, and taking that curve in a
+/// second run would mean rebuilding the index to get it.
+const SAMPLES: [usize; 3] = [16, 64, 256];
+
+/// Whether the answer a probe is measured against is assembled from coded
+/// distances or from exact ones.
+///
+/// Step one measured the coded threshold. The driver's is exact - every walk
+/// re-scores its candidate list before returning it - so the exact column is the
+/// one an implementation would see, and the coded one is here to line up against
+/// what was already reported.
+const THRESHOLD_KINDS: [&str; 2] = ["coded", "exact"];
+
+/// How far behind the threshold runs, as a count of probes whose results are not
+/// yet visible.
+///
+/// `buffer_unordered(F)` starts `F` probes at once, so when probe `i` starts,
+/// `i - F + 1` have finished and no more. One is the fully serial driver, four
+/// is today's `PARTITIONS_IN_FLIGHT`, and the oracle sees every probe including
+/// the ones after it.
+const LAGS: [(&str, usize); 3] = [("serial", 1), ("in flight 4", 4), ("oracle", 0)];
+
+/// Gate forms that spend a coded distance per vertex they look at, and so carry
+/// a lambda: the full scan, then one per entry of [`SAMPLES`].
+const SCAN_FORMS: usize = 1 + SAMPLES.len();
+
+fn scan_form_name(form: usize) -> String {
+    match form {
+        0 => "scan all".to_string(),
+        form => format!("sample {}", SAMPLES[form - 1]),
+    }
+}
+
+/// Gate forms that spend nothing at all: the query-to-centroid distance is
+/// already computed at routing, and the radius is a property of the partition.
+const RADIUS_FORMS: [&str; 3] = ["radius max", "radius p99", "radius p90"];
 
 fn env_list(name: &str, fallback: &str) -> Vec<usize> {
     std::env::var(name)
@@ -227,13 +315,80 @@ fn residuals(probe: &Probe) -> (FixedSizeListArray, Float32Array) {
     )
 }
 
+/// `|v - c|^2` recovered from two of the factors a code already carries.
+///
+/// A partition-level gate wants the farthest a vertex sits from the centroid,
+/// and the cheapest place to get it would be data already resident. RaBitQ's L2
+/// factors are `scale = -2n / b` and
+/// `error = 2 sqrt(n) EPSILON sqrt((a - 1) / (d - 1))` with `a = n (d/4) / b^2`,
+/// where `n` is the norm square and `b` the inner product between the residual
+/// and its own binary code. Substituting the first into the second cancels `b` -
+/// the one term a reader does not have - and leaves
+/// `n = d scale^2 / 16 - error^2 (d - 1) / (4 EPSILON^2)`.
+///
+/// If that holds numerically, a partition's radius is a pass over the resident
+/// codes at load time rather than a new field in the segment table, and the gate
+/// needs no format change at all.
+fn recovered_norm_square(scale: f32, error: f32, code_dim: usize) -> f32 {
+    let dimension = code_dim as f32;
+    let from_scale = dimension * scale * scale / 16.0;
+    let from_error =
+        error * error * (dimension - 1.0) / (4.0 * RABIT_ERROR_EPSILON * RABIT_ERROR_EPSILON);
+    (from_scale - from_error).max(0.0)
+}
+
+/// How far a partition's vertices sit from its centroid.
+///
+/// The maximum is the only one of these that bounds anything: `|q - v|` is at
+/// least `|q - c| - max`, so a partition whose nearest possible vertex loses to
+/// the answer so far cannot contribute to it. The percentiles are the same
+/// arithmetic with the guarantee traded away, and they are here because a single
+/// outlying vertex is enough to make the maximum useless.
+struct Radii {
+    max: f32,
+    p99: f32,
+    p90: f32,
+}
+
+impl Radii {
+    fn of(norm_squares: &[f32]) -> Self {
+        let mut radii = norm_squares
+            .iter()
+            .map(|norm_square| norm_square.max(0.0).sqrt())
+            .collect::<Vec<_>>();
+        radii.sort_unstable_by(f32::total_cmp);
+        Self {
+            max: percentile(&radii, 1.0),
+            p99: percentile(&radii, 0.99),
+            p90: percentile(&radii, 0.90),
+        }
+    }
+}
+
+/// The nearest a vertex of this partition could possibly be, given `|q - c|^2`.
+fn radius_bound(dist_q_c: f32, radius: f32) -> f32 {
+    let gap = dist_q_c.max(0.0).sqrt() - radius;
+    if gap <= 0.0 { 0.0 } else { gap * gap }
+}
+
+/// One partition's codes, its error factors, and what they say about its radius.
+struct Quantised {
+    store: RabitQuantizationStorage,
+    errors: Vec<f32>,
+    radii: Radii,
+    /// The largest relative disagreement between a recovered `|v - c|^2` and the
+    /// measured one over this partition, which is the self-check the radius
+    /// forms stand on.
+    recovery_error: f32,
+}
+
 /// RaBitQ codes for one partition, and the error factor of every vertex.
 ///
 /// The factors come out of the transform's own column rather than out of our
 /// stride, so that what is measured is the quantiser's bound and not our
 /// packing of it. They are the same bytes either way: a stride carries the
 /// binary code, the extended one and five factors, of which this is the third.
-fn rabit_store(probe: &Probe, num_bits: u8) -> (RabitQuantizationStorage, Vec<f32>) {
+fn rabit_store(probe: &Probe, num_bits: u8) -> Quantised {
     let (residuals, norms) = residuals(probe);
     let dim = residuals.value_length();
     let rows = residuals.len();
@@ -251,7 +406,11 @@ fn rabit_store(probe: &Probe, num_bits: u8) -> (RabitQuantizationStorage, Vec<f3
             false,
         ),
         (VECTOR_FIELD, Arc::new(residuals) as ArrayRef, false),
-        (CENTROID_DIST_COLUMN, Arc::new(norms) as ArrayRef, false),
+        (
+            CENTROID_DIST_COLUMN,
+            Arc::new(norms.clone()) as ArrayRef,
+            false,
+        ),
         (
             PART_ID_COLUMN,
             Arc::new(UInt32Array::from(vec![0u32; rows])) as ArrayRef,
@@ -270,6 +429,32 @@ fn rabit_store(probe: &Probe, num_bits: u8) -> (RabitQuantizationStorage, Vec<f3
         .as_primitive::<Float32Type>()
         .values()
         .to_vec();
+    let scales = coded
+        .column_by_name(SCALE_FACTORS_COLUMN)
+        .unwrap_or_else(|| panic!("a {num_bits}-bit RaBitQ code carries a scale factor"))
+        .as_primitive::<Float32Type>()
+        .values()
+        .to_vec();
+
+    // Against the norms measured off the vectors, which is the only thing that
+    // says whether the closed form above survives being computed in f32.
+    let code_dim = quantizer.metadata(None).code_dim as usize;
+    let recovered = scales
+        .iter()
+        .zip(&factors)
+        .map(|(scale, error)| recovered_norm_square(*scale, *error, code_dim))
+        .collect::<Vec<_>>();
+    let recovery_error = recovered
+        .iter()
+        .zip(norms.values())
+        .map(|(recovered, measured)| {
+            if *measured <= 0.0 {
+                0.0
+            } else {
+                (recovered - measured).abs() / measured
+            }
+        })
+        .fold(0.0f32, f32::max);
 
     let kept = coded
         .schema()
@@ -292,7 +477,59 @@ fn rabit_store(probe: &Probe, num_bits: u8) -> (RabitQuantizationStorage, Vec<f3
         None,
     )
     .unwrap();
-    (store, factors)
+    Quantised {
+        store,
+        errors: factors,
+        radii: Radii::of(&recovered),
+        recovery_error,
+    }
+}
+
+/// Nanoseconds one coded distance costs, both ways a caller can spend it.
+///
+/// The number the whole question turns on. A gate that is sound has to take the
+/// minimum over every vertex, so its price is a coded distance per vertex per
+/// probe, and whether that is worth paying depends entirely on what one costs
+/// against the round trip it saves.
+///
+/// Both ways, because they are not the same price and the two callers are
+/// different. A walk asks for the vertices its hop uncovered, one id at a time,
+/// which is what `distance` is for. A scan wants all of them, which is what
+/// `distance_all` is for - and that one is free to work over the quantiser's
+/// blocked layout rather than gathering a vertex at a time, so it should be the
+/// cheaper of the two by whatever that layout is worth. Building the calculator
+/// is charged to both.
+fn coded_distance_cost(probes: &HashMap<u32, Probed>, query: &ArrayRef) -> (f64, f64, usize) {
+    let mut vertices = 0usize;
+    let single = Instant::now();
+    let mut sink = 0.0f32;
+    for probed in probes.values() {
+        let dist_q_c = centroid_distance(&probed.probe, query);
+        let calculator = probed.coded.store.dist_calculator(query.clone(), dist_q_c);
+        let count = probed.probe.partition.len();
+        for id in 0..count as u32 {
+            sink += calculator.distance(id);
+        }
+        vertices += count;
+    }
+    let single = single.elapsed().as_secs_f64();
+    std::hint::black_box(sink);
+
+    let batched = Instant::now();
+    let mut sink = 0usize;
+    for probed in probes.values() {
+        let dist_q_c = centroid_distance(&probed.probe, query);
+        let calculator = probed.coded.store.dist_calculator(query.clone(), dist_q_c);
+        sink += calculator.distance_all(K).len();
+    }
+    let batched = batched.elapsed().as_secs_f64();
+    std::hint::black_box(sink);
+
+    (
+        single * 1e9 / vertices as f64,
+        batched * 1e9 / vertices as f64,
+        vertices,
+    )
 }
 
 /// `|q - c|^2` between a query and one partition's centroid.
@@ -435,6 +672,118 @@ impl Tally {
     }
 }
 
+/// What a check *before* a partition is opened could skip.
+///
+/// Separate from [`Tally`] because it counts a different thing. That one counts
+/// expansions, and its "skipped whole" row asks whether a partition's top `L`
+/// all fail the threshold - which is the right question for a walk that has
+/// already opened the partition, and the wrong one for a gate that decides
+/// before it does. A gate that decides first has to be sound over *every*
+/// vertex, since it has no way to know which ones a walk would have reached.
+struct ProbeTally {
+    probes: usize,
+    /// `[threshold kind][lag][form][lambda]`, over [`SCAN_FORMS`].
+    scanned: [[[[usize; LAMBDAS.len()]; SCAN_FORMS]; LAGS.len()]; THRESHOLD_KINDS.len()],
+    /// `[threshold kind][lag][form]`, over [`RADIUS_FORMS`], which carry no
+    /// lambda: there is no error term in a distance to a centroid.
+    radius: [[[usize; RADIUS_FORMS.len()]; LAGS.len()]; THRESHOLD_KINDS.len()],
+    /// Probes where the radius bound is a positive number at all, per form.
+    ///
+    /// A bound of zero excludes nothing, and it is zero whenever the query sits
+    /// closer to the centroid than the partition's own edge. Counted separately
+    /// so that a radius form reading zero says *why* it reads zero rather than
+    /// leaving it to be guessed.
+    reachable: [usize; RADIUS_FORMS.len()],
+    /// `|q - c|` and the radius it is measured against, over every probe.
+    centroid_distances: Vec<f32>,
+    radii: Vec<f32>,
+    /// The worst relative disagreement between a recovered `|v - c|^2` and the
+    /// measured one, over every partition probed.
+    recovery_error: f32,
+}
+
+impl ProbeTally {
+    fn new() -> Self {
+        Self {
+            probes: 0,
+            scanned: [[[[0; LAMBDAS.len()]; SCAN_FORMS]; LAGS.len()]; THRESHOLD_KINDS.len()],
+            radius: [[[0; RADIUS_FORMS.len()]; LAGS.len()]; THRESHOLD_KINDS.len()],
+            reachable: [0; RADIUS_FORMS.len()],
+            centroid_distances: Vec::new(),
+            radii: Vec::new(),
+            recovery_error: 0.0,
+        }
+    }
+
+    fn report(&mut self, working: usize) {
+        self.centroid_distances.sort_unstable_by(f32::total_cmp);
+        self.radii.sort_unstable_by(f32::total_cmp);
+        println!(
+            "  |v - c|^2 recovered from (scale, error): worst relative error {:.3e}",
+            self.recovery_error
+        );
+        println!(
+            "  |q - c| (p50) {:.1} against a partition radius (p50) of {:.1}; the radius bound is \
+             a positive number on {:.2}% of probes at max, {:.2}% at p99, {:.2}% at p90",
+            percentile(&self.centroid_distances, 0.5),
+            percentile(&self.radii, 0.5),
+            self.share(self.reachable[0]),
+            self.share(self.reachable[1]),
+            self.share(self.reachable[2]),
+        );
+        println!(
+            "  partition gate: share of {} probes a check before opening would skip, L = {working}",
+            self.probes
+        );
+        print!("    {:<10}{:<13}{:<11}", "threshold", "lag", "form");
+        for lambda in LAMBDAS {
+            print!("{:>10}", format!("λ={lambda}"));
+        }
+        println!();
+        for (kind, kind_name) in THRESHOLD_KINDS.iter().enumerate() {
+            for (lag, (lag_name, _)) in LAGS.iter().enumerate() {
+                for form in 0..SCAN_FORMS {
+                    print!(
+                        "    {kind_name:<10}{lag_name:<13}{:<11}",
+                        scan_form_name(form)
+                    );
+                    for index in 0..LAMBDAS.len() {
+                        print!("{:9.2}%", self.share(self.scanned[kind][lag][form][index]));
+                    }
+                    println!();
+                }
+            }
+        }
+        println!("  the same for the forms that cost nothing, and so carry no λ");
+        print!("    {:<10}{:<13}", "threshold", "lag");
+        for name in RADIUS_FORMS {
+            print!("{name:>13}");
+        }
+        println!();
+        for (kind, kind_name) in THRESHOLD_KINDS.iter().enumerate() {
+            for (lag, (lag_name, _)) in LAGS.iter().enumerate() {
+                print!("    {kind_name:<10}{lag_name:<13}");
+                for form in 0..RADIUS_FORMS.len() {
+                    print!("{:12.2}%", self.share(self.radius[kind][lag][form]));
+                }
+                println!();
+            }
+        }
+        println!(
+            "    serial is a driver that probes one partition at a time, in flight 4 is today's \
+             PARTITIONS_IN_FLIGHT, oracle sees every probe including the ones after it."
+        );
+        println!(
+            "    coded is the threshold step one measured; exact is the one a driver has, because \
+             every walk re-scores its candidates before returning them."
+        );
+    }
+
+    fn share(&self, count: usize) -> f64 {
+        100.0 * count as f64 / self.probes as f64
+    }
+}
+
 /// One partition, its codes, and the error factor of each of its vertices.
 ///
 /// The store and the factors have to come from the *same* build: a RaBitQ
@@ -443,22 +792,39 @@ impl Tally {
 /// together.
 struct Probed {
     probe: Probe,
-    store: RabitQuantizationStorage,
-    factors: Vec<f32>,
+    coded: Quantised,
 }
 
-/// The `K`th smallest coded distance in a set of lists, or `None` before there
-/// are `K` of them - a threshold nobody has reached yet gates nothing.
-fn threshold_of(lists: &[&[(f32, f32)]]) -> Option<f32> {
+/// One vertex as the gate sees it: its coded distance, its error factor and the
+/// truth the two are approximating.
+type Scored = (f32, f32, f32);
+
+/// The `K`th smallest distance in a set of lists, under whichever of the two a
+/// caller asks for, or `None` before there are `K` of them - a threshold nobody
+/// has reached yet gates nothing.
+fn kth_best(lists: &[&[Scored]], of: fn(&Scored) -> f32) -> Option<f32> {
     let mut all = lists
         .iter()
-        .flat_map(|list| list.iter().map(|(coded, _)| *coded))
+        .flat_map(|list| list.iter().map(of))
         .collect::<Vec<_>>();
     if all.len() < K {
         return None;
     }
     all.select_nth_unstable_by(K - 1, f32::total_cmp);
     Some(all[K - 1])
+}
+
+/// What one probe's partition offers a gate that runs before the walk.
+struct Bounds {
+    /// One per [`SCAN_FORMS`]: the minimum of `est - lambda * err` over every
+    /// vertex, then over evenly spaced samples of it.
+    ///
+    /// Only the first bounds anything. Evenly spaced rather than drawn at
+    /// random so that a rerun of this stand reproduces its own numbers.
+    scanned: [[f32; LAMBDAS.len()]; SCAN_FORMS],
+    /// `(|q - c| - r)^2` for each radius in [`RADIUS_FORMS`], which costs nothing
+    /// beyond the centroid distance routing has already computed.
+    radius: [f32; RADIUS_FORMS.len()],
 }
 
 /// Measure one query against every partition it would probe.
@@ -468,20 +834,26 @@ fn measure(
     query: &ArrayRef,
     list_sizes: &[usize],
     tally: &mut Tally,
+    gate: &mut ProbeTally,
 ) {
     let mut scratch = Vec::new();
     let mut scored_by_probe = Vec::with_capacity(plan.len());
+    let mut bounds_by_probe = Vec::with_capacity(plan.len());
     for partition_id in plan {
-        let Probed {
-            probe,
+        let Probed { probe, coded } = &probes[partition_id];
+        let Quantised {
             store,
-            factors,
-        } = &probes[partition_id];
+            errors,
+            radii,
+            ..
+        } = coded;
         let vertices = probe.partition.len();
         let dist_q_c = centroid_distance(probe, query);
         let exact = probe.exact.dist_calculator(query.clone(), 0.0);
         let coded = store.dist_calculator(query.clone(), dist_q_c);
         let mut scored = Vec::with_capacity(vertices);
+        let mut scanned = [[f32::INFINITY; LAMBDAS.len()]; SCAN_FORMS];
+        let steps = SAMPLES.map(|sample| (vertices / sample).max(1));
         {
             let binary = store.dist_calculator_with_scratch(
                 query.clone(),
@@ -496,16 +868,39 @@ fn measure(
                 let truth = exact.distance(id);
                 let binary = binary.distance(id);
                 let coded = coded.distance(id);
-                let err = factors[id as usize] * dist_q_c.max(0.0).sqrt();
+                let err = errors[id as usize] * dist_q_c.max(0.0).sqrt();
                 tally.vertices += 1;
                 tally.binary_violations += usize::from(binary - err > truth);
                 tally.coded_violations += usize::from(coded - err > truth);
                 tally.errs.push(err);
                 tally.binary_errors.push((binary - truth).abs());
                 tally.coded_errors.push((coded - truth).abs());
-                scored.push((coded, err));
+                for (index, lambda) in LAMBDAS.iter().enumerate() {
+                    let bound = coded - lambda * err;
+                    scanned[0][index] = scanned[0][index].min(bound);
+                    for (form, (step, sample)) in steps.iter().zip(SAMPLES).enumerate() {
+                        if (id as usize).is_multiple_of(*step) && (id as usize) / step < sample {
+                            scanned[form + 1][index] = scanned[form + 1][index].min(bound);
+                        }
+                    }
+                }
+                scored.push((coded, err, truth));
             }
         }
+        let bounds = Bounds {
+            scanned,
+            radius: [
+                radius_bound(dist_q_c, radii.max),
+                radius_bound(dist_q_c, radii.p99),
+                radius_bound(dist_q_c, radii.p90),
+            ],
+        };
+        gate.centroid_distances.push(dist_q_c.max(0.0).sqrt());
+        gate.radii.push(radii.max);
+        for (form, bound) in bounds.radius.iter().enumerate() {
+            gate.reachable[form] += usize::from(*bound > 0.0);
+        }
+        bounds_by_probe.push(bounds);
         // The search list is the `L` nearest by coded distance and the walk
         // expands all of them, so the head of this *is* the expansion set - at
         // the threshold a walk converges to rather than the looser ones it
@@ -519,11 +914,11 @@ fn measure(
             .iter()
             .map(|scored| &scored[..(*list_size).min(scored.len())])
             .collect::<Vec<_>>();
-        let oracle = threshold_of(&lists);
+        let oracle = kth_best(&lists, |scored| scored.0);
         for (at, list) in lists.iter().enumerate() {
             let thresholds = [
-                threshold_of(&lists[at..=at]),
-                threshold_of(&lists[..=at]),
+                kth_best(&lists[at..=at], |scored| scored.0),
+                kth_best(&lists[..=at], |scored| scored.0),
                 oracle,
             ];
             tally.expansions[row] += list.len();
@@ -535,12 +930,46 @@ fn measure(
                 for (index, lambda) in LAMBDAS.iter().enumerate() {
                     let skipped = list
                         .iter()
-                        .filter(|(coded, err)| coded - lambda * err >= *threshold)
+                        .filter(|(coded, err, _)| coded - lambda * err >= *threshold)
                         .count();
                     tally.skipped[which][row][index] += skipped;
                     if skipped == list.len() {
                         tally.skipped_whole[which][row][index] += skipped;
                     }
+                }
+            }
+        }
+    }
+
+    // The partition gate is measured at one list size rather than swept: the
+    // threshold is the `K`th best and `K` is under every `L` in the sweep, so
+    // the coded threshold does not move with `L` at all, and the exact one moves
+    // only through which rows a longer list re-scores.
+    let working = list_sizes[0];
+    let lists = scored_by_probe
+        .iter()
+        .map(|scored| &scored[..working.min(scored.len())])
+        .collect::<Vec<_>>();
+    let projections: [fn(&Scored) -> f32; THRESHOLD_KINDS.len()] =
+        [|scored| scored.0, |scored| scored.2];
+    for (at, bounds) in bounds_by_probe.iter().enumerate() {
+        gate.probes += 1;
+        for (kind, of) in projections.iter().enumerate() {
+            for (lag, (_, behind)) in LAGS.iter().enumerate() {
+                let visible = match behind {
+                    0 => &lists[..],
+                    behind => &lists[..at.saturating_sub(behind - 1)],
+                };
+                let Some(threshold) = kth_best(visible, *of) else {
+                    continue;
+                };
+                for (form, bounds) in bounds.scanned.iter().enumerate() {
+                    for (index, bound) in bounds.iter().enumerate() {
+                        gate.scanned[kind][lag][form][index] += usize::from(*bound >= threshold);
+                    }
+                }
+                for (form, bound) in bounds.radius.iter().enumerate() {
+                    gate.radius[kind][lag][form] += usize::from(*bound >= threshold);
                 }
             }
         }
@@ -554,11 +983,19 @@ async fn granularity(
     list_sizes: &[usize],
     degree: u32,
     rows_per_fragment: usize,
-    probe_percent: usize,
+    probe_counts: &[usize],
 ) {
     let rows = vectors.len();
     let partitions = rows.div_ceil(rows_per_partition).max(1) as u32;
-    let nprobes = ((probe_percent * partitions as usize).div_ceil(100)).max(1);
+    // Deduplicated after capping, because a budget larger than the index has
+    // partitions is the same measurement twice.
+    let mut probe_counts = probe_counts
+        .iter()
+        .map(|nprobes| (*nprobes).clamp(1, partitions as usize))
+        .collect::<Vec<_>>();
+    probe_counts.sort_unstable();
+    probe_counts.dedup();
+    let widest = *probe_counts.last().expect("at least one probe count");
     let temp = tempfile::tempdir().unwrap();
     let uri = temp.path().to_str().unwrap();
     let mut dataset = write_dataset(uri, vectors.clone(), rows_per_fragment).await;
@@ -576,8 +1013,8 @@ async fn granularity(
     .await
     .unwrap();
     println!(
-        "\n=== {rows_per_partition} rows a partition: {partitions} partitions, {nprobes} probed, \
-         built in {:.1}s ===",
+        "\n=== {rows_per_partition} rows a partition: {partitions} partitions, {probe_counts:?} \
+         probed, built in {:.1}s ===",
         started.elapsed().as_secs_f64()
     );
 
@@ -604,9 +1041,12 @@ async fn granularity(
     .await
     .unwrap();
 
+    // Planned once at the widest budget and truncated per sweep point, so that
+    // every budget probes the same partitions in the same order and the sweep
+    // measures the budget rather than a reshuffle.
     let plans = queries
         .iter()
-        .map(|query| probe_plan(&manifest, query, nprobes))
+        .map(|query| probe_plan(&manifest, query, widest))
         .collect::<Vec<_>>();
     let wanted = plans.iter().flatten().copied().collect::<HashSet<_>>();
     let probes = load_probes(&scheduler, &segment_dir, &file_sizes, &manifest, &wanted).await;
@@ -614,15 +1054,8 @@ async fn granularity(
     let probes = probes
         .into_iter()
         .map(|(partition_id, probe)| {
-            let (store, factors) = rabit_store(&probe, 3);
-            (
-                partition_id,
-                Probed {
-                    probe,
-                    store,
-                    factors,
-                },
-            )
+            let coded = rabit_store(&probe, 3);
+            (partition_id, Probed { probe, coded })
         })
         .collect::<HashMap<_, _>>();
     println!(
@@ -631,15 +1064,45 @@ async fn granularity(
         started.elapsed().as_secs_f64()
     );
 
-    let mut tally = Tally::new(list_sizes.len());
-    for (query, plan) in queries.iter().zip(&plans) {
-        measure(&probes, plan, query, list_sizes, &mut tally);
-    }
+    let (single, batched, vertices) = coded_distance_cost(&probes, &queries[0]);
+    println!(
+        "  one coded distance costs {single:.1} ns one at a time, {batched:.1} ns a whole \
+         partition at once, over {vertices} vertices"
+    );
+    let nanoseconds = batched;
+
+    let recovery_error = probes
+        .values()
+        .map(|probed| probed.coded.recovery_error)
+        .fold(0.0f32, f32::max);
     let factors = probes
         .values()
-        .flat_map(|probed| probed.factors.iter().copied())
+        .flat_map(|probed| probed.coded.errors.iter().copied())
         .collect::<Vec<_>>();
-    tally.report(&factors, list_sizes);
+
+    for nprobes in probe_counts {
+        let scan = rows_per_partition * nprobes;
+        println!(
+            "\n-- {nprobes} probes: a sound gate scans {scan} vertices a query, {:.0} us of \
+             arithmetic at the batched price --",
+            scan as f64 * nanoseconds / 1000.0
+        );
+        let mut tally = Tally::new(list_sizes.len());
+        let mut gate = ProbeTally::new();
+        gate.recovery_error = recovery_error;
+        for (query, plan) in queries.iter().zip(&plans) {
+            measure(
+                &probes,
+                &plan[..nprobes.min(plan.len())],
+                query,
+                list_sizes,
+                &mut tally,
+                &mut gate,
+            );
+        }
+        tally.report(&factors, list_sizes);
+        gate.report(list_sizes[0]);
+    }
 }
 
 #[tokio::main]
@@ -662,6 +1125,13 @@ async fn main() {
     let degree = env_usize("DEGREE", 64) as u32;
     let rows_per_fragment = env_usize("ROWS_PER_FRAGMENT", 10_000);
     let probe_percent = env_usize("PROBE_PERCENT", 20);
+    // A budget in partitions rather than a share of them, because the point that
+    // has to be measured is the one a driver would set, and that is read off a
+    // recall curve rather than off the partition count. Absent, the share
+    // stands, which is what every earlier run of this stand used.
+    let probe_counts = std::env::var("NPROBES")
+        .is_ok()
+        .then(|| env_list("NPROBES", ""));
 
     let vectors = FixedSizeListArray::try_new_from_values(
         Float32Array::from(base[..rows * dim].to_vec()),
@@ -681,6 +1151,10 @@ async fn main() {
     );
 
     for rows_per_partition in sweep {
+        let partitions = rows.div_ceil(rows_per_partition).max(1);
+        let counts = probe_counts
+            .clone()
+            .unwrap_or_else(|| vec![((probe_percent * partitions).div_ceil(100)).max(1)]);
         granularity(
             &vectors,
             &queries,
@@ -688,7 +1162,7 @@ async fn main() {
             &list_sizes,
             degree,
             rows_per_fragment,
-            probe_percent,
+            &counts,
         )
         .await;
     }
