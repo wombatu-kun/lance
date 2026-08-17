@@ -120,8 +120,12 @@ impl SearchScratch {
 }
 
 /// A vertex in the search list, and whether its out-edges have been followed.
+///
+/// Not `Candidate`: [`crate::lazy::Candidate`] owns that name, and means the
+/// other end of the same walk - a vertex the list finished with, on its way to
+/// an exact distance.
 #[derive(Debug, Clone)]
-struct Candidate {
+struct Entry {
     node: OrderedNode,
     expanded: bool,
 }
@@ -137,7 +141,7 @@ struct Candidate {
 /// identical is for there to be one copy of it.
 #[derive(Debug)]
 pub struct SearchList {
-    list: Vec<Candidate>,
+    list: Vec<Entry>,
     size: usize,
 }
 
@@ -163,13 +167,13 @@ impl SearchList {
         let distance = OrderedFloat(distance);
         let at = self
             .list
-            .partition_point(|candidate| candidate.node.dist <= distance);
+            .partition_point(|entry| entry.node.dist <= distance);
         if at >= self.size {
             return;
         }
         self.list.insert(
             at,
-            Candidate {
+            Entry {
                 node: OrderedNode::new(id, distance),
                 expanded: false,
             },
@@ -184,17 +188,14 @@ impl SearchList {
     /// yields the `n` nearest unexpanded vertices - which is exactly the
     /// frontier a lazy hop fetches in one request.
     pub fn next_unexpanded(&mut self) -> Option<OrderedNode> {
-        let position = self.list.iter().position(|candidate| !candidate.expanded)?;
+        let position = self.list.iter().position(|entry| !entry.expanded)?;
         self.list[position].expanded = true;
         Some(self.list[position].node.clone())
     }
 
     /// The list itself, nearest first.
     pub fn into_candidates(self) -> Vec<OrderedNode> {
-        self.list
-            .into_iter()
-            .map(|candidate| candidate.node)
-            .collect()
+        self.list.into_iter().map(|entry| entry.node).collect()
     }
 }
 

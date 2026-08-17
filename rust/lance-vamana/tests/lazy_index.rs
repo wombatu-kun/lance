@@ -307,7 +307,7 @@ async fn a_lazy_walk_answers_only_live_rows() {
     }
 }
 
-/// The two ways a lazy walk can be asked for something it cannot do.
+/// The ways a lazy walk can be asked for something it cannot do.
 #[tokio::test]
 async fn a_lazy_walk_refuses_what_it_cannot_do() {
     let dir = tempfile::tempdir().unwrap();
@@ -340,6 +340,26 @@ async fn a_lazy_walk_refuses_what_it_cannot_do() {
         assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
         assert!(error.to_string().contains("without codes"), "{error}");
     }
+
+    // A budget is refused rather than ignored by the modes that cannot spend
+    // it, for the same reason: a caller who set one is asking about cost.
+    for mode in [WalkMode::Exact, WalkMode::Coded] {
+        let error = index
+            .search(query, &search(mode).with_rescore_budget(BEAM))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("rescore_budget"), "{error}");
+    }
+
+    // And a budget too small to hold the answer, which would otherwise return
+    // fewer rows than were asked for and say nothing about it.
+    let error = index
+        .search(query, &search(WalkMode::Flat).with_rescore_budget(K - 1))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("smaller than k"), "{error}");
 }
 
 /// A beam wider than the partition, which is the case the mode is *not* for.
@@ -570,6 +590,129 @@ async fn a_flat_scan_reads_no_edges() {
         "a scan that considered every vertex scored {:.4} against a walk's {:.4}",
         flat.recall,
         lazy.recall
+    );
+}
+
+/// The degenerate budget: one wide enough for every candidate changes nothing.
+///
+/// The two-pass shape is a rewrite of the path every lazy query takes, so the
+/// case where the budget decides nothing has to come back exactly - the same
+/// rows in the same order, the same distance count, the same partitions read. A
+/// recall bar would pass through a re-scoring that quietly dropped half of every
+/// list, and both modes go through the same rewrite, so both are checked.
+#[tokio::test]
+async fn a_budget_wider_than_the_candidates_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let rows = fixture().indexed_rows();
+
+    for mode in [WalkMode::Lazy, WalkMode::Flat] {
+        for query in random_vectors(8, 77) {
+            let unbudgeted = index.search(&query, &search(mode)).await.unwrap();
+            // Every candidate every probe kept, and then two numbers past it.
+            // The first is the boundary the allocation short-circuits on.
+            let spent = unbudgeted.partitions_read * BEAM;
+            for budget in [spent, spent + 1, rows] {
+                let budgeted = index
+                    .search(&query, &search(mode).with_rescore_budget(budget))
+                    .await
+                    .unwrap();
+                let what = format!("{mode:?}, budget {budget}");
+                assert_eq!(budgeted.neighbors, unbudgeted.neighbors, "{what}");
+                assert_eq!(budgeted.comparisons, unbudgeted.comparisons, "{what}");
+                assert_eq!(
+                    budgeted.partitions_read, unbudgeted.partitions_read,
+                    "{what}"
+                );
+            }
+        }
+    }
+}
+
+/// What the budget is for: the same recall off a fraction of the strides.
+///
+/// A scan reads nothing but its candidates, and its distance count says how many
+/// of them there were - one per centroid ranked, one per vertex scored, one per
+/// candidate re-scored. With no budget that last term is `L` a probe whatever
+/// the probes turned out to be worth; with one it is the budget itself, and the
+/// equality below is what a budget spent per partition rather than per query
+/// fails.
+///
+/// The claim it exists to pin is the second half: a budget of `L` for the whole
+/// query clears the recall bar that `L` *per probe* was set for, having read a
+/// fraction of the rows and skipped whole probes on the way. The partitions are
+/// still all read - a budget decides what is fetched to correct a candidate, not
+/// what is probed - so `partitions_read` may not move.
+#[tokio::test]
+async fn a_budget_spends_the_strides_where_they_are_worth_most() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let rows = fixture().indexed_rows();
+
+    for query in random_vectors(8, 4242) {
+        let plain = index.search(&query, &search(WalkMode::Flat)).await.unwrap();
+        let spent = plain.partitions_read * BEAM;
+        assert_eq!(
+            plain.comparisons,
+            (PARTITIONS as usize + rows + spent) as u64,
+            "an unbudgeted scan re-scored something other than {BEAM} a probe"
+        );
+        for budget in [spent - 1, spent / 2, BEAM, K] {
+            let result = index
+                .search(&query, &search(WalkMode::Flat).with_rescore_budget(budget))
+                .await
+                .unwrap();
+            assert_eq!(
+                result.comparisons,
+                (PARTITIONS as usize + rows + budget) as u64,
+                "a budget of {budget} re-scored a different number of candidates"
+            );
+            assert_eq!(result.partitions_read, plain.partitions_read);
+        }
+    }
+
+    let queries = random_vectors(QUERIES, 4242);
+    let truth = ground_truth(&dataset, &queries).await;
+    let unbudgeted = measure(&index, &queries, &truth, &search(WalkMode::Flat)).await;
+    let budgeted = measure(
+        &index,
+        &queries,
+        &truth,
+        &search(WalkMode::Flat).with_rescore_budget(BEAM),
+    )
+    .await;
+    println!(
+        "unbudgeted recall@{K}={:.4}  {:>8.0} B  {:>6.1} requests\n\
+         budgeted   recall@{K}={:.4}  {:>8.0} B  {:>6.1} requests",
+        unbudgeted.recall,
+        unbudgeted.bytes,
+        unbudgeted.requests,
+        budgeted.recall,
+        budgeted.bytes,
+        budgeted.requests
+    );
+    assert!(
+        budgeted.requests < unbudgeted.requests,
+        "a budget of {BEAM} for the whole query made {:.1} requests against the {:.1} of {BEAM} a \
+         probe, so no probe was left with nothing to fetch",
+        budgeted.requests,
+        unbudgeted.requests
+    );
+    assert!(
+        budgeted.bytes < unbudgeted.bytes,
+        "a budget of {BEAM} read {:.0} bytes against {:.0}",
+        budgeted.bytes,
+        unbudgeted.bytes
+    );
+    assert!(
+        budgeted.recall >= 0.9,
+        "a budget of {BEAM} for the whole query scored {:.4}, where {BEAM} a probe scored {:.4}",
+        budgeted.recall,
+        unbudgeted.recall
     );
 }
 

@@ -21,6 +21,18 @@
 //! granularities, reaches higher recall at every beam, and is 3.0x quicker at
 //! 8192 rows a partition and 1.8x at 65536.
 //!
+//! Arriving at a candidate list and paying for it are separate steps here, and
+//! no probe takes the second one for itself. A candidate costs a stride of
+//! `__vector` - 512 bytes at `d = 128` against the 68 of the code that nominated
+//! it - and those strides are nearly the whole of what a query of either mode
+//! moves. Giving every probe the same number of them spends the budget where the
+//! query happened to look rather than where the answer is, so [`rescore`] is
+//! called once the probes are all in, over a list
+//! [`crate::query::SearchParams::rescore_budget`] has chosen from across them.
+//! At equal recall that is another 4.6x off the scan's bytes at 8192 rows a
+//! partition and 3.2x at 65536, and it leaves nearly half the probes with
+//! nothing to fetch at all.
+//!
 //! It was not quicker at 65536 until the scan stopped asking for distances and
 //! started asking for a top-`L`. A scanned vertex costs 16 ns when every one of
 //! them is refined from its extra bits and about 2 when RaBitQ's error bound is
@@ -70,7 +82,30 @@ use lance_linalg::distance::DistanceType;
 use crate::format::{NEIGHBORS_COLUMN, VECTOR_COLUMN};
 use crate::io::{PartitionFile, read_scattered};
 use crate::partition::{checked_neighbors, neighbor_slots, vectors_of};
+use crate::query::Neighbor;
 use crate::search::{Comparisons, SearchList, SearchScratch, flat_storage};
+
+/// A vertex a walk or a scan kept, before anything exact has been measured
+/// against it.
+///
+/// What comes out of this module and what [`rescore`] takes back in. The two are
+/// separate steps because the choice of which candidates deserve an exact
+/// distance is not one partition's to make: every probe of a query is competing
+/// for the same answer, and a list that is the best its own partition could do
+/// may still be worse than another partition's rejects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Candidate {
+    /// Position within the partition: what the codes are indexed by and what
+    /// re-scoring reads by.
+    pub(crate) id: u32,
+    /// Where the vertex lives in the dataset, carried along so that candidates
+    /// of different partitions can be ranked against each other once the
+    /// partitions themselves have been let go.
+    pub(crate) row_addr: u64,
+    /// The *coded* distance that kept it: an estimate, and the thing re-scoring
+    /// exists to replace.
+    pub(crate) coded: f32,
+}
 
 /// One partition, and everything answering from it lazily needs but the query.
 ///
@@ -82,16 +117,16 @@ use crate::search::{Comparisons, SearchList, SearchScratch, flat_storage};
 /// [`crate::Partition`], so nothing else is in a position to notice a partition
 /// file whose stride disagrees with the segment listing it.
 ///
-/// [`Self::scan`] leaves `medoid`, `max_degree` and `beam_width` unread: they
-/// describe the graph, and a scan is the arm that does not have one.
+/// [`Self::scan`] leaves everything but the codes and `search_list_size`
+/// unread: `medoid`, `max_degree` and `beam_width` describe the graph, and a
+/// scan is the arm that does not have one; `file` is where the graph is, and a
+/// scan opens no file at all.
 pub(crate) struct LazyProbe<'a> {
     pub(crate) file: &'a PartitionFile,
     pub(crate) codes: &'a RabitQuantizationStorage,
     pub(crate) row_ids: &'a [u64],
     pub(crate) medoid: u32,
     pub(crate) max_degree: u32,
-    pub(crate) dimension: u32,
-    pub(crate) distance_type: DistanceType,
     pub(crate) search_list_size: usize,
     /// How many vertices one hop expands, and therefore how many rows of
     /// `__neighbors` one request asks for.
@@ -99,16 +134,16 @@ pub(crate) struct LazyProbe<'a> {
 }
 
 impl LazyProbe<'_> {
-    /// Walk, then re-score the candidate list exactly.
+    /// Walk the graph and return the candidate list it ends with.
     ///
-    /// Returns the list as local ids and *exact* distances, nearest first, which
-    /// is the same thing the whole-partition walks return and is what lets every
-    /// mode share the step that turns a candidate list into an answer.
+    /// Ascending by local id, which is the order [`rescore`] wants to read them
+    /// in, and carrying the *coded* distance that kept each one. Re-scoring is
+    /// not done here: which candidates earn an exact distance is a decision
+    /// across the query's probes rather than within one of them.
     ///
     /// `routing_query` and `dist_q_c` are what a coded distance is assembled
-    /// from; `query` is the raw one the re-scoring measures against. The two are
-    /// the same array for every metric but cosine, and passing the wrong one is
-    /// silent, which is why they arrive named.
+    /// from. The raw query does not appear at all - it belongs to the step that
+    /// measures exactly, and this one never does.
     ///
     /// Nothing here is handed to the CPU pool, unlike the walk over a partition
     /// held in memory. It cannot be: the pool takes work that never waits, and
@@ -119,8 +154,7 @@ impl LazyProbe<'_> {
         &self,
         routing_query: ArrayRef,
         dist_q_c: f32,
-        query: ArrayRef,
-    ) -> Result<(Vec<(u32, f32)>, u64)> {
+    ) -> Result<(Vec<Candidate>, u64)> {
         let num_rows = self.row_ids.len();
         if self.medoid as usize >= num_rows {
             return Err(Error::corrupt_file_named(
@@ -183,26 +217,29 @@ impl LazyProbe<'_> {
         let mut candidates = list
             .into_candidates()
             .into_iter()
-            .map(|node| node.id)
+            .map(|node| Candidate {
+                id: node.id,
+                row_addr: self.row_ids[node.id as usize],
+                coded: node.dist.0,
+            })
             .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Ok((Vec::new(), comparisons.get()));
-        }
-        candidates.sort_unstable();
-        let rescored = self.rescore(&candidates, query).await?;
-        comparisons.record(rescored.len() as u64);
-        Ok((rescored, comparisons.get()))
+        candidates.sort_unstable_by_key(|candidate| candidate.id);
+        Ok((candidates, comparisons.get()))
     }
 
-    /// Score every vertex of the partition, keep the nearest `L`, and re-score
-    /// those exactly.
+    /// Score every vertex of the partition against its code and keep the
+    /// nearest `L`.
     ///
-    /// The graph is never opened: this reads the codes the caller already holds
-    /// and then the vectors of the candidate list, and `__neighbors` - 256 bytes
-    /// a vertex at `R = 64`, more than a quarter of a partition file - does not
-    /// enter into it. What it costs instead is arithmetic, `num_rows` coded
-    /// distances against the few hundred a walk measures, which is the one
-    /// column where this mode is the expensive one.
+    /// Reads nothing, and is the only step of a query that does not: the codes
+    /// arrive from the caller, `__neighbors` - 256 bytes a vertex at `R = 64`,
+    /// more than a quarter of a partition file - is never opened, and the
+    /// vectors are [`rescore`]'s business. So a cached `Flat` probe makes no
+    /// request of its own at all, and every byte a query of this mode moves is a
+    /// candidate somebody decided to measure exactly.
+    ///
+    /// What it costs instead is arithmetic, `num_rows` coded distances against
+    /// the few hundred a walk measures, which is the one column where this mode
+    /// is the expensive one.
     ///
     /// That is why it asks for a top-`L` rather than for the distances. A
     /// multi-bit RaBitQ distance is two passes: a binary inner product every
@@ -211,12 +248,20 @@ impl LazyProbe<'_> {
     /// already worse than the `L`-th best found so far cannot enter the list and
     /// need not be refined, and [`DistCalculator::accumulate_topk_with_scratch`]
     /// classifies sixteen at a time against that bound and refines only the
-    /// survivors. Both arms of that branch are the same arithmetic this crate's
-    /// codes would get from [`DistCalculator::distance_all`], because the
+    /// survivors. A vertex that survives is measured by the same arithmetic this
+    /// crate's codes would get from [`DistCalculator::distance_all`], because the
     /// refinement has a packed bulk form and Lance only builds it for indices
     /// without error factors; our stride carries them. Below two bits there is
     /// no refinement and no bound, and the call degrades to exactly the scan it
     /// replaced.
+    ///
+    /// The list it returns is therefore an approximation of the nearest `L`
+    /// rather than the nearest `L`. The bound's error term is a confidence
+    /// interval and not a guarantee, so a vertex can be pruned that should have
+    /// been kept: measured in `codes::tests`, about one partition in a hundred
+    /// loses one, seated a hundredth of the partition's own spread too far out.
+    /// That is the same kind of miss the codes themselves already are, an order
+    /// smaller, and the recall sweeps were taken with it in place.
     ///
     /// Measured, that is 14.8 ns off every vertex scanned - the same figure at
     /// 8192 rows a partition and at 65536, which is what a saving that is per
@@ -235,12 +280,7 @@ impl LazyProbe<'_> {
     /// it does not know which vertices it wants until it has scored the ones
     /// before them. So the two arms are not comparable by their distance counts,
     /// only by what they cost and what they read.
-    pub(crate) async fn scan(
-        &self,
-        routing_query: ArrayRef,
-        dist_q_c: f32,
-        query: ArrayRef,
-    ) -> Result<(Vec<(u32, f32)>, u64)> {
+    pub(crate) fn scan(&self, routing_query: ArrayRef, dist_q_c: f32) -> (Vec<Candidate>, u64) {
         let num_rows = self.row_ids.len();
         let comparisons = Comparisons::default();
         let coded = self.codes.dist_calculator(routing_query, dist_q_c);
@@ -274,55 +314,75 @@ impl LazyProbe<'_> {
         );
         comparisons.record(dists.len() as u64);
 
-        if nearest.is_empty() {
-            return Ok((Vec::new(), comparisons.get()));
-        }
         // Local ids, because that is what the closure above put in the heap.
         // Ascending, because that is what the reader coalesces by and a heap
         // yields its contents in no order at all.
         let mut candidates = nearest
             .into_iter()
-            .map(|node| node.id as u32)
+            .map(|node| {
+                let id = node.id as u32;
+                Candidate {
+                    id,
+                    row_addr: self.row_ids[node.id as usize],
+                    coded: node.dist.0,
+                }
+            })
             .collect::<Vec<_>>();
-        candidates.sort_unstable();
-        let rescored = self.rescore(&candidates, query).await?;
-        comparisons.record(rescored.len() as u64);
-        Ok((rescored, comparisons.get()))
+        candidates.sort_unstable_by_key(|candidate| candidate.id);
+        (candidates, comparisons.get())
     }
+}
 
-    /// Fetch the vectors of a candidate list and put it in exact order.
-    ///
-    /// Every candidate and not the nearest `k` of them: a coded ordering tops
-    /// out around 0.95 recall at any code width, and the rows that make up the
-    /// difference are the ones it put behind `k`. One request either way, so the
-    /// whole list costs `L - k` strides more.
-    ///
-    /// `candidates` arrives ascending, which is the order the reader coalesces
-    /// by, and comes back reordered by an exact distance.
-    ///
-    /// The distances it measures are counted by the caller rather than here. A
-    /// `&Comparisons` held across the awaits below would make this future
-    /// `!Send` - the counter is a `Cell` - and the two callers both have the
-    /// length in hand anyway.
-    async fn rescore(&self, candidates: &[u32], query: ArrayRef) -> Result<Vec<(u32, f32)>> {
-        let vectors = self.file.project(&[VECTOR_COLUMN]).await?;
-        let batch = read_scattered(&vectors, candidates).await?;
-        let values = vectors_of(&batch, self.dimension)?;
-        let row_ids = candidates
-            .iter()
-            .map(|id| self.row_ids[*id as usize])
-            .collect::<Vec<_>>();
-        let store = flat_storage(&row_ids, &values, self.distance_type)?;
-        let exact = store.dist_calculator(query, 0.0);
+/// Fetch the vectors of a candidate list and measure the query against them.
+///
+/// The whole list and not its nearest `k`: a coded ordering tops out around 0.95
+/// recall at any code width, and the rows that make up the difference are the
+/// ones it put behind `k`. One request whatever the list holds, so a longer one
+/// costs only its extra strides - which is the reason it is worth deciding
+/// across a query's probes how many strides each of them gets.
+///
+/// A free function rather than a method on [`LazyProbe`] because by the time it
+/// runs there is no probe left: the codes and the row ids the walk needed have
+/// been let go, and what remains is the file, the candidates and the shape to
+/// check what comes back against.
+///
+/// `candidates` arrives ascending by local id, which is the order the reader
+/// coalesces by, and comes back ordered by an exact distance.
+///
+/// The distances it measures are counted by the caller rather than here. A
+/// `&Comparisons` held across the awaits below would make this future `!Send` -
+/// the counter is a `Cell` - and the caller has the length in hand anyway.
+pub(crate) async fn rescore(
+    file: &PartitionFile,
+    dimension: u32,
+    distance_type: DistanceType,
+    candidates: &[Candidate],
+    query: ArrayRef,
+) -> Result<Vec<Neighbor>> {
+    let ids = candidates
+        .iter()
+        .map(|candidate| candidate.id)
+        .collect::<Vec<_>>();
+    let row_addrs = candidates
+        .iter()
+        .map(|candidate| candidate.row_addr)
+        .collect::<Vec<_>>();
+    let vectors = file.project(&[VECTOR_COLUMN]).await?;
+    let batch = read_scattered(&vectors, &ids).await?;
+    let values = vectors_of(&batch, dimension)?;
+    let store = flat_storage(&row_addrs, &values, distance_type)?;
+    let exact = store.dist_calculator(query, 0.0);
 
-        // Positions in what came back, not local ids: the batch holds only the
-        // candidates, in the order they were asked for.
-        let mut rescored = candidates
-            .iter()
-            .enumerate()
-            .map(|(position, id)| (*id, exact.distance(position as u32)))
-            .collect::<Vec<_>>();
-        rescored.sort_by(|left, right| left.1.total_cmp(&right.1));
-        Ok(rescored)
-    }
+    // Positions in what came back, not local ids: the batch holds only the
+    // candidates, in the order they were asked for.
+    let mut rescored = candidates
+        .iter()
+        .enumerate()
+        .map(|(position, candidate)| Neighbor {
+            row_addr: candidate.row_addr,
+            distance: exact.distance(position as u32),
+        })
+        .collect::<Vec<_>>();
+    rescored.sort_by(|left, right| left.distance.total_cmp(&right.distance));
+    Ok(rescored)
 }
