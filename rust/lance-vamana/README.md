@@ -246,13 +246,13 @@ two are meant to say the same thing.
   walk reads minus the edges, by construction rather than by measurement.
 
   Against that walk at equal recall, with the same cache (`examples/lazy_walk.rs`).
-  At **8192 rows a partition and seven probes** a query reads **50.2 kB against
-  117.9**, makes **7.0 requests against 55.9** - exactly one to a probe, because
-  the candidate vectors are the only dependent read - and takes **1.5 ms against
+  At **8192 rows a partition and seven probes** a query reads **52.2 kB against
+  126.6**, makes **7.0 requests against 57.5** - exactly one to a probe, because
+  the candidate vectors are the only dependent read - and takes **1.6 ms against
   4.5**. At **65536 rows and four probes** it reads **30.9 kB against 72.1**,
-  makes **4.0 requests against 38.1**, and takes **1.9 ms against 3.3**. The scan
-  also reaches *higher* recall at every beam - 0.9690 against 0.9665 at 8192,
-  0.9910 against 0.9860 at 65536 - because it keeps the true nearest `L` of the
+  makes **4.0 requests against 38.0**, and takes **1.8 ms against 3.5**. The scan
+  also reaches *higher* recall at every beam - 0.9695 against 0.9665 at 8192,
+  0.9920 against 0.9855 at 65536 - because it keeps the true nearest `L` of the
   partition while a greedy walk keeps the `L` it found.
 
   It wins the clock while measuring ten times as many coded distances, and the
@@ -276,6 +276,40 @@ two are meant to say the same thing.
   vertex against 68 for the codes and 512 for the vector, more than a quarter of a
   partition file that a scan would not have written. At the granularities measured
   it is not earning that, and an index there is `IVF_RQ` with a graph attached.
+
+- **A query's exact distances are the query's budget, not each probe's.** Every
+  mode picks its candidates by code and then reads a vector to correct each one,
+  and for the modes that keep no vectors resident those strides are essentially
+  the whole byte cost: a linear fit over the sweeps puts a candidate at 764 bytes
+  at 8192 rows a partition and 610 at 65536, against a vector's own 512. Dealing
+  `L` of them to every probe spends the budget where the query looked rather than
+  where the answer is - seven probes at `L = 16` correct a hundred and twelve rows
+  to answer for ten, and the farthest partitions contribute none of them.
+
+  `SearchParams::rescore_budget` makes it one pool. Probes come back with coded
+  candidates and read nothing; the query keeps the nearest `budget` of them
+  across every probe, ranked by coded distance and tie-broken on the row address
+  so that the order the probes happen to finish in cannot change the answer; only
+  then are vectors fetched. At equal recall, with the budget set to `L`:
+
+  | | 8192 rows, 7 probes | 65536 rows, 4 probes |
+  |---|---|---|
+  | scan, per probe | 52.2 kB, 7.0 requests, 1.6 ms | 30.9 kB, 4.0, 1.8 ms |
+  | **scan, pooled** | **11.3 kB, 3.7 requests, 1.1 ms** | **9.6 kB, 2.1, 1.6 ms** |
+  | walk, per probe | 126.6 kB, 57.5 requests, 4.5 ms | 72.1 kB, 38.0, 3.5 ms |
+  | walk, pooled | 67.4 kB, 59.0 requests, 4.2 ms | 43.6 kB, 37.5, 3.1 ms |
+
+  Nearly half the probes then fetch nothing at all, which is the partition gate
+  this crate measured and declined to build (below), reached from the other end
+  and for free. It does not help the walk's round trips, because those are the
+  hop chain rather than the re-scoring.
+
+  What it costs is a wider `L` at the same recall: at a narrow beam a pooled scan
+  is well behind - 0.8225 against 0.9335 at `L = 10` - the curves meet by
+  `L = 24`, where pooling reads 15.9 kB against 114.8 for a thousandth of recall,
+  and both top out at the same ceiling. `None` is the default and is the old
+  behaviour exactly.
+
   One thing is still untouched and it favours the scan further: the top-`L` call
   allocates its scratch per probe rather than reusing it across the four in
   flight.
