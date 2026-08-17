@@ -196,6 +196,41 @@ two are meant to say the same thing.
 
   Codes are off by default, and refused rather than skipped for a dimension that
   is not a multiple of eight, which is what RaBitQ packs a bit a dimension into.
+- **A probe is taken whether or not it can help.** RaBitQ carries a per-vector
+  error factor, so a partition whose nearest possible vertex cannot beat the
+  answer assembled so far need not be walked at all, and whether that check pays
+  was measured rather than assumed (`examples/expansion_gate.rs`). Against a
+  partition's own `K`th best it never fires. Against the `K`th best over every
+  partition probed so far it removes 10 to 54 per cent of the probes, and the
+  threshold lagging by `PARTITIONS_IN_FLIGHT` costs 1.3 points of that at
+  twenty-five probes and all of it at four - so the lag is not the obstacle.
+
+  Deciding is. Sound means the minimum over *every* vertex, which is a coded
+  distance each: 16.8 ns a vertex through `distance_all`, so 137.6 us to scan an
+  8192-row partition against 703 us to walk one, and the check pays for the
+  partitions it does not skip as well as the ones it does. It breaks even at 19.6
+  per cent skipped and only clears that above ten probes - so at the seven where
+  recall 0.95 lands it costs nine per cent more than it saves, and at twenty-five
+  it takes a third off the query at an unchanged recall. A gate is a way to buy
+  the recall of twenty-five probes for the price of sixteen, not a way to make
+  the working point cheaper, so it is not built. Neither is a cheaper stand-in:
+  `(|q - c| - max|v - c|)^2` is positive only when the query is farther from the
+  centroid than every vertex in the partition, which at thousands of vertices
+  does not happen and reads 0.00 per cent everywhere, and a sample is not cheaper
+  but looser - 256 vertices of 8192 skip 79 per cent where the sound check skips
+  54, which is recall being spent rather than saved.
+
+  The same two prices say something larger and less comfortable, and it is
+  arithmetic rather than a measurement. Walking a probe costs about the same
+  whatever the partition holds - 703 us at 8192 rows, 810 at 65536 - because hops
+  are set by the beam and the graph's diameter, not by the vertex count, while
+  scanning is linear in it. The two meet somewhere around 42 to 53 thousand rows
+  a partition. Below that a full coded scan is the cheaper way to search a
+  partition *and* reads strictly less, since it wants no out-edges at all - at
+  8192 rows, five times cheaper. Which is to say that at the granularity these
+  numbers are quoted at, the `__neighbors` column may not be earning its place.
+  Confirming or refuting that needs a flat-scan arm measured at equal recall,
+  which has not been run.
 
 An index is **refused** at open, rather than answering from what is left, when:
 
