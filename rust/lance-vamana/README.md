@@ -220,17 +220,50 @@ two are meant to say the same thing.
   but looser - 256 vertices of 8192 skip 79 per cent where the sound check skips
   54, which is recall being spent rather than saved.
 
-  The same two prices say something larger and less comfortable, and it is
-  arithmetic rather than a measurement. Walking a probe costs about the same
-  whatever the partition holds - 703 us at 8192 rows, 810 at 65536 - because hops
-  are set by the beam and the graph's diameter, not by the vertex count, while
-  scanning is linear in it. The two meet somewhere around 42 to 53 thousand rows
-  a partition. Below that a full coded scan is the cheaper way to search a
-  partition *and* reads strictly less, since it wants no out-edges at all - at
-  8192 rows, five times cheaper. Which is to say that at the granularity these
-  numbers are quoted at, the `__neighbors` column may not be earning its place.
-  Confirming or refuting that needs a flat-scan arm measured at equal recall,
-  which has not been run.
+  The same two prices said something larger and less comfortable. Walking a
+  probe costs about the same whatever the partition holds - 703 us at 8192 rows,
+  810 at 65536 - because hops are set by the beam and the graph's diameter, not
+  by the vertex count, while scanning is linear in it. So the two meet somewhere,
+  and the granularity these numbers are quoted at is below the crossing. That is
+  now measured rather than reasoned, by `WalkMode::Flat` and the arm below.
+
+- **The graph buys arithmetic, not bytes.** `WalkMode::Flat` throws the traversal
+  away: it scores every vertex of a probed partition against its code, keeps the
+  nearest `L` and re-scores those exactly. Same resident codes, same candidate
+  vectors, no `__neighbors` at all - so it reads what a lazy walk reads minus the
+  edges, by construction rather than by measurement.
+
+  Against that walk at equal recall, with the same cache (`examples/lazy_walk.rs`).
+  At **8192 rows a partition and seven probes** a query reads **52.9 kB against
+  120.0**, makes **7.0 requests against 56.4** - exactly one to a probe, because
+  the candidate vectors are the only dependent read - and takes **2.4 ms against
+  4.6**. At **65536 rows and four probes** it reads **32.0 kB against 76.9**,
+  makes **4.0 requests against 39.1**, and takes **5.7 ms against 3.6**. Only the
+  time column changes sign; bytes and round trips keep the same ratio either
+  side. The scan also reaches *higher* recall at every beam - 0.9695 against
+  0.9660 at 8192, 0.9915 against 0.9860 at 65536 - because it keeps the true
+  nearest `L` of the partition while a greedy walk keeps the `L` it found.
+
+  So what the graph is actually buying is arithmetic. A scan spends 963 us of
+  coded distance at 8192 rows and 3985 at 65536 where a walk spends about 213 and
+  175, and it hands back 49.4 and 35.1 round trips for it: **15 us of CPU per
+  round trip saved at 8192, 109 us at 65536**. A round trip on this machine's
+  page cache is 85 us, which is why the trade pays at one granularity and not at
+  the other; on a store with real latency it pays by two orders of magnitude at
+  both. The two arms are therefore optimal at opposite ends - a server whose CPU
+  is saturated wants the walk, a client bound by latency wants the scan - and the
+  honest claim for the mode is that one parameter chooses between round trips and
+  arithmetic over one unchanged index file.
+
+  What that costs to have is the `__neighbors` column: at `R = 64` it is 256
+  bytes a vertex against 68 for the codes and 512 for the vector, more than a
+  quarter of a partition file that a scan would not have written. At 8192 rows
+  it is not
+  earning that, and an index at that granularity is `IVF_RQ` with a graph
+  attached. Two things are untouched and both favour the scan: it allocates a
+  vector of distances per probe rather than reusing scratch, and it does not use
+  the RaBitQ lower bound inside `accumulate_topk_with_scratch`, which is precisely
+  the column it loses in.
 
 An index is **refused** at open, rather than answering from what is left, when:
 
