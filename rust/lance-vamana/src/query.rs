@@ -174,9 +174,11 @@ pub enum WalkMode {
     /// Half of that is here and the other half is [`VamanaIndex::with_cache`],
     /// because nine tenths of the 18.2 MB is the codes, which do not depend on
     /// the query and are re-read by every one of them. Given somewhere to keep
-    /// them, the same query reads **71.9 kB** and takes 3.2 ms against 131.0 -
+    /// them, the same query reads **72.1 kB** and takes 3.5 ms against 130.5 -
     /// the mode's real number, and the reason it is worth having whenever the
-    /// index does not fit in the memory available to it.
+    /// index does not fit in the memory available to it. With
+    /// [`SearchParams::rescore_budget`] set as well it is 43.6 kB, off the same
+    /// cache.
     ///
     /// Requires codes, same as [`Self::Coded`].
     Lazy,

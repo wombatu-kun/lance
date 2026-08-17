@@ -149,49 +149,59 @@ two are meant to say the same thing.
 
   On SIFT1M at 65536 rows a partition, four probes and equal recall
   (`examples/lazy_walk.rs`), that is **18.2 MB a query against 198.6 MB** read
-  whole, and **18.6 ms of warm CPU against 131.0 ms** - decoding two hundred
+  whole, and **18.6 ms of warm CPU against 130.5 ms** - decoding two hundred
   megabytes costs more than fetching eighteen, even with every byte already in
   the page cache. What it pays is round trips: 20 requests become 54, and 28
-  iops become 197.
+  iops become 198.
 
   Nine tenths of that 18.2 MB is the code column, re-read by every query, so the
-  mode is only half of the design: **with a cache the same query reads 71.9 kB**,
-  0.0004x of reading whole and 254 times less than reading lazily without one,
-  in **3.2 ms** against 131.0, holding 89 MB to do it. What the walk itself
+  mode is only half of the design: **with a cache the same query reads 72.1 kB**,
+  0.0004x of reading whole and 253 times less than reading lazily without one,
+  in **3.5 ms** against 130.5, holding 89 MB to do it. What the walk itself
   chooses to fetch - the out-edges of the vertices it expands, the vectors of the
-  candidates it ends with - is that 71.9 kB and nothing more; the 640 kB between
+  candidates it ends with - is that 72.1 kB and nothing more; the 640 kB between
   it and the code column is `__row_id`, which is read whole beside the codes and
   cached with them. The distances are identical with and without the cache, which
   is the point: it changes what a query reads and nothing else.
 
   The cache also reverses which granularity is cheaper. Without one, 8192-row
   partitions read less than 65536-row ones (4.5 MB against 18.2); with one it is
-  the other way round - **71.9 kB against 119.7 kB, and 3.2 ms against 4.9** -
+  the other way round - **72.1 kB against 126.6 kB, and 3.5 ms against 4.5** -
   because the resident part is paid once while seven probes cost seven entry
   points, seven sets of edges and seven candidate lists against four.
+
+  Two bullets below take that figure down twice more and neither of them needs a
+  larger cache: pooling the exact distances over the query instead of over each
+  probe makes it 43.6 kB, and dropping the graph for a flat scan of the same
+  resident codes makes it **9.6 kB at 65536 rows and 11.3 kB at 8192**. The cache
+  is what all three arms have in common, which is why it is described here rather
+  than with either of them.
 
   What that is worth needs something to compare it against, and the nearest
   measured one is Lance's own `IVF_HNSW_SQ` over the same vectors at the same
   recall, counted through `Scanner::scan_stats_callback`: **12.29 MB a query**
   read cold with its partitions tuned to 8192 rows, and 197.78 MB at the shipped
-  default of one partition to a million rows. At that same 8192 rows this reads
-  4.5 MB cold and 119.7 kB warm. Bytes are all that compares - those numbers
-  come from Lance's scanner and these from this driver, the quantisers differ,
-  eight-bit scalar against three-bit RaBitQ, and what is held equal is the
-  dataset and the recall rather than the index.
+  default of one partition to a million rows. At that same 8192 rows the best arm
+  here reads **11.3 kB** warm, which is a thousandfold, and 4.4 MB cold. Bytes
+  are all that compares - those numbers come from Lance's scanner and these from
+  this driver, the quantisers differ, eight-bit scalar against three-bit RaBitQ,
+  and what is held equal is the dataset and the recall rather than the index.
 
   Warm against cold is not the comparison, though, because Lance's reads
   collapse too once its cache holds the partitions. What each has to hold to get
   there is: 257 to 297 bytes a row on disk for that index, and more again in
-  Lance's cache, which holds an unpacked form - against 89 bytes a row here,
-  which still reads 71.9 kB a query rather than nothing. The saving is the ratio
-  between those two resident figures, and it only becomes a saving in bytes read
-  when neither budget covers the index.
+  Lance's cache, which holds an unpacked form - against 87 to 89 bytes a row
+  here, which still reads 11.3 kB a query rather than nothing. The saving is the
+  ratio between those two resident figures, and it only becomes a saving in bytes
+  read when neither budget covers the index.
 
   Which is what makes the cache load-bearing rather than an optimisation.
   Without one a lazy walk over 65536-row partitions reads 18.2 MB a query, worse
   than the tuned baseline it is meant to beat; at 8192 rows it reads 4.5 MB,
-  which is better. Granularity and the cache are chosen together, and neither
+  which is better. Pooling rescues neither, because a cold query's bytes are the
+  resident part and not its candidates: of the 4.4 MB a cold flat scan reads at
+  8192 rows, 4.38 MB is codes and row ids, and pooling can only take from the
+  52 kB that is left. Granularity and the cache are chosen together, and neither
   choice survives the other being changed.
 
   Codes are off by default, and refused rather than skipped for a dimension that

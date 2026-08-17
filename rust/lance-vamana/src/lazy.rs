@@ -66,7 +66,7 @@
 //! which vertices this walk expanded, which candidates it ended with - and is
 //! therefore nobody's to keep. What is worth keeping is what the walk needed
 //! before it could start, and [`crate::cache`] keeps it: a query that has probed
-//! a partition before fetches 71.9 kB on SIFT1M where one that has not fetches
+//! a partition before fetches 72.1 kB on SIFT1M where one that has not fetches
 //! 18.2 MB, and the 18.1 MB between them is the codes and the row ids, read once
 //! rather than by every query.
 
