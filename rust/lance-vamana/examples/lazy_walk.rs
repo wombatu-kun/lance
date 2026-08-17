@@ -30,10 +30,12 @@
 //!   queries would do and what leaves only the walk's own fetches.
 //! - `flat` throws the graph away: it scores every vertex of the partition
 //!   against its code and keeps the nearest `L`, so it reads what `lazy` reads
-//!   minus the edges and does thirty times the arithmetic. It is here because a
-//!   walk's cost barely moves with the partition's size while a scan's is linear
-//!   in it, and the arithmetic puts the crossing somewhere near the granularity
-//!   the rest of these numbers were taken at.
+//!   minus the edges and measures thirty times as many distances. It is here
+//!   because a walk's cost barely moves with the partition's size while a scan's
+//!   is linear in it, so the two cross somewhere; the crossing sits well above
+//!   the coarser granularity below, since a scanned vertex costs about two
+//!   nanoseconds once RaBitQ's error bound is throwing out most of the extra-bit
+//!   refinement.
 //!
 //! `flat` clears a recall target at a beam the walks need a wider one for, so
 //! the interpolation below often reports it at the narrowest beam on the grid.

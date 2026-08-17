@@ -190,18 +190,25 @@ pub enum WalkMode {
     ///
     /// A walk's cost hardly moves with the size of the partition, since its hops
     /// are set by the beam and the graph's diameter rather than by the vertex
-    /// count, while a scan's is linear in it - so the two cross somewhere, and
-    /// on SIFT1M at equal recall the crossing is between the two granularities
-    /// the rest of this crate quotes (`examples/lazy_walk.rs`). A scan reads
-    /// 52.9 kB a query against a cached lazy walk's 120.0 at 8192 rows a
-    /// partition and 32.0 against 76.9 at 65536, makes one request to a probe
-    /// against the walk's eight, and reaches higher recall at every beam; what
-    /// it pays is CPU, which puts it ahead by 1.9x at 8192 rows and behind by
-    /// 1.6x at 65536.
+    /// count, while a scan's is linear in it - so the two cross somewhere. On
+    /// SIFT1M at equal recall (`examples/lazy_walk.rs`) the crossing is not
+    /// between the two granularities this crate quotes: against a cached lazy
+    /// walk a scan reads 50.2 kB a query against 117.9 at 8192 rows a partition
+    /// and 30.9 against 72.1 at 65536, makes one request to a probe against the
+    /// walk's eight, reaches higher recall at every beam, and takes 1.5 ms
+    /// against 4.5 and 1.9 against 3.3.
     ///
-    /// So the choice is round trips against arithmetic, over one unchanged index
-    /// file: a deployment whose CPU is saturated wants [`Self::Lazy`], one bound
-    /// by a store's latency wants this.
+    /// It wins the arithmetic too, and not by doing less of it: it measures ten
+    /// times as many coded distances but pays about two nanoseconds for each
+    /// where a walk pays sixteen, because a scan can hand the whole partition to
+    /// [`lance_index::vector::storage::DistCalculator::accumulate_topk_with_scratch`]
+    /// and let RaBitQ's error bound throw out most of the extra-bit refinement,
+    /// while a walk has to ask one vertex at a time and cannot know in advance
+    /// which ones. So the choice is round trips against arithmetic over one
+    /// unchanged index file, but at this granularity the arithmetic is no longer
+    /// what decides it: a deployment whose CPU is saturated still wants
+    /// [`Self::Lazy`] once a partition is large enough, and everything else
+    /// wants this.
     ///
     /// Requires codes, same as [`Self::Coded`].
     Flat,

@@ -15,13 +15,20 @@
 //! right is a property of the deployment rather than of the index.
 //! [`LazyProbe::walk`] steers by the graph; [`LazyProbe::scan`] ignores it and
 //! scores every vertex of the partition instead - ten to fifty times the
-//! arithmetic, and strictly fewer bytes, because it opens no `__neighbors` at
-//! all. Measured at equal recall, the scan reads 0.42 to 0.44 of what the walk
-//! reads and makes a tenth of the round trips at both granularities, and only
-//! the CPU changes sign: it wins by 1.9x at 8192 rows a partition and loses by
-//! 1.6x at 65536 (`examples/lazy_walk.rs`). What the graph buys is arithmetic,
-//! at fifteen microseconds of it per round trip saved at 8192 rows and a hundred
-//! and nine at 65536.
+//! distances, and strictly fewer bytes, because it opens no `__neighbors` at
+//! all. Measured at equal recall (`examples/lazy_walk.rs`), the scan reads 0.43
+//! of what the walk reads and makes a tenth of the round trips at both
+//! granularities, reaches higher recall at every beam, and is 3.0x quicker at
+//! 8192 rows a partition and 1.8x at 65536.
+//!
+//! It was not quicker at 65536 until the scan stopped asking for distances and
+//! started asking for a top-`L`. A scanned vertex costs 16 ns when every one of
+//! them is refined from its extra bits and about 2 when RaBitQ's error bound is
+//! allowed to throw most of the refinements out, and the 14.8 ns between those
+//! came off two granularities alike, which is what a per-vertex saving should
+//! do. So the graph's own claim is narrower than it looked: it buys a partition
+//! large enough for two nanoseconds a vertex to add up, which on SIFT1M is
+//! several times the coarsest granularity here.
 //!
 //! Three measurements decide the shape, and none of them is obvious:
 //!
@@ -51,9 +58,12 @@
 //! 18.2 MB, and the 18.1 MB between them is the codes and the row ids, read once
 //! rather than by every query.
 
+use std::collections::BinaryHeap;
+
 use arrow_array::ArrayRef;
 use lance_core::{Error, Result};
 use lance_index::vector::bq::storage::RabitQuantizationStorage;
+use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
 
@@ -191,17 +201,40 @@ impl LazyProbe<'_> {
     /// and then the vectors of the candidate list, and `__neighbors` - 256 bytes
     /// a vertex at `R = 64`, more than a quarter of a partition file - does not
     /// enter into it. What it costs instead is arithmetic, `num_rows` coded
-    /// distances against the few hundred a walk measures, and two vectors the
-    /// length of the partition while it selects, which is the one place this
-    /// mode holds more than a walk does.
+    /// distances against the few hundred a walk measures, which is the one
+    /// column where this mode is the expensive one.
     ///
-    /// Those distances are not the walk's distances at the walk's price. One
-    /// [`DistCalculator::distance_all`] over the quantiser's block layout costs
-    /// 16.8 ns a vertex where [`DistCalculator::distance`] one at a time costs
-    /// 40.0 (`examples/expansion_gate.rs`), and a walk cannot have the cheaper
-    /// one: it does not know which vertices it wants until it has scored the
-    /// ones before them. So the two arms are not comparable by their distance
-    /// counts, only by what they cost and what they read.
+    /// That is why it asks for a top-`L` rather than for the distances. A
+    /// multi-bit RaBitQ distance is two passes: a binary inner product every
+    /// vertex pays, then an extra-bit refinement that costs several times as
+    /// much. The binary pass carries an error bound, so a vertex whose bound is
+    /// already worse than the `L`-th best found so far cannot enter the list and
+    /// need not be refined, and [`DistCalculator::accumulate_topk_with_scratch`]
+    /// classifies sixteen at a time against that bound and refines only the
+    /// survivors. Both arms of that branch are the same arithmetic this crate's
+    /// codes would get from [`DistCalculator::distance_all`], because the
+    /// refinement has a packed bulk form and Lance only builds it for indices
+    /// without error factors; our stride carries them. Below two bits there is
+    /// no refinement and no bound, and the call degrades to exactly the scan it
+    /// replaced.
+    ///
+    /// Measured, that is 14.8 ns off every vertex scanned - the same figure at
+    /// 8192 rows a partition and at 65536, which is what a saving that is per
+    /// vertex rather than per query has to look like. It is most of a coded
+    /// distance, and it is the whole reason a scan of the coarser granularity
+    /// beats a walk of it. Note what it does *not* change: the comparison count
+    /// this returns is still one a vertex, because the binary pass is what every
+    /// vertex pays and Lance hands back no count of what it refined. For this
+    /// mode that column is an upper bound on the arithmetic, and the clock is
+    /// where the bound shows.
+    ///
+    /// The distances it does compute are not the walk's distances at the walk's
+    /// price. A batched pass over the quantiser's block layout costs 16.8 ns a
+    /// vertex where [`DistCalculator::distance`] one at a time costs 40.0
+    /// (`examples/expansion_gate.rs`), and a walk cannot have the cheaper one:
+    /// it does not know which vertices it wants until it has scored the ones
+    /// before them. So the two arms are not comparable by their distance counts,
+    /// only by what they cost and what they read.
     pub(crate) async fn scan(
         &self,
         routing_query: ArrayRef,
@@ -211,32 +244,47 @@ impl LazyProbe<'_> {
         let num_rows = self.row_ids.len();
         let comparisons = Comparisons::default();
         let coded = self.codes.dist_calculator(routing_query, dist_q_c);
-        let distances = coded.distance_all(self.search_list_size);
+
+        // Bounded by the partition as well as by `L`, like `SearchList::new`
+        // and for the same reason: `L` comes from a caller who may have passed
+        // `usize::MAX`. The quantiser's four scratch buffers are the caller's
+        // to own, and there is nothing here to own them across probes - each
+        // arrives with its own partition and its own borrow of the cache.
+        let mut nearest: BinaryHeap<OrderedNode<u64>> =
+            BinaryHeap::with_capacity(self.search_list_size.min(num_rows));
+        let mut dists = Vec::new();
+        let mut quantized_dists = Vec::new();
+        let mut quantized_dists_table = Vec::new();
+        let mut hacc_quantized_dists = Vec::new();
+        coded.accumulate_topk_with_scratch(
+            self.search_list_size,
+            None,
+            None,
+            u64::from,
+            &mut nearest,
+            &mut dists,
+            &mut quantized_dists,
+            &mut quantized_dists_table,
+            &mut hacc_quantized_dists,
+        );
         debug_assert_eq!(
-            distances.len(),
+            dists.len(),
             num_rows,
             "the code storage and the row ids of a partition disagree about its length"
         );
-        comparisons.record(distances.len() as u64);
+        comparisons.record(dists.len() as u64);
 
-        let mut ranked = distances
-            .into_iter()
-            .enumerate()
-            .map(|(id, distance)| (id as u32, distance))
-            .collect::<Vec<_>>();
-        if self.search_list_size < ranked.len() {
-            ranked.select_nth_unstable_by(self.search_list_size, |left, right| {
-                left.1.total_cmp(&right.1)
-            });
-            ranked.truncate(self.search_list_size);
-        }
-        if ranked.is_empty() {
+        if nearest.is_empty() {
             return Ok((Vec::new(), comparisons.get()));
         }
-        // By id, because that is what the reader coalesces by, and because a
-        // partial sort leaves ties wherever the partition happened to put them.
-        ranked.sort_unstable_by_key(|(id, _)| *id);
-        let candidates = ranked.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        // Local ids, because that is what the closure above put in the heap.
+        // Ascending, because that is what the reader coalesces by and a heap
+        // yields its contents in no order at all.
+        let mut candidates = nearest
+            .into_iter()
+            .map(|node| node.id as u32)
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
         let rescored = self.rescore(&candidates, query).await?;
         comparisons.record(rescored.len() as u64);
         Ok((rescored, comparisons.get()))

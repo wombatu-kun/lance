@@ -637,6 +637,8 @@ fn factor_columns(coded: &RecordBatch, factors: usize) -> Result<Vec<&[f32]>> {
 mod tests {
     use super::*;
 
+    use std::collections::BinaryHeap;
+
     use lance_index::vector::storage::{DistCalculator, VectorStore};
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
@@ -860,6 +862,83 @@ mod tests {
             median < 0.2,
             "the median coded distance is off by {median:.3} of the real one"
         );
+    }
+
+    /// The gated top-`L` and the exhaustive one have to be the same `L`.
+    ///
+    /// [`crate::lazy::LazyProbe::scan`] asks Lance for a top-`L` rather than for
+    /// every distance, because above one bit the error bound above lets a vertex
+    /// already worse than the `L`-th best skip its extra-bit refinement. That is
+    /// a rule about what may be *dropped*, so its failure is a candidate quietly
+    /// missing from the list rather than an error, and recall over a whole index
+    /// is far too coarse to see one go.
+    ///
+    /// Two queries, because one is not enough to exercise it. A query sitting on
+    /// a vertex makes the threshold tight at once, which is what gets the bound
+    /// consulted at all; a query sitting nowhere in particular puts the `L`-th
+    /// and the `L + 1`-th within a hair of each other, which is where a bound
+    /// off by a slack decides the wrong one.
+    #[test]
+    fn a_gated_top_l_is_the_exhaustive_one() {
+        for num_bits in [1u8, 3, 5] {
+            let params = CodeParams::mint(num_bits, DIMENSION).unwrap();
+            let (vectors, centroid, row_ids) = sample(7);
+            let column = encode(&params, DistanceType::L2, &vectors, &centroid).unwrap();
+            let store = storage(&params, DistanceType::L2, DIMENSION, &row_ids, &column).unwrap();
+
+            let on_a_vertex = vectors.values().as_primitive::<Float32Type>().values()
+                [..DIMENSION as usize]
+                .to_vec();
+            let (elsewhere, _, _) = sample(31);
+            let elsewhere = elsewhere.values().as_primitive::<Float32Type>().values()
+                [..DIMENSION as usize]
+                .to_vec();
+            for (placement, query) in [("on a vertex", on_a_vertex), ("elsewhere", elsewhere)] {
+                let key: ArrayRef = Arc::new(Float32Array::from(query));
+                let dist_q_c = key
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+                    .zip(centroid.as_primitive::<Float32Type>().values())
+                    .map(|(value, center)| (value - center) * (value - center))
+                    .sum::<f32>();
+                let coded = store.dist_calculator(key, dist_q_c);
+
+                let mut exhaustive = coded
+                    .distance_all(0)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(id, distance)| (id as u64, distance))
+                    .collect::<Vec<_>>();
+                exhaustive.sort_by(|left, right| left.1.total_cmp(&right.1));
+
+                for search_list_size in [1usize, 5, 17, ROWS] {
+                    let mut nearest = BinaryHeap::new();
+                    coded.accumulate_topk_with_scratch(
+                        search_list_size,
+                        None,
+                        None,
+                        u64::from,
+                        &mut nearest,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                    );
+                    let mut gated = nearest.into_iter().map(|node| node.id).collect::<Vec<_>>();
+                    gated.sort_unstable();
+                    let mut expected = exhaustive[..search_list_size]
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .collect::<Vec<_>>();
+                    expected.sort_unstable();
+                    assert_eq!(
+                        gated, expected,
+                        "{num_bits} bits, query {placement}, list of {search_list_size}"
+                    );
+                }
+            }
+        }
     }
 
     /// A code column the partition's own width disagrees with is a corrupt file,
