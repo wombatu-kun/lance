@@ -21,6 +21,57 @@ Both halves of the cost are returned rather than logged: a graph is a trade
 between what a build pays and what a query pays, and a change that improves one
 by spending the other is not visible from either number alone.
 
+## Without writing any Rust
+
+```
+cd rust/lance-vamana
+cargo run --profile release-no-lto --bin vamana -- --help
+```
+
+Seven subcommands over the calls this crate exports: `ingest`, `build`,
+`search`, `insert`, `merge`, `consolidate` and `info`. The maintenance three
+take nothing beyond the dataset and the index name, for the reason
+[Maintenance](#maintenance) gives.
+
+`ingest` is there so that the published ANN benchmark datasets can be pointed at
+directly. It writes a `.fvecs` file out as a Lance dataset a batch at a time -
+GIST1M is 3.8 GB and is never held whole - and records each vector's position in
+a column of its own, which is what lets a published `.ivecs` ground truth be
+scored against an answer: a row address says nothing about which base vector a
+row was.
+
+The whole loop on SIFT1M, at the working point the figures below are quoted at:
+
+```
+vamana ingest --fvecs sift_base.fvecs --dataset sift.lance
+vamana build  --dataset sift.lance --index-name idx \
+              --rows-per-partition 8192 --code-bits 3
+vamana search --dataset sift.lance --index-name idx \
+              --fvecs sift_query.fvecs --limit 200 \
+              --truth sift_groundtruth.ivecs \
+              -k 10 --nprobes 7 -L 24 --mode flat --rescore-budget 24 \
+              --cache-mb 4096 --warmup 200
+```
+
+`search` reports what a query cost as well as what it found, because recall
+without a cost is not a number - and it prints the settings the figures were
+taken at above them, because the same index and the same queries cost wildly
+different amounts under another mode, beam or cache.
+
+The two flags on the last line are what the phase D figures are measured with
+and neither is on by default: `--cache-mb` gives the codes somewhere to live
+across queries, and `--warmup` answers a first pass and throws it away. Set
+neither and the run is a cold process, which is a real number and a different
+one. Set only `--cache-mb` and it is neither, because the cache fills inside the
+measured pass and the fill is charged to the queries that shared it - which is
+why the report also prints the share of lookups the cache served and the bytes
+it ended up holding.
+
+`--json` prints one object carrying every answer and every cost; the table form
+prints answers only when there is a single query. `--take id,title` fetches
+columns of the rows that came back, joined on the row id rather than on
+position - `Dataset::take_rows` drops rows it cannot find instead of erroring.
+
 ## What this costs the dataset
 
 **Committing a Vamana index breaks Lance's own vector search on the indexed
@@ -459,10 +510,13 @@ cd rust/lance-vamana
 CARGO_INCREMENTAL=0 cargo fmt --all
 CARGO_INCREMENTAL=0 cargo clippy --all-targets -- -D warnings
 CARGO_INCREMENTAL=0 cargo test
+CARGO_INCREMENTAL=0 cargo check --no-default-features
 ```
 
 `CARGO_INCREMENTAL=0` because the incremental cache across the fork's three
-workspaces grows to tens of gigabytes.
+workspaces grows to tens of gigabytes. The last line builds the library without
+the `cli` feature, which is what keeps `clap` out of a consumer that only
+embeds it.
 
 Nothing here runs in Lance's CI, for the same reason. `tests/spike.rs`
 is executable documentation of what Lance's public API permits an external index
