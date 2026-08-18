@@ -11,9 +11,14 @@
 //! Environment: `SIFT_DIR` (required), `VECTORS` (default 100000, `0` for all),
 //! `QUERIES` (default 200), `ROWS_PER_PARTITION` (default 8192), `NPROBES`
 //! (default 4), `DEGREE` (default 64), `CODE_BITS` (default 3), `BEAMS`
-//! (default `20,24,28,32,40,56`), `WIDTHS` (default `1,2,4,8,16`),
-//! `CACHE_WIDTHS` (default `4`), `CACHE_MB` (default 4096), `TARGET`
-//! (default 95, the recall percentage the arms are compared at).
+//! (default `12,16,20,24,28,40`), `WIDTHS` (default `1,2,4,8,16`),
+//! `CACHE_WIDTHS` (default `4`), `CACHE_MB` (default `4096`, a list: the arms
+//! that hold a cache are measured once per rung and the rest once in all),
+//! `TARGET` (default 95, the recall percentage the arms are compared at),
+//! `DATASET_DIR` (unset: build into a temporary directory and throw it away.
+//! Set: build into a path named after the shape, or reuse what is there),
+//! `ARMS` (unset: every arm. Set: only those whose label starts with one of
+//! the names listed, as in `ARMS=lazy,flat,cached,pooled`).
 //!
 //! Six arms through one index and one binary, which is the only comparison
 //! worth making: the same graph, the same routing, the same codes, and a switch.
@@ -318,7 +323,7 @@ async fn measure(
 
 fn report(label: &str, beam: usize, cost: &Cost) {
     println!(
-        "{label:<12} {beam:>5} {:>8.4} {:>12.0} {:>8.0} {:>9.1} {:>10.0} {:>10.0} {:>7.2}",
+        "{label:<19} {beam:>5} {:>8.4} {:>12.0} {:>8.0} {:>9.1} {:>10.0} {:>10.0} {:>7.2}",
         cost.recall,
         cost.bytes,
         cost.iops,
@@ -379,7 +384,7 @@ async fn main() {
     assert!(!beams.is_empty(), "BEAMS left nothing to sweep");
     let widths = env_list("WIDTHS", "1,2,4,8,16");
     let cache_widths = env_list("CACHE_WIDTHS", "4");
-    let cache_bytes = env_usize("CACHE_MB", 4096) << 20;
+    let cache_budgets = env_list("CACHE_MB", "4096");
     let target = env_usize("TARGET", 95) as f64 / 100.0;
     // The whole query set by default: an arm that keeps things is only worth
     // measuring once it has them, and every other arm is warmed the same way so
@@ -417,24 +422,55 @@ async fn main() {
     );
     drop(store);
 
-    let temp = tempfile::tempdir().unwrap();
-    let uri = temp.path().to_str().unwrap();
-    let mut dataset = write_dataset(uri, vectors).await;
-    let started = Instant::now();
-    create_index(
-        &mut dataset,
-        INDEX_NAME,
-        &IndexParams::new(VECTOR_FIELD, partitions)
-            .with_distance_type(DISTANCE_TYPE)
-            .with_code_bits(code_bits)
-            .with_graph_params(BuildParams {
-                max_degree: degree,
-                ..Default::default()
-            }),
-    )
-    .await
-    .unwrap();
-    println!("indexed in {:.1}s", started.elapsed().as_secs_f64());
+    // A build is sixteen minutes at d = 960 and nothing below writes to what
+    // it produces, so `DATASET_DIR` points a run at one that already exists.
+    // The shape is in the path because an index cannot be asked how many
+    // partitions it has, and one of the wrong shape would be reported under the
+    // settings it was asked for rather than the ones it was built with.
+    let scratch = std::env::var("DATASET_DIR").ok();
+    let temp = scratch.is_none().then(|| tempfile::tempdir().unwrap());
+    let uri = match (&scratch, &temp) {
+        (Some(dir), _) => {
+            format!("{dir}/{prefix}-{rows}-p{partitions}-r{degree}-c{code_bits}.lance")
+        }
+        (None, Some(temp)) => temp.path().to_str().unwrap().to_string(),
+        _ => unreachable!(),
+    };
+    let dataset = if std::fs::metadata(&uri).is_ok() {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+        let metadata = index.metadata();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), rows);
+        assert_eq!(metadata.dimension as usize, dim);
+        assert_eq!(metadata.max_degree, degree);
+        assert_eq!(
+            metadata.codes.as_ref().map(|codes| codes.num_bits),
+            Some(code_bits)
+        );
+        println!("reusing the index at {uri}");
+        dataset
+    } else {
+        let mut dataset = write_dataset(&uri, vectors).await;
+        let started = Instant::now();
+        create_index(
+            &mut dataset,
+            INDEX_NAME,
+            &IndexParams::new(VECTOR_FIELD, partitions)
+                .with_distance_type(DISTANCE_TYPE)
+                .with_code_bits(code_bits)
+                .with_graph_params(BuildParams {
+                    max_degree: degree,
+                    ..Default::default()
+                }),
+        )
+        .await
+        .unwrap();
+        println!(
+            "indexed in {:.1}s at {uri}",
+            started.elapsed().as_secs_f64()
+        );
+        dataset
+    };
     let positions = positions_by_address(&dataset).await;
 
     let mut arms = vec![
@@ -460,13 +496,6 @@ async fn main() {
         cache: None,
         pooled: false,
     }));
-    arms.extend(cache_widths.iter().map(|width| Arm {
-        label: format!("cached W={width}"),
-        mode: WalkMode::Lazy,
-        width: *width,
-        cache: Some(cache_bytes),
-        pooled: false,
-    }));
     // Both, because the cache is what the comparison against `cached` has to be
     // made at - and the uncached one is what says how much of a scan's read is
     // the codes it would be holding anyway.
@@ -477,34 +506,57 @@ async fn main() {
         cache: None,
         pooled: false,
     });
-    arms.push(Arm {
-        label: "flat cached".to_string(),
-        mode: WalkMode::Flat,
-        width: 1,
-        cache: Some(cache_bytes),
-        pooled: false,
-    });
-    // The same two arms the comparison is usually read across, with the exact
-    // distances pooled over the query instead of dealt out per probe.
-    arms.push(Arm {
-        label: "flat pooled".to_string(),
-        mode: WalkMode::Flat,
-        width: 1,
-        cache: Some(cache_bytes),
-        pooled: true,
-    });
-    if let Some(width) = cache_widths.first() {
-        arms.push(Arm {
-            label: format!("pooled W={width}"),
+    // One block per rung of the ladder. Everything above holds nothing, so no
+    // budget can move it and it is measured once however long the ladder is -
+    // which matters because those arms are the slow ones.
+    for budget in &cache_budgets {
+        let bytes = budget << 20;
+        arms.extend(cache_widths.iter().map(|width| Arm {
+            label: format!("cached W={width} @{budget}M"),
             mode: WalkMode::Lazy,
             width: *width,
-            cache: Some(cache_bytes),
+            cache: Some(bytes),
+            pooled: false,
+        }));
+        arms.push(Arm {
+            label: format!("flat cached @{budget}M"),
+            mode: WalkMode::Flat,
+            width: 1,
+            cache: Some(bytes),
+            pooled: false,
+        });
+        // The same two arms the comparison is usually read across, with the
+        // exact distances pooled over the query instead of dealt out per probe.
+        arms.push(Arm {
+            label: format!("flat pooled @{budget}M"),
+            mode: WalkMode::Flat,
+            width: 1,
+            cache: Some(bytes),
             pooled: true,
         });
+        if let Some(width) = cache_widths.first() {
+            arms.push(Arm {
+                label: format!("pooled W={width} @{budget}M"),
+                mode: WalkMode::Lazy,
+                width: *width,
+                cache: Some(bytes),
+                pooled: true,
+            });
+        }
+    }
+
+    // A whole-partition arm reads the same bytes at every beam, so on a coarse
+    // partition it costs the same 1.4 GB a query at all ten of them and the two
+    // of them own most of a sweep. `ARMS` keeps the arms whose label starts with
+    // one of the names it lists.
+    if let Ok(kept) = std::env::var("ARMS") {
+        let names = kept.split(',').map(str::trim).collect::<Vec<_>>();
+        arms.retain(|arm| names.iter().any(|name| arm.label.starts_with(name)));
+        assert!(!arms.is_empty(), "ARMS left nothing to sweep");
     }
 
     println!(
-        "\n{:<12} {:>5} {:>8} {:>12} {:>8} {:>9} {:>10} {:>10} {:>7}",
+        "\n{:<19} {:>5} {:>8} {:>12} {:>8} {:>9} {:>10} {:>10} {:>7}",
         "arm", "beam", "recall", "bytes", "iops", "requests", "us (warm)", "distances", "hits"
     );
     let mut sweeps = Vec::with_capacity(arms.len());
@@ -528,24 +580,21 @@ async fn main() {
 
     println!("\nat recall {target:.2}, interpolated between the beams either side of it");
     println!(
-        "{:<12} {:>12} {:>8} {:>9} {:>10} {:>10} {:>8}",
+        "{:<19} {:>12} {:>8} {:>9} {:>10} {:>10} {:>8}",
         "arm", "bytes", "iops", "requests", "us (warm)", "distances", "vs exact"
     );
-    let reference = sweeps
-        .first()
-        .and_then(|(_, points)| at_recall(points, target))
-        .map(|(cost, _)| cost);
+    let reference = arm_at(&sweeps, "exact", target);
     for (label, points) in &sweeps {
         match at_recall(points, target) {
             None => println!(
-                "{label:<12} never reaches {target:.2} on this grid (best {:.4})",
+                "{label:<19} never reaches {target:.2} on this grid (best {:.4})",
                 points
                     .iter()
                     .map(|(_, cost)| cost.recall)
                     .fold(0.0, f64::max)
             ),
             Some((cost, bracketed)) => println!(
-                "{label:<12} {:>12.0} {:>8.0} {:>9.1} {:>10.0} {:>10.0} {:>8}{}",
+                "{label:<19} {:>12.0} {:>8.0} {:>9.1} {:>10.0} {:>10.0} {:>8}{}",
                 cost.bytes,
                 cost.iops,
                 cost.requests,
@@ -567,8 +616,9 @@ async fn main() {
     // The widest arm that both sweeps have, so the lazy and cached arms being
     // compared differ in the cache and in nothing else.
     let width = cache_widths.first().copied().unwrap_or(4);
+    let budget = cache_budgets.first().copied().unwrap_or(0);
     let lazy = arm_at(&sweeps, &format!("lazy W={width}"), target);
-    let cached = arm_at(&sweeps, &format!("cached W={width}"), target);
+    let cached = arm_at(&sweeps, &format!("cached W={width} @{budget}M"), target);
     let coded = arm_at(&sweeps, "coded", target);
     if let (Some(exact), Some(coded), Some(lazy)) = (reference, coded, lazy) {
         println!(
@@ -624,7 +674,10 @@ async fn main() {
     // earning the reads and the bytes it costs at this granularity. Both arms
     // hold the same codes, probe the same partitions and re-score the same way,
     // so what is left between them is the walk itself.
-    if let (Some(cached), Some(flat)) = (cached, arm_at(&sweeps, "flat cached", target)) {
+    if let (Some(cached), Some(flat)) = (
+        cached,
+        arm_at(&sweeps, &format!("flat cached @{budget}M"), target),
+    ) {
         println!(
             "  a scan of the same partitions with the same cache: {:.0} B against {:.0} ({:.2}x), \
              {:.1} requests against {:.1}, {:.0} us against {:.0}, {:.0} distances against {:.0}",
