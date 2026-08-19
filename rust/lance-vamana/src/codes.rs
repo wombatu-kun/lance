@@ -637,9 +637,11 @@ fn factor_columns(coded: &RecordBatch, factors: usize) -> Result<Vec<&[f32]>> {
 mod tests {
     use super::*;
 
+    use std::collections::BinaryHeap;
+
     use lance_index::vector::storage::{DistCalculator, VectorStore};
     use rand::rngs::SmallRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{Rng, RngCore, SeedableRng};
 
     const DIMENSION: u32 = 64;
     const ROWS: usize = 50;
@@ -860,6 +862,215 @@ mod tests {
             median < 0.2,
             "the median coded distance is off by {median:.3} of the real one"
         );
+    }
+
+    /// A rotation drawn from `seed` rather than from the machine.
+    ///
+    /// [`CodeParams::mint`] takes a fresh random rotation every call, which is
+    /// right for an index and wrong for a test that measures how often an
+    /// estimate built on one misses: the answer would be a different number
+    /// every run, and any bar tight enough to be worth setting would fail on
+    /// some of them. How many sign bits a fast rotation wants stays Lance's
+    /// business - the bytes are minted and then overwritten, not counted here.
+    fn code_params(num_bits: u8, seed: u64) -> CodeParams {
+        let mut rotation_signs = random_fast_rotation_signs(DIMENSION as usize);
+        SmallRng::seed_from_u64(seed).fill_bytes(&mut rotation_signs);
+        CodeParams {
+            num_bits,
+            rotation_signs,
+        }
+    }
+
+    /// Where a query sits relative to the partition it is scored against.
+    ///
+    /// Both placements are needed to exercise the gate. One *on a vertex* makes
+    /// the heap threshold tight from the first group, which is what gets the
+    /// bound consulted at all; one *elsewhere* puts the `L`-th and the `L + 1`-th
+    /// within a hair of each other, which is where a bound off by a slack decides
+    /// the wrong one.
+    #[derive(Debug, Clone, Copy)]
+    enum Placement {
+        OnAVertex,
+        Elsewhere,
+    }
+
+    /// One coded partition, and one query scored against it both ways.
+    ///
+    /// Returns what [`DistCalculator::accumulate_topk_with_scratch`] kept, as
+    /// `(vertex, distance)`, and every distance
+    /// [`DistCalculator::distance_all`] measured. Between them those answer the
+    /// two questions the tests below ask: whether the gate kept the right
+    /// vertices, and whether it gave them the right distances.
+    fn gate(
+        num_bits: u8,
+        seed: u64,
+        placement: Placement,
+        search_list_size: usize,
+    ) -> (Vec<(u64, f32)>, Vec<f32>) {
+        let params = code_params(num_bits, seed);
+        let (vectors, centroid, row_ids) = sample(seed % 17 + 1);
+        let column = encode(&params, DistanceType::L2, &vectors, &centroid).unwrap();
+        let store = storage(&params, DistanceType::L2, DIMENSION, &row_ids, &column).unwrap();
+
+        let query = match placement {
+            Placement::OnAVertex => vectors.values().as_primitive::<Float32Type>().values()
+                [..DIMENSION as usize]
+                .to_vec(),
+            Placement::Elsewhere => {
+                let (elsewhere, _, _) = sample(seed + 1000);
+                elsewhere.values().as_primitive::<Float32Type>().values()[..DIMENSION as usize]
+                    .to_vec()
+            }
+        };
+        let key: ArrayRef = Arc::new(Float32Array::from(query));
+        let dist_q_c = key
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .zip(centroid.as_primitive::<Float32Type>().values())
+            .map(|(value, center)| (value - center) * (value - center))
+            .sum::<f32>();
+        let coded = store.dist_calculator(key, dist_q_c);
+
+        let mut nearest = BinaryHeap::new();
+        coded.accumulate_topk_with_scratch(
+            search_list_size,
+            None,
+            None,
+            u64::from,
+            &mut nearest,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let kept = nearest
+            .into_iter()
+            .map(|node| (node.id, node.dist.0))
+            .collect::<Vec<_>>();
+        (kept, coded.distance_all(0))
+    }
+
+    /// The gate's distances, ascending, having checked each against the vertex
+    /// it was credited to.
+    ///
+    /// That check is the one exactness that holds wherever the gate runs: a mask
+    /// evaluated at the wrong lane offset would hand back a real distance
+    /// attached to the wrong vertex, and every other assertion here looks only at
+    /// distances and would let it through.
+    fn kept_distances(kept: &[(u64, f32)], all: &[f32], what: &str) -> Vec<f32> {
+        let mut distances = kept
+            .iter()
+            .map(|(vertex, distance)| {
+                assert_eq!(
+                    *distance, all[*vertex as usize],
+                    "{what}: vertex {vertex} came back at a distance the exhaustive scan does not \
+                     give it"
+                );
+                *distance
+            })
+            .collect::<Vec<_>>();
+        distances.sort_by(f32::total_cmp);
+        distances
+    }
+
+    /// Where the gate cannot prune, it has to be the exhaustive scan exactly.
+    ///
+    /// There are two such places, and they are the two ways
+    /// [`DistCalculator::accumulate_topk_with_scratch`] can decline to gate. At
+    /// one bit there is no extra-bit refinement to skip, so Lance bypasses the
+    /// mask altogether and runs `distance_all`; at a list as wide as the
+    /// partition the heap never fills, so the threshold the mask compares against
+    /// is never set. Both are exact, and an equality is what a mutation to either
+    /// guard fails - a recall bar over a whole index would not notice.
+    #[test]
+    fn a_gate_with_nothing_to_prune_is_the_exhaustive_scan() {
+        for placement in [Placement::OnAVertex, Placement::Elsewhere] {
+            for search_list_size in [1usize, 5, 17, ROWS] {
+                // One bit, every width: bypassed.
+                let cases = [(1u8, search_list_size)]
+                    .into_iter()
+                    // Three and five bits, but only at the full width: gated,
+                    // with a threshold that is never set.
+                    .chain((search_list_size == ROWS).then_some((3, ROWS)))
+                    .chain((search_list_size == ROWS).then_some((5, ROWS)));
+                for (num_bits, size) in cases {
+                    let what = format!("{num_bits} bits, query {placement:?}, list of {size}");
+                    let (kept, all) = gate(num_bits, 7, placement, size);
+                    let mut exhaustive = all.clone();
+                    exhaustive.sort_by(f32::total_cmp);
+                    assert_eq!(
+                        kept_distances(&kept, &all, &what),
+                        exhaustive[..size],
+                        "{what}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Where the gate can prune, it prunes by a bound that is only *probably*
+    /// right, and this is how wrong it is allowed to be.
+    ///
+    /// [`crate::lazy::LazyProbe::scan`] asks for a top-`L` rather than for every
+    /// distance because the bound `estimate - error_factor * query_error` lets a
+    /// vertex already worse than the `L`-th best skip its extra-bit refinement.
+    /// The error term is a confidence interval and not a guarantee, so the answer
+    /// is an approximation of the top-`L` rather than the top-`L`: measured over
+    /// this fixture the two differ in about one run in a hundred, and when they
+    /// do it is one vertex, seated a couple of per cent of the partition's own
+    /// spread too far out.
+    ///
+    /// That is worth pinning precisely because the failure it has to be told
+    /// apart from looks identical and is far larger. A bound with its slack
+    /// removed prunes candidates by the dozen, and neither a single query nor a
+    /// recall figure over a whole index separates the two - the first sees
+    /// nothing most of the time, and the second averages it away.
+    #[test]
+    fn a_gate_with_something_to_prune_rarely_misses() {
+        const SEEDS: u64 = 100;
+
+        for num_bits in [3u8, 5] {
+            for search_list_size in [1usize, 5, 17] {
+                for placement in [Placement::OnAVertex, Placement::Elsewhere] {
+                    let what =
+                        format!("{num_bits} bits, query {placement:?}, list of {search_list_size}");
+                    let mut differed = 0u64;
+                    let mut worst = 0.0f32;
+                    for seed in 0..SEEDS {
+                        let (kept, all) = gate(num_bits, seed, placement, search_list_size);
+                        let mut exhaustive = all.clone();
+                        exhaustive.sort_by(f32::total_cmp);
+                        let gated = kept_distances(&kept, &all, &what);
+                        if gated[..] == exhaustive[..search_list_size] {
+                            continue;
+                        }
+                        differed += 1;
+                        // As a share of the whole partition's spread rather than
+                        // of the distance itself, which passes through zero.
+                        let spread = exhaustive[ROWS - 1] - exhaustive[0];
+                        worst = worst.max(
+                            (gated[search_list_size - 1] - exhaustive[search_list_size - 1])
+                                / spread,
+                        );
+                    }
+                    // Deterministic, so these are the measured numbers with a
+                    // little air rather than a confidence interval: one run in a
+                    // hundred differs, by 0.0055 of the spread at the worst. A
+                    // bound with its slack removed misses twenty-seven runs in a
+                    // hundred, so the two are nowhere near each other.
+                    assert!(
+                        differed <= 2,
+                        "{what}: the gate kept a different list in {differed} runs of {SEEDS}"
+                    );
+                    assert!(
+                        worst <= 0.02,
+                        "{what}: the gate's candidate {search_list_size} sat {worst:.4} of the \
+                         partition's spread beyond the one it should have kept"
+                    );
+                }
+            }
+        }
     }
 
     /// A code column the partition's own width disagrees with is a corrupt file,

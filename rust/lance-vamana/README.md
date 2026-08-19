@@ -149,53 +149,180 @@ two are meant to say the same thing.
 
   On SIFT1M at 65536 rows a partition, four probes and equal recall
   (`examples/lazy_walk.rs`), that is **18.2 MB a query against 198.6 MB** read
-  whole, and **18.6 ms of warm CPU against 131.0 ms** - decoding two hundred
+  whole, and **18.6 ms of warm CPU against 130.5 ms** - decoding two hundred
   megabytes costs more than fetching eighteen, even with every byte already in
   the page cache. What it pays is round trips: 20 requests become 54, and 28
-  iops become 197.
+  iops become 198.
 
   Nine tenths of that 18.2 MB is the code column, re-read by every query, so the
-  mode is only half of the design: **with a cache the same query reads 71.9 kB**,
-  0.0004x of reading whole and 254 times less than reading lazily without one,
-  in **3.2 ms** against 131.0, holding 89 MB to do it. What the walk itself
+  mode is only half of the design: **with a cache the same query reads 72.1 kB**,
+  0.0004x of reading whole and 253 times less than reading lazily without one,
+  in **3.5 ms** against 130.5, holding 89 MB to do it. What the walk itself
   chooses to fetch - the out-edges of the vertices it expands, the vectors of the
-  candidates it ends with - is that 71.9 kB and nothing more; the 640 kB between
+  candidates it ends with - is that 72.1 kB and nothing more; the 640 kB between
   it and the code column is `__row_id`, which is read whole beside the codes and
   cached with them. The distances are identical with and without the cache, which
   is the point: it changes what a query reads and nothing else.
 
   The cache also reverses which granularity is cheaper. Without one, 8192-row
   partitions read less than 65536-row ones (4.5 MB against 18.2); with one it is
-  the other way round - **71.9 kB against 119.7 kB, and 3.2 ms against 4.9** -
+  the other way round - **72.1 kB against 126.6 kB, and 3.5 ms against 4.5** -
   because the resident part is paid once while seven probes cost seven entry
   points, seven sets of edges and seven candidate lists against four.
+
+  Two bullets below take that figure down twice more and neither of them needs a
+  larger cache: pooling the exact distances over the query instead of over each
+  probe makes it 43.6 kB, and dropping the graph for a flat scan of the same
+  resident codes makes it **9.6 kB at 65536 rows and 11.3 kB at 8192**. The cache
+  is what all three arms have in common, which is why it is described here rather
+  than with either of them.
 
   What that is worth needs something to compare it against, and the nearest
   measured one is Lance's own `IVF_HNSW_SQ` over the same vectors at the same
   recall, counted through `Scanner::scan_stats_callback`: **12.29 MB a query**
   read cold with its partitions tuned to 8192 rows, and 197.78 MB at the shipped
-  default of one partition to a million rows. At that same 8192 rows this reads
-  4.5 MB cold and 119.7 kB warm. Bytes are all that compares - those numbers
-  come from Lance's scanner and these from this driver, the quantisers differ,
-  eight-bit scalar against three-bit RaBitQ, and what is held equal is the
-  dataset and the recall rather than the index.
+  default of one partition to a million rows. At that same 8192 rows the best arm
+  here reads **11.3 kB** warm, which is a thousandfold, and 4.4 MB cold. Bytes
+  are all that compares - those numbers come from Lance's scanner and these from
+  this driver, the quantisers differ, eight-bit scalar against three-bit RaBitQ,
+  and what is held equal is the dataset and the recall rather than the index.
 
   Warm against cold is not the comparison, though, because Lance's reads
   collapse too once its cache holds the partitions. What each has to hold to get
   there is: 257 to 297 bytes a row on disk for that index, and more again in
-  Lance's cache, which holds an unpacked form - against 89 bytes a row here,
-  which still reads 71.9 kB a query rather than nothing. The saving is the ratio
-  between those two resident figures, and it only becomes a saving in bytes read
-  when neither budget covers the index.
+  Lance's cache, which holds an unpacked form - against 87 to 89 bytes a row
+  here, which still reads 11.3 kB a query rather than nothing. The saving is the
+  ratio between those two resident figures, and it only becomes a saving in bytes
+  read when neither budget covers the index.
 
   Which is what makes the cache load-bearing rather than an optimisation.
   Without one a lazy walk over 65536-row partitions reads 18.2 MB a query, worse
   than the tuned baseline it is meant to beat; at 8192 rows it reads 4.5 MB,
-  which is better. Granularity and the cache are chosen together, and neither
+  which is better. Pooling rescues neither, because a cold query's bytes are the
+  resident part and not its candidates: of the 4.4 MB a cold flat scan reads at
+  8192 rows, 4.38 MB is codes and row ids, and pooling can only take from the
+  52 kB that is left. Granularity and the cache are chosen together, and neither
   choice survives the other being changed.
 
   Codes are off by default, and refused rather than skipped for a dimension that
   is not a multiple of eight, which is what RaBitQ packs a bit a dimension into.
+- **A probe is taken whether or not it can help.** RaBitQ carries a per-vector
+  error factor, so a partition whose nearest possible vertex cannot beat the
+  answer assembled so far need not be walked at all, and whether that check pays
+  was measured rather than assumed (`examples/expansion_gate.rs`). Against a
+  partition's own `K`th best it never fires. Against the `K`th best over every
+  partition probed so far it removes 10 to 54 per cent of the probes, and the
+  threshold lagging by `PARTITIONS_IN_FLIGHT` costs 1.3 points of that at
+  twenty-five probes and all of it at four - so the lag is not the obstacle.
+
+  Deciding is. Sound means the minimum over *every* vertex, which is a coded
+  distance each: 16.8 ns a vertex through `distance_all`, so 137.6 us to scan an
+  8192-row partition against 703 us to walk one, and the check pays for the
+  partitions it does not skip as well as the ones it does. It breaks even at 19.6
+  per cent skipped and only clears that above ten probes - so at the seven where
+  recall 0.95 lands it costs nine per cent more than it saves, and at twenty-five
+  it takes a third off the query at an unchanged recall. A gate is a way to buy
+  the recall of twenty-five probes for the price of sixteen, not a way to make
+  the working point cheaper, so it is not built. Neither is a cheaper stand-in:
+  `(|q - c| - max|v - c|)^2` is positive only when the query is farther from the
+  centroid than every vertex in the partition, which at thousands of vertices
+  does not happen and reads 0.00 per cent everywhere, and a sample is not cheaper
+  but looser - 256 vertices of 8192 skip 79 per cent where the sound check skips
+  54, which is recall being spent rather than saved.
+
+  One price in that paragraph has since fallen, and the break-even is computed
+  from it. A sound check needs the *bound* of every vertex, not its distance, and
+  a bound is the binary pass plus one multiply - about two nanoseconds a vertex
+  rather than 16.8, as the arm below measures. At that price 137.6 us becomes
+  nearer 17 and the break-even nearer three per cent skipped than twenty, which
+  the measured ten per cent at seven probes clears. What stops it being an easy
+  win is where the numbers live: Lance computes exactly this bound inside its
+  prune kernel but returns masks rather than a minimum, and the error factors it
+  reduces over are private to the calculator. So the conclusion above is sound
+  for the price it was taken at and stale for the price now available, and
+  settling it means a minimum over factors this crate cannot currently read.
+
+  The same two prices said something larger and less comfortable. Walking a
+  probe costs about the same whatever the partition holds - 703 us at 8192 rows,
+  810 at 65536 - because hops are set by the beam and the graph's diameter, not
+  by the vertex count, while scanning is linear in it. So the two meet somewhere,
+  and the granularity these numbers are quoted at is below the crossing. That is
+  now measured rather than reasoned, by `WalkMode::Flat` and the arm below.
+
+- **The graph earns nothing at either granularity measured.** `WalkMode::Flat`
+  throws the traversal away: it scores every vertex of a probed partition against
+  its code, keeps the nearest `L` and re-scores those exactly. Same resident
+  codes, same candidate vectors, no `__neighbors` at all - so it reads what a lazy
+  walk reads minus the edges, by construction rather than by measurement.
+
+  Against that walk at equal recall, with the same cache (`examples/lazy_walk.rs`).
+  At **8192 rows a partition and seven probes** a query reads **52.2 kB against
+  126.6**, makes **7.0 requests against 57.5** - exactly one to a probe, because
+  the candidate vectors are the only dependent read - and takes **1.6 ms against
+  4.5**. At **65536 rows and four probes** it reads **30.9 kB against 72.1**,
+  makes **4.0 requests against 38.0**, and takes **1.8 ms against 3.5**. The scan
+  also reaches *higher* recall at every beam - 0.9695 against 0.9665 at 8192,
+  0.9920 against 0.9855 at 65536 - because it keeps the true nearest `L` of the
+  partition while a greedy walk keeps the `L` it found.
+
+  It wins the clock while measuring ten times as many coded distances, and the
+  reason is that a scan can buy them in bulk. A multi-bit RaBitQ distance is a
+  binary inner product plus an extra-bit refinement that costs several times as
+  much, and the binary pass carries an error bound - so
+  `DistCalculator::accumulate_topk_with_scratch` classifies sixteen vertices at a
+  time against the `L`-th best so far and refines only what survives. Asking it
+  for a top-`L` instead of asking `distance_all` for every distance took **14.8 ns
+  off every vertex scanned**, the same figure at both granularities, which is what
+  a per-vertex saving has to look like; a scanned vertex went from about 16 ns to
+  about 2. A walk cannot have any of this: it does not know which vertex it wants
+  until it has scored the one before it, so it pays 40 ns a distance, one at a
+  time. Before that change the walk won the clock at 65536 rows by 1.6x; it now
+  loses it by 1.8x.
+
+  So the crossing between a walk's flat cost and a scan's linear one is real but
+  sits well above both granularities here - by arithmetic, near a quarter of a
+  million rows a partition, which nothing in the sweeps below runs at. What the
+  graph costs to have is the `__neighbors` column: at `R = 64` it is 256 bytes a
+  vertex against 68 for the codes and 512 for the vector, more than a quarter of a
+  partition file that a scan would not have written. At the granularities measured
+  it is not earning that, and an index there is `IVF_RQ` with a graph attached.
+
+- **A query's exact distances are the query's budget, not each probe's.** Every
+  mode picks its candidates by code and then reads a vector to correct each one,
+  and for the modes that keep no vectors resident those strides are essentially
+  the whole byte cost: a linear fit over the sweeps puts a candidate at 764 bytes
+  at 8192 rows a partition and 610 at 65536, against a vector's own 512. Dealing
+  `L` of them to every probe spends the budget where the query looked rather than
+  where the answer is - seven probes at `L = 16` correct a hundred and twelve rows
+  to answer for ten, and the farthest partitions contribute none of them.
+
+  `SearchParams::rescore_budget` makes it one pool. Probes come back with coded
+  candidates and read nothing; the query keeps the nearest `budget` of them
+  across every probe, ranked by coded distance and tie-broken on the row address
+  so that the order the probes happen to finish in cannot change the answer; only
+  then are vectors fetched. At equal recall, with the budget set to `L`:
+
+  | | 8192 rows, 7 probes | 65536 rows, 4 probes |
+  |---|---|---|
+  | scan, per probe | 52.2 kB, 7.0 requests, 1.6 ms | 30.9 kB, 4.0, 1.8 ms |
+  | **scan, pooled** | **11.3 kB, 3.7 requests, 1.1 ms** | **9.6 kB, 2.1, 1.6 ms** |
+  | walk, per probe | 126.6 kB, 57.5 requests, 4.5 ms | 72.1 kB, 38.0, 3.5 ms |
+  | walk, pooled | 67.4 kB, 59.0 requests, 4.2 ms | 43.6 kB, 37.5, 3.1 ms |
+
+  Nearly half the probes then fetch nothing at all, which is the partition gate
+  this crate measured and declined to build (below), reached from the other end
+  and for free. It does not help the walk's round trips, because those are the
+  hop chain rather than the re-scoring.
+
+  What it costs is a wider `L` at the same recall: at a narrow beam a pooled scan
+  is well behind - 0.8225 against 0.9335 at `L = 10` - the curves meet by
+  `L = 24`, where pooling reads 15.9 kB against 114.8 for a thousandth of recall,
+  and both top out at the same ceiling. `None` is the default and is the old
+  behaviour exactly.
+
+  One thing is still untouched and it favours the scan further: the top-`L` call
+  allocates its scratch per probe rather than reusing it across the four in
+  flight.
 
 An index is **refused** at open, rather than answering from what is left, when:
 

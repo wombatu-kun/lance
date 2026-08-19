@@ -15,7 +15,7 @@
 //! `CACHE_WIDTHS` (default `4`), `CACHE_MB` (default 4096), `TARGET`
 //! (default 95, the recall percentage the arms are compared at).
 //!
-//! Four arms through one index and one binary, which is the only comparison
+//! Six arms through one index and one binary, which is the only comparison
 //! worth making: the same graph, the same routing, the same codes, and a switch.
 //!
 //! - `exact` reads every partition it probes whole and measures against the
@@ -28,6 +28,28 @@
 //! - `cached` is `lazy` with the row ids and the codes kept across queries
 //!   instead of read again by each of them, which is what a process serving
 //!   queries would do and what leaves only the walk's own fetches.
+//! - `flat` throws the graph away: it scores every vertex of the partition
+//!   against its code and keeps the nearest `L`, so it reads what `lazy` reads
+//!   minus the edges and measures thirty times as many distances. It is here
+//!   because a walk's cost barely moves with the partition's size while a scan's
+//!   is linear in it, so the two cross somewhere; the crossing sits well above
+//!   the coarser granularity below, since a scanned vertex costs about two
+//!   nanoseconds once RaBitQ's error bound is throwing out most of the extra-bit
+//!   refinement.
+//! - `pooled` is `cached` and `flat cached` with one change: the `L` exact
+//!   distances are spent on the whole query rather than on each probe. Every
+//!   other arm hands each partition the same `L` and re-scores all of them, so a
+//!   query of `p` probes reads `p * L` vectors to answer for `k` - and a vector
+//!   is the byte cost of these modes. What it trades is recall at a given `L`,
+//!   which is why the comparison below is at equal recall and not equal beam. On
+//!   SIFT1M it takes the scan from 52.2 kB a query to 11.3 at 8192 rows a
+//!   partition and from 30.9 to 9.6 at 65536, and leaves nearly half the probes
+//!   with nothing to fetch.
+//!
+//! `flat` clears a recall target at a beam the walks need a wider one for, so
+//! the interpolation below often reports it at the narrowest beam on the grid.
+//! `L` cannot go below `k`, so that point is not an artefact of the grid: it is
+//! the cheapest the arm can be asked to be.
 //!
 //! **Every arm is warmed with the whole query set before it is measured**, so
 //! `cached` is measured in the state a server reaches rather than in its first
@@ -137,6 +159,8 @@ struct Arm {
     width: usize,
     /// Budget in bytes, or `None` for an arm that reads everything again.
     cache: Option<usize>,
+    /// Whether `L` exact distances are the query's budget or each probe's.
+    pooled: bool,
 }
 
 /// The cost at exactly `target` recall, and whether the grid actually bracketed
@@ -419,12 +443,14 @@ async fn main() {
             mode: WalkMode::Exact,
             width: 1,
             cache: None,
+            pooled: false,
         },
         Arm {
             label: "coded".to_string(),
             mode: WalkMode::Coded,
             width: 1,
             cache: None,
+            pooled: false,
         },
     ];
     arms.extend(widths.iter().map(|width| Arm {
@@ -432,13 +458,50 @@ async fn main() {
         mode: WalkMode::Lazy,
         width: *width,
         cache: None,
+        pooled: false,
     }));
     arms.extend(cache_widths.iter().map(|width| Arm {
         label: format!("cached W={width}"),
         mode: WalkMode::Lazy,
         width: *width,
         cache: Some(cache_bytes),
+        pooled: false,
     }));
+    // Both, because the cache is what the comparison against `cached` has to be
+    // made at - and the uncached one is what says how much of a scan's read is
+    // the codes it would be holding anyway.
+    arms.push(Arm {
+        label: "flat".to_string(),
+        mode: WalkMode::Flat,
+        width: 1,
+        cache: None,
+        pooled: false,
+    });
+    arms.push(Arm {
+        label: "flat cached".to_string(),
+        mode: WalkMode::Flat,
+        width: 1,
+        cache: Some(cache_bytes),
+        pooled: false,
+    });
+    // The same two arms the comparison is usually read across, with the exact
+    // distances pooled over the query instead of dealt out per probe.
+    arms.push(Arm {
+        label: "flat pooled".to_string(),
+        mode: WalkMode::Flat,
+        width: 1,
+        cache: Some(cache_bytes),
+        pooled: true,
+    });
+    if let Some(width) = cache_widths.first() {
+        arms.push(Arm {
+            label: format!("pooled W={width}"),
+            mode: WalkMode::Lazy,
+            width: *width,
+            cache: Some(cache_bytes),
+            pooled: true,
+        });
+    }
 
     println!(
         "\n{:<12} {:>5} {:>8} {:>12} {:>8} {:>9} {:>10} {:>10} {:>7}",
@@ -448,11 +511,14 @@ async fn main() {
     for arm in &arms {
         let mut points = Vec::with_capacity(beams.len());
         for beam in &beams {
-            let params = SearchParams::new(K)
+            let mut params = SearchParams::new(K)
                 .with_nprobes(nprobes)
                 .with_search_list_size(*beam)
                 .with_mode(arm.mode)
                 .with_beam_width(arm.width);
+            if arm.pooled {
+                params = params.with_rescore_budget(*beam);
+            }
             let cost = measure(&dataset, &queries, &truth, &positions, &params, arm, warmup).await;
             report(&arm.label, *beam, &cost);
             points.push((*beam, cost));
@@ -552,5 +618,31 @@ async fn main() {
                 );
             }
         }
+    }
+
+    // The question the cache raised and could not answer: whether the graph is
+    // earning the reads and the bytes it costs at this granularity. Both arms
+    // hold the same codes, probe the same partitions and re-score the same way,
+    // so what is left between them is the walk itself.
+    if let (Some(cached), Some(flat)) = (cached, arm_at(&sweeps, "flat cached", target)) {
+        println!(
+            "  a scan of the same partitions with the same cache: {:.0} B against {:.0} ({:.2}x), \
+             {:.1} requests against {:.1}, {:.0} us against {:.0}, {:.0} distances against {:.0}",
+            flat.bytes,
+            cached.bytes,
+            flat.bytes / cached.bytes,
+            flat.requests,
+            cached.requests,
+            flat.micros,
+            cached.micros,
+            flat.comparisons,
+            cached.comparisons,
+        );
+        println!(
+            "  so walking costs {:.2}x what scanning does here, and the graph it walks is {} \
+             bytes a vertex of index that a scan would not have written",
+            cached.micros / flat.micros,
+            degree * 4,
+        );
     }
 }

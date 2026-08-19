@@ -307,7 +307,7 @@ async fn a_lazy_walk_answers_only_live_rows() {
     }
 }
 
-/// The two ways a lazy walk can be asked for something it cannot do.
+/// The ways a lazy walk can be asked for something it cannot do.
 #[tokio::test]
 async fn a_lazy_walk_refuses_what_it_cannot_do() {
     let dir = tempfile::tempdir().unwrap();
@@ -333,12 +333,33 @@ async fn a_lazy_walk_refuses_what_it_cannot_do() {
         .unwrap();
     let uncoded = VamanaIndex::open(&uncoded, INDEX_NAME).await.unwrap();
 
-    let error = uncoded
-        .search(query, &search(WalkMode::Lazy))
+    // Both modes that steer by codes, because the refusal is the mode's and not
+    // the walk's: a scan has no beam to fall back on either.
+    for mode in [WalkMode::Lazy, WalkMode::Flat] {
+        let error = uncoded.search(query, &search(mode)).await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("without codes"), "{error}");
+    }
+
+    // A budget is refused rather than ignored by the modes that cannot spend
+    // it, for the same reason: a caller who set one is asking about cost.
+    for mode in [WalkMode::Exact, WalkMode::Coded] {
+        let error = index
+            .search(query, &search(mode).with_rescore_budget(BEAM))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("rescore_budget"), "{error}");
+    }
+
+    // And a budget too small to hold the answer, which would otherwise return
+    // fewer rows than were asked for and say nothing about it.
+    let error = index
+        .search(query, &search(WalkMode::Flat).with_rescore_budget(K - 1))
         .await
         .unwrap_err();
     assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
-    assert!(error.to_string().contains("without codes"), "{error}");
+    assert!(error.to_string().contains("smaller than k"), "{error}");
 }
 
 /// A beam wider than the partition, which is the case the mode is *not* for.
@@ -391,6 +412,308 @@ async fn a_walk_that_reaches_everything_still_answers() {
         "a walk that reached the whole partition answered differently when it read it lazily"
     );
     assert_eq!(answers[1].len(), K);
+}
+
+/// The pin the flat arm rests on, and one no graph walk can offer.
+///
+/// A scan told to keep every vertex of every partition it probes has measured an
+/// exact distance against every indexed row, so its answer is the brute-force
+/// answer - not close to it, equal to it. Each way of getting a scan wrong lands
+/// here as recall below one rather than as a number to argue about: codes read
+/// for the wrong partition, a rank mapped to the wrong local id, a candidate
+/// re-scored at the wrong position in the batch that came back.
+///
+/// The distance count is exact for the same reason. A scan is oblivious - it
+/// measures every vertex whatever the query is - so the only number it can
+/// produce is one per centroid ranked, one per vertex scored and one per
+/// candidate re-scored.
+#[tokio::test]
+async fn a_flat_scan_that_keeps_everything_is_brute_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+
+    let rows = fixture().indexed_rows();
+    let everything = search(WalkMode::Flat).with_search_list_size(rows);
+    for query in random_vectors(8, 1234) {
+        let truth = brute_force(&dataset, &query, K).await;
+        let result = index.search(&query, &everything).await.unwrap();
+        let found = result
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_addr)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recall(&found, &truth),
+            1.0,
+            "a scan that kept every vertex still missed a true neighbour"
+        );
+        assert_eq!(
+            result.comparisons,
+            (PARTITIONS as usize + 2 * rows) as u64,
+            "a scan measured a different number of distances from one per centroid, one per \
+             vertex and one per candidate"
+        );
+    }
+
+    // The selecting half, which the case above never reaches: a list wider than
+    // the partition keeps everything without choosing. Exactly `L` survive each
+    // probe, which is what a list truncated to `k` or ordered the wrong way
+    // round fails - and the recall floor is what a reversed comparator fails,
+    // since it would keep the farthest `L` instead. Both rest on the fixture's
+    // partitions being far wider than the beam, which is what it is for.
+    let narrow = search(WalkMode::Flat);
+    for query in random_vectors(8, 1234) {
+        let truth = brute_force(&dataset, &query, K).await;
+        let result = index.search(&query, &narrow).await.unwrap();
+        let found = result
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_addr)
+            .collect::<Vec<_>>();
+        assert!(
+            recall(&found, &truth) >= 0.9,
+            "a scan keeping the nearest {BEAM} of every partition scored {:.4}",
+            recall(&found, &truth)
+        );
+        assert_eq!(
+            result.comparisons,
+            (PARTITIONS as usize + rows + result.partitions_read * BEAM) as u64,
+            "a scan kept a different number of candidates from {BEAM} a probe"
+        );
+    }
+}
+
+/// The same pin over two segments, which is the ordinary state of an index that
+/// has been appended to.
+///
+/// Worth its own case rather than a wider `nprobes` on the one above, because
+/// what it can catch is different: a scan turns a rank into a local id and a
+/// local id into a row id, and every segment of an index has a partition 0 and a
+/// vertex 0. Codes taken from one segment beside row ids from another produce
+/// plausible answers, and only an exact one shows it.
+#[tokio::test]
+async fn a_flat_scan_over_two_segments_is_brute_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    coded_dataset(uri).await;
+    fixture().append(uri).await;
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    lance_vamana::insert_as_segment(&mut dataset, INDEX_NAME)
+        .await
+        .unwrap();
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let segments = index.num_segments();
+    assert!(segments > 1, "the append wrote no second segment");
+
+    // Every row of both segments, since `nprobes` is per segment and the list is
+    // wider than any partition either of them holds.
+    let rows = segments * fixture().indexed_rows();
+    let everything = search(WalkMode::Flat).with_search_list_size(rows);
+    for query in random_vectors(8, 606) {
+        let truth = brute_force(&dataset, &query, K).await;
+        let result = index.search(&query, &everything).await.unwrap();
+        let found = result
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_addr)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recall(&found, &truth),
+            1.0,
+            "a scan of every vertex of two segments missed a true neighbour"
+        );
+        assert_eq!(
+            result.comparisons,
+            (segments * PARTITIONS as usize + 2 * rows) as u64,
+            "the centroids of both segments and every vertex of both, once each"
+        );
+    }
+}
+
+/// What the mode is for: the same partitions, without their graph.
+///
+/// Neither arm caches, so both pay for the codes of every partition they probe
+/// on every query and what separates them is only what each *chooses* to fetch:
+/// the vectors of the candidate list for both, plus the out-edges of every
+/// vertex the walk expanded. A scan never opens `__neighbors`, so it has to read
+/// strictly less.
+///
+/// The distances go the other way, by a factor the count alone overstates: a
+/// scan's are measured in one batched call over the quantiser's block layout at
+/// 16.8 ns each, a walk's one at a time at 40.0, so the column is a ratio of
+/// work rather than of time (`examples/expansion_gate.rs`).
+#[tokio::test]
+async fn a_flat_scan_reads_no_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let queries = random_vectors(QUERIES, 8888);
+    let truth = ground_truth(&dataset, &queries).await;
+
+    let mut measured = Vec::new();
+    for mode in [WalkMode::Lazy, WalkMode::Flat] {
+        let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+        measured.push(measure(&index, &queries, &truth, &search(mode)).await);
+    }
+    let (lazy, flat) = (&measured[0], &measured[1]);
+    for (label, arm) in [("lazy", lazy), ("flat", flat)] {
+        println!(
+            "{label:<6} recall@{K}={:.4}  {:>8.0} B  {:>6.1} requests  {:>7.0} comparisons",
+            arm.recall, arm.bytes, arm.requests, arm.comparisons
+        );
+    }
+
+    assert!(
+        flat.bytes < lazy.bytes,
+        "a scan read {:.0} bytes against the walk's {:.0}, so it fetched something the walk did \
+         and it should have fetched no edges at all",
+        flat.bytes,
+        lazy.bytes
+    );
+    assert!(
+        flat.comparisons > lazy.comparisons,
+        "a scan measured {:.0} distances against the walk's {:.0}, so it did not score the whole \
+         partition",
+        flat.comparisons,
+        lazy.comparisons
+    );
+    // Not an equality and not a strict improvement either. A scan keeps the `L`
+    // nearest of the partition by coded distance where a walk keeps the `L` it
+    // found, so the walk's list can hold a true neighbour the codes ranked
+    // outside the scan's - rarely, and never often enough to make the scan the
+    // worse arm.
+    assert!(
+        flat.recall > lazy.recall - 0.01,
+        "a scan that considered every vertex scored {:.4} against a walk's {:.4}",
+        flat.recall,
+        lazy.recall
+    );
+}
+
+/// The degenerate budget: one wide enough for every candidate changes nothing.
+///
+/// The two-pass shape is a rewrite of the path every lazy query takes, so the
+/// case where the budget decides nothing has to come back exactly - the same
+/// rows in the same order, the same distance count, the same partitions read. A
+/// recall bar would pass through a re-scoring that quietly dropped half of every
+/// list, and both modes go through the same rewrite, so both are checked.
+#[tokio::test]
+async fn a_budget_wider_than_the_candidates_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let rows = fixture().indexed_rows();
+
+    for mode in [WalkMode::Lazy, WalkMode::Flat] {
+        for query in random_vectors(8, 77) {
+            let unbudgeted = index.search(&query, &search(mode)).await.unwrap();
+            // Every candidate every probe kept, and then two numbers past it.
+            // The first is the boundary the allocation short-circuits on.
+            let spent = unbudgeted.partitions_read * BEAM;
+            for budget in [spent, spent + 1, rows] {
+                let budgeted = index
+                    .search(&query, &search(mode).with_rescore_budget(budget))
+                    .await
+                    .unwrap();
+                let what = format!("{mode:?}, budget {budget}");
+                assert_eq!(budgeted.neighbors, unbudgeted.neighbors, "{what}");
+                assert_eq!(budgeted.comparisons, unbudgeted.comparisons, "{what}");
+                assert_eq!(
+                    budgeted.partitions_read, unbudgeted.partitions_read,
+                    "{what}"
+                );
+            }
+        }
+    }
+}
+
+/// What the budget is for: the same recall off a fraction of the strides.
+///
+/// A scan reads nothing but its candidates, and its distance count says how many
+/// of them there were - one per centroid ranked, one per vertex scored, one per
+/// candidate re-scored. With no budget that last term is `L` a probe whatever
+/// the probes turned out to be worth; with one it is the budget itself, and the
+/// equality below is what a budget spent per partition rather than per query
+/// fails.
+///
+/// The claim it exists to pin is the second half: a budget of `L` for the whole
+/// query clears the recall bar that `L` *per probe* was set for, having read a
+/// fraction of the rows and skipped whole probes on the way. The partitions are
+/// still all read - a budget decides what is fetched to correct a candidate, not
+/// what is probed - so `partitions_read` may not move.
+#[tokio::test]
+async fn a_budget_spends_the_strides_where_they_are_worth_most() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let rows = fixture().indexed_rows();
+
+    for query in random_vectors(8, 4242) {
+        let plain = index.search(&query, &search(WalkMode::Flat)).await.unwrap();
+        let spent = plain.partitions_read * BEAM;
+        assert_eq!(
+            plain.comparisons,
+            (PARTITIONS as usize + rows + spent) as u64,
+            "an unbudgeted scan re-scored something other than {BEAM} a probe"
+        );
+        for budget in [spent - 1, spent / 2, BEAM, K] {
+            let result = index
+                .search(&query, &search(WalkMode::Flat).with_rescore_budget(budget))
+                .await
+                .unwrap();
+            assert_eq!(
+                result.comparisons,
+                (PARTITIONS as usize + rows + budget) as u64,
+                "a budget of {budget} re-scored a different number of candidates"
+            );
+            assert_eq!(result.partitions_read, plain.partitions_read);
+        }
+    }
+
+    let queries = random_vectors(QUERIES, 4242);
+    let truth = ground_truth(&dataset, &queries).await;
+    let unbudgeted = measure(&index, &queries, &truth, &search(WalkMode::Flat)).await;
+    let budgeted = measure(
+        &index,
+        &queries,
+        &truth,
+        &search(WalkMode::Flat).with_rescore_budget(BEAM),
+    )
+    .await;
+    println!(
+        "unbudgeted recall@{K}={:.4}  {:>8.0} B  {:>6.1} requests\n\
+         budgeted   recall@{K}={:.4}  {:>8.0} B  {:>6.1} requests",
+        unbudgeted.recall,
+        unbudgeted.bytes,
+        unbudgeted.requests,
+        budgeted.recall,
+        budgeted.bytes,
+        budgeted.requests
+    );
+    assert!(
+        budgeted.requests < unbudgeted.requests,
+        "a budget of {BEAM} for the whole query made {:.1} requests against the {:.1} of {BEAM} a \
+         probe, so no probe was left with nothing to fetch",
+        budgeted.requests,
+        unbudgeted.requests
+    );
+    assert!(
+        budgeted.bytes < unbudgeted.bytes,
+        "a budget of {BEAM} read {:.0} bytes against {:.0}",
+        budgeted.bytes,
+        unbudgeted.bytes
+    );
+    assert!(
+        budgeted.recall >= 0.9,
+        "a budget of {BEAM} for the whole query scored {:.4}, where {BEAM} a probe scored {:.4}",
+        budgeted.recall,
+        unbudgeted.recall
+    );
 }
 
 /// Several segments, which is the ordinary state of an index that has been

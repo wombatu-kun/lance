@@ -39,13 +39,14 @@
 //!   query pays for its own partitions again. [`VamanaIndex::with_cache`] is
 //!   what changes that, and what it keeps is the part of a partition that does
 //!   not depend on the query: the layout of its file, and for a
-//!   [`WalkMode::Lazy`] walk the codes and row ids it steers by, which are nine
-//!   tenths of what such a query reads.
+//!   [`WalkMode::Lazy`] walk or a [`WalkMode::Flat`] scan the codes and row ids
+//!   they measure by, which are nine tenths of what such a query reads.
 //! - **A partition is read whole unless the walk is told not to.**
 //!   [`WalkMode::Lazy`] keeps the row ids and the codes and fetches the rest as
-//!   it turns out to need it. Which of the two is right is a property of the
-//!   deployment rather than of the index, and it was measured rather than
-//!   assumed.
+//!   it turns out to need it; [`WalkMode::Flat`] keeps the same and fetches even
+//!   less, because it scores every vertex instead of following edges to a few of
+//!   them. Which of the three is right is a property of the deployment rather
+//!   than of the index, and it was measured rather than assumed.
 //!
 //!   Reading only what a walk touches does not pay on its own
 //!   (`examples/memory_gate.rs`): a walk expands a few dozen vertices in a
@@ -125,7 +126,7 @@ use crate::format::{
 use crate::io::{
     PartitionFile, check_partition_shape, read_partition_batch, read_segment, scan_scheduler,
 };
-use crate::lazy::LazyWalk;
+use crate::lazy::{self, Candidate, LazyProbe};
 use crate::partition::Partition;
 use crate::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
 use crate::segment::{PartitionEntry, SegmentManifest};
@@ -173,18 +174,55 @@ pub enum WalkMode {
     /// Half of that is here and the other half is [`VamanaIndex::with_cache`],
     /// because nine tenths of the 18.2 MB is the codes, which do not depend on
     /// the query and are re-read by every one of them. Given somewhere to keep
-    /// them, the same query reads **71.9 kB** and takes 3.2 ms against 131.0 -
+    /// them, the same query reads **72.1 kB** and takes 3.5 ms against 130.5 -
     /// the mode's real number, and the reason it is worth having whenever the
-    /// index does not fit in the memory available to it.
+    /// index does not fit in the memory available to it. With
+    /// [`SearchParams::rescore_budget`] set as well it is 43.6 kB, off the same
+    /// cache.
     ///
     /// Requires codes, same as [`Self::Coded`].
     Lazy,
+    /// Do not use the graph at all: score every vertex of the partition against
+    /// its code, keep the nearest [`SearchParams::search_list_size`], and
+    /// re-score those exactly.
+    ///
+    /// Reads what [`Self::Lazy`] reads minus the edges - the row ids and the
+    /// codes, then the vectors of the candidate list - so `__neighbors` is never
+    /// opened and, at this mode's granularity, need not have been written.
+    ///
+    /// A walk's cost hardly moves with the size of the partition, since its hops
+    /// are set by the beam and the graph's diameter rather than by the vertex
+    /// count, while a scan's is linear in it - so the two cross somewhere. On
+    /// SIFT1M at equal recall (`examples/lazy_walk.rs`) the crossing is not
+    /// between the two granularities this crate quotes: against a cached lazy
+    /// walk a scan reads 52.2 kB a query against 126.6 at 8192 rows a partition
+    /// and 30.9 against 72.1 at 65536, makes one request to a probe against the
+    /// walk's eight, reaches higher recall at every beam, and takes 1.6 ms
+    /// against 4.5 and 1.8 against 3.5. With
+    /// [`SearchParams::rescore_budget`] set as well it reads **11.3 kB and
+    /// 9.6**, and makes 3.7 requests and 2.1 - eleven and seven times less than
+    /// the walk, off fewer round trips than there are probes.
+    ///
+    /// It wins the arithmetic too, and not by doing less of it: it measures ten
+    /// times as many coded distances but pays about two nanoseconds for each
+    /// where a walk pays sixteen, because a scan can hand the whole partition to
+    /// [`lance_index::vector::storage::DistCalculator::accumulate_topk_with_scratch`]
+    /// and let RaBitQ's error bound throw out most of the extra-bit refinement,
+    /// while a walk has to ask one vertex at a time and cannot know in advance
+    /// which ones. So the choice is round trips against arithmetic over one
+    /// unchanged index file, but at this granularity the arithmetic is no longer
+    /// what decides it: a deployment whose CPU is saturated still wants
+    /// [`Self::Lazy`] once a partition is large enough, and everything else
+    /// wants this.
+    ///
+    /// Requires codes, same as [`Self::Coded`].
+    Flat,
 }
 
 impl WalkMode {
-    /// Whether this walk can only run on an index that carries codes.
+    /// Whether this mode can only run on an index that carries codes.
     fn needs_codes(self) -> bool {
-        matches!(self, Self::Coded | Self::Lazy)
+        matches!(self, Self::Coded | Self::Lazy | Self::Flat)
     }
 }
 
@@ -199,7 +237,8 @@ pub struct SearchParams {
     /// whether or not anything was assigned to it, so a budget spent on centroids
     /// rather than on data would let the nearest one silently return nothing.
     pub nprobes: usize,
-    /// `L`: how wide a search list each graph walk keeps.
+    /// `L`: how wide a search list each graph walk keeps, and how many
+    /// candidates a [`WalkMode::Flat`] scan keeps out of the whole partition.
     pub search_list_size: usize,
     /// What the walk measures its distances against.
     pub mode: WalkMode,
@@ -207,12 +246,48 @@ pub struct SearchParams {
     /// therefore how many rows of `__neighbors` it asks for in one request.
     ///
     /// Ignored by the walks that read a partition whole, which have every edge
-    /// already. For the lazy one it is the trade the mode exists to make: the
+    /// already, and by [`WalkMode::Flat`], which reads none. For the lazy one it
+    /// is the trade the mode exists to make: the
     /// chain of dependent round trips divides by it, while a wider hop expands
     /// vertices the strictly greedy order would have skipped. Four is the width
     /// the phase gate modelled and is deliberately on the low side - what it
     /// should be on a high-latency store is a measurement nobody has taken.
     pub beam_width: usize,
+    /// How many candidates a query measures exactly, counted across every
+    /// partition it probes rather than within each of them.
+    ///
+    /// `None` measures all of them - one exact distance per candidate per probe,
+    /// which was the only behaviour before this existed.
+    ///
+    /// The knob exists because that is where the bytes are. Every mode arrives
+    /// at its candidates by code and then corrects them by reading a vector, and
+    /// a vector is 512 bytes at `d = 128` against the 68 its code occupies. For
+    /// [`WalkMode::Lazy`] and [`WalkMode::Flat`], where the vector is not
+    /// resident, that correction is very nearly the whole byte cost of the
+    /// query. Spreading it evenly over the probes spends it where the query
+    /// looked rather than where the answer is: at seven probes and an `L` of
+    /// sixteen, a `k = 10` query corrects a hundred and twelve rows, and the
+    /// partitions nearest the query deserve most of them.
+    ///
+    /// On SIFT1M at equal recall (`examples/lazy_walk.rs`), setting it to `L`
+    /// takes a cached [`WalkMode::Flat`] query from 52.2 kB to **11.3** at 8192
+    /// rows a partition and from 30.9 to **9.6** at 65536, and a cached
+    /// [`WalkMode::Lazy`] one from 126.6 to 67.4 and from 72.1 to 43.6. Nearly
+    /// half the probes then fetch nothing at all - a scan makes 3.7 requests
+    /// against 7.0 and 2.1 against 4.0 - which is where the round trips go, and
+    /// it is the partition gate this crate measured and did not build, arrived
+    /// at from the other end.
+    ///
+    /// What it costs is a wider `L` for the same recall, which is why the
+    /// figures above are taken at equal recall and not equal beam: at a fixed
+    /// narrow beam a pooled scan is well behind, the two curves meet by
+    /// `L = 24`, and from there it reads a seventh as much for a thousandth of
+    /// recall and tops out at the same ceiling.
+    ///
+    /// Refused for [`WalkMode::Exact`], which has no coded ordering to choose
+    /// by, and for [`WalkMode::Coded`], which holds every vector already and
+    /// would be spending recall on a saving it cannot collect.
+    pub rescore_budget: Option<usize>,
 }
 
 impl SearchParams {
@@ -225,6 +300,7 @@ impl SearchParams {
             search_list_size: k.saturating_add(k / 2),
             mode: WalkMode::default(),
             beam_width: 4,
+            rescore_budget: None,
         }
     }
 
@@ -245,6 +321,11 @@ impl SearchParams {
 
     pub fn with_beam_width(mut self, beam_width: usize) -> Self {
         self.beam_width = beam_width;
+        self
+    }
+
+    pub fn with_rescore_budget(mut self, rescore_budget: usize) -> Self {
+        self.rescore_budget = Some(rescore_budget);
         self
     }
 }
@@ -396,6 +477,27 @@ struct Probed {
     /// already taken its own copy of, and it would stay alive for the length of
     /// the walk.
     coded: Option<(FixedSizeListArray, f32)>,
+}
+
+/// One probed partition after its walk or its scan, and before anything has
+/// been read to correct what they measured.
+///
+/// The one thing a query holds per probe rather than per probe *in flight*, and
+/// deliberately small enough for that: a file handle whose metadata is shared
+/// with the cache, a width, and `L` candidates of sixteen bytes each. The codes
+/// and the row ids the walk ran on are gone by the time one of these exists -
+/// [`crate::lazy::Candidate`] carries the row address forward so that nothing
+/// downstream needs them - so [`PARTITIONS_IN_FLIGHT`] still bounds what a query
+/// holds of a partition.
+struct Probing {
+    file: PartitionFile,
+    /// What the segment declares the vector width to be, carried so that
+    /// re-scoring can check it against what comes back.
+    dimension: u32,
+    /// Ascending by local id, which is the order re-scoring reads them in and
+    /// the order [`allocate`] leaves them in.
+    candidates: Vec<Candidate>,
+    comparisons: u64,
 }
 
 /// How many partitions a query holds at once.
@@ -866,6 +968,26 @@ impl VamanaIndex {
                 "beam_width must be greater than zero".to_string(),
             ));
         }
+        if let Some(budget) = params.rescore_budget {
+            // Refused rather than ignored, for the reason the coded modes are:
+            // a caller setting a budget is asking about cost, and a mode that
+            // cannot spend it would answer a question they did not ask.
+            if !matches!(params.mode, WalkMode::Lazy | WalkMode::Flat) {
+                return Err(Error::invalid_input(format!(
+                    "rescore_budget was set for {:?}, which cannot spend it: WalkMode::Exact has \
+                     no coded ordering to choose a budget by, and WalkMode::Coded holds every \
+                     vector already, so a budget would cost it recall and save it nothing",
+                    params.mode
+                )));
+            }
+            if budget < params.k {
+                return Err(Error::invalid_input(format!(
+                    "rescore_budget {budget} is smaller than k {}, so the query could never \
+                     return k neighbours",
+                    params.k
+                )));
+            }
+        }
         // Refused rather than answered exactly. A caller asking for a coded
         // walk is asking about cost, and quietly giving them a walk that reads
         // every vector would be an answer to a different question.
@@ -943,34 +1065,68 @@ impl VamanaIndex {
         // partition's next hop overlaps another's arithmetic.
         // [`PARTITIONS_IN_FLIGHT`] bounds both, and means the same thing in
         // both: how many partitions' worth of resident data a query holds.
-        let mut walks = match params.mode {
-            WalkMode::Lazy => stream::iter(probes)
-                .map({
-                    let query = query.clone();
-                    let routing_query = routing_query.clone();
-                    move |probe| {
-                        self.walk_lazily(probe, query.clone(), routing_query.clone(), params)
-                    }
-                })
-                .buffer_unordered(PARTITIONS_IN_FLIGHT)
-                .boxed(),
-            _ => stream::iter(probes)
-                .map(|probe| self.read_probe(probe))
-                .buffer_unordered(PARTITIONS_IN_FLIGHT)
-                .and_then({
-                    let query = query.clone();
-                    let routing_query = routing_query.clone();
-                    move |probed| {
-                        self.walk_partition(probed, query.clone(), routing_query.clone(), params)
-                    }
-                })
-                .boxed(),
-        };
+        match params.mode {
+            // Two passes with a barrier between them, because deciding which
+            // candidates deserve an exact distance needs every probe's list at
+            // once. The barrier costs no round trip: the reads of the second
+            // pass are independent of each other and go out together, exactly as
+            // they did when each probe issued its own, and what used to overlap
+            // them was another probe's *arithmetic* rather than another read.
+            WalkMode::Lazy | WalkMode::Flat => {
+                let mut probings = Vec::new();
+                let mut probed = stream::iter(probes)
+                    .map({
+                        let routing_query = routing_query.clone();
+                        move |probe| self.probe_lazily(probe, routing_query.clone(), params)
+                    })
+                    .buffer_unordered(PARTITIONS_IN_FLIGHT)
+                    .boxed();
+                while let Some(probing) = probed.try_next().await? {
+                    partitions_read += 1;
+                    comparisons = comparisons.saturating_add(probing.comparisons);
+                    probings.push(probing);
+                }
+                drop(probed);
 
-        while let Some(walked) = walks.try_next().await? {
-            partitions_read += 1;
-            found.extend(walked.neighbors);
-            comparisons = comparisons.saturating_add(walked.comparisons);
+                if let Some(budget) = params.rescore_budget {
+                    allocate(&mut probings, budget);
+                }
+
+                let mut rescoring = stream::iter(probings)
+                    .map({
+                        let query = query.clone();
+                        move |probing| self.rescore_probing(probing, query.clone(), params)
+                    })
+                    .buffer_unordered(PARTITIONS_IN_FLIGHT)
+                    .boxed();
+                while let Some(walked) = rescoring.try_next().await? {
+                    found.extend(walked.neighbors);
+                    comparisons = comparisons.saturating_add(walked.comparisons);
+                }
+            }
+            WalkMode::Exact | WalkMode::Coded => {
+                let mut walks = stream::iter(probes)
+                    .map(|probe| self.read_probe(probe))
+                    .buffer_unordered(PARTITIONS_IN_FLIGHT)
+                    .and_then({
+                        let query = query.clone();
+                        let routing_query = routing_query.clone();
+                        move |probed| {
+                            self.walk_partition(
+                                probed,
+                                query.clone(),
+                                routing_query.clone(),
+                                params,
+                            )
+                        }
+                    })
+                    .boxed();
+                while let Some(walked) = walks.try_next().await? {
+                    partitions_read += 1;
+                    found.extend(walked.neighbors);
+                    comparisons = comparisons.saturating_add(walked.comparisons);
+                }
+            }
         }
 
         Ok(QueryResult {
@@ -1155,34 +1311,44 @@ impl VamanaIndex {
                 }
             };
 
+            let row_ids = partition.graph().row_ids();
+            let neighbors = candidates
+                .into_iter()
+                .map(|(id, distance)| Neighbor {
+                    row_addr: row_ids[id as usize],
+                    distance,
+                })
+                .collect::<Vec<_>>();
             Ok(Walked {
-                neighbors: answer(candidates, partition.graph().row_ids(), &rows, k)?,
+                neighbors: answer(neighbors, &rows, k)?,
                 comparisons: walked.get(),
             })
         })
         .await
     }
 
-    /// Walk one partition without reading it, on this runtime rather than on the
-    /// CPU pool.
+    /// Answer from one partition without reading it, on this runtime rather than
+    /// on the CPU pool.
     ///
     /// The opposite bargain from [`Self::walk_partition`], and forced rather than
     /// chosen: the pool takes work that never waits, and this waits once a hop.
     /// What it hands the pool instead is nothing at all - a hop is `beam_width`
     /// times `max_degree` coded distances, tens of microseconds, below the size
-    /// at which the pool's own overhead starts to pay.
+    /// at which the pool's own overhead starts to pay. A [`WalkMode::Flat`] scan
+    /// waits twice however large the partition is, and is milliseconds of
+    /// arithmetic in between, so it is the one thing here the pool would suit -
+    /// which is a measurement to take once the mode has earned it.
     ///
     /// The read of the row ids and the codes is the one thing here that is
-    /// proportional to the partition. It is also what makes the walk possible at
-    /// all, and it is a tenth of what reading the partition whole would be at
+    /// proportional to the partition. It is also what makes both modes possible
+    /// at all, and it is a tenth of what reading the partition whole would be at
     /// `d = 128`.
-    async fn walk_lazily(
+    async fn probe_lazily(
         &self,
         probe: Probe,
-        query: ArrayRef,
         routing_query: ArrayRef,
         params: &SearchParams,
-    ) -> Result<Walked> {
+    ) -> Result<Probing> {
         let Some(dist_q_c) = probe.dist_q_c else {
             return Err(Error::internal(
                 "a Vamana lazy walk was scheduled for a segment without codes".to_string(),
@@ -1198,22 +1364,62 @@ impl VamanaIndex {
         )
         .await?;
 
-        let (candidates, comparisons) = LazyWalk {
-            file: &file,
-            codes: &resident.codes,
-            row_ids: &resident.row_ids,
-            medoid: probe.entry.medoid,
-            max_degree: probe.max_degree,
-            dimension: probe.dimension,
-            distance_type: self.metadata.distance_type,
-            search_list_size: params.search_list_size,
-            beam_width: params.beam_width,
-        }
-        .run(routing_query, dist_q_c, query)
-        .await?;
+        let (candidates, comparisons) = {
+            let probing = LazyProbe {
+                file: &file,
+                codes: &resident.codes,
+                row_ids: &resident.row_ids,
+                medoid: probe.entry.medoid,
+                max_degree: probe.max_degree,
+                search_list_size: params.search_list_size,
+                beam_width: params.beam_width,
+            };
+            match params.mode {
+                WalkMode::Flat => probing.scan(routing_query, dist_q_c),
+                WalkMode::Exact | WalkMode::Coded | WalkMode::Lazy => {
+                    probing.walk(routing_query, dist_q_c).await?
+                }
+            }
+        };
 
+        Ok(Probing {
+            file,
+            dimension: probe.dimension,
+            candidates,
+            comparisons,
+        })
+    }
+
+    /// Measure the query exactly against the candidates one probe still has, and
+    /// turn them into that partition's share of the answer.
+    ///
+    /// The second half of a lazy probe, split off from the first because
+    /// [`allocate`] sits between them. A probe whose candidates were all taken
+    /// by better ones elsewhere reads nothing at all - that is where the saving
+    /// is, and it is a whole request rather than a fraction of one.
+    async fn rescore_probing(
+        &self,
+        probing: Probing,
+        query: ArrayRef,
+        params: &SearchParams,
+    ) -> Result<Walked> {
+        if probing.candidates.is_empty() {
+            return Ok(Walked {
+                neighbors: Vec::new(),
+                comparisons: 0,
+            });
+        }
+        let rescored = lazy::rescore(
+            &probing.file,
+            probing.dimension,
+            self.metadata.distance_type,
+            &probing.candidates,
+            query,
+        )
+        .await?;
+        let comparisons = rescored.len() as u64;
         Ok(Walked {
-            neighbors: answer(candidates, &resident.row_ids, &self.rows, params.k)?,
+            neighbors: answer(rescored, &self.rows, params.k)?,
             comparisons,
         })
     }
@@ -1249,18 +1455,13 @@ impl VamanaIndex {
     }
 }
 
-/// Turn one walk's candidate list into that partition's share of the answer.
+/// Turn one partition's re-scored candidates into its share of the answer.
 ///
-/// Shared by every mode, and the reason the three of them return the same shape:
-/// what separates them is how a candidate list is arrived at, and nothing after
-/// that may differ. `candidates` is nearest first by an *exact* distance
-/// whichever walk produced it, which is what the merge downstream rests on.
-fn answer(
-    candidates: Vec<(u32, f32)>,
-    row_ids: &[u64],
-    rows: &RowFilter,
-    k: usize,
-) -> Result<Vec<Neighbor>> {
+/// Shared by every mode, and the reason they all return the same shape: what
+/// separates them is how a candidate list is arrived at, and nothing after that
+/// may differ. `candidates` is nearest first by an *exact* distance whichever
+/// walk produced it, which is what the merge downstream rests on.
+fn answer(candidates: Vec<Neighbor>, rows: &RowFilter, k: usize) -> Result<Vec<Neighbor>> {
     // A stored vector that is not finite makes every distance measured against
     // it NaN, and a NaN goes wherever `total_cmp` puts it: a negative one sorts
     // ahead of every real answer, survives the merge and comes back as the
@@ -1269,19 +1470,16 @@ fn answer(
     // that is `rows * dimension` per partition on the hot path of every query,
     // more work than the walk it would be protecting - so it is caught here
     // instead, over the `search_list_size` candidates the walk actually kept.
-    if let Some((id, distance)) = candidates.iter().find(|(_, d)| !d.is_finite()) {
+    if let Some(candidate) = candidates.iter().find(|c| !c.distance.is_finite()) {
         return Err(Error::corrupt_file_named(
             "partition",
             format!(
-                "Vamana row {} is at distance {distance} from a finite query, so the vector \
-                 stored for it is not finite",
-                row_ids[*id as usize],
+                "Vamana row {} is at distance {} from a finite query, so the vector stored for \
+                 it is not finite",
+                candidate.row_addr, candidate.distance,
             ),
         ));
     }
-    // Local ids are per partition, so they become row ids *before* the merge:
-    // every partition has a vertex 0, and they are different rows.
-    //
     // Dead vertices are dropped here and not earlier. They are still walked,
     // because they carry the out-edges that keep the graph connected - removing
     // them from the traversal would strand whatever they were the only route to.
@@ -1289,10 +1487,6 @@ fn answer(
     // rows" instead of "k rows, some of which the caller will find missing".
     Ok(candidates
         .into_iter()
-        .map(|(id, distance)| Neighbor {
-            row_addr: row_ids[id as usize],
-            distance,
-        })
         .filter(|neighbor| !rows.rejects(neighbor.row_addr))
         .take(k)
         .collect())
@@ -1338,6 +1532,61 @@ fn descends_from(schema: &Schema, field: i32, ancestor: i32) -> bool {
     schema
         .field_ancestry_by_id(field)
         .is_some_and(|ancestry| ancestry.iter().any(|step| step.id == ancestor))
+}
+
+/// Spend a query's exact distances on its `budget` most promising candidates,
+/// wherever they were probed from.
+///
+/// A candidate costs a stride of `__vector` to correct, and correcting them is
+/// what a lazy query's bytes are. Each probe arrives having chosen the best `L`
+/// its own partition could offer, which is the wrong question: a query is one
+/// answer, and the partition nearest it usually deserves several probes' worth
+/// of the budget while the farthest deserves none.
+///
+/// Ties break on the row address rather than on which probe raised the
+/// candidate. The probes complete in no fixed order - that is what
+/// `buffer_unordered` is for - so a tie broken by arrival order would let the
+/// same query on the same index return different rows from one run to the next.
+///
+/// What comes back is still ascending by local id within each probe, which is
+/// the order the reader coalesces by and the order the candidates arrived in.
+fn allocate(probings: &mut [Probing], budget: usize) {
+    let total = probings
+        .iter()
+        .map(|probing| probing.candidates.len())
+        .sum::<usize>();
+    if total <= budget {
+        return;
+    }
+
+    let mut ranked = probings
+        .iter()
+        .enumerate()
+        .flat_map(|(probe, probing)| {
+            probing
+                .candidates
+                .iter()
+                .enumerate()
+                .map(move |(position, candidate)| {
+                    (candidate.coded, candidate.row_addr, probe, position)
+                })
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
+    ranked.truncate(budget);
+
+    let mut kept = vec![Vec::new(); probings.len()];
+    for (_, _, probe, position) in ranked {
+        kept[probe].push(position);
+    }
+    for (probing, mut positions) in probings.iter_mut().zip(kept) {
+        positions.sort_unstable();
+        let candidates = positions
+            .into_iter()
+            .map(|position| probing.candidates[position])
+            .collect::<Vec<_>>();
+        probing.candidates = candidates;
+    }
 }
 
 /// Every walk's candidates as one answer: nearest first, each row once, `k` long.
