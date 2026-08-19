@@ -48,7 +48,10 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 mod common;
-use common::{DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, random_vectors, recall, sample_partition};
+use common::{
+    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, random_vectors, recall,
+    sample_partition,
+};
 
 const INDEX_NAME: &str = "vamana_idx";
 const PARTITIONS: u32 = 4;
@@ -106,20 +109,6 @@ async fn brute_force_best_distance(dataset: &Dataset, query: &[f32]) -> f32 {
     scanner.use_index(false);
     let batch = scanner.try_into_batch().await.unwrap();
     batch["_distance"].as_primitive::<Float32Type>().value(0)
-}
-
-/// Lance's own exhaustive k-NN over the same column.
-async fn brute_force(dataset: &Dataset, query: &[f32], k: usize) -> Vec<u64> {
-    let key = Float32Array::from(query.to_vec());
-    let mut scanner = dataset.scan();
-    scanner.nearest(VECTOR_COLUMN, &key, k).unwrap();
-    scanner.use_index(false);
-    scanner.with_row_id();
-    let batch = scanner.try_into_batch().await.unwrap();
-    batch[lance_core::ROW_ID]
-        .as_primitive::<UInt64Type>()
-        .values()
-        .to_vec()
 }
 
 struct Measured {
@@ -1508,6 +1497,7 @@ fn declaring(fragments: Vec<u32>) -> IndexMetadata {
     IndexMetadata {
         format_version: FORMAT_VERSION,
         max_degree: 16,
+        search_list_size: 32,
         alpha: 1.2,
         dimension: VECTOR_DIM as u32,
         distance_type: DistanceType::L2,
@@ -1944,6 +1934,7 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
         IndexMetadata {
             format_version: FORMAT_VERSION,
             max_degree: 16,
+            search_list_size: 32,
             alpha: 1.2,
             dimension: VECTOR_DIM as u32,
             distance_type: DistanceType::L2,
@@ -2158,6 +2149,7 @@ async fn a_partition_holding_a_non_finite_vector_is_reported_as_corrupt() {
             IndexMetadata {
                 format_version: FORMAT_VERSION,
                 max_degree: graph_params.max_degree,
+                search_list_size: graph_params.search_list_size,
                 alpha: graph_params.alpha,
                 dimension: VECTOR_DIM as u32,
                 distance_type: DistanceType::L2,

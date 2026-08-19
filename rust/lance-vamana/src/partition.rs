@@ -83,6 +83,33 @@ impl PartitionGraph {
         Self::try_new(max_degree, row_ids, adjacency)
     }
 
+    /// Append vertices with no out-edges yet, leaving every existing vertex and
+    /// its local id exactly where it was.
+    ///
+    /// What insertion starts from. The existing ids have to survive because the
+    /// edges already in the graph are written in them: renumbering here would
+    /// mean rewriting every neighbour list in the partition to say the same
+    /// thing.
+    pub fn extend(&mut self, row_ids: &[u64]) -> Result<()> {
+        let total = self
+            .row_ids
+            .len()
+            .checked_add(row_ids.len())
+            .filter(|total| *total <= MAX_PARTITION_ROWS as usize)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Vamana cannot add {} vertices to a partition of {}, exceeding the \
+                     addressable maximum {MAX_PARTITION_ROWS}",
+                    row_ids.len(),
+                    self.row_ids.len()
+                ))
+            })?;
+        self.row_ids.extend_from_slice(row_ids);
+        self.neighbors
+            .resize(total * self.max_degree as usize, NO_NEIGHBOR);
+        Ok(())
+    }
+
     pub fn max_degree(&self) -> u32 {
         self.max_degree
     }
@@ -145,6 +172,44 @@ impl PartitionGraph {
         self.neighbors[start..start + neighbors.len()].copy_from_slice(neighbors);
         self.neighbors[start + neighbors.len()..start + width].fill(NO_NEIGHBOR);
         Ok(())
+    }
+
+    /// How many vertices a walk from `entry_point` can reach along out-edges.
+    ///
+    /// Not a search: no distances and no order, only whether the graph is in one
+    /// piece. Consolidation asks because the one-hop repair it runs guarantees
+    /// that no *edge* dangles and not that the graph stays connected, and a
+    /// partition that came apart can only ever answer from the island holding
+    /// its entry point. Asking costs `len * max_degree` pointer chases against
+    /// the `len * max_degree` *distances* the repair itself spends, so the check
+    /// disappears next to the thing it checks.
+    ///
+    /// Every id in `neighbors` is in range for anything built through this
+    /// type's constructors or read through [`Partition::try_from_batch`], both
+    /// of which refuse one that is not - the same invariant a graph walk
+    /// already indexes the visit marks with.
+    pub fn reachable_from(&self, entry_point: u32) -> Result<usize> {
+        let mut seen = vec![false; self.len()];
+        let Some(start) = seen.get_mut(entry_point as usize) else {
+            return Err(Error::invalid_input(format!(
+                "Vamana cannot walk from vertex {entry_point} of a partition of {} vertices",
+                self.len()
+            )));
+        };
+        *start = true;
+
+        let mut reached = 1;
+        let mut frontier = vec![entry_point];
+        while let Some(vertex) = frontier.pop() {
+            for neighbor in self.neighbors(vertex)? {
+                if !seen[*neighbor as usize] {
+                    seen[*neighbor as usize] = true;
+                    reached += 1;
+                    frontier.push(*neighbor);
+                }
+            }
+        }
+        Ok(reached)
     }
 
     fn slots(&self, local_id: u32) -> Option<&[u32]> {
@@ -327,7 +392,12 @@ impl Partition {
     }
 }
 
-fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
+/// Decode [`ROW_ID_COLUMN`], which a batch may carry on its own.
+///
+/// Also reached without the rest of the partition: deciding whether a partition
+/// holds any deleted row needs this column and nothing else, and the schema
+/// keeps the three columns apart so that asking for it alone is a projection.
+pub(crate) fn row_ids_from_batch(batch: &RecordBatch) -> Result<Vec<u64>> {
     let column = batch.column_by_name(ROW_ID_COLUMN).ok_or_else(|| {
         Error::corrupt_file_named(
             ROW_ID_COLUMN,
@@ -346,13 +416,17 @@ fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
             format!("Vamana partition column {ROW_ID_COLUMN} holds nulls"),
         ));
     }
-    let row_ids = column
+    Ok(column
         .as_primitive_opt::<UInt64Type>()
         .ok_or_else(|| {
             Error::corrupt_file_named(ROW_ID_COLUMN, "Vamana row id column is not UInt64")
         })?
         .values()
-        .to_vec();
+        .to_vec())
+}
+
+fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
+    let row_ids = row_ids_from_batch(batch)?;
 
     let neighbors = fixed_size_list(batch, NEIGHBORS_COLUMN)?;
     let max_degree = u32::try_from(neighbors.value_length()).map_err(|_| {

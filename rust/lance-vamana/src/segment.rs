@@ -338,6 +338,7 @@ mod tests {
         IndexMetadata {
             format_version: FORMAT_VERSION,
             max_degree: 32,
+            search_list_size: 64,
             alpha: 1.2,
             dimension,
             distance_type: DistanceType::L2,

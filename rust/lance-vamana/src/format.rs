@@ -91,7 +91,7 @@ pub const MAX_DEGREE: u32 = 1024;
 /// manifest's `index_version` and the segment's own [`IndexMetadata`] - and
 /// checked against both on open. Two *different* numbers is what this replaced,
 /// and the one recorded in the manifest was checked nowhere at all.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Schema metadata key under which [`IndexMetadata`] is stored as JSON.
 pub const INDEX_METADATA_KEY: &str = "lance-vamana:index";
@@ -125,6 +125,17 @@ pub struct IndexMetadata {
     pub format_version: u32,
     /// `R` in the Vamana papers: the fixed width of [`NEIGHBORS_COLUMN`].
     pub max_degree: u32,
+    /// `L`: the beam the build that produced this segment searched with.
+    ///
+    /// Nothing reads a segment with it, which is why it is worth saying what it
+    /// is here for: a partition can have to be *rebuilt* after the fact -
+    /// consolidation does it when the one-hop repair leaves the graph in pieces -
+    /// and a rebuild is a build, so it needs the same beam its siblings were
+    /// built with. Taking that from the caller instead would be a second record
+    /// of one number with nothing to check it against, and the number decides
+    /// graph quality: at `max_degree = 32` doubling it made query cost at recall
+    /// 0.99 worse by a quarter.
+    pub search_list_size: usize,
     /// Pruning slack. `1.0` reproduces the HNSW diversity heuristic exactly.
     pub alpha: f32,
     pub dimension: u32,
@@ -272,6 +283,7 @@ mod tests {
         let metadata = IndexMetadata {
             format_version: FORMAT_VERSION,
             max_degree: 64,
+            search_list_size: 100,
             alpha: 1.2,
             dimension: 128,
             distance_type: DistanceType::Cosine,
@@ -290,6 +302,7 @@ mod tests {
         let metadata = IndexMetadata {
             format_version: FORMAT_VERSION,
             max_degree: 16,
+            search_list_size: 32,
             alpha: 1.0,
             dimension: 8,
             distance_type: DistanceType::L2,
@@ -311,6 +324,7 @@ mod tests {
         let metadata = IndexMetadata {
             format_version: FORMAT_VERSION,
             max_degree: 64,
+            search_list_size: 100,
             alpha: f32::INFINITY,
             dimension: 128,
             distance_type: DistanceType::L2,
@@ -328,6 +342,7 @@ mod tests {
         let json = serde_json::json!({
             "format_version": FORMAT_VERSION,
             "max_degree": 64,
+            "search_list_size": 100,
             "alpha": 1.2,
             "dimension": 128,
             "distance_type": "manhattan",
@@ -344,6 +359,7 @@ mod tests {
         let json = serde_json::json!({
             "format_version": FORMAT_VERSION + 1,
             "max_degree": 64,
+            "search_list_size": 100,
             "alpha": 1.2,
             "dimension": 128,
             "distance_type": "l2",

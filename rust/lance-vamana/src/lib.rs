@@ -12,15 +12,27 @@
 
 pub mod build;
 pub mod builder;
+pub mod consolidate;
+pub mod consolidator;
 pub mod format;
+pub mod insert;
+pub mod inserter;
 pub mod io;
+pub mod merge;
+pub mod merger;
 pub mod partition;
 pub mod query;
 pub mod search;
 pub mod segment;
 
 pub use builder::{BuildStats, IndexParams, create_index};
+pub use consolidate::{Consolidated, consolidate_partition};
+pub use consolidator::{ConsolidateStats, consolidate_index};
 pub use format::{IndexMetadata, RowIdMode};
+pub use insert::{Inserted, insert_into_partition};
+pub use inserter::{InsertStats, insert_as_segment, insert_in_place};
+pub use merge::{Merged, Newcomers, merge_partition};
+pub use merger::{MergeStats, merge_index};
 pub use partition::{Partition, PartitionGraph};
 pub use query::{Neighbor, QueryResult, SearchParams, VamanaIndex};
 pub use segment::{PartitionEntry, SegmentManifest};

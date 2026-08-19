@@ -34,7 +34,7 @@ use crate::format::{
     INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, index_schema,
     partition_file_name,
 };
-use crate::partition::Partition;
+use crate::partition::{Partition, row_ids_from_batch};
 use crate::segment::{PartitionEntry, SegmentManifest};
 
 /// The file format every file in a segment is written in.
@@ -187,14 +187,14 @@ pub async fn read_rows(reader: &FileReader, rows: Range<usize>) -> Result<Record
     Ok(concat_batches(&schema, batches.iter())?)
 }
 
-/// Read a whole partition back into memory.
+/// Check a partition file against what `index.idx` says it holds.
 ///
-/// `expected_rows` comes from the segment table in `index.idx`, which is a
-/// different file from the one being read. Requiring the two to agree is what
-/// keeps a damaged footer from being believed, and it is also the only ceiling
-/// on this read: without it the row count written in the footer is what decides
-/// how much memory to allocate.
-pub async fn read_partition(reader: &FileReader, expected_rows: u32) -> Result<Partition> {
+/// `expected_rows` comes from the segment table, which is a different file from
+/// the one being read. Requiring the two to agree is what keeps a damaged footer
+/// from being believed, and it is also the only ceiling on the read that
+/// follows: without it the row count written in the footer is what decides how
+/// much memory to allocate.
+fn check_row_count(reader: &FileReader, expected_rows: u32) -> Result<()> {
     if reader.metadata().num_rows != expected_rows as u64 {
         return Err(Error::corrupt_file_named(
             "partition",
@@ -204,11 +204,63 @@ pub async fn read_partition(reader: &FileReader, expected_rows: u32) -> Result<P
             ),
         ));
     }
+    Ok(())
+}
+
+/// Read a whole partition back into memory.
+pub async fn read_partition(reader: &FileReader, expected_rows: u32) -> Result<Partition> {
+    check_row_count(reader, expected_rows)?;
     // No empty-partition branch: an empty partition is written no file and given
     // no row in the segment table, so `expected_rows` is never zero on any path
     // that reaches here, and a caller who passes zero anyway gets the empty-range
     // error from `read_rows` rather than a partition invented from a schema.
     Partition::try_from_batch(&read_rows(reader, 0..expected_rows as usize).await?)
+}
+
+/// Refuse a partition whose shape disagrees with the segment that lists it.
+///
+/// The writer checks both against the segment on the way out; a reader has to
+/// check them on the way back in, and every reader has to, which is why this is
+/// not inlined at one of them. A partition whose width disagrees with the
+/// manifest would be searched with a query of the wrong length against
+/// `flat_storage`, which takes its dimension from the array - silently wrong
+/// distances rather than an error - and consolidation would rewrite it into a
+/// segment that declares the other number.
+pub fn check_partition_shape(
+    partition: &Partition,
+    entry: &PartitionEntry,
+    max_degree: u32,
+    dimension: u32,
+) -> Result<()> {
+    if partition.graph().max_degree() != max_degree || partition.dimension() != dimension {
+        return Err(Error::corrupt_file_named(
+            entry.file.as_str(),
+            format!(
+                "Vamana partition {} holds degree {} and dimension {} but its segment declares \
+                 degree {max_degree} and dimension {dimension}",
+                entry.partition_id,
+                partition.graph().max_degree(),
+                partition.dimension(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Read the row id of every vertex, and nothing else.
+///
+/// The saving is the point. Deciding whether a partition holds any deleted row
+/// costs eight bytes a vertex this way, against `4 * (max_degree + dimension)`
+/// for the whole partition - 776 bytes a vertex at the crate's own working
+/// point. Consolidation asks that question of every partition of a segment and
+/// reads the rest of only the ones that answer yes.
+///
+/// `reader` should have been opened projected onto that one column; the saving
+/// is in the projection, not here. Reading it off an unprojected reader is
+/// correct and merely pointless.
+pub async fn read_row_ids(reader: &FileReader, expected_rows: u32) -> Result<Vec<u64>> {
+    check_row_count(reader, expected_rows)?;
+    row_ids_from_batch(&read_rows(reader, 0..expected_rows as usize).await?)
 }
 
 /// Writes a segment directory one partition at a time.
@@ -270,21 +322,7 @@ impl SegmentWriter {
                 self.metadata.dimension
             )));
         }
-        if medoid as usize >= partition.len() {
-            return Err(Error::invalid_input(format!(
-                "Vamana partition {partition_id} has medoid {medoid} but holds only {} vertices",
-                partition.len()
-            )));
-        }
-        if let Some(last) = self.partitions.last()
-            && last.partition_id >= partition_id
-        {
-            return Err(Error::invalid_input(format!(
-                "Vamana partition {partition_id} was written after partition {}; partitions must \
-                 arrive in ascending order",
-                last.partition_id
-            )));
-        }
+        self.check_entry(partition_id, medoid, partition.len() as u32)?;
 
         let file = partition_file_name(partition_id);
         let path = self.dir.clone().join(file.as_str());
@@ -296,6 +334,101 @@ impl SegmentWriter {
             file,
         });
         Ok(size)
+    }
+
+    /// Take a partition of `from` into this segment without decoding it.
+    ///
+    /// A partition with nothing deleted in it survives consolidation byte for
+    /// byte, and the only reason it has to be touched at all is that it has to
+    /// end up in *this* directory: [`PartitionEntry::file`] is a plain name
+    /// inside the segment, never a path, so a partition of the new segment
+    /// cannot point at a file of the old one. On a blob store the copy is
+    /// server-side and no byte crosses the network.
+    ///
+    /// The source's own metadata is required rather than trusted, because the
+    /// copied bytes are a graph of a given width over vectors of a given
+    /// dimension and this segment declares both. Nothing downstream reads the
+    /// file's schema back against `partition_schema`, so a copy from a segment
+    /// built with another degree would leave `index.idx` describing a file it
+    /// does not describe.
+    ///
+    /// No size comes back, unlike [`Self::write_partition`]: on a blob store the
+    /// answer would be a `HEAD` the copy itself does not need, and Lance fills
+    /// the size of every file of a committed index by listing the directory.
+    pub async fn copy_partition(
+        &mut self,
+        from_dir: &Path,
+        from: &SegmentManifest,
+        partition_id: u32,
+    ) -> Result<()> {
+        let entry = from.partition(partition_id).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Vamana was asked to copy partition {partition_id}, which the source segment does \
+                 not list"
+            ))
+        })?;
+        for (what, source, mine) in [
+            (
+                "max_degree",
+                from.metadata().max_degree,
+                self.metadata.max_degree,
+            ),
+            (
+                "dimension",
+                from.metadata().dimension,
+                self.metadata.dimension,
+            ),
+        ] {
+            if source != mine {
+                return Err(Error::invalid_input(format!(
+                    "Vamana cannot copy partition {partition_id} from a segment declaring {what} \
+                     {source} into one declaring {mine}"
+                )));
+            }
+        }
+        self.check_entry(partition_id, entry.medoid, entry.num_rows)?;
+
+        let file = partition_file_name(partition_id);
+        let from_path = from_dir.clone().join(entry.file.as_str());
+        let to_path = self.dir.clone().join(file.as_str());
+        // A copy onto itself is not a no-op. `std::fs::copy`, which the local
+        // store uses, truncates the destination before reading the source and
+        // then reports `Ok(0)` - measured: a 35-byte file comes back at 0 bytes
+        // with no error. Reachable only through this public API, consolidation
+        // always writing a segment of its own, and it destroys a partition.
+        if from_path == to_path {
+            return Err(Error::invalid_input(format!(
+                "Vamana was asked to copy partition {partition_id} onto itself at {to_path}"
+            )));
+        }
+        self.store.copy(&from_path, &to_path).await?;
+        self.partitions.push(PartitionEntry {
+            partition_id,
+            medoid: entry.medoid,
+            num_rows: entry.num_rows,
+            file,
+        });
+        Ok(())
+    }
+
+    /// What both ways into the table have to agree on before a row is added.
+    fn check_entry(&self, partition_id: u32, medoid: u32, num_rows: u32) -> Result<()> {
+        if medoid >= num_rows {
+            return Err(Error::invalid_input(format!(
+                "Vamana partition {partition_id} has medoid {medoid} but holds only {num_rows} \
+                 vertices"
+            )));
+        }
+        if let Some(last) = self.partitions.last()
+            && last.partition_id >= partition_id
+        {
+            return Err(Error::invalid_input(format!(
+                "Vamana partition {partition_id} was written after partition {}; partitions must \
+                 arrive in ascending order",
+                last.partition_id
+            )));
+        }
+        Ok(())
     }
 
     /// Write `index.idx` and return the segment as it was committed to disk.

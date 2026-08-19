@@ -21,12 +21,14 @@ use lance_file::writer::FileWriterOptions;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::DistanceType;
+use lance_vamana::PartitionEntry;
 use lance_vamana::format::{
     FORMAT_VERSION, INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata,
-    RowIdMode, partition_file_name,
+    ROW_ID_COLUMN, RowIdMode, partition_file_name,
 };
 use lance_vamana::io::{
-    SEGMENT_FILE_VERSION, SegmentWriter, open_file, read_partition, read_segment, scan_scheduler,
+    SEGMENT_FILE_VERSION, SegmentWriter, open_file, read_partition, read_row_ids, read_segment,
+    scan_scheduler, write_partition,
 };
 use lance_vamana::partition::Partition;
 use object_store::path::Path;
@@ -46,6 +48,7 @@ fn index_metadata() -> IndexMetadata {
     IndexMetadata {
         format_version: FORMAT_VERSION,
         max_degree: MAX_DEGREE,
+        search_list_size: 100,
         alpha: 1.2,
         dimension: DIMENSION,
         distance_type: DistanceType::Cosine,
@@ -250,6 +253,9 @@ async fn the_writer_rejects_a_partition_of_the_wrong_dimension() {
 async fn the_writer_rejects_partitions_out_of_order() {
     let dir = tempfile::tempdir().unwrap();
     let (store, path) = segment_dir(&dir);
+    let source = tempfile::tempdir().unwrap();
+    let (_, source_path) = segment_dir(&source);
+    let (source_manifest, _) = write_sample_segment(store.clone(), &source_path).await;
     let mut writer = SegmentWriter::new(store, path, index_metadata(), ivf_model());
 
     let partition = sample_partition(MAX_DEGREE, 4, DIMENSION);
@@ -258,6 +264,252 @@ async fn the_writer_rejects_partitions_out_of_order() {
     assert!(error.to_string().contains("ascending order"), "{error}");
     let error = writer.write_partition(3, 0, &partition).await.unwrap_err();
     assert!(error.to_string().contains("ascending order"), "{error}");
+    // The rule belongs to the table, not to one way of adding a row to it.
+    let error = writer
+        .copy_partition(&source_path, &source_manifest, 2)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("ascending order"), "{error}");
+}
+
+/// Reading the row ids alone gives the same ids, and reads less to do it.
+///
+/// The byte assertion is the one that matters. Correctness here is nearly
+/// impossible to get wrong, but the projection is the entire reason this
+/// function exists - consolidation asks "does this partition hold a deleted
+/// row" of every partition of a segment - and dropping it would be invisible
+/// without a number.
+#[tokio::test]
+async fn row_ids_read_alone_are_the_ids_and_cost_less() {
+    const PARTITION: u32 = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let (manifest, written) = write_sample_segment(store.clone(), &path).await;
+    let entry = manifest.partition(PARTITION).unwrap();
+    let file = path.clone().join(entry.file.as_str());
+
+    let projected = scan_scheduler(&store);
+    let reader = open_file(&projected, &file, Some(&[ROW_ID_COLUMN]), None)
+        .await
+        .unwrap();
+    let row_ids = read_row_ids(&reader, entry.num_rows).await.unwrap();
+
+    let whole = scan_scheduler(&store);
+    let reader = open_file(&whole, &file, None, None).await.unwrap();
+    let partition = read_partition(&reader, entry.num_rows).await.unwrap();
+
+    assert_eq!(row_ids, partition.graph().row_ids());
+    assert_eq!(&partition, &written[&PARTITION].1);
+    assert!(
+        projected.stats().bytes_read < whole.stats().bytes_read,
+        "the projection read {} bytes and the whole partition {}",
+        projected.stats().bytes_read,
+        whole.stats().bytes_read
+    );
+}
+
+/// A copied partition is the partition it was copied from, table row and all.
+#[tokio::test]
+async fn a_copied_partition_is_the_one_it_was_copied_from() {
+    let source = tempfile::tempdir().unwrap();
+    let (store, source_path) = segment_dir(&source);
+    let (source_manifest, written) = write_sample_segment(store.clone(), &source_path).await;
+
+    let target = tempfile::tempdir().unwrap();
+    let (_, target_path) = segment_dir(&target);
+    let mut writer = SegmentWriter::new(
+        store.clone(),
+        target_path.clone(),
+        index_metadata(),
+        ivf_model(),
+    );
+    // One copied, one written, one copied: the writer has to keep a single table
+    // in order across both ways of adding to it.
+    writer
+        .copy_partition(&source_path, &source_manifest, 0)
+        .await
+        .unwrap();
+    let fresh = sample_partition(MAX_DEGREE, 9, DIMENSION);
+    writer.write_partition(2, 1, &fresh).await.unwrap();
+    writer
+        .copy_partition(&source_path, &source_manifest, 3)
+        .await
+        .unwrap();
+    writer.finish().await.unwrap();
+
+    let read = read_segment(&scan_scheduler(&store), &target_path, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        read.partitions().len(),
+        3,
+        "the target lists partitions the source had and this segment never took"
+    );
+    for partition_id in [0u32, 2, 3] {
+        let entry = read.partition(partition_id).unwrap();
+        let expected = match partition_id {
+            2 => (1u32, &fresh),
+            other => {
+                let (medoid, partition) = &written[&other];
+                (*medoid, partition)
+            }
+        };
+        assert_eq!(
+            (entry.medoid, entry.num_rows as usize),
+            (expected.0, expected.1.len())
+        );
+        let reader = open_file(
+            &scan_scheduler(&store),
+            &target_path.clone().join(entry.file.as_str()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            &read_partition(&reader, entry.num_rows).await.unwrap(),
+            expected.1,
+            "partition {partition_id}"
+        );
+    }
+}
+
+/// A copy reads the source's `__file` and writes this segment's own canonical
+/// name. Two different names, so swapping the two fails rather than passing by
+/// coincidence.
+#[tokio::test]
+async fn a_copy_follows_the_source_table_and_writes_the_canonical_name() {
+    const RENAMED: &str = "somewhere-else.bin";
+    let source = tempfile::tempdir().unwrap();
+    let (store, source_path) = segment_dir(&source);
+    let partition = sample_partition(MAX_DEGREE, 12, DIMENSION);
+    write_partition(&store, &source_path.clone().join(RENAMED), &partition)
+        .await
+        .unwrap();
+    let source_manifest = lance_vamana::SegmentManifest::try_new(
+        index_metadata(),
+        ivf_model(),
+        vec![PartitionEntry {
+            partition_id: 4,
+            medoid: 2,
+            num_rows: partition.len() as u32,
+            file: RENAMED.to_string(),
+        }],
+    )
+    .unwrap();
+    write_index_file(&store, &source_path, &source_manifest).await;
+
+    let target = tempfile::tempdir().unwrap();
+    let (_, target_path) = segment_dir(&target);
+    let mut writer = SegmentWriter::new(
+        store.clone(),
+        target_path.clone(),
+        index_metadata(),
+        ivf_model(),
+    );
+    writer
+        .copy_partition(&source_path, &source_manifest, 4)
+        .await
+        .unwrap();
+    writer.finish().await.unwrap();
+
+    let read = read_segment(&scan_scheduler(&store), &target_path, None)
+        .await
+        .unwrap();
+    assert_eq!(read.partition(4).unwrap().file, partition_file_name(4));
+    let mut found = store.read_dir(target_path.clone()).await.unwrap();
+    found.sort();
+    assert_eq!(found, vec![INDEX_FILE_NAME, &partition_file_name(4)]);
+}
+
+/// `std::fs::copy` truncates the destination before it reads the source and
+/// then reports success, so a segment rewritten in place would lose the
+/// partitions it did not touch - silently, and one file at a time.
+#[tokio::test]
+async fn copying_a_partition_onto_itself_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let (manifest, written) = write_sample_segment(store.clone(), &path).await;
+    let mut writer = SegmentWriter::new(store.clone(), path.clone(), index_metadata(), ivf_model());
+
+    let error = writer
+        .copy_partition(&path, &manifest, 0)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("onto itself"), "{error}");
+
+    let entry = manifest.partition(0).unwrap();
+    let reader = open_file(
+        &scan_scheduler(&store),
+        &path.clone().join(entry.file.as_str()),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        &read_partition(&reader, entry.num_rows).await.unwrap(),
+        &written[&0].1,
+        "the refused copy still emptied the file"
+    );
+}
+
+#[tokio::test]
+async fn copying_a_partition_the_source_does_not_list_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let source = tempfile::tempdir().unwrap();
+    let (_, source_path) = segment_dir(&source);
+    let (source_manifest, _) = write_sample_segment(store.clone(), &source_path).await;
+    let mut writer = SegmentWriter::new(store, path, index_metadata(), ivf_model());
+
+    let error = writer
+        .copy_partition(&source_path, &source_manifest, 1)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("does not list"), "{error}");
+}
+
+/// The copied bytes are a graph of a given width over vectors of a given
+/// dimension, and this segment declares both. Nothing reads a partition file's
+/// schema back against what `index.idx` claims, so a copy across shapes would
+/// leave the table describing a file it does not describe.
+#[tokio::test]
+async fn copying_from_a_segment_of_another_shape_is_refused() {
+    /// A source table with no files behind it: the shape is checked before a
+    /// byte is copied, which is what lets this be hand-made.
+    fn manifest_of(max_degree: u32, dimension: u32) -> lance_vamana::SegmentManifest {
+        let values = Float32Array::from(vec![0.5; PARTITIONS * dimension as usize]);
+        lance_vamana::SegmentManifest::try_new(
+            IndexMetadata {
+                max_degree,
+                dimension,
+                ..index_metadata()
+            },
+            IvfModel::new(
+                FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap(),
+                None,
+            ),
+            vec![PartitionEntry {
+                partition_id: 0,
+                medoid: 0,
+                num_rows: 4,
+                file: partition_file_name(0),
+            }],
+        )
+        .unwrap()
+    }
+
+    for (source, expected) in [
+        (manifest_of(MAX_DEGREE + 1, DIMENSION), "max_degree 33"),
+        (manifest_of(MAX_DEGREE, DIMENSION + 1), "dimension 7"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, path) = segment_dir(&dir);
+        let mut writer = SegmentWriter::new(store, path.clone(), index_metadata(), ivf_model());
+        let error = writer.copy_partition(&path, &source, 0).await.unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 }
 
 /// Pointing the reader at somebody else's `index.idx` must say so, not decode

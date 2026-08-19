@@ -224,6 +224,36 @@ pub fn live_fragments(dataset: &Dataset) -> Vec<u32> {
         .collect()
 }
 
+/// The name of the column an index is over, which committing a further segment
+/// of it needs and the segment itself does not record.
+///
+/// Resolved against the dataset's *top-level* fields rather than through
+/// `Schema::field_by_id`, which resolves a nested leaf too and would hand back
+/// the leaf's own name - a column of that name need not exist. This module
+/// refuses a nested column outright, so anything this crate committed resolves
+/// here; anything that does not was committed by something else.
+pub(crate) fn index_column(dataset: &Dataset, index_name: &str, fields: &[i32]) -> Result<String> {
+    let [field_id] = fields else {
+        return Err(Error::invalid_input(format!(
+            "Vamana index '{index_name}' is recorded against {} fields, and a vector index is \
+             over exactly one",
+            fields.len()
+        )));
+    };
+    dataset
+        .schema()
+        .fields
+        .iter()
+        .find(|field| field.id == *field_id)
+        .map(|field| field.name.clone())
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Vamana index '{index_name}' is over field {field_id}, which is not a top-level \
+                 column of this dataset"
+            ))
+        })
+}
+
 /// Build a segment over `fragments` and describe it, ready to commit.
 ///
 /// Separate from [`create_index`] because a segment is the unit of maintenance:
@@ -244,6 +274,21 @@ pub async fn build_index_segment(
     dataset: &Dataset,
     params: &IndexParams,
     fragments: &[u32],
+) -> Result<(IndexSegment, BuildStats)> {
+    build_index_segment_with_router(dataset, params, fragments, None).await
+}
+
+/// [`build_index_segment`], with the option of routing by somebody else's
+/// centroids instead of training a router of this segment's own.
+///
+/// A segment added to an index that already has one inherits the base's model,
+/// which is what keeps every segment of an index on one partition numbering.
+/// See [`crate::inserter`] for why that matters.
+pub(crate) async fn build_index_segment_with_router(
+    dataset: &Dataset,
+    params: &IndexParams,
+    fragments: &[u32],
+    router: Option<IvfModel>,
 ) -> Result<(IndexSegment, BuildStats)> {
     // Refused before the graph is built rather than discovered on the commit
     // that follows it: Lance would open this index while committing, and cannot.
@@ -288,7 +333,7 @@ pub async fn build_index_segment(
 
     let uuid = Uuid::new_v4();
     let dir = dataset.indices_dir().join(uuid.to_string());
-    let (_, stats) = build_segment(dataset, params, &dir, fragments).await?;
+    let (_, stats) = build_segment_with_router(dataset, params, &dir, fragments, router).await?;
 
     let details = prost_types::Any {
         type_url: INDEX_DETAILS_TYPE_URL.to_string(),
@@ -359,6 +404,22 @@ pub async fn build_segment(
     params: &IndexParams,
     dir: &Path,
     fragments: &[u32],
+) -> Result<(SegmentManifest, BuildStats)> {
+    build_segment_with_router(dataset, params, dir, fragments, None).await
+}
+
+/// [`build_segment`], routing by `router` when one is given rather than
+/// training one.
+///
+/// `params.num_partitions` and the two k-means knobs are then unused: how many
+/// buckets there are is a property of the model, and it is read off the model
+/// below rather than off the request.
+pub(crate) async fn build_segment_with_router(
+    dataset: &Dataset,
+    params: &IndexParams,
+    dir: &Path,
+    fragments: &[u32],
+    router: Option<IvfModel>,
 ) -> Result<(SegmentManifest, BuildStats)> {
     if dataset.manifest().uses_stable_row_ids() {
         // The delete list of stage C is derived from deletion vectors, which are
@@ -492,9 +553,14 @@ pub async fn build_segment(
             } else {
                 vectors
             };
-            let mut rng = SmallRng::seed_from_u64(params.graph.seed);
-            let ivf = train_router(&vectors, &params, &mut rng)?;
-            let assignment = assign(&ivf, &vectors, &row_ids, &params)?;
+            let ivf = match router {
+                Some(inherited) => inherited,
+                None => {
+                    let mut rng = SmallRng::seed_from_u64(params.graph.seed);
+                    train_router(&vectors, &params, &mut rng)?
+                }
+            };
+            let assignment = assign(&ivf, &vectors, &row_ids, params.distance_type)?;
             Ok::<_, Error>((vectors, ivf, assignment))
         })
         .await?
@@ -503,12 +569,18 @@ pub async fn build_segment(
     let metadata = IndexMetadata {
         format_version: FORMAT_VERSION,
         max_degree: params.graph.max_degree,
+        search_list_size: params.graph.search_list_size,
         alpha: params.graph.alpha,
         dimension,
         distance_type: params.distance_type,
         row_id_mode: RowIdMode::Address,
         fragments: fragments.to_vec(),
     };
+    // Off the model rather than off the request, because the two are the same
+    // number only when the model was trained here. An inherited one decides how
+    // many buckets there are, and grouping by a smaller count read from the
+    // request would index out of the bucket list.
+    let num_partitions = ivf.num_partitions() as u32;
     let mut writer = SegmentWriter::new(
         dataset.object_store(None).await?,
         dir.clone(),
@@ -516,7 +588,7 @@ pub async fn build_segment(
         ivf,
     );
 
-    let members_by_partition = group_by_partition(&assignment, params.num_partitions);
+    let members_by_partition = group_by_partition(&assignment, num_partitions);
     let stats =
         write_partitions(&mut writer, members_by_partition, row_ids, vectors, params).await?;
     Ok((writer.finish().await?, stats))
@@ -570,7 +642,7 @@ async fn write_partitions(
 /// is per fragment, never per row. That is the same position Lance's own vector
 /// indices are in, and it is why a caller cannot treat "the index covers this
 /// fragment" as "every row of it is in the index".
-async fn read_vectors(
+pub(crate) async fn read_vectors(
     dataset: &Dataset,
     column: &str,
     fragments: &[u32],
@@ -750,21 +822,18 @@ fn train_router(
     Ok(IvfModel::new(centroids, Some(kmeans.loss)))
 }
 
-fn assign(
+pub(crate) fn assign(
     ivf: &IvfModel,
     vectors: &FixedSizeListArray,
     row_ids: &[u64],
-    params: &IndexParams,
+    distance_type: DistanceType,
 ) -> Result<Vec<u32>> {
     let centroids = ivf
         .centroids
         .as_ref()
         .ok_or_else(|| Error::internal("the trained router has no centroids".to_string()))?;
-    let (partitions, _) = compute_partitions_arrow_array(
-        centroids,
-        vectors,
-        routing_distance_type(params.distance_type),
-    )?;
+    let (partitions, _) =
+        compute_partitions_arrow_array(centroids, vectors, routing_distance_type(distance_type))?;
     partitions
         .into_iter()
         .enumerate()
@@ -783,7 +852,7 @@ fn assign(
         .collect()
 }
 
-fn group_by_partition(assignment: &[u32], num_partitions: u32) -> Vec<Vec<u32>> {
+pub(crate) fn group_by_partition(assignment: &[u32], num_partitions: u32) -> Vec<Vec<u32>> {
     let mut members = vec![Vec::new(); num_partitions as usize];
     for (row, partition) in assignment.iter().enumerate() {
         members[*partition as usize].push(row as u32);
@@ -792,10 +861,10 @@ fn group_by_partition(assignment: &[u32], num_partitions: u32) -> Vec<Vec<u32>> 
 }
 
 /// One partition's graph, ready to write, and what building it cost.
-struct BuiltOne {
-    partition: Partition,
-    medoid: u32,
-    comparisons: u64,
+pub(crate) struct BuiltOne {
+    pub(crate) partition: Partition,
+    pub(crate) medoid: u32,
+    pub(crate) comparisons: u64,
 }
 
 /// Build the graph of one partition over the rows assigned to it.
@@ -804,7 +873,7 @@ struct BuiltOne {
 /// caller holds: [`Comparisons`] is a `Cell`, deliberately, because it is
 /// written once per candidate in the innermost loop of the build - and a `Cell`
 /// cannot cross the thread boundary this runs behind.
-fn build_one(
+pub(crate) fn build_one(
     members: &[u32],
     row_ids: &[u64],
     vectors: &FixedSizeListArray,
@@ -826,7 +895,7 @@ fn build_one(
     })
 }
 
-fn gather(vectors: &FixedSizeListArray, rows: &[u32]) -> Result<FixedSizeListArray> {
+pub(crate) fn gather(vectors: &FixedSizeListArray, rows: &[u32]) -> Result<FixedSizeListArray> {
     let taken = take(vectors, &UInt32Array::from(rows.to_vec()), None)?;
     Ok(taken.as_fixed_size_list().clone())
 }
@@ -932,6 +1001,7 @@ mod tests {
         let metadata = IndexMetadata {
             format_version: FORMAT_VERSION,
             max_degree: params.graph.max_degree,
+            search_list_size: params.graph.search_list_size,
             alpha: params.graph.alpha,
             dimension: DIMENSION as u32,
             distance_type: params.distance_type,

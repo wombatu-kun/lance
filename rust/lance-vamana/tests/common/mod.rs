@@ -7,14 +7,19 @@
 //! them needs still lands in the others.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::types::Float32Type;
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float32Type, UInt64Type};
 use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
+use lance::index::DatasetIndexExt;
+use lance_vamana::io::{open_file, read_partition, read_segment, scan_scheduler};
 use lance_vamana::partition::{Partition, PartitionGraph};
+use lance_vamana::segment::SegmentManifest;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
@@ -151,6 +156,96 @@ impl DatasetFixture {
         .await
         .unwrap()
     }
+}
+
+/// Lance's own exhaustive k-NN over the vector column.
+///
+/// `use_index(false)` is not optional: the scanner picks a vector index by field
+/// id alone, so with one of this crate's segments committed the ordinary path
+/// would try to open it as one of Lance's own.
+pub async fn brute_force(dataset: &Dataset, query: &[f32], k: usize) -> Vec<u64> {
+    let key = Float32Array::from(query.to_vec());
+    let mut scanner = dataset.scan();
+    scanner.nearest(VECTOR_COLUMN, &key, k).unwrap();
+    scanner.use_index(false);
+    scanner.with_row_id();
+    let batch = scanner.try_into_batch().await.unwrap();
+    batch[lance_core::ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec()
+}
+
+/// Every `_rowid` the dataset still has, in scan order.
+pub async fn live_row_ids(dataset: &Dataset) -> Vec<u64> {
+    let mut scanner = dataset.scan();
+    scanner.with_row_id();
+    scanner.project::<&str>(&[]).unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    batch[lance_core::ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec()
+}
+
+/// One committed segment as it is on disk: what it says about itself, and every
+/// partition it holds.
+pub struct ReadSegment {
+    pub uuid: uuid::Uuid,
+    pub manifest: SegmentManifest,
+    pub partitions: HashMap<u32, Partition>,
+}
+
+/// Read every committed segment of `index_name` back off disk, in manifest
+/// order.
+pub async fn read_committed_segments(dataset: &Dataset, index_name: &str) -> Vec<ReadSegment> {
+    let indices = dataset.load_indices_by_name(index_name).await.unwrap();
+    let store = dataset.object_store(None).await.unwrap();
+    let scheduler = scan_scheduler(&store);
+
+    let mut segments = Vec::with_capacity(indices.len());
+    for index in indices.iter() {
+        let dir = dataset.indices_dir().join(index.uuid.to_string());
+        let manifest = read_segment(&scheduler, &dir, None).await.unwrap();
+        let mut partitions = HashMap::new();
+        for entry in manifest.partitions() {
+            let reader = open_file(
+                &scheduler,
+                &dir.clone().join(entry.file.as_str()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            partitions.insert(
+                entry.partition_id,
+                read_partition(&reader, entry.num_rows).await.unwrap(),
+            );
+        }
+        segments.push(ReadSegment {
+            uuid: index.uuid,
+            manifest,
+            partitions,
+        });
+    }
+    segments
+}
+
+/// Locate the one committed segment of `index_name` and read every partition of
+/// it back off disk.
+pub async fn read_committed_segment(
+    dataset: &Dataset,
+    index_name: &str,
+) -> (SegmentManifest, HashMap<u32, Partition>) {
+    let mut segments = read_committed_segments(dataset, index_name).await;
+    assert_eq!(
+        segments.len(),
+        1,
+        "expected exactly one committed segment, found {}",
+        segments.len()
+    );
+    let segment = segments.remove(0);
+    (segment.manifest, segment.partitions)
 }
 
 /// Query vectors drawn the same way as the dataset's, from a different seed.

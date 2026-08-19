@@ -16,9 +16,10 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 
-use crate::format::MAX_PARTITION_ROWS;
+use crate::format::{IndexMetadata, MAX_PARTITION_ROWS};
+use crate::insert::{InsertScratch, Linking, insert_point};
 use crate::partition::PartitionGraph;
-use crate::search::{Comparisons, SearchScratch, greedy_search};
+use crate::search::Comparisons;
 
 /// How a partition's graph is built.
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +60,35 @@ impl Default for BuildParams {
             search_list_size: 100,
             alpha: 1.2,
             seed: 42,
+        }
+    }
+}
+
+/// The insertion order maintenance builds in.
+///
+/// Fixed rather than carried in the segment, unlike the degree, the beam and the
+/// pruning slack, which are. Those three decide what the graph *is*, and a
+/// partition a maintenance pass rebuilds or extends has to match its siblings on
+/// them. The seed decides only which of the equally good graphs comes out, and
+/// the crate's own position on it is that varying a seed is a deliberate act -
+/// so maintenance takes the one it is given and stays reproducible.
+pub const MAINTENANCE_SEED: u64 = 42;
+
+impl BuildParams {
+    /// The parameters a maintenance pass must work at, read off the segment it
+    /// is rewriting.
+    ///
+    /// Every graph a rewrite produces sits beside siblings that were built with
+    /// these three numbers, and a partition that disagrees with them disagrees
+    /// with its own segment's table. The seed is the one thing not in the
+    /// metadata, because the metadata deliberately does not record it: see
+    /// [`MAINTENANCE_SEED`].
+    pub fn maintenance(metadata: &IndexMetadata) -> Self {
+        Self {
+            max_degree: metadata.max_degree,
+            search_list_size: metadata.search_list_size,
+            alpha: metadata.alpha,
+            seed: MAINTENANCE_SEED,
         }
     }
 }
@@ -126,60 +156,25 @@ pub fn build_partition<S: VectorStore>(
     randomize(&mut graph, &mut rng)?;
     let medoid = medoid(store, comparisons)?;
 
-    let max_degree = params.max_degree as usize;
-    let mut scratch = SearchScratch::new(num_vertices as usize);
+    let mut scratch = InsertScratch::new(num_vertices as usize, params.max_degree);
     let mut order = (0..num_vertices).collect::<Vec<_>>();
-    let mut existing = Vec::with_capacity(max_degree + 1);
 
     for alpha in [1.0, params.alpha] {
+        let linking = Linking {
+            alpha,
+            search_list_size: params.search_list_size,
+        };
         order.shuffle(&mut rng);
         for point in &order {
-            let point = *point;
-            let from_point = store.dist_calculator_from_id(point);
-            let mut candidates = greedy_search(
-                &graph,
-                &from_point,
-                medoid,
-                params.search_list_size,
+            insert_point(
+                &mut graph,
+                store,
                 &mut scratch,
+                &linking,
+                *point,
+                medoid,
                 comparisons,
-            )?
-            .visited;
-            // The paper folds the current out-edges into the candidate set
-            // inside the prune; doing it here keeps the prune ignorant of the
-            // graph, which is what lets the back-edge case below reuse it.
-            comparisons.record(graph.neighbors(point)?.len() as u64);
-            candidates.extend(graph.neighbors(point)?.iter().map(|neighbor| {
-                OrderedNode::new(*neighbor, OrderedFloat(from_point.distance(*neighbor)))
-            }));
-
-            let selected = robust_prune(store, point, candidates, alpha, max_degree, comparisons)?;
-            graph.set_neighbors(point, &selected)?;
-
-            for neighbor in &selected {
-                let neighbor = *neighbor;
-                existing.clear();
-                existing.extend_from_slice(graph.neighbors(neighbor)?);
-                if existing.contains(&point) {
-                    continue;
-                }
-                if existing.len() < max_degree {
-                    existing.push(point);
-                    graph.set_neighbors(neighbor, &existing)?;
-                    continue;
-                }
-                // Full: the back-edge has to earn its place against the rest.
-                let from_neighbor = store.dist_calculator_from_id(neighbor);
-                comparisons.record(existing.len() as u64 + 1);
-                let contenders = existing
-                    .iter()
-                    .chain(std::iter::once(&point))
-                    .map(|id| OrderedNode::new(*id, OrderedFloat(from_neighbor.distance(*id))))
-                    .collect();
-                let pruned =
-                    robust_prune(store, neighbor, contenders, alpha, max_degree, comparisons)?;
-                graph.set_neighbors(neighbor, &pruned)?;
-            }
+            )?;
         }
     }
 
@@ -374,7 +369,7 @@ fn vector_column(batch: &RecordBatch) -> Result<(&Float32Array, usize)> {
 /// writes any non-finite float as `null`, so an infinite alpha serialises
 /// cleanly, commits, and then fails every later `from_json` with "invalid type:
 /// null" - an index that can be written once and never opened again.
-fn validate_alpha(alpha: f32) -> Result<()> {
+pub(crate) fn validate_alpha(alpha: f32) -> Result<()> {
     if !alpha.is_finite() || alpha < 1.0 {
         return Err(Error::invalid_input(format!(
             "Vamana alpha must be a finite value of at least 1.0, got {alpha}"
