@@ -57,10 +57,41 @@ pub const VECTOR_COLUMN: &str = "__vector";
 /// has a fixed stride.
 pub const NO_NEIGHBOR: u32 = u32::MAX;
 
-/// Highest partition-local id addressable, given [`NO_NEIGHBOR`] takes the top.
+/// Most rows one partition may hold.
+///
+/// A *count*, and every use of it is a count - not, despite the arithmetic
+/// looking the same, the highest local id. The ids of an `n`-row partition run
+/// to `n - 1`, so the widest partition whose ids all stay clear of
+/// [`NO_NEIGHBOR`] holds `u32::MAX` rows, and this is one below that: the check
+/// errs on the safe side by a single row, deliberately, so that no arithmetic
+/// anywhere has to be exact about the boundary.
+///
+/// Do not read a maximum local id out of it. That number is `MAX_PARTITION_ROWS
+/// - 1`, and using this constant as one would put a vertex on the sentinel.
 pub const MAX_PARTITION_ROWS: u32 = u32::MAX - 1;
 
-pub const FORMAT_VERSION: u32 = 2;
+/// Widest neighbour list a partition may be built with.
+///
+/// Not a property of the format, which stores the width as a `u32` and would
+/// take any of them, but a bound on what a typo can cost. The width is the
+/// stride of `__neighbors`, so it is both `4 * max_degree` bytes per vertex on
+/// disk and `4 * max_degree * rows` bytes allocated up front by
+/// [`crate::partition::PartitionGraph`] - a `100_000` typed where `100` was
+/// meant asks the allocator for 400 GB over a million-row partition and aborts
+/// the process instead of returning an error.
+///
+/// `1024` puts one vertex's list at 4 KiB, a page, which is already far past
+/// anything the literature builds: DiskANN's `R` is tens, and this crate's own
+/// measured working point is 64.
+pub const MAX_DEGREE: u32 = 1024;
+
+/// The one version number of this format.
+///
+/// Written twice, to two independently corruptible places - the dataset
+/// manifest's `index_version` and the segment's own [`IndexMetadata`] - and
+/// checked against both on open. Two *different* numbers is what this replaced,
+/// and the one recorded in the manifest was checked nowhere at all.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Schema metadata key under which [`IndexMetadata`] is stored as JSON.
 pub const INDEX_METADATA_KEY: &str = "lance-vamana:index";
@@ -100,6 +131,16 @@ pub struct IndexMetadata {
     #[serde(with = "distance_type_as_name")]
     pub distance_type: DistanceType,
     pub row_id_mode: RowIdMode,
+    /// Ids of the fragments whose rows this segment physically holds.
+    ///
+    /// The same set is handed to Lance as the segment's committed coverage, so
+    /// the two start out equal - and Lance then edits its copy without telling
+    /// anyone. An in-place column update prunes the rewritten fragments out of
+    /// the manifest's `fragment_bitmap`; a pure row rewrite adds fragments back
+    /// into it. Both leave this list untouched, which is exactly what makes it
+    /// useful: it is the only record of what the segment was built from, so
+    /// comparing the two on open is what turns a silent edit into a refusal.
+    pub fragments: Vec<u32>,
 }
 
 /// `DistanceType` carries no serde impls, and its `Display` / `TryFrom<&str>`
@@ -158,8 +199,12 @@ impl IndexMetadata {
 ///   picks full-zip only once a value reaches 256 bytes - `max_degree >= 64`, or
 ///   `dimension >= 64` - and quietly falls back to mini-block below that, which
 ///   reintroduces chunk amplification and destroys the addressing.
-/// - Both the column and its item are non-nullable. A null anywhere adds a
-///   control word to every value, so the stride stops being a clean multiple.
+/// - Both the column and its item are non-nullable. What costs is an actual
+///   null, not the flag: a null anywhere adds a control word to *every* value in
+///   the column and the stride stops being a clean multiple (measured at 133
+///   bytes against a stride of 128). Lance drops a validity bitmap that holds no
+///   nulls, so a merely nullable column keeps its stride - declaring the field
+///   non-nullable is what makes a null impossible to write at all.
 ///
 /// The two columns stay separate rather than being interleaved into one wide
 /// value because their access patterns differ: consolidation rewrites the edges
@@ -231,9 +276,51 @@ mod tests {
             dimension: 128,
             distance_type: DistanceType::Cosine,
             row_id_mode: RowIdMode::Address,
+            fragments: vec![0, 3, 7],
         };
         let parsed = IndexMetadata::from_json(&metadata.to_json().unwrap()).unwrap();
         assert_eq!(parsed, metadata);
+    }
+
+    #[test]
+    fn metadata_round_trips_a_stable_row_id_mode() {
+        // The builder refuses to produce this mode, so serde is the only place
+        // the spelling can be exercised at all - and `query::VamanaIndex::open`
+        // rejects an index by reading it back.
+        let metadata = IndexMetadata {
+            format_version: FORMAT_VERSION,
+            max_degree: 16,
+            alpha: 1.0,
+            dimension: 8,
+            distance_type: DistanceType::L2,
+            row_id_mode: RowIdMode::Stable,
+            fragments: vec![0],
+        };
+        let json = metadata.to_json().unwrap();
+        assert!(json.contains("\"stable\""), "{json}");
+        assert_eq!(IndexMetadata::from_json(&json).unwrap(), metadata);
+    }
+
+    /// Why `validate_alpha` refuses a non-finite value, stated as a fact about
+    /// the format rather than as a comment: JSON has no spelling for infinity,
+    /// `serde_json` writes `null`, and the index becomes one that was written
+    /// once and can never be opened. The guard lives on the build path, so this
+    /// is the only place the consequence itself can be pinned.
+    #[test]
+    fn a_non_finite_alpha_would_serialise_to_an_unreadable_index() {
+        let metadata = IndexMetadata {
+            format_version: FORMAT_VERSION,
+            max_degree: 64,
+            alpha: f32::INFINITY,
+            dimension: 128,
+            distance_type: DistanceType::L2,
+            row_id_mode: RowIdMode::Address,
+            fragments: vec![0],
+        };
+        let json = metadata.to_json().unwrap();
+        assert!(json.contains("\"alpha\":null"), "{json}");
+        let error = IndexMetadata::from_json(&json).unwrap_err();
+        assert!(error.to_string().contains("invalid type: null"), "{error}");
     }
 
     #[test]
@@ -245,6 +332,7 @@ mod tests {
             "dimension": 128,
             "distance_type": "manhattan",
             "row_id_mode": "address",
+            "fragments": [0],
         })
         .to_string();
         let error = IndexMetadata::from_json(&json).unwrap_err();
@@ -260,6 +348,7 @@ mod tests {
             "dimension": 128,
             "distance_type": "l2",
             "row_id_mode": "address",
+            "fragments": [0],
         })
         .to_string();
         let error = IndexMetadata::from_json(&json).unwrap_err();

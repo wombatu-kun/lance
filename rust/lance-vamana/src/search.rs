@@ -8,12 +8,50 @@
 //! runs it to answer. Both want the same thing, so it lives on its own.
 
 use std::cell::Cell;
+use std::sync::Arc;
 
-use lance_core::{Error, Result};
+use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array};
+use lance_core::{Error, ROW_ID, Result};
+use lance_index::vector::flat::index::FlatMetadata;
+use lance_index::vector::flat::storage::{FLAT_COLUMN, FlatFloatStorage};
 use lance_index::vector::graph::{OrderedFloat, OrderedNode};
+use lance_index::vector::quantizer::QuantizerStorage;
 use lance_index::vector::storage::DistCalculator;
+use lance_linalg::distance::DistanceType;
 
 use crate::partition::PartitionGraph;
+
+/// Wrap vectors and their row ids in the [`VectorStore`] the primitives here want.
+///
+/// [`FlatFloatStorage::try_from_batch`] and not [`FlatFloatStorage::new`]: the
+/// latter synthesises row ids `0..n`, and a build reads them straight into the
+/// graph. The graph would then name positions instead of rows, and every answer
+/// would point at the wrong data - while committing, reopening and searching
+/// perfectly happily.
+///
+/// [`VectorStore`]: lance_index::vector::storage::VectorStore
+pub fn flat_storage(
+    row_ids: &[u64],
+    vectors: &FixedSizeListArray,
+    distance_type: DistanceType,
+) -> Result<FlatFloatStorage> {
+    let batch = RecordBatch::try_from_iter_with_nullable(vec![
+        (
+            ROW_ID,
+            Arc::new(UInt64Array::from(row_ids.to_vec())) as ArrayRef,
+            false,
+        ),
+        (FLAT_COLUMN, Arc::new(vectors.clone()) as ArrayRef, false),
+    ])?;
+    FlatFloatStorage::try_from_batch(
+        batch,
+        &FlatMetadata {
+            dim: vectors.value_length() as usize,
+        },
+        distance_type,
+        None,
+    )
+}
 
 /// Counts distance computations.
 ///
@@ -25,9 +63,11 @@ use crate::partition::PartitionGraph;
 pub struct Comparisons(Cell<u64>);
 
 impl Comparisons {
+    /// Saturating rather than checked: this is a measurement, and a counter that
+    /// has run out is not a reason to fail the query it was measuring.
     #[inline]
     pub fn record(&self, count: u64) {
-        self.0.set(self.0.get() + count);
+        self.0.set(self.0.get().saturating_add(count));
     }
 
     pub fn get(&self) -> u64 {
@@ -134,7 +174,10 @@ pub fn greedy_search(
     scratch.begin();
     scratch.mark(entry_point);
     comparisons.record(1);
-    let mut list = Vec::with_capacity(search_list_size + 1);
+    // Bounded by the graph as well as by `L`: the list can never hold more than
+    // one entry per vertex, and `L` comes from a caller who may have passed
+    // `usize::MAX`, which this would hand straight to the allocator.
+    let mut list = Vec::with_capacity(search_list_size.min(graph.len()).saturating_add(1));
     list.push(Candidate {
         node: OrderedNode::new(entry_point, OrderedFloat(query.distance(entry_point))),
         expanded: false,
@@ -146,7 +189,7 @@ pub fn greedy_search(
         let nearest_unexpanded = list[position].node.clone();
         visited.push(nearest_unexpanded.clone());
 
-        for neighbor in graph.neighbors(nearest_unexpanded.id) {
+        for neighbor in graph.neighbors(nearest_unexpanded.id)? {
             if !scratch.mark(*neighbor) {
                 continue;
             }
@@ -254,20 +297,69 @@ mod tests {
     }
 
     #[test]
-    fn the_search_list_never_grows_past_its_bound() {
-        let graph = path_graph(64);
+    fn the_search_list_comes_back_exactly_as_wide_as_it_may_be() {
+        const VERTICES: usize = 64;
+        let graph = path_graph(VERTICES);
         for search_list_size in [1, 2, 7, 64, 128] {
-            let (result, _) = search(&graph, &line_storage(64), 63, 0, search_list_size);
-            assert!(
-                result.candidates.len() <= search_list_size,
-                "list of {} exceeds the bound {search_list_size}",
-                result.candidates.len()
+            let (result, _) = search(&graph, &line_storage(VERTICES), 63, 0, search_list_size);
+            // Equality, not a ceiling. Every vertex of this path is reached, so
+            // the list is full whenever `L` allows it, and an upper bound alone
+            // would pass for a walk that kept one candidate at any `L`.
+            assert_eq!(
+                result.candidates.len(),
+                search_list_size.min(VERTICES),
+                "at L = {search_list_size}"
             );
             assert!(
                 result.candidates.windows(2).all(|pair| pair[0] <= pair[1]),
                 "the search list came back unsorted at L = {search_list_size}"
             );
         }
+    }
+
+    /// A graph with a trap, because a path graph cannot show what `L` is for:
+    /// every vertex along a path is strictly closer than the last, so one slot
+    /// walks it exactly like a hundred and the whole beam is inert.
+    ///
+    /// Vertices sit on a line at 0, 50, 40, 20, 99 and the query is vertex 4, at
+    /// 99. Expanding the entry point offers vertex 1 (at 50) and vertex 2 (at
+    /// 40). With `L = 1` only the nearer of them survives, its own neighbour is
+    /// worse still, and the walk ends having never seen the answer. With `L = 2`
+    /// vertex 2 stays in the list, and the answer hangs off it.
+    fn trap_graph() -> (PartitionGraph, FlatFloatStorage) {
+        let positions = [0.0f32, 50.0, 40.0, 20.0, 99.0];
+        let storage = FlatFloatStorage::new(
+            arrow_array::FixedSizeListArray::try_new_from_values(
+                Float32Array::from(positions.to_vec()),
+                1,
+            )
+            .unwrap(),
+            DistanceType::L2,
+        );
+        let graph = PartitionGraph::try_new(
+            2,
+            (0..positions.len() as u64).collect(),
+            vec![vec![1, 2], vec![3], vec![4], vec![], vec![]],
+        )
+        .unwrap();
+        (graph, storage)
+    }
+
+    #[test]
+    fn a_wider_search_list_escapes_a_local_minimum() {
+        let (graph, storage) = trap_graph();
+
+        let (narrow, _) = search(&graph, &storage, 4, 0, 1);
+        assert_eq!(
+            narrow.candidates[0].id, 1,
+            "a one-slot list must fall into the trap, or the fixture is not a trap"
+        );
+
+        let (wide, _) = search(&graph, &storage, 4, 0, 2);
+        assert_eq!(
+            wide.candidates[0].id, 4,
+            "a two-slot list must find the answer"
+        );
     }
 
     /// A vertex in another component is unreachable however good its distance.
@@ -365,5 +457,16 @@ mod tests {
         }
         assert_eq!(lengths, vec![16, 16, 16]);
         assert_eq!(comparisons.get(), 48);
+    }
+
+    /// A full counter pins itself rather than panicking in a debug build and
+    /// wrapping to nearly zero in a release one - the two ways a metric can
+    /// take a query down with it, or lie about it.
+    #[test]
+    fn a_full_comparison_counter_stops_rather_than_wraps() {
+        let comparisons = Comparisons::default();
+        comparisons.record(u64::MAX - 1);
+        comparisons.record(7);
+        assert_eq!(comparisons.get(), u64::MAX);
     }
 }

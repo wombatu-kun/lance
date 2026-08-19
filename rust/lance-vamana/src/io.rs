@@ -10,13 +10,13 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use arrow_array::RecordBatch;
 use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::LanceEncodingsIo;
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::{create_writer, reader_projection_from_column_names};
@@ -31,10 +31,10 @@ use object_store::path::Path;
 use prost::Message;
 
 use crate::format::{
-    INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, NEIGHBORS_COLUMN,
-    VECTOR_COLUMN, index_schema, partition_file_name,
+    INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, index_schema,
+    partition_file_name,
 };
-use crate::partition::{Partition, PartitionGraph};
+use crate::partition::Partition;
 use crate::segment::{PartitionEntry, SegmentManifest};
 
 /// The file format every file in a segment is written in.
@@ -50,6 +50,14 @@ pub async fn write_partition(
     path: &Path,
     partition: &Partition,
 ) -> Result<u64> {
+    // The format says an empty partition gets no row in `index.idx` and no file.
+    // `SegmentWriter` enforces that; this function is public and delegated to, so
+    // it has to enforce it too rather than write a file nothing can point at.
+    if partition.is_empty() {
+        return Err(Error::invalid_input(
+            "Vamana will not write a file for an empty partition".to_string(),
+        ));
+    }
     let batch = partition.to_batch()?;
     let schema = lance_core::datatypes::Schema::try_from(batch.schema().as_ref())?;
     let mut writer = create_writer(
@@ -62,47 +70,92 @@ pub async fn write_partition(
     Ok(writer.finish().await?.size_bytes)
 }
 
+/// The one scheduler an index reads through.
+///
+/// One per index open, never one per file, which is what Lance's own vector
+/// index does. A scheduler spawns a background task, so one per partition read
+/// would be one background task per partition read.
+///
+/// It is *not* what keeps the working set bounded, despite declaring a byte
+/// budget of `32 MiB * io_parallelism`. Every file here is opened at base
+/// priority 0, and a task's priority is `(base << 64) | top_level_row`, so the
+/// first page of every partition of every segment has priority exactly 0.
+/// `can_deliver_without_warning` admits a task unconditionally when its priority
+/// is at or below the minimum in flight, which zero always is, so the
+/// byte-budget branch is never reached and `bytes_avail` simply goes negative
+/// with a `log::debug!`. What actually bounds a query's working set is
+/// `PARTITIONS_IN_FLIGHT`.
+pub fn scan_scheduler(store: &Arc<ObjectStore>) -> Arc<ScanScheduler> {
+    ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(store))
+}
+
 /// Open a file of a segment for reading.
 ///
 /// `columns` narrows what is fetched; pass `None` to read every column.
+/// `size_bytes` skips the size probe when the caller already knows the answer -
+/// Lance records the size of every file of a committed index in the dataset
+/// manifest, so at query time it always does.
 pub async fn open_file(
-    store: Arc<ObjectStore>,
+    scheduler: &Arc<ScanScheduler>,
     path: &Path,
     columns: Option<&[&str]>,
+    size_bytes: Option<u64>,
 ) -> Result<FileReader> {
-    let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
-    let file = scheduler
-        .open_file(path, &CachedFileSize::unknown())
-        .await?;
+    let options = FileReaderOptions::default();
+    let size = size_bytes.map_or_else(CachedFileSize::unknown, CachedFileSize::new);
+    let file = scheduler.open_file(path, &size).await?;
     let reader = FileReader::try_open(
         file.clone(),
         None,
         Arc::<DecoderPlugins>::default(),
         &LanceCache::no_cache(),
-        FileReaderOptions::default(),
+        options.clone(),
     )
     .await?;
+    // The version is pinned on the way out and therefore has to be checked on
+    // the way in. It is not a formality: the projection below is computed
+    // against the structural grammar of [`SEGMENT_FILE_VERSION`], and a file
+    // written under another one lays its columns out differently - the read
+    // would succeed and return the wrong bytes rather than fail.
+    if reader.metadata().version() != SEGMENT_FILE_VERSION {
+        return Err(Error::corrupt_file_named(
+            path.filename().unwrap_or(INDEX_FILE_NAME),
+            format!(
+                "Vamana segment file is a Lance {} file, and this crate writes and reads {}",
+                reader.metadata().version(),
+                SEGMENT_FILE_VERSION
+            ),
+        ));
+    }
 
     let Some(columns) = columns else {
         return Ok(reader);
     };
+    // Reopened from the metadata the first open already read, not from the path.
+    // A projection changes what is decoded, not what the file says about itself,
+    // and `try_open` would go back to storage for the footer to be told so.
     let projection =
         reader_projection_from_column_names(SEGMENT_FILE_VERSION, reader.schema(), columns)?;
-    FileReader::try_open(
-        file,
+    FileReader::try_open_with_file_metadata(
+        Arc::new(LanceEncodingsIo::new(file).with_read_chunk_size(options.read_chunk_size)),
+        path.clone(),
         Some(projection),
         Arc::<DecoderPlugins>::default(),
+        reader.metadata().clone(),
         &LanceCache::no_cache(),
-        FileReaderOptions::default(),
+        options,
     )
     .await
 }
 
 /// Read a contiguous run of rows.
 ///
-/// `Range` rather than the whole file on purpose: this is the call a graph
-/// traversal makes, and the reason `__neighbors` has a fixed stride is that
-/// such a read must fetch `max_degree * 4` bytes per vertex and nothing else.
+/// `Range` rather than the whole file because the layout is built for it: the
+/// reason `__neighbors` has a fixed stride is that reading one vertex must fetch
+/// `max_degree * 4` bytes and nothing else. Nothing does that yet - both callers
+/// read a partition whole - so today the range is always `0..num_rows`. It stays
+/// a range because the lazy traversal that will use it is the point of the
+/// layout, and a whole-file signature would quietly give that up.
 pub async fn read_rows(reader: &FileReader, rows: Range<usize>) -> Result<RecordBatch> {
     if rows.is_empty() {
         return Err(Error::invalid_input(format!(
@@ -135,56 +188,27 @@ pub async fn read_rows(reader: &FileReader, rows: Range<usize>) -> Result<Record
 }
 
 /// Read a whole partition back into memory.
-pub async fn read_partition(reader: &FileReader) -> Result<Partition> {
-    let num_rows = reader.metadata().num_rows as usize;
-    if num_rows == 0 {
-        // An IVF partition may legitimately hold no vectors, and then there is no
-        // batch to take a schema from - so both widths come from the file itself.
-        let graph = PartitionGraph::try_new(max_degree(reader)?, Vec::new(), Vec::new())?;
-        let vectors = FixedSizeListArray::try_new(
-            Arc::new(Field::new("item", DataType::Float32, false)),
-            list_width(reader, VECTOR_COLUMN)?,
-            Arc::new(Float32Array::from(Vec::<f32>::new())),
-            None,
-        )?;
-        return Partition::try_new(graph, vectors);
-    }
-    Partition::try_from_batch(&read_rows(reader, 0..num_rows).await?)
-}
-
-/// The `max_degree` a partition file was written with.
-pub fn max_degree(reader: &FileReader) -> Result<u32> {
-    positive_width(reader, NEIGHBORS_COLUMN)
-}
-
-/// The vector dimension a partition file was written with.
-pub fn dimension(reader: &FileReader) -> Result<u32> {
-    positive_width(reader, VECTOR_COLUMN)
-}
-
-fn positive_width(reader: &FileReader, column: &str) -> Result<u32> {
-    let width = list_width(reader, column)?;
-    u32::try_from(width).map_err(|_| {
-        Error::corrupt_file_named(
-            column,
-            format!("Vamana {column} column has a negative width {width}"),
-        )
-    })
-}
-
-fn list_width(reader: &FileReader, column: &str) -> Result<i32> {
-    let schema: ArrowSchema = reader.schema().as_ref().into();
-    let field = schema.field_with_name(column)?;
-    let DataType::FixedSizeList(_, width) = field.data_type() else {
+///
+/// `expected_rows` comes from the segment table in `index.idx`, which is a
+/// different file from the one being read. Requiring the two to agree is what
+/// keeps a damaged footer from being believed, and it is also the only ceiling
+/// on this read: without it the row count written in the footer is what decides
+/// how much memory to allocate.
+pub async fn read_partition(reader: &FileReader, expected_rows: u32) -> Result<Partition> {
+    if reader.metadata().num_rows != expected_rows as u64 {
         return Err(Error::corrupt_file_named(
-            column,
+            "partition",
             format!(
-                "Vamana {column} column has type {}, expected a fixed size list",
-                field.data_type()
+                "Vamana partition file holds {} rows but the segment table lists {expected_rows}",
+                reader.metadata().num_rows
             ),
         ));
-    };
-    Ok(*width)
+    }
+    // No empty-partition branch: an empty partition is written no file and given
+    // no row in the segment table, so `expected_rows` is never zero on any path
+    // that reaches here, and a caller who passes zero anyway gets the empty-range
+    // error from `read_rows` rather than a partition invented from a schema.
+    Partition::try_from_batch(&read_rows(reader, 0..expected_rows as usize).await?)
 }
 
 /// Writes a segment directory one partition at a time.
@@ -305,8 +329,18 @@ impl SegmentWriter {
 ///
 /// One read of one small file: the partition table and the routing model are
 /// everything a query needs before it knows which partitions to open.
-pub async fn read_segment(store: Arc<ObjectStore>, dir: &Path) -> Result<SegmentManifest> {
-    let reader = open_file(store, &dir.clone().join(INDEX_FILE_NAME), None).await?;
+pub async fn read_segment(
+    scheduler: &Arc<ScanScheduler>,
+    dir: &Path,
+    size_bytes: Option<u64>,
+) -> Result<SegmentManifest> {
+    let reader = open_file(
+        scheduler,
+        &dir.clone().join(INDEX_FILE_NAME),
+        None,
+        size_bytes,
+    )
+    .await?;
     let schema_metadata = &reader.schema().metadata;
 
     let metadata =
@@ -332,9 +366,17 @@ pub async fn read_segment(store: Arc<ObjectStore>, dir: &Path) -> Result<Segment
                 format!("Vamana segment has an unreadable {IVF_POSITION_KEY}: {e}"),
             )
         })?;
-    let ivf = IvfModel::try_from(pb::Ivf::decode(
-        reader.read_global_buffer(ivf_position).await?,
-    )?)?;
+    // Global buffer indices are one-based - buffer 0 is the file's own schema
+    // descriptor - so a stored 0 is corruption, not a model.
+    if ivf_position == 0 {
+        return Err(Error::corrupt_file_named(
+            INDEX_FILE_NAME,
+            format!("Vamana segment stores {IVF_POSITION_KEY} = 0, which is the file descriptor"),
+        ));
+    }
+    let proto = pb::Ivf::decode(reader.read_global_buffer(ivf_position).await?)?;
+    validate_ivf_model(&proto)?;
+    let ivf = IvfModel::try_from(proto)?;
 
     let num_rows = reader.metadata().num_rows as usize;
     let batch = if num_rows == 0 {
@@ -342,5 +384,71 @@ pub async fn read_segment(store: Arc<ObjectStore>, dir: &Path) -> Result<Segment
     } else {
         read_rows(&reader, 0..num_rows).await?
     };
-    SegmentManifest::try_from_batch(metadata, ivf, &batch)
+    // Everything the constructor refuses it refuses as `invalid_input`, because
+    // a *writer* goes through the same constructor and there the caller is the
+    // one who got it wrong. Reaching it from here means the same values arrived
+    // out of a file, and the repository's rule sorts errors by where the bad
+    // value came from rather than by what was wrong with it.
+    SegmentManifest::try_from_batch(metadata, ivf, &batch).map_err(|error| match error {
+        Error::InvalidInput { source, .. } => {
+            Error::corrupt_file_named(INDEX_FILE_NAME, source.to_string())
+        }
+        other => other,
+    })
+}
+
+/// Reject an IVF buffer that [`IvfModel::try_from`] would crash on.
+///
+/// Every case here is a process abort taken on bytes read off disk. `try_from`
+/// is written for models Lance produced itself, so it asserts, divides and
+/// unwraps on fields its own writer always fills - which a buffer arriving from
+/// anywhere else need not.
+fn validate_ivf_model(proto: &pb::Ivf) -> Result<()> {
+    // Asserted rather than checked, so a mismatch aborts instead of reporting.
+    if !proto.offsets.is_empty() && proto.offsets.len() != proto.lengths.len() {
+        return Err(Error::corrupt_file_named(
+            INDEX_FILE_NAME,
+            format!(
+                "Vamana segment carries an IVF model with {} offsets and {} lengths",
+                proto.offsets.len(),
+                proto.lengths.len()
+            ),
+        ));
+    }
+    // The v1 centroid layout is a flat buffer whose width is recovered by
+    // dividing by the number of partitions - taken from `lengths`, which the v1
+    // writer always filled and nothing enforces.
+    if proto.centroids_tensor.is_none() && !proto.centroids.is_empty() && proto.lengths.is_empty() {
+        return Err(Error::corrupt_file_named(
+            INDEX_FILE_NAME,
+            format!(
+                "Vamana segment carries {} legacy centroid values but no partition lengths to \
+                 recover their width from",
+                proto.centroids.len()
+            ),
+        ));
+    }
+
+    let Some(tensor) = proto.centroids_tensor.as_ref() else {
+        return Ok(());
+    };
+    let data_type = pb::tensor::DataType::try_from(tensor.data_type).map_err(|_| {
+        Error::corrupt_file_named(
+            INDEX_FILE_NAME,
+            format!(
+                "Vamana segment carries IVF centroids of unknown data type {}",
+                tensor.data_type
+            ),
+        )
+    })?;
+    // Not a crash but a failure deferred: centroids of another width open
+    // cleanly and then fail per query, because routing dispatches on the pair
+    // of centroid and query types and this crate only ever builds an f32 query.
+    if data_type != pb::tensor::DataType::Float32 {
+        return Err(Error::corrupt_file_named(
+            INDEX_FILE_NAME,
+            format!("Vamana segment carries {data_type:?} IVF centroids, expected Float32"),
+        ));
+    }
+    Ok(())
 }

@@ -9,13 +9,29 @@
 //! ```
 //!
 //! Environment: `SIFT_DIR` (required), `VECTORS` (default 100000, `0` for all),
-//! `QUERIES` (default 200), `DEGREE` (Vamana `R`, default 32).
+//! `QUERIES` (default 200), `DEGREE` (Vamana `R`, default 32), `SEARCH_LIST`
+//! (Vamana `L`, default 100), `SEED` (default 42), `HNSW_EDGES` (default
+//! `DEGREE / 2`) and `HNSW_EF_CONSTRUCTION` (default 150).
 //!
-//! Both indexes are built and queried through the same counting wrapper, so the
-//! distance counts are comparable by construction rather than by trusting two
-//! sets of instrumentation to mean the same thing. The comparison to read is
-//! **distances per query at equal recall**, never at equal beam width: the two
-//! beams are not the same parameter and matching them measures nothing.
+//! `HNSW_EDGES` is what sets the memory the two indexes are compared at, and its
+//! default is not that value: `m` has to be raised until the printed ratio of
+//! HNSW edges to Vamana slots is near 1, and what that takes changes whenever
+//! upstream changes how many edges an `m` buys.
+//!
+//! Both indexes are *queried* through the same counting wrapper, and an
+//! assertion below pins that the wrapper and this crate's own counter agree, so
+//! the per-query numbers - the ones the comparison rests on - are comparable by
+//! construction rather than by trusting two sets of instrumentation to mean the
+//! same thing.
+//!
+//! The build numbers are not: Vamana's come from its own `Comparisons` and
+//! HNSW's from the wrapper, because Lance's builder takes a metrics argument and
+//! ignores it. They count the same event and are printed side by side, but
+//! nothing here proves they count it the same way.
+//!
+//! The comparison to read is **distances per query at equal recall**, never at
+//! equal beam width: the two beams are not the same parameter and matching them
+//! measures nothing.
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -318,7 +334,11 @@ fn main() {
         max_degree: degree as u32,
         search_list_size: env_usize("SEARCH_LIST", 100),
         alpha: 1.2,
-        ..BuildParams::default()
+        // Exposed so that a build number that has moved can be told apart from
+        // a build number that was drawn differently: the insertion order of both
+        // passes comes off this seed, and its spread is the noise floor any
+        // before-and-after comparison of a build has to clear.
+        seed: env_usize("SEED", 42) as u64,
     };
     let building = Comparisons::default();
     let started = Instant::now();
@@ -329,7 +349,7 @@ fn main() {
     // way would flatter us against an index that pays only for what it uses.
     let vamana_slots = vectors * degree;
     let used = (0..vectors as u32)
-        .map(|vertex| built.graph.neighbors(vertex).len())
+        .map(|vertex| built.graph.neighbors(vertex).unwrap().len())
         .sum::<usize>();
     println!(
         "\nvamana   R={degree} L={} alpha={}: built in {vamana_build:.1}s, \
