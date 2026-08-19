@@ -315,6 +315,7 @@ async fn a_partition_disagreeing_with_its_segment_is_refused() {
             &store,
             &segment_dir.join(manifest.partitions()[0].file.as_str()),
             &doctor(declared),
+            None,
         )
         .await
         .unwrap();
@@ -1503,6 +1504,7 @@ fn declaring(fragments: Vec<u32>) -> IndexMetadata {
         distance_type: DistanceType::L2,
         row_id_mode: RowIdMode::Address,
         fragments,
+        codes: None,
     }
 }
 
@@ -1940,6 +1942,7 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
             distance_type: DistanceType::L2,
             row_id_mode: RowIdMode::Address,
             fragments: covered.clone(),
+            codes: None,
         },
         lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
     );
@@ -2155,6 +2158,7 @@ async fn a_partition_holding_a_non_finite_vector_is_reported_as_corrupt() {
                 distance_type: DistanceType::L2,
                 row_id_mode: RowIdMode::Address,
                 fragments: covered.clone(),
+                codes: None,
             },
             lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
         );

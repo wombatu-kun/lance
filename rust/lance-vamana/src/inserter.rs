@@ -42,8 +42,8 @@
 //! What a delta really costs is **read operations, latency and files**: 400
 //! reads against 50, three times the latency, and 807 manifest entries against
 //! 101 - and Lance copies that list into every manifest the dataset writes
-//! afterwards. Against that, growing the index took 9.0 seconds where building
-//! it once took 14.3.
+//! afterwards. Against that, growing the index took 2.7 seconds where building
+//! it once took 3.3.
 //!
 //! So the case for putting new rows into the base's own graphs instead is not
 //! bytes and not recall. It is that a query stays on one segment's worth of
@@ -82,6 +82,7 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, FixedSizeListArray};
+use futures::{StreamExt, TryStreamExt, stream};
 use lance::Dataset;
 use lance::index::{DatasetIndexExt, IndexSegment};
 use lance_core::utils::tokio::spawn_cpu;
@@ -94,12 +95,15 @@ use uuid::Uuid;
 
 use crate::build::BuildParams;
 use crate::builder::{
-    INDEX_DETAILS_TYPE_URL, IndexParams, assign, build_index_segment_with_router, build_one,
-    gather, group_by_partition, index_column, read_vectors,
+    BuiltOne, INDEX_DETAILS_TYPE_URL, IndexParams, Inherited, assign,
+    build_index_segment_inheriting, build_one, gather, group_by_partition, index_column,
+    read_vectors,
 };
 use crate::format::{FORMAT_VERSION, IndexMetadata};
-use crate::insert::insert_into_partition;
-use crate::io::{SegmentWriter, check_partition_shape, open_file, read_partition};
+use crate::insert::{Inserted, insert_into_partition};
+use crate::io::{
+    SegmentWriter, check_partition_shape, open_file, partitions_in_flight, read_partition,
+};
 use crate::query::{Segment, VamanaIndex};
 use crate::search::Comparisons;
 
@@ -148,7 +152,7 @@ pub struct InsertStats {
 /// What the delta costs afterwards is read operations: a query probes `nprobes`
 /// partitions in it as in every other segment. [`crate::merger::merge_index`]
 /// folds it back into the base, and on SIFT 100k that fold has paid for itself
-/// after 533 queries against eight segments - so what a schedule of these is
+/// after 123 queries against eight segments - so what a schedule of these is
 /// paired with is a fold, not a rebuild.
 ///
 /// A concurrent commit under the same index name is a retryable conflict, and
@@ -180,11 +184,14 @@ pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Resul
     let base = index.base_segment()?;
     let column = index_column(dataset, index_name, &base.fields)?;
     let params = inherited_params(&column, base.manifest.metadata(), base.manifest.ivf());
-    let (segment, built) = build_index_segment_with_router(
+    let (segment, built) = build_index_segment_inheriting(
         dataset,
         &params,
         &new_fragments,
-        Some(base.manifest.ivf().clone()),
+        Some(Inherited {
+            router: base.manifest.ivf().clone(),
+            codes: base.manifest.metadata().codes.clone(),
+        }),
     )
     .await?;
 
@@ -265,9 +272,9 @@ pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Resul
 ///
 /// | round | recall@10 | distances/query | files | iops/query | maintenance |
 /// |---|---|---|---|---|---|
-/// | 0 | 0.9778 | 8045 | 101 | 50 | 4.6 s |
-/// | 4 | 0.9764 | 8463 | 101 | 50 | 8.6 s |
-/// | rebuilt | 0.9812 | 7801 | 101 | 50 | 14.3 s |
+/// | 0 | 0.9778 | 8045 | 101 | 50 | 1.1 s |
+/// | 4 | 0.9764 | 8463 | 101 | 50 | 2.2 s |
+/// | rebuilt | 0.9812 | 7801 | 101 | 50 | 3.4 s |
 ///
 /// Recall loses **0.14 of a percentage point** across the whole cycle and stops
 /// falling after the first round, against the roughly one point the FreshVamana
@@ -405,6 +412,94 @@ struct Growth<'a> {
     metadata: IndexMetadata,
 }
 
+/// What one partition of the grown segment turned into.
+enum Landed {
+    /// A centroid nothing was ever assigned to. It has no file and no table row,
+    /// and it still has none.
+    Untouched,
+    /// The base holds it and this batch drew nothing for it.
+    Copied,
+    /// A centroid the base drew nothing for and this batch did. Built rather
+    /// than inserted into: there is no graph to insert into, and no entry point
+    /// to search from.
+    Created(BuiltOne),
+    Grown {
+        inserted: Inserted,
+        comparisons: u64,
+    },
+}
+
+/// Read whatever the base holds of partition `partition_id` and put this batch's
+/// rows into it.
+///
+/// Everything an insertion does that does not touch the writer, so that the
+/// partitions can be through it several at a time while they are still written
+/// one at a time.
+async fn insert_one(growth: &Growth<'_>, partition_id: u32, members: &[u32]) -> Result<Landed> {
+    match (
+        growth.target.manifest.partition(partition_id),
+        members.is_empty(),
+    ) {
+        (None, true) => Ok(Landed::Untouched),
+        (Some(_), true) => Ok(Landed::Copied),
+        (None, false) => {
+            let members = members.to_vec();
+            let row_ids = growth.row_ids.clone();
+            let vectors = growth.vectors.clone();
+            let params = growth.params.clone();
+            Ok(Landed::Created(
+                spawn_cpu(move || build_one(&members, row_ids.as_slice(), &vectors, &params))
+                    .await?,
+            ))
+        }
+        (Some(entry), false) => {
+            let reader = open_file(
+                growth.index.scheduler(),
+                &growth.target.dir.clone().join(entry.file.as_str()),
+                None,
+                growth.target.file_sizes.get(&entry.file).copied(),
+            )
+            .await?;
+            let partition = read_partition(&reader, entry.num_rows).await?;
+            check_partition_shape(
+                &partition,
+                entry,
+                growth.metadata.max_degree,
+                growth.metadata.dimension,
+            )?;
+
+            let members = members.to_vec();
+            let row_ids = growth.row_ids.clone();
+            let vectors = growth.vectors.clone();
+            let params = growth.params.clone();
+            let entry_point = entry.medoid;
+            let (inserted, comparisons) = spawn_cpu(move || {
+                let batch = gather(&vectors, &members)?;
+                let batch_row_ids = members
+                    .iter()
+                    .map(|row| row_ids[*row as usize])
+                    .collect::<Vec<_>>();
+                let comparisons = Comparisons::default();
+                let inserted = insert_into_partition(
+                    &partition,
+                    &batch_row_ids,
+                    &batch,
+                    entry_point,
+                    params.distance_type,
+                    &params.graph,
+                    &comparisons,
+                )?;
+                Ok::<_, Error>((inserted, comparisons.get()))
+            })
+            .await?;
+            Ok(Landed::Grown {
+                inserted,
+                comparisons,
+            })
+        }
+    }
+}
+
 /// Write every partition of the grown segment, in ascending id order.
 ///
 /// One pass over the whole partition space rather than over the two lists
@@ -413,86 +508,44 @@ struct Growth<'a> {
 /// them in ascending order only. Walking the space costs a lookup per centroid
 /// against a partition read per occupied one.
 ///
-/// A partition at a time, as consolidation does it and for the same reason: a
-/// partition is read whole, so overlapping the reads would mean holding as many
-/// of them in memory as are kept in flight.
+/// [`partitions_in_flight`] partitions are read and linked at once and written
+/// one at a time, as consolidation does it and for the same reason: the work is
+/// processor-bound, and a partition at a time left every core but one idle. The
+/// working set is that many partitions rather than one.
 async fn grow_segment(
     growth: &Growth<'_>,
     writer: &mut SegmentWriter,
     stats: &mut InsertStats,
 ) -> Result<()> {
-    for (partition_id, members) in growth.members.iter().enumerate() {
-        let partition_id = partition_id as u32;
-        match (
-            growth.target.manifest.partition(partition_id),
-            members.is_empty(),
-        ) {
-            // A centroid nothing was ever assigned to. It has no file and no
-            // table row, and it still has none.
-            (None, true) => continue,
-            (Some(_), true) => {
+    let mut grown = stream::iter(growth.members.iter().enumerate().map(
+        |(partition_id, members)| async move {
+            let partition_id = partition_id as u32;
+            insert_one(growth, partition_id, members)
+                .await
+                .map(|outcome| (partition_id, outcome))
+        },
+    ))
+    .buffered(partitions_in_flight());
+    while let Some((partition_id, outcome)) = grown.try_next().await? {
+        match outcome {
+            Landed::Untouched => continue,
+            Landed::Copied => {
                 writer
                     .copy_partition(&growth.target.dir, &growth.target.manifest, partition_id)
                     .await?;
                 stats.partitions_copied += 1;
             }
-            // A centroid the base drew nothing for and this batch did. Built
-            // rather than inserted into: there is no graph to insert into, and
-            // no entry point to search from.
-            (None, false) => {
-                let members = members.clone();
-                let row_ids = growth.row_ids.clone();
-                let vectors = growth.vectors.clone();
-                let params = growth.params.clone();
-                let built =
-                    spawn_cpu(move || build_one(&members, row_ids.as_slice(), &vectors, &params))
-                        .await?;
+            Landed::Created(built) => {
                 writer
                     .write_partition(partition_id, built.medoid, &built.partition)
                     .await?;
                 stats.comparisons = stats.comparisons.saturating_add(built.comparisons);
                 stats.partitions_created += 1;
             }
-            (Some(entry), false) => {
-                let reader = open_file(
-                    growth.index.scheduler(),
-                    &growth.target.dir.clone().join(entry.file.as_str()),
-                    None,
-                    growth.target.file_sizes.get(&entry.file).copied(),
-                )
-                .await?;
-                let partition = read_partition(&reader, entry.num_rows).await?;
-                check_partition_shape(
-                    &partition,
-                    entry,
-                    growth.metadata.max_degree,
-                    growth.metadata.dimension,
-                )?;
-
-                let members = members.clone();
-                let row_ids = growth.row_ids.clone();
-                let vectors = growth.vectors.clone();
-                let params = growth.params.clone();
-                let entry_point = entry.medoid;
-                let (inserted, comparisons) = spawn_cpu(move || {
-                    let batch = gather(&vectors, &members)?;
-                    let batch_row_ids = members
-                        .iter()
-                        .map(|row| row_ids[*row as usize])
-                        .collect::<Vec<_>>();
-                    let comparisons = Comparisons::default();
-                    let inserted = insert_into_partition(
-                        &partition,
-                        &batch_row_ids,
-                        &batch,
-                        entry_point,
-                        params.distance_type,
-                        &params.graph,
-                        &comparisons,
-                    )?;
-                    Ok::<_, Error>((inserted, comparisons.get()))
-                })
-                .await?;
+            Landed::Grown {
+                inserted,
+                comparisons,
+            } => {
                 writer
                     .write_partition(partition_id, inserted.medoid, &inserted.partition)
                     .await?;

@@ -15,18 +15,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::UInt32Type;
-use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt64Array};
-use arrow_schema::{Fields, Schema as ArrowSchema};
+use arrow_array::types::{UInt32Type, UInt64Type};
+use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array};
+use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
 use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_encoding::constants::{STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::versions::create_writer;
 use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
+use lance_vamana::codes::{CODE_COLUMN, CodeParams};
 use lance_vamana::format::{NEIGHBORS_COLUMN, ROW_ID_COLUMN, VECTOR_COLUMN, partition_schema};
 use lance_vamana::io::{
-    SEGMENT_FILE_VERSION, open_file, read_partition, read_rows, scan_scheduler,
+    SEGMENT_FILE_VERSION, open_file, read_partition, read_rows, read_scattered, scan_scheduler,
 };
 use lance_vamana::partition::Partition;
 use object_store::path::Path;
@@ -77,7 +78,7 @@ fn local_store_and_path(dir: &tempfile::TempDir, name: &str) -> (Arc<ObjectStore
 /// measurements below can fail. It writes literally the same arrays, stripped of
 /// the encoding hints, so nothing but the hint differs between the two arms.
 async fn write_without_encoding_hint(store: &ObjectStore, path: &Path, partition: &Partition) {
-    let hinted = partition.to_batch().unwrap();
+    let hinted = partition.to_batch(None).unwrap();
     let fields = hinted
         .schema()
         .fields()
@@ -157,7 +158,7 @@ async fn vertex_cost_at(
 /// The same partition written through a nullable schema, optionally with one
 /// vertex's neighbour list actually set to null.
 async fn write_nullable(store: &ObjectStore, path: &Path, partition: &Partition, hole: bool) {
-    let hinted = partition.to_batch().unwrap();
+    let hinted = partition.to_batch(None).unwrap();
     let neighbors = hinted[NEIGHBORS_COLUMN].as_fixed_size_list();
     let width = neighbors.value_length() as usize;
     let slots = neighbors
@@ -223,7 +224,7 @@ async fn write_nullable(store: &ObjectStore, path: &Path, partition: &Partition,
 async fn addressable_and_chunked(dir: &tempfile::TempDir) -> (Arc<ObjectStore>, Path, Path) {
     let partition = sample_partition(MAX_DEGREE, VERTICES, DIMENSION);
     let (store, addressable) = local_store_and_path(dir, "fullzip.idx");
-    lance_vamana::io::write_partition(&store, &addressable, &partition)
+    lance_vamana::io::write_partition(&store, &addressable, &partition, None)
         .await
         .unwrap();
     let (_, chunked) = local_store_and_path(dir, "miniblock.idx");
@@ -237,7 +238,7 @@ async fn partition_round_trips_through_a_file() {
     let (store, path) = local_store_and_path(&dir, "part_00000.idx");
     let partition = sample_partition(64, 512, DIMENSION);
 
-    let size = lance_vamana::io::write_partition(&store, &path, &partition)
+    let size = lance_vamana::io::write_partition(&store, &path, &partition, None)
         .await
         .unwrap();
     assert!(size > 0);
@@ -269,6 +270,52 @@ async fn partition_round_trips_through_a_file() {
     assert!(error.to_string().contains("selects nothing"), "{error}");
 }
 
+/// A scattered read gives back exactly the rows asked for, in the order asked
+/// for.
+///
+/// The contract a lazy walk is built on, and it belongs to Lance rather than to
+/// this crate: the walk reads the edges of `beam_width` vertices in one request
+/// and then attributes each returned row to the vertex at the same position, so
+/// a reader that reordered, deduplicated or coalesced rows away would credit
+/// every edge list to the wrong vertex - and produce a perfectly plausible walk
+/// over a graph that does not exist.
+#[tokio::test]
+async fn a_scattered_read_returns_the_rows_asked_for_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = local_store_and_path(&dir, "part_00000.idx");
+    let partition = sample_partition(MAX_DEGREE, VERTICES, DIMENSION);
+    lance_vamana::io::write_partition(&store, &path, &partition, None)
+        .await
+        .unwrap();
+    let reader = open_file(&scan_scheduler(&store), &path, Some(&[ROW_ID_COLUMN]), None)
+        .await
+        .unwrap();
+
+    // Deliberately uneven: two adjacent rows the scheduler will coalesce, and
+    // gaps of every size around them.
+    let wanted = [0u32, 1, 2, 37, 38, 1000, 2047, 2048, VERTICES as u32 - 1];
+    let batch = read_scattered(&reader, &wanted).await.unwrap();
+    let got = batch[ROW_ID_COLUMN]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    let expected = wanted
+        .iter()
+        .map(|row| partition.graph().row_ids()[*row as usize])
+        .collect::<Vec<_>>();
+    assert_eq!(got, expected);
+
+    // Both halves of the contract the caller owns. The reader coalesces without
+    // sorting, so descending ranges would silently read the wrong rows, and an
+    // empty request would come back as a batch with no schema to concatenate.
+    let error = read_scattered(&reader, &[7, 3]).await.unwrap_err();
+    assert!(error.to_string().contains("strictly ascending"), "{error}");
+    let error = read_scattered(&reader, &[]).await.unwrap_err();
+    assert!(error.to_string().contains("no rows at all"), "{error}");
+    let error = read_scattered(&reader, &[4, 4]).await.unwrap_err();
+    assert!(error.to_string().contains("strictly ascending"), "{error}");
+}
+
 /// The size a caller declares is the size the reader uses. That is what lets a
 /// query open a partition without first asking storage how big it is, and it is
 /// only worth passing if a wrong one is refused rather than quietly re-probed -
@@ -278,7 +325,7 @@ async fn a_declared_file_size_is_the_one_used() {
     let dir = tempfile::tempdir().unwrap();
     let (store, path) = local_store_and_path(&dir, "part_00000.idx");
     let partition = sample_partition(64, 128, DIMENSION);
-    let size = lance_vamana::io::write_partition(&store, &path, &partition)
+    let size = lance_vamana::io::write_partition(&store, &path, &partition, None)
         .await
         .unwrap();
 
@@ -303,7 +350,7 @@ async fn partition_file_opens_with_the_stock_reader() {
     let dir = tempfile::tempdir().unwrap();
     let (store, path) = local_store_and_path(&dir, "part_00000.idx");
     let partition = sample_partition(64, 128, DIMENSION);
-    lance_vamana::io::write_partition(&store, &path, &partition)
+    lance_vamana::io::write_partition(&store, &path, &partition, None)
         .await
         .unwrap();
 
@@ -444,6 +491,7 @@ async fn the_hint_is_harmless_above_the_heuristic_threshold() {
         &store,
         &path,
         &sample_partition(WIDE_DEGREE, VERTICES, WIDE_DIMENSION),
+        None,
     )
     .await
     .unwrap();
@@ -494,7 +542,7 @@ async fn vertices_are_addressed_independently_across_partitions() {
             vectors,
         )
         .unwrap();
-        lance_vamana::io::write_partition(&store, &path, &partition)
+        lance_vamana::io::write_partition(&store, &path, &partition, None)
             .await
             .unwrap();
         written.insert(partition_id, (path, partition));
@@ -543,6 +591,7 @@ async fn the_stride_holds_past_a_page_boundary() {
         &store,
         &path,
         &sample_partition(MAX_DEGREE, MANY, DIMENSION),
+        None,
     )
     .await
     .unwrap();
@@ -602,10 +651,54 @@ async fn a_null_costs_the_stride_but_a_nullable_flag_does_not() {
     );
 }
 
+/// A code column is one more addressable column, not a change to the others.
+///
+/// Both halves matter. Its own stride is what makes a partition's codes one
+/// contiguous read; leaving the neighbours' stride alone is what keeps the
+/// disk-resident traversal possible on an index that carries codes, and there is
+/// nothing about adding a fourth column that guarantees it - a column with a
+/// null, or one Lance chose mini-block for, costs the whole file its addressing.
+#[tokio::test]
+async fn a_code_column_gets_its_own_stride_and_disturbs_no_other() {
+    const CODE_BITS: u8 = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = local_store_and_path(&dir, "coded.idx");
+    let partition = sample_partition(MAX_DEGREE, VERTICES, DIMENSION);
+    let params = CodeParams::mint(CODE_BITS, DIMENSION).unwrap();
+    let stride = params.stride(DIMENSION).unwrap();
+    let codes = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::UInt8, false)),
+        stride as i32,
+        Arc::new(UInt8Array::from(
+            (0..VERTICES * stride as usize)
+                .map(|byte| byte as u8)
+                .collect::<Vec<_>>(),
+        )),
+        None,
+    )
+    .unwrap();
+    lance_vamana::io::write_partition(&store, &path, &partition, Some(&codes))
+        .await
+        .unwrap();
+
+    for (column, expected) in [
+        (CODE_COLUMN, stride as f64),
+        (NEIGHBORS_COLUMN, NEIGHBOR_STRIDE),
+        (VECTOR_COLUMN, VECTOR_STRIDE),
+    ] {
+        let cost = vertex_cost(store.clone(), &path, &[column]).await;
+        println!(
+            "{column}: marginal={} single={}",
+            cost.marginal, cost.single
+        );
+        assert_eq!(cost.marginal, expected, "{column}");
+    }
+}
+
 /// Guard against the schema drifting away from what the layout needs.
 #[tokio::test]
 async fn the_written_schema_keeps_the_encoding_hint() {
-    let schema = partition_schema(64, 96).unwrap();
+    let schema = partition_schema(64, 96, None).unwrap();
     let hinted = schema
         .fields()
         .iter()

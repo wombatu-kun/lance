@@ -10,10 +10,11 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{FixedSizeListArray, RecordBatch};
 use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
@@ -25,11 +26,13 @@ use lance_index::pb;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use prost::Message;
 
+use crate::cache::FileKey;
+use crate::codes::encode;
 use crate::format::{
     INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, index_schema,
     partition_file_name,
@@ -49,6 +52,7 @@ pub async fn write_partition(
     store: &ObjectStore,
     path: &Path,
     partition: &Partition,
+    codes: Option<&FixedSizeListArray>,
 ) -> Result<u64> {
     // The format says an empty partition gets no row in `index.idx` and no file.
     // `SegmentWriter` enforces that; this function is public and delegated to, so
@@ -58,7 +62,7 @@ pub async fn write_partition(
             "Vamana will not write a file for an empty partition".to_string(),
         ));
     }
-    let batch = partition.to_batch()?;
+    let batch = partition.to_batch(codes)?;
     let schema = lance_core::datatypes::Schema::try_from(batch.schema().as_ref())?;
     let mut writer = create_writer(
         SEGMENT_FILE_VERSION,
@@ -89,73 +93,168 @@ pub fn scan_scheduler(store: &Arc<ObjectStore>) -> Arc<ScanScheduler> {
     ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(store))
 }
 
+/// One file of a segment, opened once and projected as often as wanted.
+///
+/// A projection is fixed when a reader is built, and a lazy walk reads three
+/// different sets of columns out of one partition: the codes it steers by, then
+/// the edges of every vertex it expands, then the vectors of what it ended up
+/// with. Opening the file once per projection would re-read the footer for each,
+/// and the footer is a round trip - which is the currency the lazy path is
+/// spending to save bytes, so it must not spend three where one will do.
+pub struct PartitionFile {
+    path: Path,
+    file: FileScheduler,
+    /// The unprojected reader: where the file metadata every projection is built
+    /// from comes from, and the answer when a caller wants every column.
+    reader: FileReader,
+}
+
+impl PartitionFile {
+    /// Open `path`, reading its footer once.
+    ///
+    /// `size_bytes` skips the size probe when the caller already knows the
+    /// answer - Lance records the size of every file of a committed index in the
+    /// dataset manifest, so at query time it always does.
+    pub async fn open(
+        scheduler: &Arc<ScanScheduler>,
+        path: &Path,
+        size_bytes: Option<u64>,
+    ) -> Result<Self> {
+        Self::open_with(scheduler, path, size_bytes, None).await
+    }
+
+    /// Open `path`, taking its layout from `cache` if a query has read it before.
+    ///
+    /// The footer is a round trip before a single vertex can be fetched, and a
+    /// partition file is immutable - maintenance writes a new segment under a
+    /// new uuid rather than editing one - so a query that probes the same
+    /// partition as an earlier query is re-reading a byte-for-byte identical
+    /// answer.
+    pub async fn open_cached(
+        scheduler: &Arc<ScanScheduler>,
+        path: &Path,
+        size_bytes: Option<u64>,
+        cache: &LanceCache,
+    ) -> Result<Self> {
+        Self::open_with(scheduler, path, size_bytes, Some(cache)).await
+    }
+
+    async fn open_with(
+        scheduler: &Arc<ScanScheduler>,
+        path: &Path,
+        size_bytes: Option<u64>,
+        cache: Option<&LanceCache>,
+    ) -> Result<Self> {
+        let size = size_bytes.map_or_else(CachedFileSize::unknown, CachedFileSize::new);
+        let file = scheduler.open_file(path, &size).await?;
+        // Only the cached arm goes near a key, because the uncached one is what
+        // every build and maintenance pass takes, and those open a file once
+        // each: hashing a path and weighing the metadata would be pure overhead
+        // there.
+        let metadata = match cache {
+            Some(cache) => {
+                cache
+                    .get_or_insert_with_key(FileKey { path }, || {
+                        FileReader::read_all_metadata(&file)
+                    })
+                    .await?
+            }
+            None => Arc::new(FileReader::read_all_metadata(&file).await?),
+        };
+        // The version is pinned on the way out and therefore has to be checked
+        // on the way in. It is not a formality: a projection is computed against
+        // the structural grammar of [`SEGMENT_FILE_VERSION`], and a file written
+        // under another one lays its columns out differently - the read would
+        // succeed and return the wrong bytes rather than fail.
+        if metadata.version() != SEGMENT_FILE_VERSION {
+            return Err(Error::corrupt_file_named(
+                path.filename().unwrap_or(INDEX_FILE_NAME),
+                format!(
+                    "Vamana segment file is a Lance {} file, and this crate writes and reads {}",
+                    metadata.version(),
+                    SEGMENT_FILE_VERSION
+                ),
+            ));
+        }
+        let options = FileReaderOptions::default();
+        let reader = FileReader::try_open_with_file_metadata(
+            Arc::new(
+                LanceEncodingsIo::new(file.clone()).with_read_chunk_size(options.read_chunk_size),
+            ),
+            path.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            metadata,
+            &LanceCache::no_cache(),
+            options,
+        )
+        .await?;
+        Ok(Self {
+            path: path.clone(),
+            file,
+            reader,
+        })
+    }
+
+    /// A reader that decodes `columns` and nothing else.
+    ///
+    /// Built from the metadata [`Self::open`] already read rather than from the
+    /// path: a projection changes what is decoded, not what the file says about
+    /// itself, and `try_open` would go back to storage for the footer to be told
+    /// so.
+    pub async fn project(&self, columns: &[&str]) -> Result<FileReader> {
+        let options = FileReaderOptions::default();
+        let projection = reader_projection_from_column_names(
+            SEGMENT_FILE_VERSION,
+            self.reader.schema(),
+            columns,
+        )?;
+        FileReader::try_open_with_file_metadata(
+            Arc::new(
+                LanceEncodingsIo::new(self.file.clone())
+                    .with_read_chunk_size(options.read_chunk_size),
+            ),
+            self.path.clone(),
+            Some(projection),
+            Arc::<DecoderPlugins>::default(),
+            self.reader.metadata().clone(),
+            &LanceCache::no_cache(),
+            options,
+        )
+        .await
+    }
+
+    /// The reader over every column.
+    pub fn whole(self) -> FileReader {
+        self.reader
+    }
+}
+
 /// Open a file of a segment for reading.
 ///
-/// `columns` narrows what is fetched; pass `None` to read every column.
-/// `size_bytes` skips the size probe when the caller already knows the answer -
-/// Lance records the size of every file of a committed index in the dataset
-/// manifest, so at query time it always does.
+/// `columns` narrows what is fetched; pass `None` to read every column. Reach
+/// for [`PartitionFile`] instead when the same file is to be read under more
+/// than one projection.
 pub async fn open_file(
     scheduler: &Arc<ScanScheduler>,
     path: &Path,
     columns: Option<&[&str]>,
     size_bytes: Option<u64>,
 ) -> Result<FileReader> {
-    let options = FileReaderOptions::default();
-    let size = size_bytes.map_or_else(CachedFileSize::unknown, CachedFileSize::new);
-    let file = scheduler.open_file(path, &size).await?;
-    let reader = FileReader::try_open(
-        file.clone(),
-        None,
-        Arc::<DecoderPlugins>::default(),
-        &LanceCache::no_cache(),
-        options.clone(),
-    )
-    .await?;
-    // The version is pinned on the way out and therefore has to be checked on
-    // the way in. It is not a formality: the projection below is computed
-    // against the structural grammar of [`SEGMENT_FILE_VERSION`], and a file
-    // written under another one lays its columns out differently - the read
-    // would succeed and return the wrong bytes rather than fail.
-    if reader.metadata().version() != SEGMENT_FILE_VERSION {
-        return Err(Error::corrupt_file_named(
-            path.filename().unwrap_or(INDEX_FILE_NAME),
-            format!(
-                "Vamana segment file is a Lance {} file, and this crate writes and reads {}",
-                reader.metadata().version(),
-                SEGMENT_FILE_VERSION
-            ),
-        ));
+    let file = PartitionFile::open(scheduler, path, size_bytes).await?;
+    match columns {
+        Some(columns) => file.project(columns).await,
+        None => Ok(file.whole()),
     }
-
-    let Some(columns) = columns else {
-        return Ok(reader);
-    };
-    // Reopened from the metadata the first open already read, not from the path.
-    // A projection changes what is decoded, not what the file says about itself,
-    // and `try_open` would go back to storage for the footer to be told so.
-    let projection =
-        reader_projection_from_column_names(SEGMENT_FILE_VERSION, reader.schema(), columns)?;
-    FileReader::try_open_with_file_metadata(
-        Arc::new(LanceEncodingsIo::new(file).with_read_chunk_size(options.read_chunk_size)),
-        path.clone(),
-        Some(projection),
-        Arc::<DecoderPlugins>::default(),
-        reader.metadata().clone(),
-        &LanceCache::no_cache(),
-        options,
-    )
-    .await
 }
 
 /// Read a contiguous run of rows.
 ///
 /// `Range` rather than the whole file because the layout is built for it: the
-/// reason `__neighbors` has a fixed stride is that reading one vertex must fetch
-/// `max_degree * 4` bytes and nothing else. Nothing does that yet - both callers
-/// read a partition whole - so today the range is always `0..num_rows`. It stays
-/// a range because the lazy traversal that will use it is the point of the
-/// layout, and a whole-file signature would quietly give that up.
+/// reason `__neighbors` has a fixed stride is that reading one vertex fetches
+/// `max_degree * 4` bytes and nothing else. A lazy walk reaches for
+/// [`read_scattered`] instead, which is the same read for a set of rows that are
+/// not adjacent.
 pub async fn read_rows(reader: &FileReader, rows: Range<usize>) -> Result<RecordBatch> {
     if rows.is_empty() {
         return Err(Error::invalid_input(format!(
@@ -187,6 +286,70 @@ pub async fn read_rows(reader: &FileReader, rows: Range<usize>) -> Result<Record
     Ok(concat_batches(&schema, batches.iter())?)
 }
 
+/// Read a scattered set of single rows as one request.
+///
+/// [`ReadBatchParams::Ranges`] and not a call per row: the scheduler coalesces
+/// adjacent ranges in one pass, which measured half the iops and half the bytes
+/// of issuing them separately, and it is what turns one hop of a lazy walk into
+/// one round trip instead of `beam_width` of them.
+///
+/// `rows` must be strictly ascending, because that coalescing pass does not
+/// sort - and the returned batch is in the order given, so a caller reading a
+/// row back by position depends on it too. Both are internal contracts of the
+/// lazy walk rather than anything a file can violate, hence the plain check.
+pub async fn read_scattered(reader: &FileReader, rows: &[u32]) -> Result<RecordBatch> {
+    if rows.is_empty() {
+        return Err(Error::invalid_input(
+            "Vamana was asked to read no rows at all".to_string(),
+        ));
+    }
+    if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(Error::internal(
+            "Vamana scattered reads must arrive strictly ascending; the scheduler coalesces \
+             ranges without sorting them"
+                .to_string(),
+        ));
+    }
+    let ranges = rows
+        .iter()
+        .map(|row| *row as u64..*row as u64 + 1)
+        .collect::<Vec<Range<u64>>>();
+    let batches = reader
+        .read_stream(
+            ReadBatchParams::Ranges(ranges.into()),
+            u32::MAX,
+            1,
+            FilterExpression::no_filter(),
+        )
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+    let schema = batches
+        .first()
+        .ok_or_else(|| {
+            Error::corrupt_file_named(
+                "partition",
+                format!(
+                    "Vamana read of {} scattered rows returned no data",
+                    rows.len()
+                ),
+            )
+        })?
+        .schema();
+    let batch = concat_batches(&schema, batches.iter())?;
+    if batch.num_rows() != rows.len() {
+        return Err(Error::corrupt_file_named(
+            "partition",
+            format!(
+                "Vamana asked for {} scattered rows and got {}",
+                rows.len(),
+                batch.num_rows()
+            ),
+        ));
+    }
+    Ok(batch)
+}
+
 /// Check a partition file against what `index.idx` says it holds.
 ///
 /// `expected_rows` comes from the segment table, which is a different file from
@@ -207,14 +370,24 @@ fn check_row_count(reader: &FileReader, expected_rows: u32) -> Result<()> {
     Ok(())
 }
 
+/// Read a whole partition's file, checked against what the segment table says.
+///
+/// The batch rather than the [`Partition`] because a partition file holds more
+/// than a partition: a query wants the codes out of the same read, and codes are
+/// deliberately not a field of `Partition`.
+///
+/// No empty-partition branch: an empty partition is written no file and given no
+/// row in the segment table, so `expected_rows` is never zero on any path that
+/// reaches here, and a caller who passes zero anyway gets the empty-range error
+/// from [`read_rows`] rather than a partition invented from a schema.
+pub async fn read_partition_batch(reader: &FileReader, expected_rows: u32) -> Result<RecordBatch> {
+    check_row_count(reader, expected_rows)?;
+    read_rows(reader, 0..expected_rows as usize).await
+}
+
 /// Read a whole partition back into memory.
 pub async fn read_partition(reader: &FileReader, expected_rows: u32) -> Result<Partition> {
-    check_row_count(reader, expected_rows)?;
-    // No empty-partition branch: an empty partition is written no file and given
-    // no row in the segment table, so `expected_rows` is never zero on any path
-    // that reaches here, and a caller who passes zero anyway gets the empty-range
-    // error from `read_rows` rather than a partition invented from a schema.
-    Partition::try_from_batch(&read_rows(reader, 0..expected_rows as usize).await?)
+    Partition::try_from_batch(&read_partition_batch(reader, expected_rows).await?)
 }
 
 /// Refuse a partition whose shape disagrees with the segment that lists it.
@@ -261,6 +434,32 @@ pub fn check_partition_shape(
 pub async fn read_row_ids(reader: &FileReader, expected_rows: u32) -> Result<Vec<u64>> {
     check_row_count(reader, expected_rows)?;
     row_ids_from_batch(&read_rows(reader, 0..expected_rows as usize).await?)
+}
+
+/// How many partitions a pass that writes a segment prepares at once.
+///
+/// Every such pass - build, consolidation, insertion, merge - reads and rebuilds
+/// partitions concurrently up to this many, then hands the results to
+/// [`SegmentWriter`] one at a time in ascending id order, because
+/// [`SegmentWriter::write_partition`] accepts them in no other order. So the
+/// arithmetic overlaps and the writing does not, which is the whole of what this
+/// bounds. The same number is what Lance's own index builder gives the
+/// equivalent stage (`lance/src/index/vector/builder.rs`), and a round of graph
+/// maintenance is processor-bound by measurement, so the bound that matters is
+/// the pool's width rather than the store's.
+///
+/// It costs memory: a pass holds this many partitions' vectors and edges at
+/// once, and a partition being rebuilt holds both what was read and what came
+/// out of it. That is not the guarantee the query path's `PARTITIONS_IN_FLIGHT`
+/// makes - that one is a ceiling a caller can quote, this one is a throughput
+/// knob on a batch operation - but it is set by the same lever, `num_partitions`.
+///
+/// Never zero, which matters because `buffered(0)` admits nothing and waits
+/// forever rather than failing: the count falls back to one core on a machine
+/// with fewer cores than Lance reserves for io, and the environment variable that
+/// overrides it refuses a value below one.
+pub(crate) fn partitions_in_flight() -> usize {
+    get_num_compute_intensive_cpus()
 }
 
 /// Writes a segment directory one partition at a time.
@@ -324,9 +523,33 @@ impl SegmentWriter {
         }
         self.check_entry(partition_id, medoid, partition.len() as u32)?;
 
+        // Encoded here rather than by the caller, so that no pass that produces a
+        // partition can forget to, and none of them has to keep a code in step
+        // with a vertex it moved. The centroid comes off this segment's own
+        // routing model, which is the one the partition was assigned by.
+        let codes = self
+            .metadata
+            .codes
+            .as_ref()
+            .map(|params| {
+                let centroid = self.ivf.centroid(partition_id as usize).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Vamana partition {partition_id} has no centroid in a routing model of {}",
+                        self.ivf.num_partitions()
+                    ))
+                })?;
+                encode(
+                    params,
+                    self.metadata.distance_type,
+                    partition.vectors(),
+                    &centroid,
+                )
+            })
+            .transpose()?;
+
         let file = partition_file_name(partition_id);
         let path = self.dir.clone().join(file.as_str());
-        let size = write_partition(&self.store, &path, partition).await?;
+        let size = write_partition(&self.store, &path, partition, codes.as_ref()).await?;
         self.partitions.push(PartitionEntry {
             partition_id,
             medoid,
@@ -385,6 +608,18 @@ impl SegmentWriter {
                      {source} into one declaring {mine}"
                 )));
             }
+        }
+        // Codes are bytes quantised under one rotation, and nothing downstream
+        // reads a rotation back off a partition file: copied into a segment
+        // declaring another one, they would be decoded into distances that are
+        // meaningless rather than approximate. Equality of the whole parameters
+        // is the check because the rotation is inside them, and it is what makes
+        // "one rotation per index" enforced rather than merely inherited.
+        if from.metadata().codes != self.metadata.codes {
+            return Err(Error::invalid_input(format!(
+                "Vamana cannot copy partition {partition_id} between segments whose codes \
+                 disagree; the rotation a code was built under is not recoverable from it"
+            )));
         }
         self.check_entry(partition_id, entry.medoid, entry.num_rows)?;
 

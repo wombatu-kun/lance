@@ -57,6 +57,7 @@
 use std::sync::Arc;
 
 use arrow_array::{FixedSizeListArray, Float32Array};
+use futures::{StreamExt, TryStreamExt, stream};
 use lance::Dataset;
 use lance::index::{DatasetIndexExt, IndexSegment};
 use lance_arrow::FixedSizeListArrayExt;
@@ -77,7 +78,9 @@ use crate::consolidator::dead_by_partition;
 use crate::format::{FORMAT_VERSION, IndexMetadata};
 use crate::insert::concat_vectors;
 use crate::inserter::inherited_params;
-use crate::io::{SegmentWriter, check_partition_shape, open_file, read_partition};
+use crate::io::{
+    SegmentWriter, check_partition_shape, open_file, partitions_in_flight, read_partition,
+};
 use crate::merge::{Newcomers, merge_partition};
 use crate::partition::Partition;
 use crate::query::{Segment, VamanaIndex};
@@ -132,8 +135,8 @@ pub struct MergeStats {
 /// merge, this merges. *When* to ask is the caller's, and it is the one question
 /// here that is really about money - a merge costs what it costs once, and a
 /// delta left in place costs `nprobes` extra partition reads on every query
-/// until it is folded. Measured on SIFT 100k, that crossover is **533 queries**
-/// for eight segments, 1345 for four and 6509 for two: the fold costs 3.5 to 4.5
+/// until it is folded. Measured on SIFT 100k, that crossover is **123 queries**
+/// for eight segments, 296 for four and 905 for two: the fold costs 0.8 to 1.2
 /// seconds whatever the count, while what it saves grows with it. At those
 /// numbers a threshold would only be a slower way of saying "fold".
 ///
@@ -162,10 +165,11 @@ pub struct MergeStats {
 /// `examples/churn_cycle.rs` on SIFT 100k this leaves an index with the same
 /// recall and the same distances per query as the pair, to the last digit, in
 /// every round - it runs the same operations over the same data without putting
-/// the partition on disk in between - and costs 35.9 seconds against 37.0. The
-/// missing pass is one read and one write of the index per round, and that is 3%
+/// the partition on disk in between - and costs 8.2 seconds against 8.7. The
+/// missing pass is one read and one write of the index per round, and that is 6%
 /// of a round on local storage: maintenance here is bound by the arithmetic of
-/// the graph. The saving is worth having, and it is not the reason to call this.
+/// the graph, which every core now works on at once. The saving is worth having,
+/// and it is not the reason to call this.
 ///
 /// # When it refuses
 ///
@@ -295,8 +299,44 @@ pub async fn merge_index(dataset: &mut Dataset, index_name: &str) -> Result<Merg
         params,
         metadata,
     };
-    for partition_id in 0..router.num_partitions() as u32 {
-        fold_partition(&fold, partition_id, &mut writer, &mut stats).await?;
+    let mut folded = stream::iter((0..router.num_partitions() as u32).map(|partition_id| {
+        let fold = &fold;
+        async move {
+            fold_partition(fold, partition_id)
+                .await
+                .map(|outcome| (partition_id, outcome))
+        }
+    }))
+    .buffered(partitions_in_flight());
+    while let Some((partition_id, (folding, outcome))) = folded.try_next().await? {
+        stats.vertices_removed += folding.vertices_removed;
+        stats.vertices_folded += folding.vertices_folded;
+        stats.vectors_inserted += folding.vectors_inserted;
+        match outcome {
+            Folded::Untouched => {}
+            Folded::Dropped => stats.partitions_dropped += 1,
+            Folded::Copied(from) => {
+                writer
+                    .copy_partition(&from.dir, &from.manifest, partition_id)
+                    .await?;
+                stats.partitions_copied += 1;
+            }
+            Folded::Written {
+                partition,
+                medoid,
+                rebuilt,
+                comparisons,
+            } => {
+                writer
+                    .write_partition(partition_id, medoid, &partition)
+                    .await?;
+                stats.comparisons = stats.comparisons.saturating_add(comparisons);
+                stats.partitions_written += 1;
+                if rebuilt {
+                    stats.partitions_rebuilt += 1;
+                }
+            }
+        }
     }
     if stats.partitions_written + stats.partitions_copied == 0 {
         return Err(Error::invalid_input(format!(
@@ -417,14 +457,53 @@ struct Fold<'a> {
     metadata: IndexMetadata,
 }
 
-/// Write partition `partition_id` of the merged segment, from whatever the
-/// index's segments hold of it and whatever the new rows added to it.
-async fn fold_partition(
-    fold: &Fold<'_>,
+/// What one partition of the merged segment turned into.
+enum Folded<'a> {
+    /// No segment held it and nothing landed in it.
+    Untouched,
+    /// Every segment that held it holds nothing live of it, and nothing new
+    /// landed in it either.
+    Dropped,
+    /// Nothing happened to it: one segment holds it, nothing in it is deleted and
+    /// no new row landed in it. The bytes are already a partition of exactly the
+    /// shape this segment declares - every segment of the index agrees on the
+    /// degree, or the merge refused before reading anything - so they cross over
+    /// without being decoded.
+    Copied(&'a Segment),
+    Written {
+        partition: Partition,
+        medoid: u32,
+        rebuilt: bool,
+        comparisons: u64,
+    },
+}
+
+/// What one folded partition adds to the merge's counters.
+///
+/// Tallied where the rows are and applied where the writing is, because the
+/// partitions are folded several at a time and a counter cannot be shared across
+/// them.
+#[derive(Default)]
+struct Folding {
+    vertices_removed: usize,
+    vertices_folded: usize,
+    vectors_inserted: usize,
+}
+
+/// Fold partition `partition_id` out of whatever the index's segments hold of it
+/// and whatever new rows landed in it.
+///
+/// Everything a merge does to a partition except write it, so that a segment's
+/// partitions can be folded [`partitions_in_flight`] at a time while they are
+/// still written one at a time, in ascending id order. A folded partition holds
+/// every source it folds, so this is the one pass whose working set is that many
+/// partitions *times the segments being folded* - deltas are proportionally small,
+/// which is what keeps that product near the base segment's own size.
+async fn fold_partition<'a>(
+    fold: &'a Fold<'a>,
     partition_id: u32,
-    writer: &mut SegmentWriter,
-    stats: &mut MergeStats,
-) -> Result<()> {
+) -> Result<(Folding, Folded<'a>)> {
+    let mut folding = Folding::default();
     let arrivals = &fold.arrivals.members[partition_id as usize];
     let mut sources = Vec::with_capacity(fold.segments.len());
     let mut had_a_file = false;
@@ -444,7 +523,7 @@ async fn fold_partition(
         // be the whole file for nothing. It also keeps the rule below simple -
         // every source that survives this loop has at least one live row.
         if dead.len() == entry.num_rows as u64 {
-            stats.vertices_removed += dead.len() as usize;
+            folding.vertices_removed += dead.len() as usize;
             continue;
         }
         sources.push(Source {
@@ -455,27 +534,18 @@ async fn fold_partition(
     }
 
     if sources.is_empty() && arrivals.is_empty() {
-        if had_a_file {
-            stats.partitions_dropped += 1;
-        }
-        return Ok(());
+        return Ok((
+            folding,
+            if had_a_file {
+                Folded::Dropped
+            } else {
+                Folded::Untouched
+            },
+        ));
     }
 
-    // Nothing happened to it: one segment holds it, nothing in it is deleted and
-    // no new row landed in it. The bytes are already a partition of exactly the
-    // shape this segment declares - every segment of the index agrees on the
-    // degree, or the merge refused before reading anything - so they cross over
-    // without being decoded.
     if arrivals.is_empty() && sources.len() == 1 && sources[0].dead.is_empty() {
-        writer
-            .copy_partition(
-                &sources[0].segment.dir,
-                &sources[0].segment.manifest,
-                partition_id,
-            )
-            .await?;
-        stats.partitions_copied += 1;
-        return Ok(());
+        return Ok((folding, Folded::Copied(sources[0].segment)));
     }
 
     let mut read = Vec::with_capacity(sources.len());
@@ -518,8 +588,8 @@ async fn fold_partition(
         let live = (0..partition.len() as u32)
             .filter(|id| !dead.contains(*id))
             .collect::<Vec<_>>();
-        stats.vertices_removed += dead.len() as usize;
-        stats.vertices_folded += live.len();
+        folding.vertices_removed += dead.len() as usize;
+        folding.vertices_folded += live.len();
         newcomer_row_ids.extend(
             live.iter()
                 .map(|id| partition.graph().row_ids()[*id as usize]),
@@ -533,12 +603,12 @@ async fn fold_partition(
                 .map(|row| fold.arrivals.row_ids[*row as usize]),
         );
         newcomer_vectors.push(gather(&fold.arrivals.vectors, arrivals)?);
-        stats.vectors_inserted += arrivals.len();
+        folding.vectors_inserted += arrivals.len();
     }
 
     let into = into.map(|position| {
         let dead = sources[position].dead.clone();
-        stats.vertices_removed += dead.len() as usize;
+        folding.vertices_removed += dead.len() as usize;
         (
             read.swap_remove(position),
             sources[position].entry.medoid,
@@ -594,13 +664,13 @@ async fn fold_partition(
     })
     .await?;
 
-    writer
-        .write_partition(partition_id, medoid, &partition)
-        .await?;
-    stats.comparisons = stats.comparisons.saturating_add(comparisons);
-    stats.partitions_written += 1;
-    if rebuilt {
-        stats.partitions_rebuilt += 1;
-    }
-    Ok(())
+    Ok((
+        folding,
+        Folded::Written {
+            partition,
+            medoid,
+            rebuilt,
+            comparisons,
+        },
+    ))
 }

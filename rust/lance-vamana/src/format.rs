@@ -15,6 +15,8 @@ use lance_encoding::constants::{STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
+use crate::codes::{CODE_COLUMN, CodeParams};
+
 /// Name of the file describing a segment.
 ///
 /// Not a free choice: Lance decides whether an index is a vector index or a
@@ -91,7 +93,7 @@ pub const MAX_DEGREE: u32 = 1024;
 /// manifest's `index_version` and the segment's own [`IndexMetadata`] - and
 /// checked against both on open. Two *different* numbers is what this replaced,
 /// and the one recorded in the manifest was checked nowhere at all.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Schema metadata key under which [`IndexMetadata`] is stored as JSON.
 pub const INDEX_METADATA_KEY: &str = "lance-vamana:index";
@@ -152,6 +154,17 @@ pub struct IndexMetadata {
     /// useful: it is the only record of what the segment was built from, so
     /// comparing the two on open is what turns a silent edit into a refusal.
     pub fragments: Vec<u32>,
+    /// How this segment's [`CODE_COLUMN`] was built, when it has one.
+    ///
+    /// `None` says the partitions carry no codes and every walk over them
+    /// measures against the stored vectors. It is not a version marker - codes
+    /// are opt-in at build time and cost thirteen per cent of the index at
+    /// `d = 128` - and it is also what a dimension RaBitQ cannot quantise
+    /// leaves behind.
+    ///
+    /// Inherited wholesale by every maintenance pass, which is what makes the
+    /// rotation inside it one per index rather than one per segment.
+    pub codes: Option<CodeParams>,
 }
 
 /// `DistanceType` carries no serde impls, and its `Display` / `TryFrom<&str>`
@@ -217,18 +230,36 @@ impl IndexMetadata {
 ///   nulls, so a merely nullable column keeps its stride - declaring the field
 ///   non-nullable is what makes a null impossible to write at all.
 ///
-/// The two columns stay separate rather than being interleaved into one wide
-/// value because their access patterns differ: consolidation rewrites the edges
-/// and not the vectors, and a graph walk reads the vectors and edges but never
-/// the row ids. Separate columns are what makes each of those a projection.
-pub fn partition_schema(max_degree: u32, dimension: u32) -> Result<Schema> {
-    let neighbors = addressable_list(NEIGHBORS_COLUMN, DataType::UInt32, max_degree, "max_degree")?;
-    let vector = addressable_list(VECTOR_COLUMN, DataType::Float32, dimension, "dimension")?;
-    Ok(Schema::new(vec![
+/// The columns stay separate rather than being interleaved into one wide value
+/// because their access patterns differ: consolidation rewrites the edges and
+/// not the vectors, a graph walk reads the vectors and edges but never the row
+/// ids, and a coded walk reads [`CODE_COLUMN`] and nothing else until it has an
+/// answer to re-score. Separate columns are what makes each of those a
+/// projection.
+///
+/// `code_stride` is `None` for a segment built without codes, which is the
+/// default and what a dimension RaBitQ cannot quantise leaves behind. The code
+/// column goes last so that a reader projecting the other three by name is
+/// unaffected by its presence.
+pub fn partition_schema(
+    max_degree: u32,
+    dimension: u32,
+    code_stride: Option<u32>,
+) -> Result<Schema> {
+    let mut fields = vec![
         Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
-        neighbors,
-        vector,
-    ]))
+        addressable_list(NEIGHBORS_COLUMN, DataType::UInt32, max_degree, "max_degree")?,
+        addressable_list(VECTOR_COLUMN, DataType::Float32, dimension, "dimension")?,
+    ];
+    if let Some(stride) = code_stride {
+        fields.push(addressable_list(
+            CODE_COLUMN,
+            DataType::UInt8,
+            stride,
+            "code stride",
+        )?);
+    }
+    Ok(Schema::new(fields))
 }
 
 /// A non-nullable `FixedSizeList` field that is explicitly full-zip encoded.
@@ -289,6 +320,7 @@ mod tests {
             distance_type: DistanceType::Cosine,
             row_id_mode: RowIdMode::Address,
             fragments: vec![0, 3, 7],
+            codes: None,
         };
         let parsed = IndexMetadata::from_json(&metadata.to_json().unwrap()).unwrap();
         assert_eq!(parsed, metadata);
@@ -308,6 +340,7 @@ mod tests {
             distance_type: DistanceType::L2,
             row_id_mode: RowIdMode::Stable,
             fragments: vec![0],
+            codes: None,
         };
         let json = metadata.to_json().unwrap();
         assert!(json.contains("\"stable\""), "{json}");
@@ -330,6 +363,7 @@ mod tests {
             distance_type: DistanceType::L2,
             row_id_mode: RowIdMode::Address,
             fragments: vec![0],
+            codes: None,
         };
         let json = metadata.to_json().unwrap();
         assert!(json.contains("\"alpha\":null"), "{json}");
@@ -377,7 +411,7 @@ mod tests {
 
     #[test]
     fn partition_schema_requests_fullzip_and_stays_non_nullable() {
-        let schema = partition_schema(32, 24).unwrap();
+        let schema = partition_schema(32, 24, None).unwrap();
         // Both widths are under the 256-byte threshold at which Lance would pick
         // full-zip unprompted, so both columns depend on the explicit hint.
         for (column, expected_width, expected_item) in [
@@ -407,14 +441,14 @@ mod tests {
 
     #[test]
     fn partition_schema_rejects_a_zero_degree() {
-        let error = partition_schema(0, 8).unwrap_err();
+        let error = partition_schema(0, 8, None).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("max_degree"), "{error}");
     }
 
     #[test]
     fn partition_schema_rejects_a_zero_dimension() {
-        let error = partition_schema(32, 0).unwrap_err();
+        let error = partition_schema(32, 0, None).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("dimension"), "{error}");
     }

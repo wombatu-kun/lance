@@ -99,10 +99,103 @@ two are meant to say the same thing.
   makes them ordinary new rows, and `insert_as_segment` brings them back.
 - **No predicate prefilter and no refine step.** Both live in Lance's scanner,
   which this driver bypasses.
-- **Partitions are read whole, and nothing is cached between queries.** A query
-  keeps a few reads in flight, so its working set is a few partitions rather
-  than every partition it probes - but a lazy per-vertex traversal and a cache
-  budget are both still ahead.
+- **Nothing is cached between queries unless the index is given a cache.** A
+  query keeps a few reads in flight, so its working set is a few partitions
+  rather than every partition it probes - and by default the next query pays for
+  those same partitions again. `VamanaIndex::with_cache(LanceCache)` changes
+  that, and holds the part of a partition that does not depend on the query: the
+  layout of its file, and for a lazy walk the codes and row ids it steers by.
+  Nothing needs invalidating, because nothing an entry describes can change -
+  deleting rows edits no index file, and adding rows or consolidating writes a
+  *new* segment under a new uuid.
+
+  The budget is the caller's to set and is in bytes of *resident* form, which is
+  more than the codes weigh on disk: they are stored one contiguous stride a
+  vertex and read back into the seven columns Lance's estimator wants, with the
+  row ids beside them. On SIFT1M that is **89 MB a million rows** against 68 MB
+  on disk, and against 776 bytes a row for the vectors themselves.
+  An index given no cache reads every time - it holds no empty cache, because a
+  cache of capacity zero is not the same thing as none: it admits an entry and
+  reclaims it later, so it serves the occasional hit out of what is meant to be
+  nothing.
+- **A partition is read whole unless the walk is told otherwise.** Reading only
+  the vertices a walk touches was measured instead of assumed
+  (`examples/memory_gate.rs`): on its own it halves the pages moved at best and
+  costs *more* CPU at fine granularity, because a walk scores `R` neighbours for
+  every vertex it expands and so touches twenty-five to forty times as many as it
+  expands. It pays with quantised codes standing in for those vectors, and only
+  while the cache holds a fraction of the index - replaying real probe sequences
+  through an LRU that holds all of it serves 25 to 250 queries per load, far past
+  the crossover where reading whole was cheaper. Three bits a dimension is what
+  "codes" has to mean (`examples/coded_walk.rs`): at three the walk spends two to
+  thirteen per cent more comparisons than an exact one at equal recall, at one it
+  needs a beam one and a half to three and a half times wider, and either way the
+  answer has to be re-scored from the whole candidate list rather than from its
+  nearest `K`. Reading a vertex's vector as it is expanded - which DiskANN gets
+  free, because one page carries a vertex's edges next to its vector - was
+  measured too, and does not pay: correcting a distance seats that vertex at the
+  back of the list, the back of the list is the bar a new candidate has to beat,
+  and so the walk expands more for it - three times more at one bit. At equal
+  work a wider beam on plain codes reaches higher recall.
+
+  Both halves are here. `IndexParams::with_code_bits(3)` builds a partition file
+  with a `__code` column beside its vectors and its edges;
+  `SearchParams::with_mode(WalkMode::Coded)` walks by it and re-scores the whole
+  candidate list exactly, still reading the partition whole; and
+  `WalkMode::Lazy` keeps the row ids and the codes and fetches the rest as it
+  goes - the out-edges of a vertex when it expands one,
+  `SearchParams::with_beam_width` vertices to a request, then the vectors of the
+  candidate list in one more.
+
+  On SIFT1M at 65536 rows a partition, four probes and equal recall
+  (`examples/lazy_walk.rs`), that is **18.2 MB a query against 198.6 MB** read
+  whole, and **18.6 ms of warm CPU against 131.0 ms** - decoding two hundred
+  megabytes costs more than fetching eighteen, even with every byte already in
+  the page cache. What it pays is round trips: 20 requests become 54, and 28
+  iops become 197.
+
+  Nine tenths of that 18.2 MB is the code column, re-read by every query, so the
+  mode is only half of the design: **with a cache the same query reads 71.9 kB**,
+  0.0004x of reading whole and 254 times less than reading lazily without one,
+  in **3.2 ms** against 131.0, holding 89 MB to do it. What the walk itself
+  chooses to fetch - the out-edges of the vertices it expands, the vectors of the
+  candidates it ends with - is that 71.9 kB and nothing more; the 640 kB between
+  it and the code column is `__row_id`, which is read whole beside the codes and
+  cached with them. The distances are identical with and without the cache, which
+  is the point: it changes what a query reads and nothing else.
+
+  The cache also reverses which granularity is cheaper. Without one, 8192-row
+  partitions read less than 65536-row ones (4.5 MB against 18.2); with one it is
+  the other way round - **71.9 kB against 119.7 kB, and 3.2 ms against 4.9** -
+  because the resident part is paid once while seven probes cost seven entry
+  points, seven sets of edges and seven candidate lists against four.
+
+  What that is worth needs something to compare it against, and the nearest
+  measured one is Lance's own `IVF_HNSW_SQ` over the same vectors at the same
+  recall, counted through `Scanner::scan_stats_callback`: **12.29 MB a query**
+  read cold with its partitions tuned to 8192 rows, and 197.78 MB at the shipped
+  default of one partition to a million rows. At that same 8192 rows this reads
+  4.5 MB cold and 119.7 kB warm. Bytes are all that compares - those numbers
+  come from Lance's scanner and these from this driver, the quantisers differ,
+  eight-bit scalar against three-bit RaBitQ, and what is held equal is the
+  dataset and the recall rather than the index.
+
+  Warm against cold is not the comparison, though, because Lance's reads
+  collapse too once its cache holds the partitions. What each has to hold to get
+  there is: 257 to 297 bytes a row on disk for that index, and more again in
+  Lance's cache, which holds an unpacked form - against 89 bytes a row here,
+  which still reads 71.9 kB a query rather than nothing. The saving is the ratio
+  between those two resident figures, and it only becomes a saving in bytes read
+  when neither budget covers the index.
+
+  Which is what makes the cache load-bearing rather than an optimisation.
+  Without one a lazy walk over 65536-row partitions reads 18.2 MB a query, worse
+  than the tuned baseline it is meant to beat; at 8192 rows it reads 4.5 MB,
+  which is better. Granularity and the cache are chosen together, and neither
+  choice survives the other being changed.
+
+  Codes are off by default, and refused rather than skipped for a dimension that
+  is not a multiple of eight, which is what RaBitQ packs a bit a dimension into.
 
 An index is **refused** at open, rather than answering from what is left, when:
 
@@ -117,8 +210,8 @@ An index is **refused** at open, rather than answering from what is left, when:
 - the manifest records a format version this build does not read;
 - a segment was inherited from another dataset by a shallow clone, so its files
   live under a base path this crate cannot resolve;
-- its segments disagree about the dimension, the metric or the identifier space,
-  because a query merges their answers.
+- its segments disagree about the dimension, the metric, the identifier space or
+  the codes, because a query merges their answers.
 
 In every case the answer is to rebuild the index.
 
@@ -160,15 +253,15 @@ how they came to exist, eight segments against one cost 8x the partition reads,
 8x the files and about 3x the latency, for +10% bytes and **no** loss of recall.
 A delta is nearly free to a query's bandwidth and expensive to its IOPS.
 
-**And a delta is cheap to undo.** Folding eight segments into one costs 4.5s and
-takes 8.47ms off every query, so it pays for itself after **533 queries**; four
-cost 4.3s and pay back after 1345, two cost 3.5s and pay back after 6509. The
+**And a delta is cheap to undo.** Folding eight segments into one costs 1.2s and
+takes 9.70ms off every query, so it pays for itself after **123 queries**; four
+cost 1.1s and pay back after 296, two cost 0.8s and pay back after 905. The
 fold leaves an index a query cannot tell from a one-pass build - the same 74 MiB
 in the same 101 files, the same ten partitions and fifty reads per query, at
 recall 0.9782 against 0.9777 - for a third of what rebuilding costs. What it does
 not give back is the 8% more distances per query a grown graph spends: it moves
 the vertices, it does not retrain the router or rebuild the base. That is why
-there is no threshold inside `merge_index` and none is wanted. At 533 queries the
+there is no threshold inside `merge_index` and none is wanted. At 123 queries the
 policy is "fold if anyone reads this index at all".
 
 **Order matters between the two calls: consolidate, then insert.** A delete that
@@ -186,18 +279,18 @@ SIFT 100k leave nothing of the original data and cost **0.14 of a percentage
 point** of recall, against the roughly one point the FreshVamana paper allows.
 What churn actually costs is arithmetic: the worn graph spends 8.5% more
 distances per query than a rebuild, which also takes the recall back. The cycle
-costs 2.4 rebuilds, a round 0.3 to 0.6 of one.
+costs 2.6 rebuilds, a round 0.3 to 0.7 of one.
 
 The two are the same pipeline, and the measurement says so: round for round,
 `merge_index` answers with the same recall and the same distances per query as
 `consolidate_index` followed by `insert_in_place`, to the last digit, in every
 round of that cycle. It runs the same operations over the same data without
 putting the partition on disk in between, so what the one pass saves is one read
-and one write of the index per round - **3%** of the work here, 35.9s against
-37.0s over five rounds. Maintenance is bound by the arithmetic of the graph
+and one write of the index per round - **6%** of the work here, 8.2s against
+8.7s over five rounds. Maintenance is bound by the arithmetic of the graph
 rather than by the disk, which is why fusing the passes is worth having and is
 not where the money is. Where a partition read is a network round trip the same
-two passes are not 3%.
+two passes are not 6%.
 
 They also answer compaction, which used to need a rebuild. Compaction strands the
 index over fragments that no longer exist, and the rows it moved are then rows
@@ -210,11 +303,19 @@ call, or `consolidate_index` and then `insert_in_place`.
 - The whole vector column is held in memory for the duration of a build - twice
   over, briefly, while the batches are concatenated. A build is a builder-side
   cost; a query reads one partition at a time.
+- Building and every maintenance call work on as many partitions at once as Lance
+  gives the compute pool cores, and write them one at a time in id order. That is
+  a fivefold saving on twelve cores and a working set of that many partitions:
+  `num_partitions` sets both. A query's own bound is separate and unchanged.
 - `L2` and `Cosine` only. Cosine normalises the vectors it stores, so what the
   index holds is not bit-identical to the dataset's column. `Dot` is refused: see
   `supported_distance_type` for why.
 - Address-style row ids only. A dataset created with `enable_stable_row_ids` is
   refused at build and at open.
+- `with_code_bits` mints one RaBitQ rotation for the whole index and every later
+  segment inherits it, because a partition copied between two segments carries
+  its codes unchanged and a code says nothing about the rotation it was built
+  under. A copy between segments that disagree is refused.
 - A build is reproducible from `BuildParams::seed`, with one hole outside this
   crate's control: Lance re-seeds from the OS when a k-means iteration leaves a
   cluster empty.

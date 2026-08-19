@@ -12,12 +12,15 @@
 
 pub mod build;
 pub mod builder;
+mod cache;
+pub mod codes;
 pub mod consolidate;
 pub mod consolidator;
 pub mod format;
 pub mod insert;
 pub mod inserter;
 pub mod io;
+mod lazy;
 pub mod merge;
 pub mod merger;
 pub mod partition;
@@ -26,6 +29,7 @@ pub mod search;
 pub mod segment;
 
 pub use builder::{BuildStats, IndexParams, create_index};
+pub use codes::CodeParams;
 pub use consolidate::{Consolidated, consolidate_partition};
 pub use consolidator::{ConsolidateStats, consolidate_index};
 pub use format::{IndexMetadata, RowIdMode};
