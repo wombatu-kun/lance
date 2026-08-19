@@ -18,7 +18,17 @@
 //! `DATASET_DIR` (unset: build into a temporary directory and throw it away.
 //! Set: build into a path named after the shape, or reuse what is there),
 //! `ARMS` (unset: every arm. Set: only those whose label starts with one of
-//! the names listed, as in `ARMS=lazy,flat,cached,pooled`).
+//! the names listed, as in `ARMS=lazy,flat,cached,pooled`), `CONCURRENCY`
+//! (default 1: one query at a time, which is a latency measurement. Above that,
+//! how many are in flight, which is a throughput one).
+//!
+//! **Concurrency is a measurement and not an accelerator.** A server does not
+//! split one query across cores, it answers many at once, and the two arms have
+//! different ceilings: a scan's is cores and a walk's is iops. On SIFT1M held in
+//! one partition the scan scales 6.1x across six of them while the walk scales
+//! 3.1x and tops out at six queries in flight - and single-query latency on a
+//! laptop varies by half between repeats where saturated throughput varies by
+//! two per cent, so the number worth quoting is the saturated one.
 //!
 //! Six arms through one index and one binary, which is the only comparison
 //! worth making: the same graph, the same routing, the same codes, and a switch.
@@ -85,6 +95,7 @@ use arrow_array::{
     UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use futures::StreamExt;
 use lance::Dataset;
 use lance::dataset::WriteParams;
 use lance_arrow::FixedSizeListArrayExt;
@@ -252,15 +263,26 @@ fn exact_top(store: &FlatFloatStorage, query: ArrayRef) -> Vec<u64> {
     scored.into_iter().map(|(_, id)| id as u64).collect()
 }
 
-async fn measure(
-    dataset: &Dataset,
-    queries: &[Vec<f32>],
-    truth: &[Vec<u64>],
-    positions: &HashMap<u64, u64>,
-    params: &SearchParams,
-    arm: &Arm,
+/// Everything a point of the sweep holds still, so that what varies is the two
+/// arguments beside it.
+struct Fixture<'a> {
+    dataset: &'a Dataset,
+    queries: &'a [Vec<f32>],
+    truth: &'a [Vec<u64>],
+    positions: Arc<HashMap<u64, u64>>,
     warmup: usize,
-) -> Cost {
+    concurrency: usize,
+}
+
+async fn measure(fixture: &Fixture<'_>, params: &SearchParams, arm: &Arm) -> Cost {
+    let &Fixture {
+        dataset,
+        queries,
+        truth,
+        ref positions,
+        warmup,
+        concurrency,
+    } = fixture;
     // A fresh index per point, so the byte count is the queries' and not the
     // queries' plus whatever opening the index read - and so that an arm that
     // caches starts from an empty one.
@@ -280,18 +302,46 @@ async fn measure(
     let before = index.io_stats();
     let cache_before = index.cache_stats().await;
     let started = Instant::now();
-    let mut recall = 0.0;
-    let mut comparisons = 0u64;
-    for (query, exact) in queries.iter().zip(truth) {
-        let result = index.search(query, params).await.unwrap();
-        let found = result
-            .neighbors
-            .iter()
-            .map(|neighbor| positions[&neighbor.row_addr])
-            .collect::<Vec<_>>();
-        recall += found.iter().filter(|id| exact.contains(id)).count() as f64 / K as f64;
-        comparisons += result.comparisons;
-    }
+    // Concurrency is the measurement rather than an accelerator. A server does
+    // not split one query across cores, it answers many at once, so what decides
+    // a deployment's cost is what a query costs while the machine is busy - and
+    // an arm whose price is memory bandwidth degrades under that where an arm
+    // waiting on io does not. At `concurrency = 1` this is the sequential loop
+    // it replaced, which is why the sweeps taken before it have to reproduce.
+    //
+    // A task per query and not a future per query. `buffered` alone interleaves
+    // futures on the one task that polls them, and `WalkMode::Lazy` and
+    // `WalkMode::Flat` keep their arithmetic on that task rather than handing it
+    // to the cpu pool the way the whole-partition modes do - so a stream of bare
+    // futures would run twelve queries strictly one after another and report it
+    // as concurrency. Measured before this was fixed: twelve in flight moved a
+    // scan's cost by 9%, because the process was using 1.07 cores.
+    let index = Arc::new(index);
+    let (recall, comparisons) = futures::stream::iter(queries.iter().zip(truth))
+        .map(|(query, exact)| {
+            let index = index.clone();
+            let positions = positions.clone();
+            let params = params.clone();
+            let query = query.clone();
+            let exact = exact.clone();
+            tokio::spawn(async move {
+                let result = index.search(&query, &params).await.unwrap();
+                let hits = result
+                    .neighbors
+                    .iter()
+                    .map(|neighbor| positions[&neighbor.row_addr])
+                    .filter(|id| exact.contains(id))
+                    .count() as f64
+                    / K as f64;
+                (hits, result.comparisons)
+            })
+        })
+        .buffered(concurrency)
+        .fold((0.0f64, 0u64), |(recall, comparisons), joined| async move {
+            let (hits, count) = joined.unwrap();
+            (recall + hits, comparisons + count)
+        })
+        .await;
     let micros = started.elapsed().as_micros() as f64;
     let after = index.io_stats();
     let (hit_ratio, held) = match (cache_before, index.cache_stats().await) {
@@ -390,6 +440,11 @@ async fn main() {
     // measuring once it has them, and every other arm is warmed the same way so
     // that the cache is the only thing that differs.
     let warmup = env_usize("WARMUP", num_queries).min(num_queries);
+    // How many queries are in flight while the pass is timed. One is a latency
+    // measurement, more is a throughput one, and the two answer different
+    // questions: a scan's price is memory bandwidth, which is shared, while a
+    // walk's is round trips, which are not.
+    let concurrency = env_usize("CONCURRENCY", 1).max(1);
 
     let vectors = FixedSizeListArray::try_new_from_values(
         Float32Array::from(base[..rows * dim].to_vec()),
@@ -402,7 +457,8 @@ async fn main() {
 
     println!(
         "SIFT {rows} x {dim}, {partitions} partitions of about {rows_per_partition}, R = {degree}, \
-         {code_bits} code bits, {nprobes} probes, {num_queries} queries, k = {K}"
+         {code_bits} code bits, {nprobes} probes, {num_queries} queries, k = {K}, \
+         {concurrency} in flight"
     );
 
     let store = FlatFloatStorage::new(vectors.clone(), DISTANCE_TYPE);
@@ -471,7 +527,7 @@ async fn main() {
         );
         dataset
     };
-    let positions = positions_by_address(&dataset).await;
+    let positions = Arc::new(positions_by_address(&dataset).await);
 
     let mut arms = vec![
         Arm {
@@ -555,6 +611,15 @@ async fn main() {
         assert!(!arms.is_empty(), "ARMS left nothing to sweep");
     }
 
+    let fixture = Fixture {
+        dataset: &dataset,
+        queries: &queries,
+        truth: &truth,
+        positions: positions.clone(),
+        warmup,
+        concurrency,
+    };
+
     println!(
         "\n{:<19} {:>5} {:>8} {:>12} {:>8} {:>9} {:>10} {:>10} {:>7}",
         "arm", "beam", "recall", "bytes", "iops", "requests", "us (warm)", "distances", "hits"
@@ -571,7 +636,7 @@ async fn main() {
             if arm.pooled {
                 params = params.with_rescore_budget(*beam);
             }
-            let cost = measure(&dataset, &queries, &truth, &positions, &params, arm, warmup).await;
+            let cost = measure(&fixture, &params, arm).await;
             report(&arm.label, *beam, &cost);
             points.push((*beam, cost));
         }
