@@ -1,0 +1,40 @@
+# Deliberately its own workspace root: this crate lives in the Lance fork's
+# tree for convenience but is not a member of its workspace. Cargo grants
+# workspace members no extra visibility, so the boundary would be the same
+# either way; staying out keeps the fork's root manifest and lockfiles
+# untouched and makes extraction into a standalone repository a directory move.
+[workspace]
+
+[package]
+name = "lance-vamana"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.0"
+description = "Disk-resident Vamana vector index for Lance datasets"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+lance-core = { path = "../lance-core" }
+lance-encoding = { path = "../lance-encoding" }
+lance-file = { path = "../lance-file" }
+lance-index = { path = "../lance-index" }
+lance-io = { path = "../lance-io" }
+lance-linalg = { path = "../lance-linalg" }
+
+arrow-array = "58.0.0"
+arrow-schema = "58.0.0"
+arrow-select = "58.0.0"
+bytes = "1.11.1"
+futures = "0.3"
+object_store = "0.13.2"
+prost = "0.14.1"
+rand = { version = "0.9.1", features = ["small_rng"] }
+serde = { version = "^1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+lance-arrow = { path = "../lance-arrow" }
+lance-encoding = { path = "../lance-encoding" }
+tempfile = "3"
+tokio = { version = "1.23", features = ["macros", "rt-multi-thread"] }
