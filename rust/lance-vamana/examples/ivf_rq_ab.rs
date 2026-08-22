@@ -11,10 +11,13 @@
 //!
 //! Environment: `SIFT_DIR` (required), `VECTORS` (default 100000, `0` for all),
 //! `QUERIES` (default 200), `ROWS_PER_PARTITION` (default 8192), `NPROBES`
-//! (default 7), `DEGREE` (default 64), `CODE_BITS` (default 3), `WIDTHS`
-//! (default `10,20,30,40,60,80,120,160`, each a multiple of `k`), `CACHE_MB`
-//! (default 4096), `TARGET` (default 95), `WARMUP` (default: every query),
-//! `DATASET_DIR` (unset: temporary directories thrown away at the end).
+//! (default 7), `VAMANA_ROWS_PER_PARTITION`, `RQ_ROWS_PER_PARTITION`,
+//! `VAMANA_NPROBES`, `RQ_NPROBES` (each defaults to the shared value above),
+//! `DEGREE` (default 64), `CODE_BITS` (default 3), `WIDTHS`
+//! (default `10,20,30,40,60,80,120,160`, each a multiple of `k`),
+//! `CONCURRENCY` (default 1), `CACHE_MB` (default 4096), `TARGET`
+//! (default 95), `WARMUP` (default: every query), `DATASET_DIR` (unset:
+//! temporary directories thrown away at the end).
 //!
 //! Every earlier sweep in this crate compares the walk against a scan *this
 //! crate* wrote. That scan is the walk's own parts with the graph switched off,
@@ -28,11 +31,21 @@
 //! the crate's own sweeps, and the walk the crate exists for.
 //!
 //! **What is held equal.** Both indexes are built over the same vectors in the
-//! same row order, into the same number of partitions, at the same `CODE_BITS`,
-//! and are queried with the same `k`, the same `NPROBES`, the same query set and
-//! the same ground truth. Both are given a warm cache, and each point reopens
-//! its index so a cache starts empty and is filled by the warmup rather than by
-//! the measured pass.
+//! same row order at the same `CODE_BITS`, and are queried with the same `k`,
+//! the same query set and the same ground truth. Both are given a warm cache,
+//! and each point reopens its index so a cache starts empty and is filled by
+//! the warmup rather than by the measured pass.
+//!
+//! **What is deliberately not equal: the shape.** Partition count and probe
+//! budget are set per arm, `VAMANA_*` against `RQ_*`, defaulting to one shared
+//! value so an invocation that names neither is the run this example started
+//! as. They are separable because the two shapes worth comparing are not the
+//! same shape: a graph is what answers inside one partition large enough that
+//! there is nothing left to route, while `IVF_RQ` answers by probing a few
+//! small ones - and at `d = 960` seven probes of 123 cannot reach 0.95 however
+//! the rest is set, because the missing neighbours are in partitions the query
+//! never opened. Forced onto one shape, one arm is always outside its working
+//! point, and the comparison measures that instead of the index.
 //!
 //! **The one knob, swept.** Each arm carries a candidate list and re-scores it
 //! exactly, so the sweep is over its width: `L` here, `k * refine_factor` there.
@@ -56,6 +69,19 @@
 //! one file, while Lance takes them from the dataset, where the same rows are
 //! scattered across fragments. That is a real difference in shape and the
 //! `requests` column is where it shows.
+//!
+//! **Time, and why it needs `CONCURRENCY`.** `us` is wall time per query and
+//! `cpu` is the process's own core time over the same pass. With one query in
+//! flight the first is a latency, and on a laptop it is not reproducible: the
+//! same pass repeated varies by half, because a single thread runs at whatever
+//! turbo state the chip is in. With enough queries in flight that throughput
+//! has stopped growing, the chip sits at its all-core clock and the same pass
+//! repeats to within two per cent - so the figure worth quoting is that one,
+//! and `bytes`, `iops` and `requests` are unaffected either way. The two arms'
+//! wall times are also not the same measurement: this crate's is a library
+//! call, Lance's is a whole DataFusion plan, built and executed per query.
+//! `IVF_RQ plan only` prints what building one costs with nothing executed, so
+//! that part can be subtracted rather than argued about.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -68,10 +94,11 @@ use arrow_array::{
     UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use futures::StreamExt;
 use lance::Dataset;
 use lance::dataset::WriteParams;
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::scanner::ExecutionStatsCallback;
+use lance::dataset::scanner::{ExecutionStatsCallback, Scanner};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance_arrow::FixedSizeListArrayExt;
@@ -118,6 +145,7 @@ struct Cost {
     iops: f64,
     requests: f64,
     micros: f64,
+    cpu_micros: f64,
     hit_ratio: f64,
 }
 
@@ -130,9 +158,29 @@ impl Cost {
             iops: mix(self.iops, other.iops),
             requests: mix(self.requests, other.requests),
             micros: mix(self.micros, other.micros),
+            cpu_micros: mix(self.cpu_micros, other.cpu_micros),
             hit_ratio: mix(self.hit_ratio, other.hit_ratio),
         }
     }
+}
+
+/// The process's own core time so far, summed over its threads.
+///
+/// The first field of a task's `schedstat` is the nanoseconds it has spent on a
+/// cpu, and every thread of the process has one. The difference across a pass is
+/// the work the machine did rather than the time the pass took, which is what
+/// separates an arm that is waiting from an arm that is busy. A thread that
+/// exits inside a pass takes its share with it; the pools here outlive one.
+fn cpu_micros() -> f64 {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return 0.0;
+    };
+    let nanos: u64 = tasks
+        .flatten()
+        .filter_map(|task| std::fs::read_to_string(task.path().join("schedstat")).ok())
+        .filter_map(|line| line.split_whitespace().next()?.parse::<u64>().ok())
+        .sum();
+    nanos as f64 / 1_000.0
 }
 
 /// The cost at exactly `target` recall, interpolated between the two widths
@@ -223,10 +271,14 @@ struct Fixture<'a> {
     truth: &'a [Vec<u64>],
     /// Base-vector positions keyed by row address, of the dataset this fixture
     /// names - the two datasets are written alike but are not the same index.
-    positions: &'a HashMap<u64, u64>,
+    positions: &'a Arc<HashMap<u64, u64>>,
     nprobes: usize,
     cache_bytes: usize,
     warmup: usize,
+    /// How many queries are in flight while the pass is timed. One is a latency
+    /// measurement and reproduces badly; enough of them that throughput has
+    /// stopped growing is a throughput one, and that is the reproducible state.
+    concurrency: usize,
 }
 
 /// This crate's own arms, both with one pooled budget of exact distances:
@@ -246,6 +298,7 @@ async fn measure_vamana(
         nprobes,
         cache_bytes,
         warmup,
+        concurrency,
     } = *fixture;
     let params = SearchParams::new(K)
         .with_nprobes(nprobes)
@@ -253,28 +306,46 @@ async fn measure_vamana(
         .with_mode(mode)
         .with_beam_width(beam_width)
         .with_rescore_budget(budget);
-    let index = VamanaIndex::open(dataset, VAMANA_INDEX)
-        .await
-        .unwrap()
-        .with_cache(LanceCache::with_capacity(cache_bytes));
+    let index = Arc::new(
+        VamanaIndex::open(dataset, VAMANA_INDEX)
+            .await
+            .unwrap()
+            .with_cache(LanceCache::with_capacity(cache_bytes)),
+    );
     for query in queries.iter().take(warmup) {
         index.search(query, &params).await.unwrap();
     }
 
     let before = index.io_stats();
     let cache_before = index.cache_stats().await;
+    let cpu_before = cpu_micros();
     let started = Instant::now();
-    let mut recall = 0.0;
-    for (query, exact) in queries.iter().zip(truth) {
-        let result = index.search(query, &params).await.unwrap();
-        let found = result
-            .neighbors
-            .iter()
-            .map(|neighbor| positions[&neighbor.row_addr])
-            .collect::<Vec<_>>();
-        recall += recall_of(&found, exact);
-    }
+    let recall = futures::stream::iter(queries.iter().zip(truth))
+        .map(|(query, exact)| {
+            let index = index.clone();
+            let params = params.clone();
+            let positions = Arc::clone(positions);
+            let query = query.clone();
+            let exact = exact.clone();
+            // A task per query rather than a future per query: `buffered` alone
+            // interleaves futures on the one task polling them, and both modes
+            // here keep their arithmetic on that task, so bare futures would run
+            // the queries one after another and report it as concurrency.
+            tokio::spawn(async move {
+                let result = index.search(&query, &params).await.unwrap();
+                let found = result
+                    .neighbors
+                    .iter()
+                    .map(|neighbor| positions[&neighbor.row_addr])
+                    .collect::<Vec<_>>();
+                recall_of(&found, &exact)
+            })
+        })
+        .buffered(concurrency)
+        .fold(0.0f64, |recall, hits| async move { recall + hits.unwrap() })
+        .await;
     let micros = started.elapsed().as_micros() as f64;
+    let cpu = cpu_micros() - cpu_before;
     let after = index.io_stats();
     let hit_ratio = match (cache_before, index.cache_stats().await) {
         (Some(before), Some(after)) => {
@@ -296,6 +367,7 @@ async fn measure_vamana(
         iops: (after.iops - before.iops) as f64 / queries,
         requests: (after.requests - before.requests) as f64 / queries,
         micros: micros / queries,
+        cpu_micros: cpu / queries,
         hit_ratio,
     }
 }
@@ -310,13 +382,13 @@ struct Counts {
     misses: u64,
 }
 
-async fn rq_neighbors(
+fn rq_scanner(
     dataset: &Dataset,
     query: &[f32],
     nprobes: usize,
     refine: Option<u32>,
     callback: Option<ExecutionStatsCallback>,
-) -> Vec<u64> {
+) -> Scanner {
     let key = Float32Array::from(query.to_vec());
     let mut scanner = dataset.scan();
     scanner.empty_project().unwrap();
@@ -330,7 +402,20 @@ async fn rq_neighbors(
         scanner.scan_stats_callback(callback);
     }
     scanner.with_row_id();
-    let batch = scanner.try_into_batch().await.unwrap();
+    scanner
+}
+
+async fn rq_neighbors(
+    dataset: &Dataset,
+    query: &[f32],
+    nprobes: usize,
+    refine: Option<u32>,
+    callback: Option<ExecutionStatsCallback>,
+) -> Vec<u64> {
+    let batch = rq_scanner(dataset, query, nprobes, refine, callback)
+        .try_into_batch()
+        .await
+        .unwrap();
     batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec()
 }
 
@@ -343,6 +428,7 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
         nprobes,
         cache_bytes,
         warmup,
+        concurrency,
     } = *fixture;
     let dataset = DatasetBuilder::from_uri(uri)
         .with_index_cache_size_bytes(cache_bytes)
@@ -364,18 +450,30 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
         counts.misses += summary.index_cache_misses() as u64;
     });
 
+    let cpu_before = cpu_micros();
     let started = Instant::now();
-    let mut recall = 0.0;
-    for (query, exact) in queries.iter().zip(truth) {
-        let addresses =
-            rq_neighbors(&dataset, query, nprobes, refine, Some(callback.clone())).await;
-        let found = addresses
-            .iter()
-            .map(|address| positions[address])
-            .collect::<Vec<_>>();
-        recall += recall_of(&found, exact);
-    }
+    let recall = futures::stream::iter(queries.iter().zip(truth))
+        .map(|(query, exact)| {
+            let dataset = dataset.clone();
+            let positions = Arc::clone(positions);
+            let callback = callback.clone();
+            let query = query.clone();
+            let exact = exact.clone();
+            tokio::spawn(async move {
+                let addresses =
+                    rq_neighbors(&dataset, &query, nprobes, refine, Some(callback)).await;
+                let found = addresses
+                    .iter()
+                    .map(|address| positions[address])
+                    .collect::<Vec<_>>();
+                recall_of(&found, &exact)
+            })
+        })
+        .buffered(concurrency)
+        .fold(0.0f64, |recall, hits| async move { recall + hits.unwrap() })
+        .await;
     let micros = started.elapsed().as_micros() as f64;
+    let cpu = cpu_micros() - cpu_before;
 
     let counts = counts.lock().unwrap();
     let lookups = counts.hits + counts.misses;
@@ -386,6 +484,7 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
         iops: counts.iops as f64 / queries,
         requests: counts.requests as f64 / queries,
         micros: micros / queries,
+        cpu_micros: cpu / queries,
         hit_ratio: if lookups == 0 {
             0.0
         } else {
@@ -394,10 +493,66 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
     }
 }
 
+/// What building Lance's plan costs with nothing executed.
+///
+/// The `IVF_RQ` arm answers through the ordinary scanner, so its wall time is a
+/// whole DataFusion plan built and executed per query, where this crate's is a
+/// library call. This is the part that is not the index answering, measured the
+/// same way and at the same concurrency so it can be subtracted.
+async fn measure_rq_plan(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> (f64, f64) {
+    let Fixture {
+        queries,
+        nprobes,
+        cache_bytes,
+        warmup,
+        concurrency,
+        ..
+    } = *fixture;
+    let dataset = DatasetBuilder::from_uri(uri)
+        .with_index_cache_size_bytes(cache_bytes)
+        .load()
+        .await
+        .unwrap();
+    for query in queries.iter().take(warmup) {
+        rq_scanner(&dataset, query, nprobes, refine, None)
+            .create_plan()
+            .await
+            .unwrap();
+    }
+
+    let cpu_before = cpu_micros();
+    let started = Instant::now();
+    futures::stream::iter(queries.iter())
+        .map(|query| {
+            let dataset = dataset.clone();
+            let query = query.clone();
+            tokio::spawn(async move {
+                rq_scanner(&dataset, &query, nprobes, refine, None)
+                    .create_plan()
+                    .await
+                    .unwrap();
+            })
+        })
+        .buffered(concurrency)
+        .fold((), |(), joined| async move { joined.unwrap() })
+        .await;
+    let queries = queries.len() as f64;
+    (
+        started.elapsed().as_micros() as f64 / queries,
+        (cpu_micros() - cpu_before) / queries,
+    )
+}
+
 fn report(label: &str, width: usize, cost: &Cost) {
     println!(
-        "{label:<16} {width:>6} {:>8.4} {:>12.0} {:>8.0} {:>9.1} {:>10.0} {:>7.2}",
-        cost.recall, cost.bytes, cost.iops, cost.requests, cost.micros, cost.hit_ratio
+        "{label:<16} {width:>6} {:>8.4} {:>12.0} {:>8.0} {:>9.1} {:>10.0} {:>9.0} {:>7.2}",
+        cost.recall,
+        cost.bytes,
+        cost.iops,
+        cost.requests,
+        cost.micros,
+        cost.cpu_micros,
+        cost.hit_ratio
     );
 }
 
@@ -422,8 +577,13 @@ async fn main() {
     };
     let num_queries = env_usize("QUERIES", 200).min(total_queries);
     let rows_per_partition = env_usize("ROWS_PER_PARTITION", 8192);
-    let partitions = rows.div_ceil(rows_per_partition).max(1) as u32;
     let nprobes = env_usize("NPROBES", 7);
+    let vamana_rows_per_partition = env_usize("VAMANA_ROWS_PER_PARTITION", rows_per_partition);
+    let rq_rows_per_partition = env_usize("RQ_ROWS_PER_PARTITION", rows_per_partition);
+    let vamana_partitions = rows.div_ceil(vamana_rows_per_partition).max(1) as u32;
+    let rq_partitions = rows.div_ceil(rq_rows_per_partition).max(1) as u32;
+    let vamana_nprobes = env_usize("VAMANA_NPROBES", nprobes);
+    let rq_nprobes = env_usize("RQ_NPROBES", nprobes);
     let degree = env_usize("DEGREE", 64) as u32;
     let code_bits = env_usize("CODE_BITS", 3) as u8;
     let widths = env_list("WIDTHS", "10,20,30,40,60,80,120,160");
@@ -437,6 +597,7 @@ async fn main() {
     let cache_bytes = env_usize("CACHE_MB", 4096) << 20;
     let target = env_usize("TARGET", 95) as f64 / 100.0;
     let warmup = env_usize("WARMUP", num_queries).min(num_queries);
+    let concurrency = env_usize("CONCURRENCY", 1).max(1);
 
     let vectors = FixedSizeListArray::try_new_from_values(
         Float32Array::from(base[..rows * dim].to_vec()),
@@ -448,10 +609,14 @@ async fn main() {
         .collect::<Vec<_>>();
 
     println!(
-        "{prefix} {rows} x {dim}, {partitions} partitions of about {rows_per_partition}, \
-         R = {degree}, {code_bits} code bits, {nprobes} probes, {num_queries} queries, k = {K}, \
-         cache {} MB",
+        "{prefix} {rows} x {dim}, R = {degree}, {code_bits} code bits, {num_queries} queries, \
+         k = {K}, cache {} MB, {concurrency} in flight",
         cache_bytes >> 20
+    );
+    println!(
+        "vamana: {vamana_partitions} partitions of about {vamana_rows_per_partition}, \
+         {vamana_nprobes} probes | IVF_RQ: {rq_partitions} partitions of about \
+         {rq_rows_per_partition}, {rq_nprobes} probes"
     );
 
     let store = FlatFloatStorage::new(vectors.clone(), DISTANCE_TYPE);
@@ -480,8 +645,9 @@ async fn main() {
         (None, Some(temp)) => temp.path().to_str().unwrap().to_string(),
         _ => unreachable!(),
     };
-    let vamana_uri = format!("{home}/{prefix}-{rows}-p{partitions}-r{degree}-c{code_bits}.lance");
-    let rq_uri = format!("{home}/{prefix}-{rows}-p{partitions}-rq{code_bits}.lance");
+    let vamana_uri =
+        format!("{home}/{prefix}-{rows}-p{vamana_partitions}-r{degree}-c{code_bits}.lance");
+    let rq_uri = format!("{home}/{prefix}-{rows}-p{rq_partitions}-rq{code_bits}.lance");
 
     let vamana_dataset = if std::fs::metadata(&vamana_uri).is_ok() {
         let dataset = Dataset::open(&vamana_uri).await.unwrap();
@@ -502,7 +668,7 @@ async fn main() {
         create_index(
             &mut dataset,
             VAMANA_INDEX,
-            &IndexParams::new(VECTOR_FIELD, partitions)
+            &IndexParams::new(VECTOR_FIELD, vamana_partitions)
                 .with_distance_type(DISTANCE_TYPE)
                 .with_code_bits(code_bits)
                 .with_graph_params(BuildParams {
@@ -533,7 +699,7 @@ async fn main() {
                 Some(RQ_INDEX.to_string()),
                 &VectorIndexParams::with_ivf_rq_params(
                     DISTANCE_TYPE,
-                    IvfBuildParams::new(partitions as usize),
+                    IvfBuildParams::new(rq_partitions as usize),
                     RQBuildParams {
                         num_bits: code_bits,
                         ..Default::default()
@@ -549,24 +715,26 @@ async fn main() {
         );
     }
 
-    let vamana_positions = positions_by_address(&vamana_dataset).await;
-    let rq_positions = positions_by_address(&Dataset::open(&rq_uri).await.unwrap()).await;
+    let vamana_positions = Arc::new(positions_by_address(&vamana_dataset).await);
+    let rq_positions = Arc::new(positions_by_address(&Dataset::open(&rq_uri).await.unwrap()).await);
     let vamana_fixture = Fixture {
         queries: &queries,
         truth: &truth,
         positions: &vamana_positions,
-        nprobes,
+        nprobes: vamana_nprobes,
         cache_bytes,
         warmup,
+        concurrency,
     };
     let rq_fixture = Fixture {
         positions: &rq_positions,
+        nprobes: rq_nprobes,
         ..vamana_fixture
     };
 
     println!(
-        "\n{:<16} {:>6} {:>8} {:>12} {:>8} {:>9} {:>10} {:>7}",
-        "arm", "width", "recall", "bytes", "iops", "requests", "us (warm)", "hits"
+        "\n{:<16} {:>6} {:>8} {:>12} {:>8} {:>9} {:>10} {:>9} {:>7}",
+        "arm", "width", "recall", "bytes", "iops", "requests", "us (warm)", "cpu us", "hits"
     );
 
     let mut sweeps: Vec<(String, Vec<(usize, Cost)>)> = Vec::with_capacity(list_scales.len() + 1);
@@ -604,11 +772,16 @@ async fn main() {
 
     let bare = measure_rq(&rq_uri, &rq_fixture, None).await;
     report("IVF_RQ default", K, &bare);
+    let (plan_micros, plan_cpu) = measure_rq_plan(&rq_uri, &rq_fixture, Some(1)).await;
+    println!(
+        "{:<16} {:>6} {:>8} {:>12} {:>8} {:>9} {:>10.0} {:>9.0}",
+        "IVF_RQ plan only", "-", "-", "-", "-", "-", plan_micros, plan_cpu
+    );
 
     println!("\nat recall {target:.2}, interpolated between the widths either side of it");
     println!(
-        "{:<16} {:>12} {:>8} {:>9} {:>10} {:>10}",
-        "arm", "bytes", "iops", "requests", "us (warm)", "vs IVF_RQ"
+        "{:<16} {:>12} {:>8} {:>9} {:>10} {:>9} {:>10}",
+        "arm", "bytes", "iops", "requests", "us (warm)", "cpu us", "vs IVF_RQ"
     );
     let reference = sweeps
         .iter()
@@ -625,11 +798,12 @@ async fn main() {
                     .fold(0.0, f64::max)
             ),
             Some((cost, bracketed)) => println!(
-                "{label:<16} {:>12.0} {:>8.0} {:>9.1} {:>10.0} {:>9}{}",
+                "{label:<16} {:>12.0} {:>8.0} {:>9.1} {:>10.0} {:>9.0} {:>10}{}",
                 cost.bytes,
                 cost.iops,
                 cost.requests,
                 cost.micros,
+                cost.cpu_micros,
                 match reference {
                     Some(reference) => format!("{:.2}x", cost.bytes / reference.bytes),
                     None => "-".to_string(),
