@@ -15,7 +15,8 @@
 //! `VAMANA_NPROBES`, `RQ_NPROBES` (each defaults to the shared value above),
 //! `DEGREE` (default 64), `CODE_BITS` (default 3), `WIDTHS`
 //! (default `10,20,30,40,60,80,120,160`, each a multiple of `k`),
-//! `CONCURRENCY` (default 1), `CACHE_MB` (default 4096), `TARGET`
+//! `LIST_SCALES` (default `1`), `BUDGETS` and `QUEUES` (unset: the width sweep
+//! above), `CONCURRENCY` (default 1), `CACHE_MB` (default 4096), `TARGET`
 //! (default 95), `WARMUP` (default: every query), `DATASET_DIR` (unset:
 //! temporary directories thrown away at the end).
 //!
@@ -52,12 +53,22 @@
 //! That is the comparison's real subject, because Lance spends one knob where
 //! this crate spends two - `refine_factor` widens the candidate list *and* the
 //! set of vectors read, while `SearchParams` sets `search_list_size` and
-//! `rescore_budget` apart. `LIST_SCALES` is what asks whether the second knob
-//! is worth anything: at a scale of `n` each probe keeps `n` times the budget
-//! and the same budget is re-scored, which costs the same bytes and can only
-//! pay if a probe's own truncation was throwing away a candidate the pooled
-//! list wanted. A run at `refine_factor` unset is printed too: it is the
-//! default, and it reads no original vectors at all.
+//! `rescore_budget` apart. `LIST_SCALES` asks what the second knob is worth by
+//! tying it to the first: at a scale of `n` a probe keeps `n` times the budget
+//! and re-scores the budget. A run at `refine_factor` unset is printed too: it
+//! is the default, and it reads no original vectors at all.
+//!
+//! **And the second knob is a second axis, not a second setting of the first.**
+//! `BUDGETS` with `QUEUES` sweeps the queue at a budget set outright, which is
+//! the shape the knobs actually have: a walk needs a long queue to *reach* its
+//! neighbours and a budget to *re-score* them, and at one partition of a
+//! million rows those two came apart by a factor of 3.4 in bytes. It is off
+//! unless both are set, because it is not the same sweep - the axis is the
+//! queue rather than the width, and `WIDTHS` keeps driving the `IVF_RQ` arm, so
+//! the reference at the recall target does not move. Note what cannot be asked:
+//! Lance re-scores `k * refine_factor` with an integer factor, so a budget that
+//! is not a multiple of `k` has no `IVF_RQ` counterpart at all, and the two arms
+//! meet only at the recall target, never at a shared budget.
 //!
 //! **What is not equal, and cannot be made so.** The two builds run their own
 //! k-means, so the partitions differ; RaBitQ's rotation is random per build, so
@@ -125,16 +136,30 @@ const RQ_INDEX: &str = "rq_idx";
 const DISTANCE_TYPE: DistanceType = DistanceType::L2;
 const K: usize = 10;
 
-fn env_list(name: &str, fallback: &str) -> Vec<usize> {
-    std::env::var(name)
-        .unwrap_or_else(|_| fallback.to_string())
-        .split(',')
-        .map(|raw| {
-            raw.trim()
+fn parse_list(name: &str, raw: &str) -> Vec<usize> {
+    raw.split(',')
+        .map(|item| {
+            item.trim()
                 .parse()
                 .unwrap_or_else(|_| panic!("{name} must be a comma-separated list of numbers"))
         })
         .collect()
+}
+
+fn env_list(name: &str, fallback: &str) -> Vec<usize> {
+    parse_list(
+        name,
+        &std::env::var(name).unwrap_or_else(|_| fallback.to_string()),
+    )
+}
+
+/// An unset or empty variable is an empty list rather than a default one: what
+/// this selects is a different sweep, so it has to be possible not to ask for it.
+fn env_list_opt(name: &str) -> Vec<usize> {
+    match std::env::var(name) {
+        Ok(raw) if !raw.trim().is_empty() => parse_list(name, &raw),
+        _ => Vec::new(),
+    }
 }
 
 /// What one arm cost at one candidate width, per query.
@@ -147,6 +172,20 @@ struct Cost {
     micros: f64,
     cpu_micros: f64,
     hit_ratio: f64,
+    /// Loader runs over the whole pass rather than per query: how many times an
+    /// arm read a partition instead of being handed one.
+    ///
+    /// The column `hit_ratio` cannot answer that. A caller that waits on a load
+    /// another caller started is served without running the loader, and the
+    /// backend counts it as a hit, so twelve queries stalled on one reload of a
+    /// partition report eleven hits and one miss.
+    loads: f64,
+    /// What the cache held when the pass ended.
+    ///
+    /// A budget is a target and not a bound: an entry larger than the whole
+    /// budget is admitted and reclaimed by later housekeeping, so a cache far
+    /// too small to hold one partition still serves that partition for a while.
+    held_bytes: f64,
 }
 
 impl Cost {
@@ -160,6 +199,8 @@ impl Cost {
             micros: mix(self.micros, other.micros),
             cpu_micros: mix(self.cpu_micros, other.cpu_micros),
             hit_ratio: mix(self.hit_ratio, other.hit_ratio),
+            loads: mix(self.loads, other.loads),
+            held_bytes: mix(self.held_bytes, other.held_bytes),
         }
     }
 }
@@ -347,17 +388,19 @@ async fn measure_vamana(
     let micros = started.elapsed().as_micros() as f64;
     let cpu = cpu_micros() - cpu_before;
     let after = index.io_stats();
-    let hit_ratio = match (cache_before, index.cache_stats().await) {
+    let (hit_ratio, loads, held_bytes) = match (cache_before, index.cache_stats().await) {
         (Some(before), Some(after)) => {
             let hits = after.hits - before.hits;
-            let lookups = hits + (after.misses - before.misses);
-            if lookups == 0 {
+            let loads = after.misses - before.misses;
+            let lookups = hits + loads;
+            let ratio = if lookups == 0 {
                 0.0
             } else {
                 hits as f64 / lookups as f64
-            }
+            };
+            (ratio, loads as f64, after.size_bytes as f64)
         }
-        _ => 0.0,
+        _ => (0.0, 0.0, 0.0),
     };
 
     let queries = queries.len() as f64;
@@ -369,6 +412,8 @@ async fn measure_vamana(
         micros: micros / queries,
         cpu_micros: cpu / queries,
         hit_ratio,
+        loads,
+        held_bytes,
     }
 }
 
@@ -490,6 +535,10 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
         } else {
             counts.hits as f64 / lookups as f64
         },
+        loads: counts.misses as f64,
+        // Lance's index cache is the dataset's, reached through the plan's
+        // summary rather than held here, and the summary carries no size.
+        held_bytes: 0.0,
     }
 }
 
@@ -543,16 +592,40 @@ async fn measure_rq_plan(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) 
     )
 }
 
+/// One point of a vamana sweep: what the axis column reads, and the pair of
+/// knobs it stands for. The two sweeps differ only in which of them moves.
+#[derive(Clone, Copy)]
+struct Point {
+    axis: usize,
+    list_size: usize,
+    budget: usize,
+}
+
+/// One curve: the points along its axis, and what its label is called after the
+/// arm name.
+struct Curve {
+    suffix: String,
+    points: Vec<Point>,
+}
+
 fn report(label: &str, width: usize, cost: &Cost) {
     println!(
-        "{label:<16} {width:>6} {:>8.4} {:>12.0} {:>8.0} {:>9.1} {:>10.0} {:>9.0} {:>7.2}",
+        "{label:<16} {width:>6} {:>8.4} {:>12.0} {:>8.0} {:>9.1} {:>10.0} {:>9.0} {:>7.2} {:>6.0} {:>8}",
         cost.recall,
         cost.bytes,
         cost.iops,
         cost.requests,
         cost.micros,
         cost.cpu_micros,
-        cost.hit_ratio
+        cost.hit_ratio,
+        cost.loads,
+        // Lance's arm reaches its cache through the plan's summary, which
+        // carries no size, so there is nothing to print rather than a zero.
+        if cost.held_bytes == 0.0 {
+            "-".to_string()
+        } else {
+            format!("{:.0}", cost.held_bytes / (1 << 20) as f64)
+        }
     );
 }
 
@@ -593,6 +666,25 @@ async fn main() {
          crate spends `L`, and a width it cannot express would compare two different lists"
     );
     let list_scales = env_list("LIST_SCALES", "1");
+    let budgets = env_list_opt("BUDGETS");
+    let queues = env_list_opt("QUEUES");
+    assert_eq!(
+        budgets.is_empty(),
+        queues.is_empty(),
+        "BUDGETS and QUEUES name one sweep between them: set both or neither"
+    );
+    assert!(
+        budgets.iter().all(|budget| *budget >= K),
+        "every budget must be at least k = {K}: a query that re-scores fewer vectors than it \
+         returns could never return k neighbours, and the crate refuses it"
+    );
+    assert!(
+        queues
+            .iter()
+            .all(|queue| budgets.iter().all(|budget| queue >= budget)),
+        "every queue must be at least as long as every budget, or the budget cannot be spent and \
+         the point measures a shorter list than its label claims"
+    );
     let beam_width = env_usize("BEAM_WIDTH", 4);
     let cache_bytes = env_usize("CACHE_MB", 4096) << 20;
     let target = env_usize("TARGET", 95) as f64 / 100.0;
@@ -733,32 +825,77 @@ async fn main() {
     };
 
     println!(
-        "\n{:<16} {:>6} {:>8} {:>12} {:>8} {:>9} {:>10} {:>9} {:>7}",
-        "arm", "width", "recall", "bytes", "iops", "requests", "us (warm)", "cpu us", "hits"
+        "\n{:<16} {:>6} {:>8} {:>12} {:>8} {:>9} {:>10} {:>9} {:>7} {:>6} {:>8}",
+        "arm",
+        if budgets.is_empty() { "width" } else { "queue" },
+        "recall",
+        "bytes",
+        "iops",
+        "requests",
+        "us (warm)",
+        "cpu us",
+        "hits",
+        "loads",
+        "held MB"
     );
 
-    let mut sweeps: Vec<(String, Vec<(usize, Cost)>)> = Vec::with_capacity(list_scales.len() + 1);
-    for scale in &list_scales {
+    // Which of the two knobs moves along a curve is the whole difference
+    // between the two sweeps, so it is decided once, here, rather than inside
+    // the loop that measures.
+    let curves: Vec<Curve> = if budgets.is_empty() {
+        list_scales
+            .iter()
+            .map(|scale| Curve {
+                suffix: match scale {
+                    1 => String::new(),
+                    _ => format!(" L={scale}x"),
+                },
+                points: widths
+                    .iter()
+                    .map(|width| Point {
+                        axis: *width,
+                        list_size: width * scale,
+                        budget: *width,
+                    })
+                    .collect(),
+            })
+            .collect()
+    } else {
+        budgets
+            .iter()
+            .map(|budget| Curve {
+                suffix: format!(" b={budget}"),
+                points: queues
+                    .iter()
+                    .map(|queue| Point {
+                        axis: *queue,
+                        list_size: *queue,
+                        budget: *budget,
+                    })
+                    .collect(),
+            })
+            .collect()
+    };
+
+    let mut sweeps: Vec<(String, Vec<(usize, Cost)>)> = Vec::with_capacity(curves.len() * 2 + 1);
+    for curve in &curves {
         for (mode, name) in [(WalkMode::Flat, "scan"), (WalkMode::Lazy, "walk")] {
-            let label = match scale {
-                1 => format!("vamana {name}"),
-                _ => format!("vamana {name} L={scale}x"),
-            };
-            let mut points = Vec::with_capacity(widths.len());
-            for width in &widths {
+            let label = format!("vamana {name}{}", curve.suffix);
+            let mut measured = Vec::with_capacity(curve.points.len());
+            for point in &curve.points {
                 let cost = measure_vamana(
                     &vamana_dataset,
                     &vamana_fixture,
-                    width * scale,
-                    *width,
+                    point.list_size,
+                    point.budget,
                     mode,
                     beam_width,
                 )
                 .await;
-                report(&label, *width, &cost);
-                points.push((*width, cost));
+                report(&label, point.axis, &cost);
+                measured.push((point.axis, cost));
             }
-            sweeps.push((label, points));
+            sweeps.push((label, measured));
         }
     }
 
