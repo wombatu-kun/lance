@@ -253,6 +253,17 @@ pub struct SearchParams {
     /// the phase gate modelled and is deliberately on the low side - what it
     /// should be on a high-latency store is a measurement nobody has taken.
     pub beam_width: usize,
+    /// Whether a [`WalkMode::Lazy`] probe holds the whole `__neighbors` column
+    /// of a partition it opens, rather than fetching a hop's rows at a time.
+    ///
+    /// Off by default, because it is memory the alternative does not spend: 256
+    /// bytes a vertex at `R = 64`, against the 68 a three-bit code occupies at
+    /// `d = 128` and the 376 at `d = 960`. What it buys is every request a walk
+    /// makes before its re-score, which after the codes are resident is every
+    /// request a walk makes at all. It changes no answer - the same hops, the
+    /// same candidate list - and it is ignored by [`WalkMode::Flat`], which
+    /// opens the column never and would only be charged for it.
+    pub resident_edges: bool,
     /// How many candidates a query measures exactly, counted across every
     /// partition it probes rather than within each of them.
     ///
@@ -300,6 +311,7 @@ impl SearchParams {
             search_list_size: k.saturating_add(k / 2),
             mode: WalkMode::default(),
             beam_width: 4,
+            resident_edges: false,
             rescore_budget: None,
         }
     }
@@ -321,6 +333,11 @@ impl SearchParams {
 
     pub fn with_beam_width(mut self, beam_width: usize) -> Self {
         self.beam_width = beam_width;
+        self
+    }
+
+    pub fn with_resident_edges(mut self, resident_edges: bool) -> Self {
+        self.resident_edges = resident_edges;
         self
     }
 
@@ -1355,12 +1372,16 @@ impl VamanaIndex {
             ));
         };
         let file = self.partition_file(&probe).await?;
+        // A scan opens `__neighbors` never, so holding it for one would charge
+        // the arm without a graph for the graph.
+        let hold_edges = params.resident_edges && !matches!(params.mode, WalkMode::Flat);
         let resident = cache::resident(
             self.cache.as_ref(),
             probe.segment,
             &probe.entry,
             &file,
             &self.metadata,
+            hold_edges.then_some(probe.max_degree),
         )
         .await?;
 
@@ -1373,6 +1394,7 @@ impl VamanaIndex {
                 max_degree: probe.max_degree,
                 search_list_size: params.search_list_size,
                 beam_width: params.beam_width,
+                edges: resident.edges.as_deref(),
             };
             match params.mode {
                 WalkMode::Flat => probing.scan(routing_query, dist_q_c),

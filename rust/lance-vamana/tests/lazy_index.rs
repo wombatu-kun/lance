@@ -41,6 +41,7 @@ const K: usize = 10;
 const BEAM: usize = 30;
 const QUERIES: usize = 40;
 const CODE_BITS: u8 = 3;
+const MAX_DEGREE: u32 = 16;
 
 /// Partitions a single walk cannot exhaust, because a lazy read of a partition
 /// a walk reaches every vertex of has read the partition.
@@ -55,7 +56,7 @@ fn fixture() -> DatasetFixture {
 fn params() -> IndexParams {
     IndexParams::new(VECTOR_COLUMN, PARTITIONS)
         .with_graph_params(BuildParams {
-            max_degree: 16,
+            max_degree: MAX_DEGREE,
             search_list_size: 64,
             ..Default::default()
         })
@@ -925,6 +926,13 @@ async fn a_cache_removes_the_read_the_walk_does_not_choose() {
 
 /// What a query's codes weigh on disk: every partition of the one segment is
 /// probed, so the rows behind them are the rows of the dataset.
+/// What `__neighbors` weighs across the whole index: a fixed stride of
+/// `max_degree` slots a vertex, so it does not depend on how the rows fell into
+/// partitions.
+fn edge_column_bytes() -> usize {
+    fixture().fragments * fixture().rows_per_fragment * MAX_DEGREE as usize * size_of::<u32>()
+}
+
 fn code_column_bytes() -> usize {
     let dimension = VECTOR_DIM as u32;
     let stride = CodeParams::mint(CODE_BITS, dimension)
@@ -1153,4 +1161,111 @@ async fn a_lazy_query_is_validated_like_any_other() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("dimensions"), "{error}");
+}
+
+/// Holding `__neighbors` across queries changes what a walk reads and must
+/// change nothing else: the same hops in the same order over the same graph, and
+/// so the same answer to the last bit.
+///
+/// The requests are pinned beside the equality because the equality alone would
+/// hold just as well if the flag had done nothing at all.
+#[tokio::test]
+async fn resident_edges_do_not_change_an_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let queries = random_vectors(QUERIES, 1717);
+    let fetching = search(WalkMode::Lazy);
+    let holding = search(WalkMode::Lazy).with_resident_edges(true);
+
+    let index = cached(&dataset, BUDGET).await;
+    replay(&index, &queries, &fetching).await;
+    let (fetched, fetched_cost) = replay(&index, &queries, &fetching).await;
+
+    let index = cached(&dataset, BUDGET).await;
+    replay(&index, &queries, &holding).await;
+    let (held, held_cost) = replay(&index, &queries, &holding).await;
+
+    assert_same(&fetched, &held, "resident edges");
+    assert!(
+        held_cost.requests < fetched_cost.requests,
+        "a walk holding the edges made {:.1} requests against {:.1} fetching them, so the column \
+         was fetched either way and the equality above pins nothing",
+        held_cost.requests,
+        fetched_cost.requests
+    );
+}
+
+/// The two flavours of a resident partition share a segment and a partition id,
+/// so the key has to carry which of them it holds.
+///
+/// Without that, the entry a fetching walk left behind answers one that wanted
+/// the edges held, and that walk silently goes back to fetching a hop at a time
+/// - with a cache hit recorded, the right answer returned and nothing at all to
+/// see in the run.
+#[tokio::test]
+async fn a_partition_held_without_its_edges_does_not_answer_a_walk_that_wants_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let queries = random_vectors(QUERIES, 606);
+    let fetching = search(WalkMode::Lazy);
+    let holding = search(WalkMode::Lazy).with_resident_edges(true);
+
+    let index = cached(&dataset, BUDGET).await;
+    replay(&index, &queries, &fetching).await;
+    let (_, fetched_cost) = replay(&index, &queries, &fetching).await;
+    replay(&index, &queries, &holding).await;
+    let (_, held_cost) = replay(&index, &queries, &holding).await;
+
+    assert!(
+        held_cost.requests < fetched_cost.requests,
+        "after a pass that fetched its edges, a walk asking to hold them still made {:.1} \
+         requests against {:.1}, so it was handed the partition without them",
+        held_cost.requests,
+        fetched_cost.requests
+    );
+}
+
+/// What holding them costs, in the units the budget is spent in.
+///
+/// Exactly the column rather than about it: `__neighbors` is a fixed stride of
+/// `max_degree` slots a vertex, so the resident form has no per-vertex overhead
+/// to hide behind, and a difference that is not the column means something else
+/// was held or something was evicted.
+#[tokio::test]
+async fn holding_the_edges_costs_exactly_the_edge_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let queries = random_vectors(2, 88);
+
+    let fetching = cached(&dataset, BUDGET).await;
+    replay(&fetching, &queries, &search(WalkMode::Lazy)).await;
+    let holding = cached(&dataset, BUDGET).await;
+    replay(
+        &holding,
+        &queries,
+        &search(WalkMode::Lazy).with_resident_edges(true),
+    )
+    .await;
+
+    let without = fetching.cache_stats().await.unwrap();
+    let with = holding.cache_stats().await.unwrap();
+    println!(
+        "{} entries holding {} B, against {} entries holding {} B",
+        with.num_entries, with.size_bytes, without.num_entries, without.size_bytes
+    );
+
+    assert_eq!(
+        with.num_entries, without.num_entries,
+        "the two arms hold a different number of entries, so their sizes are not comparable"
+    );
+    assert_eq!(
+        with.size_bytes - without.size_bytes,
+        edge_column_bytes(),
+        "holding the edges cost {} bytes where the column is {}",
+        with.size_bytes - without.size_bytes,
+        edge_column_bytes()
+    );
 }

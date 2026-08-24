@@ -131,6 +131,13 @@ pub(crate) struct LazyProbe<'a> {
     /// How many vertices one hop expands, and therefore how many rows of
     /// `__neighbors` one request asks for.
     pub(crate) beam_width: usize,
+    /// Every vertex's out-edges when [`crate::cache`] is holding the column,
+    /// indexed by local id; `None` asks the file for a hop's rows instead.
+    ///
+    /// A walk given them makes no request of its own at all until the re-score,
+    /// which is the whole of what it changes: the hops it takes and the
+    /// candidates it ends with are the same either way.
+    pub(crate) edges: Option<&'a [u32]>,
 }
 
 impl LazyProbe<'_> {
@@ -181,7 +188,10 @@ impl LazyProbe<'_> {
         list.offer(self.medoid, coded.distance(self.medoid));
 
         let width = self.max_degree as usize;
-        let edges = self.file.project(&[NEIGHBORS_COLUMN]).await?;
+        let reader = match self.edges {
+            Some(_) => None,
+            None => Some(self.file.project(&[NEIGHBORS_COLUMN]).await?),
+        };
         let mut frontier = Vec::with_capacity(self.beam_width);
         loop {
             frontier.clear();
@@ -199,11 +209,25 @@ impl LazyProbe<'_> {
             // which of two equally distant candidates survives a full list.
             frontier.sort_unstable();
 
-            let batch = read_scattered(&edges, &frontier).await?;
-            let slots = neighbor_slots(&batch, self.max_degree)?;
+            let fetched = match &reader {
+                Some(reader) => Some(read_scattered(reader, &frontier).await?),
+                None => None,
+            };
+            let hop = match &fetched {
+                Some(batch) => neighbor_slots(batch, self.max_degree)?,
+                // Never indexed: the arm that reads nothing takes its slots
+                // from the resident column below.
+                None => &[],
+            };
             for (position, vertex) in frontier.iter().enumerate() {
-                let start = position * width;
-                let out_edges = checked_neighbors(&slots[start..start + width], *vertex, num_rows)?;
+                // A request answers in the order it was made, so a vertex's
+                // slots sit at its position in the frontier; the resident
+                // column is in partition order, so they sit at its own id.
+                let slots = match self.edges {
+                    Some(edges) => &edges[*vertex as usize * width..][..width],
+                    None => &hop[position * width..][..width],
+                };
+                let out_edges = checked_neighbors(slots, *vertex, num_rows)?;
                 for neighbor in out_edges {
                     if !scratch.mark(*neighbor) {
                         continue;

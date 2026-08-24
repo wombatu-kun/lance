@@ -320,6 +320,10 @@ struct Fixture<'a> {
     /// measurement and reproduces badly; enough of them that throughput has
     /// stopped growing is a throughput one, and that is the reproducible state.
     concurrency: usize,
+    /// Whether the walk holds `__neighbors` across queries instead of fetching
+    /// a hop at a time. Reaches the `Flat` arm too and is ignored there, which
+    /// is what makes the pass a comparison rather than two.
+    resident_edges: bool,
 }
 
 /// This crate's own arms, both with one pooled budget of exact distances:
@@ -340,12 +344,14 @@ async fn measure_vamana(
         cache_bytes,
         warmup,
         concurrency,
+        resident_edges,
     } = *fixture;
     let params = SearchParams::new(K)
         .with_nprobes(nprobes)
         .with_search_list_size(list_size)
         .with_mode(mode)
         .with_beam_width(beam_width)
+        .with_resident_edges(resident_edges)
         .with_rescore_budget(budget);
     let index = Arc::new(
         VamanaIndex::open(dataset, VAMANA_INDEX)
@@ -474,6 +480,7 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
         cache_bytes,
         warmup,
         concurrency,
+        ..
     } = *fixture;
     let dataset = DatasetBuilder::from_uri(uri)
         .with_index_cache_size_bytes(cache_bytes)
@@ -690,6 +697,7 @@ async fn main() {
     let target = env_usize("TARGET", 95) as f64 / 100.0;
     let warmup = env_usize("WARMUP", num_queries).min(num_queries);
     let concurrency = env_usize("CONCURRENCY", 1).max(1);
+    let resident_edges = env_usize("RESIDENT_EDGES", 0) != 0;
 
     let vectors = FixedSizeListArray::try_new_from_values(
         Float32Array::from(base[..rows * dim].to_vec()),
@@ -702,8 +710,13 @@ async fn main() {
 
     println!(
         "{prefix} {rows} x {dim}, R = {degree}, {code_bits} code bits, {num_queries} queries, \
-         k = {K}, cache {} MB, {concurrency} in flight",
-        cache_bytes >> 20
+         k = {K}, cache {} MB, {concurrency} in flight, walk edges {}",
+        cache_bytes >> 20,
+        if resident_edges {
+            "resident"
+        } else {
+            "fetched"
+        }
     );
     println!(
         "vamana: {vamana_partitions} partitions of about {vamana_rows_per_partition}, \
@@ -817,6 +830,7 @@ async fn main() {
         cache_bytes,
         warmup,
         concurrency,
+        resident_edges,
     };
     let rq_fixture = Fixture {
         positions: &rq_positions,
