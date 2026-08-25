@@ -17,8 +17,10 @@
 //! (default `10,20,30,40,60,80,120,160`, each a multiple of `k`),
 //! `LIST_SCALES` (default `1`), `BUDGETS` and `QUEUES` (unset: the width sweep
 //! above), `CONCURRENCY` (default 1), `CACHE_MB` (default 4096), `TARGET`
-//! (default 95), `WARMUP` (default: every query), `DATASET_DIR` (unset:
-//! temporary directories thrown away at the end).
+//! (default 95), `WARMUP` (default: every query), `RESIDENT_EDGES` (default
+//! 0), `REFERENCE_POSITION` (`last` or `both`, default `last`), `ARMS`
+//! (`scan`, `walk` or both, default both), `DATASET_DIR` (unset: temporary
+//! directories thrown away at the end).
 //!
 //! Every earlier sweep in this crate compares the walk against a scan *this
 //! crate* wrote. That scan is the walk's own parts with the graph switched off,
@@ -93,6 +95,21 @@
 //! call, Lance's is a whole DataFusion plan, built and executed per query.
 //! `IVF_RQ plan only` prints what building one costs with nothing executed, so
 //! that part can be subtracted rather than argued about.
+//!
+//! **The split, and why the two arms get it differently.** Every arm here
+//! reaches a candidate list by code and then corrects it by reading original
+//! vectors, and the correction is very nearly the whole byte cost of a query -
+//! so `search` and `rescore` are printed apart from each other. This crate's
+//! arm reports them from the inside: each query attaches its own I/O sink to
+//! the files it opens, one for each side of the barrier, and the pass asserts
+//! that the two add up to what the scheduler counted. Lance's arm has no such
+//! seam, so its split is a difference of two runs measured back to back: with
+//! `refine_factor` unset the scan reads no original vector at all, which makes
+//! that run exactly its search over codes, and everything the refined run
+//! spends above it is the re-score. The recall of that unrefined run is
+//! therefore the arm's recall *before* any re-score, printed as `coded`, and it
+//! is the same number at every width - the top `k` of a coded list does not
+//! depend on how much of the list is kept.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -123,7 +140,7 @@ use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
-use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode};
+use lance_vamana::query::{Neighbor, SearchParams, VamanaIndex, WalkMode};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -186,6 +203,33 @@ struct Cost {
     /// budget is admitted and reclaimed by later housekeeping, so a cache far
     /// too small to hold one partition still serves that partition for a while.
     held_bytes: f64,
+    /// The recall of the answer this arm would have given had it stopped after
+    /// its search over codes, before a single original vector was read.
+    ///
+    /// The question `recall` cannot be asked about: both arms reach a candidate
+    /// list by code and then correct it by reading vectors, and correcting it is
+    /// nearly the whole byte cost of the query, so what the correction *buys* is
+    /// the difference between these two columns.
+    coded_recall: f64,
+    /// Wall time inside one query's own future, averaged over the pass.
+    ///
+    /// Not `micros`, and the difference is the whole reason it is here: that one
+    /// is the pass divided by its queries, so at `n` in flight it is roughly the
+    /// latency divided by `n`. The split below is measured per query and
+    /// therefore adds up to *this* column, so both arms have to carry it or the
+    /// two halves would be compared against different denominators.
+    latency_micros: f64,
+    /// The two halves of that latency, split at the moment the candidate list is
+    /// settled and before anything is read to correct it.
+    ///
+    /// Their ratio is the number worth reading: the absolute level under load
+    /// includes whatever the query spent waiting to be polled.
+    search_micros: f64,
+    rescore_micros: f64,
+    /// Physical bytes, per query, split the same way. These do add up to
+    /// `bytes`, and the vamana arm asserts that they do.
+    search_bytes: f64,
+    rescore_bytes: f64,
 }
 
 impl Cost {
@@ -201,6 +245,12 @@ impl Cost {
             hit_ratio: mix(self.hit_ratio, other.hit_ratio),
             loads: mix(self.loads, other.loads),
             held_bytes: mix(self.held_bytes, other.held_bytes),
+            coded_recall: mix(self.coded_recall, other.coded_recall),
+            latency_micros: mix(self.latency_micros, other.latency_micros),
+            search_micros: mix(self.search_micros, other.search_micros),
+            rescore_micros: mix(self.rescore_micros, other.rescore_micros),
+            search_bytes: mix(self.search_bytes, other.search_bytes),
+            rescore_bytes: mix(self.rescore_bytes, other.rescore_bytes),
         }
     }
 }
@@ -352,6 +402,7 @@ async fn measure_vamana(
         .with_mode(mode)
         .with_beam_width(beam_width)
         .with_resident_edges(resident_edges)
+        .with_report_coded(true)
         .with_rescore_budget(budget);
     let index = Arc::new(
         VamanaIndex::open(dataset, VAMANA_INDEX)
@@ -367,7 +418,7 @@ async fn measure_vamana(
     let cache_before = index.cache_stats().await;
     let cpu_before = cpu_micros();
     let started = Instant::now();
-    let recall = futures::stream::iter(queries.iter().zip(truth))
+    let totals = futures::stream::iter(queries.iter().zip(truth))
         .map(|(query, exact)| {
             let index = index.clone();
             let params = params.clone();
@@ -379,17 +430,39 @@ async fn measure_vamana(
             // here keep their arithmetic on that task, so bare futures would run
             // the queries one after another and report it as concurrency.
             tokio::spawn(async move {
+                let call = Instant::now();
                 let result = index.search(&query, &params).await.unwrap();
-                let found = result
-                    .neighbors
-                    .iter()
-                    .map(|neighbor| positions[&neighbor.row_addr])
-                    .collect::<Vec<_>>();
-                recall_of(&found, &exact)
+                let latency = call.elapsed().as_micros() as f64;
+                let addresses = |neighbors: &[Neighbor]| {
+                    neighbors
+                        .iter()
+                        .map(|neighbor| positions[&neighbor.row_addr])
+                        .collect::<Vec<_>>()
+                };
+                // Checked rather than trusted: a coded answer that came back
+                // empty would be reported as a recall of zero, which reads as a
+                // finding rather than as a switch nobody turned on.
+                assert_eq!(
+                    result.coded_neighbors.len(),
+                    K,
+                    "the index answered {} coded neighbours rather than k = {K}",
+                    result.coded_neighbors.len()
+                );
+                Reported {
+                    recall: recall_of(&addresses(&result.neighbors), &exact),
+                    coded_recall: recall_of(&addresses(&result.coded_neighbors), &exact),
+                    latency_micros: latency,
+                    search_micros: result.search.elapsed.as_micros() as f64,
+                    rescore_micros: result.rescore.elapsed.as_micros() as f64,
+                    search_bytes: result.search.bytes_read as f64,
+                    rescore_bytes: result.rescore.bytes_read as f64,
+                }
             })
         })
         .buffered(concurrency)
-        .fold(0.0f64, |recall, hits| async move { recall + hits.unwrap() })
+        .fold(Reported::default(), |totals, reported| async move {
+            totals.plus(&reported.unwrap())
+        })
         .await;
     let micros = started.elapsed().as_micros() as f64;
     let cpu = cpu_micros() - cpu_before;
@@ -409,10 +482,23 @@ async fn measure_vamana(
         _ => (0.0, 0.0, 0.0),
     };
 
+    // Two independent counts of the same bytes: one off the index's scheduler
+    // over the whole pass, one summed from a sink each query attached to the
+    // files it opened. They have to agree exactly, and an arm whose split does
+    // not add up has a read path the split does not see - which would be
+    // invisible in every other column.
+    let bytes = (after.bytes_read - before.bytes_read) as f64;
+    let split = totals.search_bytes + totals.rescore_bytes;
+    assert_eq!(
+        bytes, split,
+        "the pass read {bytes} bytes but its phases account for {split}: some read is outside \
+         both sinks"
+    );
+
     let queries = queries.len() as f64;
     Cost {
-        recall: recall / queries,
-        bytes: (after.bytes_read - before.bytes_read) as f64 / queries,
+        recall: totals.recall / queries,
+        bytes: bytes / queries,
         iops: (after.iops - before.iops) as f64 / queries,
         requests: (after.requests - before.requests) as f64 / queries,
         micros: micros / queries,
@@ -420,6 +506,42 @@ async fn measure_vamana(
         hit_ratio,
         loads,
         held_bytes,
+        coded_recall: totals.coded_recall / queries,
+        latency_micros: totals.latency_micros / queries,
+        search_micros: totals.search_micros / queries,
+        rescore_micros: totals.rescore_micros / queries,
+        search_bytes: totals.search_bytes / queries,
+        rescore_bytes: totals.rescore_bytes / queries,
+    }
+}
+
+/// What one query of this crate's arm reported, and what a pass sums them into.
+///
+/// A pass sums rather than averages because the average is one division at the
+/// end, and because a per-query struct is what a `fold` over spawned tasks can
+/// carry without a lock.
+#[derive(Default)]
+struct Reported {
+    recall: f64,
+    coded_recall: f64,
+    latency_micros: f64,
+    search_micros: f64,
+    rescore_micros: f64,
+    search_bytes: f64,
+    rescore_bytes: f64,
+}
+
+impl Reported {
+    fn plus(self, other: &Self) -> Self {
+        Self {
+            recall: self.recall + other.recall,
+            coded_recall: self.coded_recall + other.coded_recall,
+            latency_micros: self.latency_micros + other.latency_micros,
+            search_micros: self.search_micros + other.search_micros,
+            rescore_micros: self.rescore_micros + other.rescore_micros,
+            search_bytes: self.search_bytes + other.search_bytes,
+            rescore_bytes: self.rescore_bytes + other.rescore_bytes,
+        }
     }
 }
 
@@ -512,18 +634,24 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
             let query = query.clone();
             let exact = exact.clone();
             tokio::spawn(async move {
+                let call = Instant::now();
                 let addresses =
                     rq_neighbors(&dataset, &query, nprobes, refine, Some(callback)).await;
+                let latency = call.elapsed().as_micros() as f64;
                 let found = addresses
                     .iter()
                     .map(|address| positions[address])
                     .collect::<Vec<_>>();
-                recall_of(&found, &exact)
+                (recall_of(&found, &exact), latency)
             })
         })
         .buffered(concurrency)
-        .fold(0.0f64, |recall, hits| async move { recall + hits.unwrap() })
+        .fold((0.0f64, 0.0f64), |(recall, latency), joined| async move {
+            let (hits, took) = joined.unwrap();
+            (recall + hits, latency + took)
+        })
         .await;
+    let (recall, latency) = recall;
     let micros = started.elapsed().as_micros() as f64;
     let cpu = cpu_micros() - cpu_before;
 
@@ -532,6 +660,7 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
     let queries = queries.len() as f64;
     Cost {
         recall: recall / queries,
+        latency_micros: latency / queries,
         bytes: counts.bytes as f64 / queries,
         iops: counts.iops as f64 / queries,
         requests: counts.requests as f64 / queries,
@@ -546,6 +675,15 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
         // Lance's index cache is the dataset's, reached through the plan's
         // summary rather than held here, and the summary carries no size.
         held_bytes: 0.0,
+        // Filled in by `reference_sweep` from the run with `refine_factor`
+        // unset: the split of this arm is a difference of two runs, not
+        // something one run reports.
+        coded_recall: 0.0,
+        search_micros: 0.0,
+        rescore_micros: 0.0,
+        // Set above from the per-query clock, unlike the split.
+        search_bytes: 0.0,
+        rescore_bytes: 0.0,
     }
 }
 
@@ -599,6 +737,64 @@ async fn measure_rq_plan(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) 
     )
 }
 
+/// The reference arm's width sweep, called once or twice depending on where in
+/// the pass the reference is to be measured.
+///
+/// `label` is what the rows are called, and it decides more than a caption: the
+/// summary takes `IVF_RQ refined` as the denominator of its `vs IVF_RQ` column,
+/// so the sweep that keeps that name is the one every earlier log compares
+/// against. A second sweep under another name is an extra row, not a new
+/// baseline.
+async fn reference_sweep(
+    uri: &str,
+    fixture: &Fixture<'_>,
+    widths: &[usize],
+    label: &str,
+) -> Vec<(usize, Cost)> {
+    // Lance spends one knob where this crate spends two, so its two phases are
+    // two runs rather than two counters: with `refine_factor` unset the scan
+    // reads no original vector at all, which makes that run exactly this arm's
+    // search over codes. Its recall is the arm's recall before any re-score -
+    // the top `k` of a coded list does not depend on how much of the list is
+    // kept - and everything the refined run spends above it is the re-score.
+    //
+    // Measured here rather than at the end of the pass so that the two readings
+    // are adjacent: a pass charges its later rows more than its earlier ones,
+    // and a difference taken across thirty rows would carry that drift.
+    let mut bare = measure_rq(uri, fixture, None).await;
+    // For this row the two recalls are the same number by definition: it is the
+    // arm that stops after its search over codes.
+    bare.coded_recall = bare.recall;
+    bare.search_micros = bare.latency_micros;
+    assert!(
+        bare.recall > 0.0,
+        "the unrefined reference answered nothing, so the split would report a recall of zero \
+         before the re-score as though that were a measurement"
+    );
+    report(&format!("{label} coded"), K, &bare);
+
+    let mut points = Vec::with_capacity(widths.len());
+    for width in widths {
+        let mut cost = measure_rq(uri, fixture, Some((width / K) as u32)).await;
+        cost.coded_recall = bare.recall;
+        // Latency against latency, never pass time: at twelve queries in flight
+        // the pass figure is about a twelfth of the latency, and a split taken
+        // from one and compared against a split taken from the other would make
+        // this arm look an order of magnitude quicker than it is.
+        cost.search_micros = bare.latency_micros;
+        cost.search_bytes = bare.bytes;
+        // Deliberately unclamped. The bytes cannot come out negative and a
+        // negative would be a bug worth seeing; the time can, and when it does
+        // the honest reading is that the re-score is under this pass's own
+        // noise floor rather than that it cost nothing.
+        cost.rescore_micros = cost.latency_micros - bare.latency_micros;
+        cost.rescore_bytes = cost.bytes - bare.bytes;
+        report(label, *width, &cost);
+        points.push((*width, cost));
+    }
+    points
+}
+
 /// One point of a vamana sweep: what the axis column reads, and the pair of
 /// knobs it stands for. The two sweeps differ only in which of them moves.
 #[derive(Clone, Copy)]
@@ -617,12 +813,19 @@ struct Curve {
 
 fn report(label: &str, width: usize, cost: &Cost) {
     println!(
-        "{label:<16} {width:>6} {:>8.4} {:>12.0} {:>8.0} {:>9.1} {:>10.0} {:>9.0} {:>7.2} {:>6.0} {:>8}",
+        "{label:<22} {width:>6} {:>8.4} {:>8.4} {:>12.0} {:>11.0} {:>11.0} {:>8.0} {:>9.1} \
+         {:>10.0} {:>8.0} {:>10.0} {:>11.0} {:>9.0} {:>6.2} {:>6.0} {:>8}",
         cost.recall,
+        cost.coded_recall,
         cost.bytes,
+        cost.search_bytes,
+        cost.rescore_bytes,
         cost.iops,
         cost.requests,
         cost.micros,
+        cost.latency_micros,
+        cost.search_micros,
+        cost.rescore_micros,
         cost.cpu_micros,
         cost.hit_ratio,
         cost.loads,
@@ -698,6 +901,15 @@ async fn main() {
     let warmup = env_usize("WARMUP", num_queries).min(num_queries);
     let concurrency = env_usize("CONCURRENCY", 1).max(1);
     let resident_edges = env_usize("RESIDENT_EDGES", 0) != 0;
+    // A pass charges its later rows more than its earlier ones - one and the
+    // same reference point cost 1812 us after two vamana rows and 2028 after
+    // thirty-two - so `both` reads the reference at each end and brackets the
+    // crate's rows between two readings of it.
+    let reference_position = std::env::var("REFERENCE_POSITION").unwrap_or_else(|_| "last".into());
+    assert!(
+        matches!(reference_position.as_str(), "last" | "both"),
+        "REFERENCE_POSITION is `last` or `both`, not {reference_position:?}"
+    );
 
     let vectors = FixedSizeListArray::try_new_from_values(
         Float32Array::from(base[..rows * dim].to_vec()),
@@ -710,7 +922,8 @@ async fn main() {
 
     println!(
         "{prefix} {rows} x {dim}, R = {degree}, {code_bits} code bits, {num_queries} queries, \
-         k = {K}, cache {} MB, {concurrency} in flight, walk edges {}",
+         k = {K}, cache {} MB, {concurrency} in flight, walk edges {}, reference \
+         measured {reference_position}",
         cache_bytes >> 20,
         if resident_edges {
             "resident"
@@ -839,14 +1052,21 @@ async fn main() {
     };
 
     println!(
-        "\n{:<16} {:>6} {:>8} {:>12} {:>8} {:>9} {:>10} {:>9} {:>7} {:>6} {:>8}",
+        "\n{:<22} {:>6} {:>8} {:>8} {:>12} {:>11} {:>11} {:>8} {:>9} {:>10} {:>8} {:>10} \
+         {:>11} {:>9} {:>6} {:>6} {:>8}",
         "arm",
         if budgets.is_empty() { "width" } else { "queue" },
         "recall",
+        "coded",
         "bytes",
+        "search B",
+        "rescore B",
         "iops",
         "requests",
         "us (warm)",
+        "lat us",
+        "search us",
+        "rescore us",
         "cpu us",
         "hits",
         "loads",
@@ -856,6 +1076,21 @@ async fn main() {
     // Which of the two knobs moves along a curve is the whole difference
     // between the two sweeps, so it is decided once, here, rather than inside
     // the loop that measures.
+    // Which of this crate's arms the pass measures. Both by default, because
+    // the scan is what the walk has to beat and dropping it silently would make
+    // every earlier log a different measurement; a campaign that has already
+    // settled that question can ask for the walk alone.
+    let arms = std::env::var("ARMS")
+        .unwrap_or_else(|_| "scan,walk".to_string())
+        .split(',')
+        .map(|arm| match arm.trim() {
+            "scan" => (WalkMode::Flat, "scan"),
+            "walk" => (WalkMode::Lazy, "walk"),
+            other => panic!("ARMS names `scan` and `walk`, not {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert!(!arms.is_empty(), "ARMS must name at least one arm");
+
     let curves: Vec<Curve> = if budgets.is_empty() {
         list_scales
             .iter()
@@ -891,9 +1126,13 @@ async fn main() {
             .collect()
     };
 
-    let mut sweeps: Vec<(String, Vec<(usize, Cost)>)> = Vec::with_capacity(curves.len() * 2 + 1);
+    let mut sweeps: Vec<(String, Vec<(usize, Cost)>)> = Vec::with_capacity(curves.len() * 2 + 2);
+    if reference_position == "both" {
+        let points = reference_sweep(&rq_uri, &rq_fixture, &widths, "IVF_RQ early").await;
+        sweeps.push(("IVF_RQ early".to_string(), points));
+    }
     for curve in &curves {
-        for (mode, name) in [(WalkMode::Flat, "scan"), (WalkMode::Lazy, "walk")] {
+        for (mode, name) in arms.iter().copied() {
             let label = format!("vamana {name}{}", curve.suffix);
             let mut measured = Vec::with_capacity(curve.points.len());
             for point in &curve.points {
@@ -913,26 +1152,46 @@ async fn main() {
         }
     }
 
-    let mut rq_points = Vec::with_capacity(widths.len());
-    for width in &widths {
-        let cost = measure_rq(&rq_uri, &rq_fixture, Some((width / K) as u32)).await;
-        report("IVF_RQ refined", *width, &cost);
-        rq_points.push((*width, cost));
-    }
+    let rq_points = reference_sweep(&rq_uri, &rq_fixture, &widths, "IVF_RQ refined").await;
     sweeps.push(("IVF_RQ refined".to_string(), rq_points));
 
-    let bare = measure_rq(&rq_uri, &rq_fixture, None).await;
-    report("IVF_RQ default", K, &bare);
     let (plan_micros, plan_cpu) = measure_rq_plan(&rq_uri, &rq_fixture, Some(1)).await;
     println!(
-        "{:<16} {:>6} {:>8} {:>12} {:>8} {:>9} {:>10.0} {:>9.0}",
-        "IVF_RQ plan only", "-", "-", "-", "-", "-", plan_micros, plan_cpu
+        "{:<22} {:>6} {:>8} {:>8} {:>12} {:>11} {:>11} {:>8} {:>9} {:>10.0} {:>8} {:>10} \
+         {:>11} {:>9.0}",
+        "IVF_RQ plan only",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        plan_micros,
+        "-",
+        "-",
+        "-",
+        plan_cpu
     );
 
     println!("\nat recall {target:.2}, interpolated between the widths either side of it");
     println!(
-        "{:<16} {:>12} {:>8} {:>9} {:>10} {:>9} {:>10}",
-        "arm", "bytes", "iops", "requests", "us (warm)", "cpu us", "vs IVF_RQ"
+        "{:<22} {:>8} {:>12} {:>11} {:>11} {:>8} {:>9} {:>10} {:>8} {:>10} {:>11} {:>9} \
+         {:>10}",
+        "arm",
+        "coded",
+        "bytes",
+        "search B",
+        "rescore B",
+        "iops",
+        "requests",
+        "us (warm)",
+        "lat us",
+        "search us",
+        "rescore us",
+        "cpu us",
+        "vs IVF_RQ"
     );
     let reference = sweeps
         .iter()
@@ -942,18 +1201,25 @@ async fn main() {
     for (label, points) in &sweeps {
         match at_recall(points, target) {
             None => println!(
-                "{label:<16} never reaches {target:.2} on this grid (best {:.4})",
+                "{label:<22} never reaches {target:.2} on this grid (best {:.4})",
                 points
                     .iter()
                     .map(|(_, cost)| cost.recall)
                     .fold(0.0, f64::max)
             ),
             Some((cost, bracketed)) => println!(
-                "{label:<16} {:>12.0} {:>8.0} {:>9.1} {:>10.0} {:>9.0} {:>10}{}",
+                "{label:<22} {:>8.4} {:>12.0} {:>11.0} {:>11.0} {:>8.0} {:>9.1} {:>10.0} \
+                 {:>8.0} {:>10.0} {:>11.0} {:>9.0} {:>10}{}",
+                cost.coded_recall,
                 cost.bytes,
+                cost.search_bytes,
+                cost.rescore_bytes,
                 cost.iops,
                 cost.requests,
                 cost.micros,
+                cost.latency_micros,
+                cost.search_micros,
+                cost.rescore_micros,
                 cost.cpu_micros,
                 match reference {
                     Some(reference) => format!("{:.2}x", cost.bytes / reference.bytes),
