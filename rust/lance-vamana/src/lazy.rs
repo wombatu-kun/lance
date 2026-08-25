@@ -77,6 +77,7 @@ use lance_core::{Error, Result};
 use lance_index::vector::bq::storage::RabitQuantizationStorage;
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::storage::{DistCalculator, VectorStore};
+use lance_io::scheduler::IoStats;
 use lance_linalg::distance::DistanceType;
 
 use crate::format::{NEIGHBORS_COLUMN, VECTOR_COLUMN};
@@ -376,12 +377,17 @@ impl LazyProbe<'_> {
 /// The distances it measures are counted by the caller rather than here. A
 /// `&Comparisons` held across the awaits below would make this future `!Send` -
 /// the counter is a `Cell` - and the caller has the length in hand anyway.
+/// `stats` is where the strides this reads are counted. They are the whole
+/// point of the split: a query arrives at its candidates by code and then pays
+/// for them here, and how much of a query is which is not answerable from one
+/// running total.
 pub(crate) async fn rescore(
     file: &PartitionFile,
     dimension: u32,
     distance_type: DistanceType,
     candidates: &[Candidate],
     query: ArrayRef,
+    stats: &IoStats,
 ) -> Result<Vec<Neighbor>> {
     let ids = candidates
         .iter()
@@ -391,7 +397,7 @@ pub(crate) async fn rescore(
         .iter()
         .map(|candidate| candidate.row_addr)
         .collect::<Vec<_>>();
-    let vectors = file.project(&[VECTOR_COLUMN]).await?;
+    let vectors = file.project_into(&[VECTOR_COLUMN], stats).await?;
     let batch = read_scattered(&vectors, &ids).await?;
     let values = vectors_of(&batch, dimension)?;
     let store = flat_storage(&row_addrs, &values, distance_type)?;

@@ -291,19 +291,29 @@ async fn a_lazy_walk_answers_only_live_rows() {
 
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
     let live = common::live_row_ids(&dataset).await;
+    // The answer before the re-score is held to the same rule, and has to be:
+    // it is built from the candidate list, which is where dead vertices are
+    // still walked - they carry the edges that keep the graph connected - so
+    // nothing upstream of the two answers has dropped them yet.
+    let params = search(WalkMode::Lazy).with_report_coded(true);
     for query in random_vectors(8, 77) {
-        let result = index.search(&query, &search(WalkMode::Lazy)).await.unwrap();
-        assert_eq!(
-            result.neighbors.len(),
-            K,
-            "fewer than k live rows came back"
-        );
-        for neighbor in &result.neighbors {
-            assert!(
-                live.contains(&neighbor.row_addr),
-                "row {} was deleted and came back anyway",
-                neighbor.row_addr
+        let result = index.search(&query, &params).await.unwrap();
+        for (what, neighbors) in [
+            ("the answer", &result.neighbors),
+            ("the coded answer", &result.coded_neighbors),
+        ] {
+            assert_eq!(
+                neighbors.len(),
+                K,
+                "{what}: fewer than k live rows came back"
             );
+            for neighbor in neighbors {
+                assert!(
+                    live.contains(&neighbor.row_addr),
+                    "{what}: row {} was deleted and came back anyway",
+                    neighbor.row_addr
+                );
+            }
         }
     }
 }
@@ -1267,5 +1277,220 @@ async fn holding_the_edges_costs_exactly_the_edge_column() {
         "holding the edges cost {} bytes where the column is {}",
         with.size_bytes - without.size_bytes,
         edge_column_bytes()
+    );
+}
+
+/// Sum the two halves of a run of queries, so that a phase split can be held
+/// against what the scheduler counted for the same run.
+fn phases(answers: &[QueryResult]) -> (u64, u64, u64, u64) {
+    answers
+        .iter()
+        .fold((0, 0, 0, 0), |(sb, sr, rb, rr), answer| {
+            (
+                sb + answer.search.bytes_read,
+                sr + answer.search.requests,
+                rb + answer.rescore.bytes_read,
+                rr + answer.rescore.requests,
+            )
+        })
+}
+
+/// Every byte a query reads belongs to exactly one of its two phases.
+///
+/// The two counts come from different places and must agree exactly: one is the
+/// index's own scheduler over the whole run, the other is a sink each query
+/// attached to the files it opened. A read the split does not see - a footer, a
+/// projection built off the wrong handle, a path that opens a file of its own -
+/// is invisible in every other column of every measurement this crate takes, and
+/// shows up here as an inequality.
+///
+/// Both with a cache and without, because the two read different things: an
+/// uncached query re-reads the codes of every partition it probes, a cached one
+/// re-reads none of them, and only the second is the state a measurement is
+/// taken in.
+#[tokio::test]
+async fn the_phases_of_a_query_add_up_to_what_it_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let queries = random_vectors(QUERIES, 4242);
+    let params = search(WalkMode::Lazy)
+        .with_rescore_budget(K)
+        .with_report_coded(true);
+
+    let bare = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let (answers, cost) = replay(&bare, &queries, &params).await;
+    let (search_bytes, _, rescore_bytes, _) = phases(&answers);
+    assert_eq!(
+        search_bytes + rescore_bytes,
+        (cost.bytes * queries.len() as f64) as u64,
+        "an uncached run read {} bytes but accounts for {} + {}",
+        cost.bytes * queries.len() as f64,
+        search_bytes,
+        rescore_bytes
+    );
+
+    let warm = cached(&dataset, BUDGET).await;
+    replay(&warm, &queries, &params).await;
+    let (answers, cost) = replay(&warm, &queries, &params).await;
+    let (search_bytes, _, rescore_bytes, _) = phases(&answers);
+    assert_eq!(
+        search_bytes + rescore_bytes,
+        (cost.bytes * queries.len() as f64) as u64,
+        "a cached run read {} bytes but accounts for {} + {}",
+        cost.bytes * queries.len() as f64,
+        search_bytes,
+        rescore_bytes
+    );
+    // The direction, not just the sum: a split that credited everything to one
+    // phase would satisfy the equality above and say nothing.
+    assert!(
+        rescore_bytes > 0,
+        "a cached run re-scored {} candidates a query and read nothing to do it",
+        K
+    );
+
+    // The same question of the clocks, and the only form of it that is not a
+    // flaky one: the two phases are disjoint stretches of one call, so together
+    // they cannot outlast the call. A second phase timed from the start of the
+    // first would double-count and break this by a factor of nearly two, while
+    // no amount of scheduler noise can.
+    let started = std::time::Instant::now();
+    let answer = warm.search(&queries[0], &params).await.unwrap();
+    let whole = started.elapsed();
+    assert!(
+        answer.search.elapsed + answer.rescore.elapsed <= whole,
+        "the phases of one query took {:?} and {:?}, which is more than the {:?} the call took",
+        answer.search.elapsed,
+        answer.rescore.elapsed,
+        whole
+    );
+}
+
+/// With the codes and the edges resident, a walk reads nothing at all until it
+/// re-scores - and what it then reads is set by the budget rather than by the
+/// queue.
+///
+/// This is the claim every byte figure this crate quotes rests on, and it is the
+/// one the split exists to make checkable. The arm with the edges on disk is
+/// measured beside it because the equality of the two answers is what says the
+/// difference between them is a read and not a different walk.
+#[tokio::test]
+async fn a_walk_that_holds_its_edges_reads_nothing_until_it_re_scores() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let queries = random_vectors(QUERIES, 909);
+    let fetching = search(WalkMode::Lazy).with_rescore_budget(K);
+    let holding = fetching.clone().with_resident_edges(true);
+
+    let index = cached(&dataset, BUDGET).await;
+    replay(&index, &queries, &holding).await;
+    let (held, _) = replay(&index, &queries, &holding).await;
+    let (search_bytes, search_requests, rescore_bytes, _) = phases(&held);
+    assert_eq!(
+        (search_bytes, search_requests),
+        (0, 0),
+        "a warm walk holding its edges still read {search_bytes} bytes in \
+         {search_requests} requests before re-scoring"
+    );
+    assert!(rescore_bytes > 0, "the run re-scored nothing");
+
+    let index = cached(&dataset, BUDGET).await;
+    replay(&index, &queries, &fetching).await;
+    let (fetched, _) = replay(&index, &queries, &fetching).await;
+    let (fetched_search, fetched_requests, fetched_rescore, _) = phases(&fetched);
+    assert!(
+        fetched_search > 0 && fetched_requests > 0,
+        "a warm walk fetching its edges read {fetched_search} bytes in {fetched_requests} \
+         requests, so the two arms are not different reads at all"
+    );
+
+    assert_same(&held, &fetched, "resident edges");
+    assert_eq!(
+        rescore_bytes, fetched_rescore,
+        "the same candidates cost {rescore_bytes} bytes to correct one way and \
+         {fetched_rescore} the other, so the split is charging the edges to the re-score"
+    );
+}
+
+/// The answer before the vectors were read is a different answer, and asking for
+/// it changes nothing about the one the query returns.
+///
+/// Recall cannot make this case: a coded ordering and an exact one over the same
+/// candidates differ by a permutation that recall is nearly blind to, and a
+/// `coded_neighbors` that quietly held the *rescored* answer would score exactly
+/// the same. So the claim is set inequality on a seeded fixture, pinned beside
+/// the two ways it can come back empty.
+#[tokio::test]
+async fn the_coded_answer_is_the_answer_before_the_vectors_were_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri).await;
+    let queries = random_vectors(QUERIES, 31337);
+    let asked = search(WalkMode::Lazy)
+        .with_rescore_budget(K * 4)
+        .with_report_coded(true);
+    let index = cached(&dataset, BUDGET).await;
+    replay(&index, &queries, &asked).await;
+    let (answers, _) = replay(&index, &queries, &asked).await;
+
+    let mut differed = 0;
+    for answer in &answers {
+        assert_eq!(
+            answer.coded_neighbors.len(),
+            K,
+            "a coded answer came back {} long",
+            answer.coded_neighbors.len()
+        );
+        let mut rows = answer
+            .coded_neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_addr)
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        let before = rows.len();
+        rows.dedup();
+        assert_eq!(before, rows.len(), "a coded answer returned a row twice");
+
+        let mut exact = answer
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_addr)
+            .collect::<Vec<_>>();
+        exact.sort_unstable();
+        if rows != exact {
+            differed += 1;
+        }
+    }
+    assert!(
+        differed > 0,
+        "not one of {QUERIES} queries changed its answer when its candidates were measured \
+         exactly, so the coded answer is the exact one under another name"
+    );
+
+    // Not asked for, and asked for by a mode that has no second half.
+    let (unasked, _) = replay(&index, &queries, &search(WalkMode::Lazy)).await;
+    assert!(
+        unasked
+            .iter()
+            .all(|answer| answer.coded_neighbors.is_empty()),
+        "a query that did not ask for a coded answer was given one"
+    );
+    let (whole, _) = replay(
+        &index,
+        &queries,
+        &search(WalkMode::Coded).with_report_coded(true),
+    )
+    .await;
+    assert!(
+        whole.iter().all(|answer| answer.coded_neighbors.is_empty()),
+        "a mode that holds every vector reported an answer from before a re-score it never makes"
+    );
+    assert!(
+        whole
+            .iter()
+            .all(|answer| answer.rescore == Default::default()),
+        "a mode that never re-scores reported a re-score cost"
     );
 }
