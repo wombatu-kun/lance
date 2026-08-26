@@ -20,7 +20,15 @@
 //! (default 95), `WARMUP` (default: every query), `RESIDENT_EDGES` (default
 //! 0), `REFERENCE_POSITION` (`last` or `both`, default `last`), `ARMS`
 //! (`scan`, `walk` or both, default both), `DATASET_DIR` (unset: temporary
-//! directories thrown away at the end).
+//! directories thrown away at the end), `HNSW_EFS` (unset: no HNSW arm),
+//! `HNSW_NPROBES` (default 1) and `HNSW_URI` (default: the `-p1-hnswsq.lance`
+//! directory beside the others).
+//!
+//! `HNSW_EFS` adds Lance's other graph index, `IVF_HNSW_SQ`, as a third arm,
+//! one width sweep per `ef`. It is measured through exactly the code that
+//! measures `IVF_RQ`, phases included, because the two differ only in which
+//! index the same scanner reaches; this example never builds it, so the
+//! directory has to exist already (`examples/hnsw_index.rs` writes it).
 //!
 //! Every earlier sweep in this crate compares the walk against a scan *this
 //! crate* wrote. That scan is the walk's own parts with the graph switched off,
@@ -374,6 +382,11 @@ struct Fixture<'a> {
     /// a hop at a time. Reaches the `Flat` arm too and is ignored there, which
     /// is what makes the pass a comparison rather than two.
     resident_edges: bool,
+    /// The search width of a Lance index that walks a graph, `None` for one
+    /// that does not. It is the same knob this crate calls the queue, and
+    /// leaving it unset on `IVF_HNSW_*` would measure Lance's default, not the
+    /// point being compared.
+    ef: Option<usize>,
 }
 
 /// This crate's own arms, both with one pooled budget of exact distances:
@@ -395,6 +408,9 @@ async fn measure_vamana(
         warmup,
         concurrency,
         resident_edges,
+        // This arm carries its own queue as `list_size`; `ef` is the same knob
+        // spelled the way Lance spells it, and only its arms read it.
+        ef: _,
     } = *fixture;
     let params = SearchParams::new(K)
         .with_nprobes(nprobes)
@@ -559,6 +575,7 @@ fn rq_scanner(
     dataset: &Dataset,
     query: &[f32],
     nprobes: usize,
+    ef: Option<usize>,
     refine: Option<u32>,
     callback: Option<ExecutionStatsCallback>,
 ) -> Scanner {
@@ -567,6 +584,9 @@ fn rq_scanner(
     scanner.empty_project().unwrap();
     scanner.nearest(VECTOR_FIELD, &key, K).unwrap();
     scanner.nprobes(nprobes);
+    if let Some(ef) = ef {
+        scanner.ef(ef);
+    }
     scanner.fast_search();
     if let Some(factor) = refine {
         scanner.refine(factor);
@@ -582,10 +602,11 @@ async fn rq_neighbors(
     dataset: &Dataset,
     query: &[f32],
     nprobes: usize,
+    ef: Option<usize>,
     refine: Option<u32>,
     callback: Option<ExecutionStatsCallback>,
 ) -> Vec<u64> {
-    let batch = rq_scanner(dataset, query, nprobes, refine, callback)
+    let batch = rq_scanner(dataset, query, nprobes, ef, refine, callback)
         .try_into_batch()
         .await
         .unwrap();
@@ -599,6 +620,7 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
         truth,
         positions,
         nprobes,
+        ef,
         cache_bytes,
         warmup,
         concurrency,
@@ -610,7 +632,7 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
         .await
         .unwrap();
     for query in queries.iter().take(warmup) {
-        rq_neighbors(&dataset, query, nprobes, refine, None).await;
+        rq_neighbors(&dataset, query, nprobes, ef, refine, None).await;
     }
 
     let counts = Arc::new(Mutex::new(Counts::default()));
@@ -636,7 +658,7 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
             tokio::spawn(async move {
                 let call = Instant::now();
                 let addresses =
-                    rq_neighbors(&dataset, &query, nprobes, refine, Some(callback)).await;
+                    rq_neighbors(&dataset, &query, nprobes, ef, refine, Some(callback)).await;
                 let latency = call.elapsed().as_micros() as f64;
                 let found = addresses
                     .iter()
@@ -697,6 +719,7 @@ async fn measure_rq_plan(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) 
     let Fixture {
         queries,
         nprobes,
+        ef,
         cache_bytes,
         warmup,
         concurrency,
@@ -708,7 +731,7 @@ async fn measure_rq_plan(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) 
         .await
         .unwrap();
     for query in queries.iter().take(warmup) {
-        rq_scanner(&dataset, query, nprobes, refine, None)
+        rq_scanner(&dataset, query, nprobes, ef, refine, None)
             .create_plan()
             .await
             .unwrap();
@@ -721,7 +744,7 @@ async fn measure_rq_plan(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) 
             let dataset = dataset.clone();
             let query = query.clone();
             tokio::spawn(async move {
-                rq_scanner(&dataset, &query, nprobes, refine, None)
+                rq_scanner(&dataset, &query, nprobes, ef, refine, None)
                     .create_plan()
                     .await
                     .unwrap();
@@ -869,6 +892,8 @@ async fn main() {
     let rq_nprobes = env_usize("RQ_NPROBES", nprobes);
     let degree = env_usize("DEGREE", 64) as u32;
     let code_bits = env_usize("CODE_BITS", 3) as u8;
+    let hnsw_efs = env_list_opt("HNSW_EFS");
+    let hnsw_nprobes = env_usize("HNSW_NPROBES", 1);
     let widths = env_list("WIDTHS", "10,20,30,40,60,80,120,160");
     assert!(
         widths.iter().all(|width| width % K == 0),
@@ -966,6 +991,8 @@ async fn main() {
     let vamana_uri =
         format!("{home}/{prefix}-{rows}-p{vamana_partitions}-r{degree}-c{code_bits}.lance");
     let rq_uri = format!("{home}/{prefix}-{rows}-p{rq_partitions}-rq{code_bits}.lance");
+    let hnsw_uri = std::env::var("HNSW_URI")
+        .unwrap_or_else(|_| format!("{home}/{prefix}-{rows}-p1-hnswsq.lance"));
 
     let vamana_dataset = if std::fs::metadata(&vamana_uri).is_ok() {
         let dataset = Dataset::open(&vamana_uri).await.unwrap();
@@ -1035,6 +1062,20 @@ async fn main() {
 
     let vamana_positions = Arc::new(positions_by_address(&vamana_dataset).await);
     let rq_positions = Arc::new(positions_by_address(&Dataset::open(&rq_uri).await.unwrap()).await);
+    let hnsw_positions = match hnsw_efs.is_empty() {
+        true => Arc::new(HashMap::new()),
+        false => {
+            assert!(
+                std::fs::metadata(&hnsw_uri).is_ok(),
+                "HNSW_EFS asked for the HNSW arm but {hnsw_uri} does not exist: build it with \
+                 the hnsw_index example"
+            );
+            let dataset = Dataset::open(&hnsw_uri).await.unwrap();
+            assert_eq!(dataset.count_rows(None).await.unwrap(), rows);
+            println!("reusing the HNSW index at {hnsw_uri}");
+            Arc::new(positions_by_address(&dataset).await)
+        }
+    };
     let vamana_fixture = Fixture {
         queries: &queries,
         truth: &truth,
@@ -1044,6 +1085,7 @@ async fn main() {
         warmup,
         concurrency,
         resident_edges,
+        ef: None,
     };
     let rq_fixture = Fixture {
         positions: &rq_positions,
@@ -1150,6 +1192,18 @@ async fn main() {
             }
             sweeps.push((label, measured));
         }
+    }
+
+    for ef in &hnsw_efs {
+        let fixture = Fixture {
+            positions: &hnsw_positions,
+            nprobes: hnsw_nprobes,
+            ef: Some(*ef),
+            ..vamana_fixture
+        };
+        let label = format!("HNSW ef={ef}");
+        let points = reference_sweep(&hnsw_uri, &fixture, &widths, &label).await;
+        sweeps.push((label, points));
     }
 
     let rq_points = reference_sweep(&rq_uri, &rq_fixture, &widths, "IVF_RQ refined").await;
