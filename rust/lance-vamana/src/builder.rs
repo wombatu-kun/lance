@@ -39,7 +39,7 @@ use rand::rngs::SmallRng;
 use uuid::Uuid;
 
 use crate::build::{BuildParams, build_partition};
-use crate::codes::CodeParams;
+use crate::codes::{CodeParams, CodeSpec};
 use crate::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
 use crate::io::{SegmentWriter, partitions_in_flight};
 use crate::partition::Partition;
@@ -109,9 +109,13 @@ pub struct IndexParams {
     /// will steer by, and the measured working point is **three** - see
     /// [`crate::codes`].
     ///
-    /// Refused, not ignored, when the dimension is not a multiple of eight,
-    /// which is what RaBitQ packs a bit a dimension into.
-    pub code_bits: Option<u8>,
+    /// RaBitQ is refused, not ignored, when the dimension is not a multiple of
+    /// eight, which is what it packs a bit a dimension into. Scalar codes carry
+    /// four times the bytes and are not a working point at all: they are here so
+    /// that a walk can be given the same representation Lance's own
+    /// `IVF_HNSW_SQ` steers by, which leaves the graph as the only difference
+    /// between the two.
+    pub codes: Option<CodeSpec>,
 }
 
 impl IndexParams {
@@ -123,7 +127,7 @@ impl IndexParams {
             graph: BuildParams::default(),
             kmeans_max_iters: 50,
             kmeans_sample_rate: 256,
-            code_bits: None,
+            codes: None,
         }
     }
 
@@ -147,8 +151,8 @@ impl IndexParams {
         self
     }
 
-    pub fn with_code_bits(mut self, code_bits: u8) -> Self {
-        self.code_bits = Some(code_bits);
+    pub fn with_codes(mut self, codes: CodeSpec) -> Self {
+        self.codes = Some(codes);
         self
     }
 }
@@ -309,8 +313,8 @@ pub(crate) struct Inherited {
     pub router: IvfModel,
     /// The base's codes, rotation and all.
     ///
-    /// Taken from here and never from [`IndexParams::code_bits`], which is a
-    /// request for a *fresh* rotation and is therefore not a thing a segment
+    /// Taken from here and never from [`IndexParams::codes`], which is a request
+    /// for freshly minted parameters and is therefore not a thing a segment
     /// joining an index may act on.
     pub codes: Option<CodeParams>,
 }
@@ -443,7 +447,7 @@ pub async fn build_segment(
 /// [`build_segment`], taking the routing and the codes from an index this
 /// segment is joining rather than choosing its own.
 ///
-/// `params.num_partitions`, the two k-means knobs and `params.code_bits` are
+/// `params.num_partitions`, the two k-means knobs and `params.codes` are
 /// then unused: how many buckets there are is a property of the model, and both
 /// the model and the rotation belong to the index rather than to this segment.
 pub(crate) async fn build_segment_inheriting(
@@ -552,19 +556,14 @@ pub(crate) async fn build_segment_inheriting(
             vectors.value_length()
         ))
     })?;
-    // A fresh rotation is minted only for an index that has none yet, and it is
+    // Code parameters are minted only for an index that has none yet, and are
     // then inherited by every segment that index ever grows: a partition copied
     // between two of them carries its codes unchanged, and a code says nothing
-    // about the rotation it was built under.
-    let (router, codes) = match inherited {
-        Some(Inherited { router, codes }) => (Some(router), codes),
-        None => (
-            None,
-            params
-                .code_bits
-                .map(|num_bits| CodeParams::mint(num_bits, dimension))
-                .transpose()?,
-        ),
+    // about the rotation or the bounds it was built under. An inherited segment
+    // therefore ignores what this call asked for.
+    let (router, inherited_codes, spec) = match inherited {
+        Some(Inherited { router, codes }) => (Some(router), codes, None),
+        None => (None, None, params.codes),
     };
 
     // Everything from here to the last partition is arithmetic, and it runs on
@@ -610,6 +609,16 @@ pub(crate) async fn build_segment_inheriting(
             Ok::<_, Error>((vectors, ivf, assignment))
         })
         .await?
+    };
+
+    // Minted here rather than beside the router, because scalar bounds have to
+    // be taken in the space the codes are built in: cosine is stored and routed
+    // as L2 over unit vectors, and the normalisation that produces them happens
+    // just above. RaBitQ takes only the dimension and would not have noticed.
+    let codes = match (inherited_codes, spec) {
+        (Some(inherited), _) => Some(inherited),
+        (None, Some(spec)) => Some(spec.mint(dimension, &vectors)?),
+        (None, None) => None,
     };
 
     let metadata = IndexMetadata {

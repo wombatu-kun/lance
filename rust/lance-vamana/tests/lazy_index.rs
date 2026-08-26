@@ -29,7 +29,7 @@ use lance::Dataset;
 use lance_core::cache::LanceCache;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
-use lance_vamana::codes::CodeParams;
+use lance_vamana::codes::{CodeParams, CodeSpec};
 use lance_vamana::query::{QueryResult, SearchParams, VamanaIndex, WalkMode};
 
 mod common;
@@ -53,19 +53,27 @@ fn fixture() -> DatasetFixture {
     }
 }
 
-fn params() -> IndexParams {
+/// The two kinds a segment can carry. Scalar codes are here for one reason: the
+/// resident half of a lazy walk holds whichever store the segment's codes need,
+/// and that is a different type for each kind.
+const RABIT: CodeSpec = CodeSpec::Rabit {
+    num_bits: CODE_BITS,
+};
+const SCALAR: CodeSpec = CodeSpec::Scalar { num_bits: 8 };
+
+fn params(codes: CodeSpec) -> IndexParams {
     IndexParams::new(VECTOR_COLUMN, PARTITIONS)
         .with_graph_params(BuildParams {
             max_degree: MAX_DEGREE,
             search_list_size: 64,
             ..Default::default()
         })
-        .with_code_bits(CODE_BITS)
+        .with_codes(codes)
 }
 
-async fn coded_dataset(uri: &str) -> Dataset {
+async fn coded_dataset(uri: &str, codes: CodeSpec) -> Dataset {
     let mut dataset = fixture().write(uri).await;
-    create_index(&mut dataset, INDEX_NAME, &params())
+    create_index(&mut dataset, INDEX_NAME, &params(codes))
         .await
         .unwrap();
     dataset
@@ -134,11 +142,10 @@ async fn measure(
 /// read at the wrong offset, a distance credited to the wrong row, a candidate
 /// list re-scored only as far as `k`) all show up here as an inequality rather
 /// than as a slightly worse recall that could be blamed on the codes.
-#[tokio::test]
-async fn a_hop_of_one_vertex_is_the_coded_walk_exactly() {
+async fn a_hop_of_one_vertex_is_the_coded_walk_exactly(codes: CodeSpec) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, codes).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
     let narrow = search(WalkMode::Lazy).with_beam_width(1);
@@ -161,6 +168,22 @@ async fn a_hop_of_one_vertex_is_the_coded_walk_exactly() {
     }
 }
 
+#[tokio::test]
+async fn a_rabit_hop_of_one_vertex_is_the_coded_walk_exactly() {
+    a_hop_of_one_vertex_is_the_coded_walk_exactly(RABIT).await;
+}
+
+/// The same equality over scalar codes.
+///
+/// Worth its own case rather than trusting the RaBitQ one: the resident half of
+/// a lazy walk holds a different store for each kind, and the query it is handed
+/// carries a term one kind wants and the other ignores. Both walks reading the
+/// same codes by two routes is exactly what this equality pins.
+#[tokio::test]
+async fn a_scalar_hop_of_one_vertex_is_the_coded_walk_exactly() {
+    a_hop_of_one_vertex_is_the_coded_walk_exactly(SCALAR).await;
+}
+
 /// What the mode is for: the same answer off a fraction of the bytes.
 ///
 /// The saving is bounded from below by what stays resident, which at this
@@ -172,7 +195,7 @@ async fn a_hop_of_one_vertex_is_the_coded_walk_exactly() {
 async fn a_lazy_walk_reads_a_fraction_of_the_partition() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 4242);
     let truth = ground_truth(&dataset, &queries).await;
 
@@ -237,7 +260,7 @@ async fn a_lazy_walk_reads_a_fraction_of_the_partition() {
 async fn a_wider_hop_trades_distances_for_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 909);
     let truth = ground_truth(&dataset, &queries).await;
 
@@ -283,7 +306,7 @@ async fn a_wider_hop_trades_distances_for_round_trips() {
 async fn a_lazy_walk_answers_only_live_rows() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut dataset = coded_dataset(uri).await;
+    let mut dataset = coded_dataset(uri, RABIT).await;
     dataset
         .delete("vec IS NOT NULL AND _rowid % 3 = 0")
         .await
@@ -323,7 +346,7 @@ async fn a_lazy_walk_answers_only_live_rows() {
 async fn a_lazy_walk_refuses_what_it_cannot_do() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
     let query = &random_vectors(1, 1)[0];
 
@@ -337,8 +360,8 @@ async fn a_lazy_walk_refuses_what_it_cannot_do() {
     let plain = tempfile::tempdir().unwrap();
     let plain_uri = plain.path().to_str().unwrap();
     let mut uncoded = fixture().write(plain_uri).await;
-    let mut without = params();
-    without.code_bits = None;
+    let mut without = params(RABIT);
+    without.codes = None;
     create_index(&mut uncoded, INDEX_NAME, &without)
         .await
         .unwrap();
@@ -400,7 +423,9 @@ async fn a_walk_that_reaches_everything_still_answers() {
                 search_list_size: 16,
                 ..Default::default()
             })
-            .with_code_bits(CODE_BITS),
+            .with_codes(CodeSpec::Rabit {
+                num_bits: CODE_BITS,
+            }),
     )
     .await
     .unwrap();
@@ -442,7 +467,7 @@ async fn a_walk_that_reaches_everything_still_answers() {
 async fn a_flat_scan_that_keeps_everything_is_brute_force() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
     let rows = fixture().indexed_rows();
@@ -508,7 +533,7 @@ async fn a_flat_scan_that_keeps_everything_is_brute_force() {
 async fn a_flat_scan_over_two_segments_is_brute_force() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    coded_dataset(uri).await;
+    coded_dataset(uri, RABIT).await;
     fixture().append(uri).await;
     let mut dataset = Dataset::open(uri).await.unwrap();
     lance_vamana::insert_as_segment(&mut dataset, INDEX_NAME)
@@ -560,7 +585,7 @@ async fn a_flat_scan_over_two_segments_is_brute_force() {
 async fn a_flat_scan_reads_no_edges() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 8888);
     let truth = ground_truth(&dataset, &queries).await;
 
@@ -615,7 +640,7 @@ async fn a_flat_scan_reads_no_edges() {
 async fn a_budget_wider_than_the_candidates_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
     let rows = fixture().indexed_rows();
 
@@ -660,7 +685,7 @@ async fn a_budget_wider_than_the_candidates_changes_nothing() {
 async fn a_budget_spends_the_strides_where_they_are_worth_most() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
     let rows = fixture().indexed_rows();
 
@@ -734,7 +759,7 @@ async fn a_budget_spends_the_strides_where_they_are_worth_most() {
 async fn a_lazy_walk_answers_across_segments() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    coded_dataset(uri).await;
+    coded_dataset(uri, RABIT).await;
     fixture().append(uri).await;
     let mut dataset = Dataset::open(uri).await.unwrap();
     lance_vamana::insert_as_segment(&mut dataset, INDEX_NAME)
@@ -845,7 +870,7 @@ async fn cached(dataset: &Dataset, budget: usize) -> VamanaIndex {
 async fn a_cache_does_not_change_an_answer() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 606);
 
     for mode in [WalkMode::Exact, WalkMode::Coded, WalkMode::Lazy] {
@@ -884,7 +909,7 @@ async fn a_cache_does_not_change_an_answer() {
 async fn a_cache_removes_the_read_the_walk_does_not_choose() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 4242);
     let params = search(WalkMode::Lazy);
 
@@ -945,7 +970,7 @@ fn edge_column_bytes() -> usize {
 
 fn code_column_bytes() -> usize {
     let dimension = VECTOR_DIM as u32;
-    let stride = CodeParams::mint(CODE_BITS, dimension)
+    let stride = CodeParams::rabit(CODE_BITS, dimension)
         .unwrap()
         .stride(dimension)
         .unwrap() as usize;
@@ -966,7 +991,7 @@ fn code_column_bytes() -> usize {
 async fn two_segments_do_not_share_a_cache_entry() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    coded_dataset(uri).await;
+    coded_dataset(uri, RABIT).await;
     fixture().append(uri).await;
     let mut dataset = Dataset::open(uri).await.unwrap();
     lance_vamana::insert_as_segment(&mut dataset, INDEX_NAME)
@@ -1014,7 +1039,7 @@ async fn two_segments_do_not_share_a_cache_entry() {
 async fn a_budget_too_small_for_a_partition_still_answers() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(16, 31337);
     let params = search(WalkMode::Lazy);
 
@@ -1054,7 +1079,7 @@ async fn a_budget_too_small_for_a_partition_still_answers() {
 async fn an_index_holds_nothing_unless_it_is_given_a_cache() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(16, 2718);
     let params = search(WalkMode::Lazy);
 
@@ -1083,7 +1108,7 @@ async fn an_index_holds_nothing_unless_it_is_given_a_cache() {
 async fn a_partition_is_read_once_however_many_queries_want_it() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(8, 1234);
     let params = search(WalkMode::Lazy);
 
@@ -1122,7 +1147,7 @@ async fn a_partition_is_read_once_however_many_queries_want_it() {
 async fn the_budget_counts_the_resident_form_and_not_the_read_one() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = cached(&dataset, BUDGET).await;
     let params = search(WalkMode::Lazy);
     let result = index
@@ -1155,7 +1180,7 @@ async fn the_budget_counts_the_resident_form_and_not_the_read_one() {
 async fn a_lazy_query_is_validated_like_any_other() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
     let mut query = random_vectors(1, 8)[0].clone();
@@ -1183,7 +1208,7 @@ async fn a_lazy_query_is_validated_like_any_other() {
 async fn resident_edges_do_not_change_an_answer() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 1717);
     let fetching = search(WalkMode::Lazy);
     let holding = search(WalkMode::Lazy).with_resident_edges(true);
@@ -1217,7 +1242,7 @@ async fn resident_edges_do_not_change_an_answer() {
 async fn a_partition_held_without_its_edges_does_not_answer_a_walk_that_wants_them() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 606);
     let fetching = search(WalkMode::Lazy);
     let holding = search(WalkMode::Lazy).with_resident_edges(true);
@@ -1247,7 +1272,7 @@ async fn a_partition_held_without_its_edges_does_not_answer_a_walk_that_wants_th
 async fn holding_the_edges_costs_exactly_the_edge_column() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(2, 88);
 
     let fetching = cached(&dataset, BUDGET).await;
@@ -1312,7 +1337,7 @@ fn phases(answers: &[QueryResult]) -> (u64, u64, u64, u64) {
 async fn the_phases_of_a_query_add_up_to_what_it_read() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 4242);
     let params = search(WalkMode::Lazy)
         .with_rescore_budget(K)
@@ -1379,7 +1404,7 @@ async fn the_phases_of_a_query_add_up_to_what_it_read() {
 async fn a_walk_that_holds_its_edges_reads_nothing_until_it_re_scores() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 909);
     let fetching = search(WalkMode::Lazy).with_rescore_budget(K);
     let holding = fetching.clone().with_resident_edges(true);
@@ -1426,7 +1451,7 @@ async fn a_walk_that_holds_its_edges_reads_nothing_until_it_re_scores() {
 async fn the_coded_answer_is_the_answer_before_the_vectors_were_read() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 31337);
     let asked = search(WalkMode::Lazy)
         .with_rescore_budget(K * 4)

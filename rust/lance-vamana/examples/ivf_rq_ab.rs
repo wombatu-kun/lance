@@ -13,7 +13,8 @@
 //! `QUERIES` (default 200), `ROWS_PER_PARTITION` (default 8192), `NPROBES`
 //! (default 7), `VAMANA_ROWS_PER_PARTITION`, `RQ_ROWS_PER_PARTITION`,
 //! `VAMANA_NPROBES`, `RQ_NPROBES` (each defaults to the shared value above),
-//! `DEGREE` (default 64), `CODE_BITS` (default 3), `WIDTHS`
+//! `DEGREE` (default 64), `CODE_BITS` (default 3), `CODE_KIND` (`rq` or `sq`,
+//! default `rq`), `SQ_BITS` (default 8, read only when `CODE_KIND=sq`), `WIDTHS`
 //! (default `10,20,30,40,60,80,120,160`, each a multiple of `k`),
 //! `LIST_SCALES` (default `1`), `BUDGETS` and `QUEUES` (unset: the width sweep
 //! above), `CONCURRENCY` (default 1), `CACHE_MB` (default 4096), `TARGET`
@@ -148,6 +149,7 @@ use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
+use lance_vamana::codes::CodeSpec;
 use lance_vamana::query::{Neighbor, SearchParams, VamanaIndex, WalkMode};
 
 #[path = "common/mod.rs"]
@@ -892,6 +894,18 @@ async fn main() {
     let rq_nprobes = env_usize("RQ_NPROBES", nprobes);
     let degree = env_usize("DEGREE", 64) as u32;
     let code_bits = env_usize("CODE_BITS", 3) as u8;
+    // `CODE_BITS` keeps driving the `IVF_RQ` reference arm whichever kind the
+    // walk is given, so that switching this crate's codes does not quietly
+    // change the arm every ratio is taken against.
+    let vamana_codes = match std::env::var("CODE_KIND").as_deref().unwrap_or("rq") {
+        "rq" => CodeSpec::Rabit {
+            num_bits: code_bits,
+        },
+        "sq" => CodeSpec::Scalar {
+            num_bits: env_usize("SQ_BITS", 8) as u16,
+        },
+        other => panic!("CODE_KIND is `rq` or `sq`, got `{other}`"),
+    };
     let hnsw_efs = env_list_opt("HNSW_EFS");
     let hnsw_nprobes = env_usize("HNSW_NPROBES", 1);
     let widths = env_list("WIDTHS", "10,20,30,40,60,80,120,160");
@@ -946,7 +960,8 @@ async fn main() {
         .collect::<Vec<_>>();
 
     println!(
-        "{prefix} {rows} x {dim}, R = {degree}, {code_bits} code bits, {num_queries} queries, \
+        "{prefix} {rows} x {dim}, R = {degree}, walk on {vamana_codes}, IVF_RQ on {code_bits} \
+         bits, {num_queries} queries, \
          k = {K}, cache {} MB, {concurrency} in flight, walk edges {}, reference \
          measured {reference_position}",
         cache_bytes >> 20,
@@ -988,8 +1003,15 @@ async fn main() {
         (None, Some(temp)) => temp.path().to_str().unwrap().to_string(),
         _ => unreachable!(),
     };
+    // The suffix names the codes so that two kinds never collide in one
+    // directory, and RaBitQ keeps the spelling it has always had so that an
+    // index built by an earlier pass is still found rather than rebuilt.
+    let code_suffix = match vamana_codes {
+        CodeSpec::Rabit { num_bits } => format!("c{num_bits}"),
+        CodeSpec::Scalar { num_bits } => format!("sq{num_bits}"),
+    };
     let vamana_uri =
-        format!("{home}/{prefix}-{rows}-p{vamana_partitions}-r{degree}-c{code_bits}.lance");
+        format!("{home}/{prefix}-{rows}-p{vamana_partitions}-r{degree}-{code_suffix}.lance");
     let rq_uri = format!("{home}/{prefix}-{rows}-p{rq_partitions}-rq{code_bits}.lance");
     let hnsw_uri = std::env::var("HNSW_URI")
         .unwrap_or_else(|_| format!("{home}/{prefix}-{rows}-p1-hnswsq.lance"));
@@ -1002,8 +1024,8 @@ async fn main() {
         assert_eq!(metadata.dimension as usize, dim);
         assert_eq!(metadata.max_degree, degree);
         assert_eq!(
-            metadata.codes.as_ref().map(|codes| codes.num_bits),
-            Some(code_bits)
+            metadata.codes.as_ref().map(|codes| codes.spec()),
+            Some(vamana_codes)
         );
         println!("reusing the vamana index at {vamana_uri}");
         dataset
@@ -1015,7 +1037,7 @@ async fn main() {
             VAMANA_INDEX,
             &IndexParams::new(VECTOR_FIELD, vamana_partitions)
                 .with_distance_type(DISTANCE_TYPE)
-                .with_code_bits(code_bits)
+                .with_codes(vamana_codes)
                 .with_graph_params(BuildParams {
                     max_degree: degree,
                     ..Default::default()

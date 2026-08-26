@@ -28,6 +28,7 @@
 //! vertex is one contiguous stride, so a partition's codes are one ranged read,
 //! and Lance's own loader rebuilds the kernel layout from it.
 
+use std::collections::BinaryHeap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -39,6 +40,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, ROW_ID, Result};
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::ex_dot::blocked_ex_code_bytes;
@@ -54,10 +56,15 @@ use lance_index::vector::bq::transform::{
 use lance_index::vector::bq::{
     RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, validate_rq_num_bits,
 };
+use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::quantizer::{Quantization, QuantizerStorage};
+use lance_index::vector::quantizer::{Quantization, QuantizerBuildParams, QuantizerStorage};
+use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::sq::builder::SQBuildParams;
+use lance_index::vector::sq::storage::ScalarQuantizationStorage;
+use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_index::vector::transform::Transformer;
-use lance_index::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
+use lance_index::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN, SQ_CODE_COLUMN};
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +94,43 @@ const EX_FACTORS: usize = 2;
 /// number in a Lance file.
 const FACTOR_BYTES: usize = std::mem::size_of::<f32>();
 
+/// What kind of code a build was asked for, before it has data to mint one from.
+///
+/// Apart from [`CodeParams`] because the two kinds want different things out of
+/// the vectors: RaBitQ takes nothing but their width, and scalar quantisation
+/// takes their range, which is not knowable until they are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CodeSpec {
+    /// RaBitQ over the residual against the partition's centroid.
+    Rabit { num_bits: u8 },
+    /// Lance's own scalar quantisation, a byte a dimension, of the vector itself.
+    Scalar { num_bits: u16 },
+}
+
+impl CodeSpec {
+    /// Mint what a segment will carry, from the vectors the codes will quantise.
+    ///
+    /// `vectors` must already be in coding space: cosine is stored and routed as
+    /// L2 over unit vectors, so a build that normalises has to do it before
+    /// minting, or the scalar bounds would describe a space nothing is ever
+    /// measured in. RaBitQ ignores them and takes only the dimension.
+    pub fn mint(&self, dimension: u32, vectors: &FixedSizeListArray) -> Result<CodeParams> {
+        match *self {
+            Self::Rabit { num_bits } => CodeParams::rabit(num_bits, dimension),
+            Self::Scalar { num_bits } => CodeParams::scalar(num_bits, dimension, vectors),
+        }
+    }
+}
+
+impl std::fmt::Display for CodeSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rabit { num_bits } => write!(f, "rabitq {num_bits} bits"),
+            Self::Scalar { num_bits } => write!(f, "scalar {num_bits} bits"),
+        }
+    }
+}
+
 /// How a segment's codes were built.
 ///
 /// Travels inside [`crate::format::IndexMetadata`], which every maintenance pass
@@ -95,21 +139,51 @@ const FACTOR_BYTES: usize = std::mem::size_of::<f32>();
 /// to go out of its way to mint a second one, and
 /// [`crate::io::SegmentWriter::copy_partition`] refuses a partition carried in
 /// from a segment whose codes disagree with these.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodeParams {
-    /// Bits a dimension.
+///
+/// The same inheritance is what makes one *set of bounds* per index true, and
+/// that matters for the same reason: a scalar code read back under bounds other
+/// than the ones it was written under is not a worse distance but a wrong one.
+///
+/// Untagged, and that is the whole reason [`crate::format::FORMAT_VERSION`] did
+/// not have to move when a second kind appeared: the RaBitQ variant serialises
+/// to exactly the object the struct that preceded it wrote, so a segment built
+/// before scalar codes existed still reads. Which keeps a measurement honest as
+/// much as it saves a rebuild - RaBitQ's rotation is drawn fresh every build, so
+/// an index rebuilt to satisfy a version bump would carry different codes and
+/// answer differently from the one every published number was taken on. The two
+/// variants are told apart by `rotation_signs` against `bounds`, neither of
+/// which the other has.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CodeParams {
+    /// RaBitQ, which quantises the residual against the partition's centroid.
     ///
-    /// Three is the measured working point: at one the walk needs a beam wide
-    /// enough to cost more reads than the codes save, and at five the last two
-    /// to thirteen per cent of comparisons cost another 32 bytes a vertex.
-    pub num_bits: u8,
-    /// The one rotation every code of this index was built under.
+    /// Three bits a dimension is the measured working point: at one the walk
+    /// needs a beam wide enough to cost more reads than the codes save, and at
+    /// five the last two to thirteen per cent of comparisons cost another 32
+    /// bytes a vertex.
+    Rabit {
+        num_bits: u8,
+        /// The one rotation every code of this index was built under.
+        ///
+        /// RaBitQ quantises a *rotated* residual, so a code read back under
+        /// another rotation is not a worse distance but a meaningless one.
+        /// Stored rather than regenerated because it is random, and it can be
+        /// stored at all because it is small: 480 bytes at `d = 960`.
+        rotation_signs: Vec<u8>,
+    },
+    /// Lance's own scalar quantisation, which quantises the vector itself.
     ///
-    /// RaBitQ quantises a *rotated* residual, so a code read back under another
-    /// rotation is not a worse distance but a meaningless one. Stored rather
-    /// than regenerated because it is random, and it can be stored at all
-    /// because it is small: 480 bytes at `d = 960`.
-    pub rotation_signs: Vec<u8>,
+    /// Four times the bytes of a three-bit RaBitQ code at `d = 960`, so it is
+    /// not what a walk would pick to keep resident. What it is for is the
+    /// comparison: it is the representation Lance's own `IVF_HNSW_SQ` steers by,
+    /// and a walk given the same one leaves the graph as the only difference.
+    Scalar {
+        num_bits: u16,
+        /// The range every code of this index was scaled against, taken over a
+        /// sample of the whole column exactly as Lance's own `IVF_SQ` takes it.
+        bounds: Range<f64>,
+    },
 }
 
 impl CodeParams {
@@ -118,65 +192,158 @@ impl CodeParams {
     /// Refuses a dimension RaBitQ cannot quantise rather than quietly building
     /// an index without codes: a caller who asked for codes and got none would
     /// find out from a query that was slower than it expected.
-    pub fn mint(num_bits: u8, dimension: u32) -> Result<Self> {
+    pub fn rabit(num_bits: u8, dimension: u32) -> Result<Self> {
         validate_rq_num_bits(num_bits)?;
         check_dimension(dimension)?;
-        Ok(Self {
+        Ok(Self::Rabit {
             num_bits,
             rotation_signs: random_fast_rotation_signs(dimension as usize),
         })
     }
 
+    /// Take a fresh set of scalar bounds from the vectors they will quantise.
+    pub fn scalar(num_bits: u16, dimension: u32, vectors: &FixedSizeListArray) -> Result<Self> {
+        validate_sq_num_bits(num_bits)?;
+        let bounds = ScalarQuantizer::new(num_bits, dimension as usize)
+            .update_bounds::<Float32Type>(&sq_sample(num_bits, vectors))?;
+        Ok(Self::Scalar { num_bits, bounds })
+    }
+
+    /// What kind and width these codes are, without their minted contents.
+    ///
+    /// The pair a caller asks for, so that a stand reusing an index off disk can
+    /// check it got the codes it wanted rather than only the right width.
+    pub fn spec(&self) -> CodeSpec {
+        match *self {
+            Self::Rabit { num_bits, .. } => CodeSpec::Rabit { num_bits },
+            Self::Scalar { num_bits, .. } => CodeSpec::Scalar { num_bits },
+        }
+    }
+
     /// Bytes one vertex's code occupies.
     pub fn stride(&self, dimension: u32) -> Result<u32> {
-        let stride = self.layout(dimension)?.stride;
+        let (stride, num_bits) = match self {
+            Self::Rabit { num_bits, .. } => {
+                (rabit_layout(*num_bits, dimension)?.stride, *num_bits as u16)
+            }
+            Self::Scalar { num_bits, .. } => (sq_stride(*num_bits, dimension)?, *num_bits),
+        };
         u32::try_from(stride).map_err(|_| {
             Error::invalid_input(format!(
-                "Vamana codes of {} bits over {dimension} dimensions are {stride} bytes a vertex, \
-                 which no Arrow list can hold",
-                self.num_bits
+                "Vamana codes of {num_bits} bits over {dimension} dimensions are {stride} bytes a \
+                 vertex, which no Arrow list can hold"
             ))
         })
     }
 
-    /// What Lance's quantiser is told about these codes.
+    /// What this kind of code wants beside the query itself.
     ///
-    /// `packed: false` because the column holds one vertex per stride; Lance
-    /// repacks into its thirty-two-vector kernel layout as it loads the batch.
-    fn quantization(&self, dimension: u32) -> RabitQuantizationMetadata {
-        RabitQuantizationMetadata {
-            rotate_mat: None,
-            rotate_mat_position: None,
-            fast_rotation_signs: Some(self.rotation_signs.clone()),
-            rotation_type: RQRotationType::Fast,
-            code_dim: dimension,
-            num_bits: self.num_bits,
-            packed: false,
-            query_estimator: RabitQueryEstimator::RawQuery,
+    /// RaBitQ's raw-query estimator wants `|q - c|^2`, because the centroid is
+    /// already folded into every vertex's own factors; scalar quantisation
+    /// wants nothing, because it quantises the vector rather than an offset from
+    /// somewhere. Decided here rather than at the query path so that a second
+    /// kind of code cannot be given a term meant for the first.
+    pub(crate) fn query_offset(
+        &self,
+        ivf: &IvfModel,
+        partition_id: u32,
+        routing_query: &ArrayRef,
+    ) -> Result<f32> {
+        match self {
+            Self::Rabit { .. } => centroid_distance(ivf, partition_id, routing_query),
+            Self::Scalar { .. } => Ok(0.0),
         }
     }
+}
 
-    fn layout(&self, dimension: u32) -> Result<Layout> {
-        validate_rq_num_bits(self.num_bits)?;
-        check_dimension(dimension)?;
-        let dimension = dimension as usize;
-        let binary = 0..rabit_binary_code_bytes(dimension);
-        let ex_bits = rabit_ex_bits(self.num_bits)?;
-        let (ex, factors) = if ex_bits == 0 {
-            (None, BINARY_FACTORS)
-        } else {
-            let end = binary.end + blocked_ex_code_bytes(dimension, ex_bits);
-            (Some(binary.end..end), BINARY_FACTORS + EX_FACTORS)
-        };
-        let first_factor = ex.as_ref().map_or(binary.end, |ex| ex.end);
-        Ok(Layout {
-            binary,
-            ex,
-            factors,
-            first_factor,
-            stride: first_factor + factors * FACTOR_BYTES,
-        })
+/// Lance quantises to a byte whatever width it is asked for (`scale_to_u8`), so
+/// anything but eight bits would silently write eight-bit codes under a label
+/// that says otherwise.
+fn validate_sq_num_bits(num_bits: u16) -> Result<()> {
+    if num_bits != 8 {
+        return Err(Error::not_supported(format!(
+            "Vamana scalar codes are 8 bits a dimension; {num_bits} was asked for"
+        )));
     }
+    Ok(())
+}
+
+/// Bytes one scalar-quantised vertex occupies: a byte a dimension.
+fn sq_stride(num_bits: u16, dimension: u32) -> Result<usize> {
+    validate_sq_num_bits(num_bits)?;
+    Ok(dimension as usize)
+}
+
+/// The rows the scalar bounds are taken over.
+///
+/// Lance trains its own scalar quantiser on `sample_rate * 2^num_bits` rows
+/// (`SQBuildParams`, 65536 at eight bits), and bounds are a minimum and a
+/// maximum: a larger sample catches more outliers, widens them and coarsens
+/// every code. Taking the whole column would therefore hand Lance's index
+/// finer codes than ours and read as a property of the graph. Strided rather
+/// than the first rows, so that a column with any order in it is sampled across
+/// its whole length, and deterministic so that two builds of one dataset agree.
+fn sq_sample(num_bits: u16, vectors: &FixedSizeListArray) -> FixedSizeListArray {
+    let wanted = SQBuildParams {
+        num_bits,
+        ..Default::default()
+    }
+    .sample_size();
+    let rows = vectors.len();
+    if rows <= wanted {
+        return vectors.clone();
+    }
+    let stride = rows / wanted;
+    let taken = UInt32Array::from_iter_values((0..wanted).map(|row| (row * stride) as u32));
+    // `take` on a fixed size list returns one, and the values it carries are the
+    // only thing `update_bounds` reads.
+    arrow_select::take::take(vectors, &taken, None)
+        .expect("taking a strided sample of a fixed size list cannot fail")
+        .as_fixed_size_list()
+        .clone()
+}
+
+/// What Lance's RaBitQ quantiser is told about a segment's codes.
+///
+/// `packed: false` because the column holds one vertex per stride; Lance
+/// repacks into its thirty-two-vector kernel layout as it loads the batch.
+fn rabit_quantization(
+    num_bits: u8,
+    rotation_signs: &[u8],
+    dimension: u32,
+) -> RabitQuantizationMetadata {
+    RabitQuantizationMetadata {
+        rotate_mat: None,
+        rotate_mat_position: None,
+        fast_rotation_signs: Some(rotation_signs.to_vec()),
+        rotation_type: RQRotationType::Fast,
+        code_dim: dimension,
+        num_bits,
+        packed: false,
+        query_estimator: RabitQueryEstimator::RawQuery,
+    }
+}
+
+fn rabit_layout(num_bits: u8, dimension: u32) -> Result<Layout> {
+    validate_rq_num_bits(num_bits)?;
+    check_dimension(dimension)?;
+    let dimension = dimension as usize;
+    let binary = 0..rabit_binary_code_bytes(dimension);
+    let ex_bits = rabit_ex_bits(num_bits)?;
+    let (ex, factors) = if ex_bits == 0 {
+        (None, BINARY_FACTORS)
+    } else {
+        let end = binary.end + blocked_ex_code_bytes(dimension, ex_bits);
+        (Some(binary.end..end), BINARY_FACTORS + EX_FACTORS)
+    };
+    let first_factor = ex.as_ref().map_or(binary.end, |ex| ex.end);
+    Ok(Layout {
+        binary,
+        ex,
+        factors,
+        first_factor,
+        stride: first_factor + factors * FACTOR_BYTES,
+    })
 }
 
 /// Where each piece of one vertex's code sits inside its stride.
@@ -251,6 +418,15 @@ pub(crate) fn encode(
             vectors.value_length()
         ))
     })?;
+    let (num_bits, rotation_signs) = match params {
+        CodeParams::Scalar { num_bits, bounds } => {
+            return encode_scalar(*num_bits, bounds, dimension, vectors);
+        }
+        CodeParams::Rabit {
+            num_bits,
+            rotation_signs,
+        } => (*num_bits, rotation_signs),
+    };
     // One row, because the transform indexes its centroids by partition id and
     // every vector here belongs to the same one.
     let centroid = FixedSizeListArray::try_new_from_values(
@@ -265,7 +441,7 @@ pub(crate) fn encode(
             .clone(),
         vectors.value_length(),
     )?;
-    let layout = params.layout(dimension)?;
+    let layout = rabit_layout(num_bits, dimension)?;
     let distance_type = coding_distance_type(distance_type)?;
 
     let (residuals, norms) = residuals(vectors, &centroid)?;
@@ -273,9 +449,9 @@ pub(crate) fn encode(
         &residuals,
         distance_type,
         &RQBuildParams {
-            num_bits: params.num_bits,
+            num_bits,
             rotation_type: RQRotationType::Fast,
-            rotation: Some(params.quantization(dimension)),
+            rotation: Some(rabit_quantization(num_bits, rotation_signs, dimension)),
         },
     )?;
     let rows = vectors.len();
@@ -292,6 +468,29 @@ pub(crate) fn encode(
         .transform(&batch)?;
 
     interleave(&coded, &layout, rows)
+}
+
+/// Scalar-quantise one partition's vectors: a byte a dimension, no centroid.
+///
+/// The list is rebuilt rather than handed on as Lance's transform returns it,
+/// because that one makes the item nullable and a fixed size list's item
+/// nullability is part of its type: the column has to match the non-nullable
+/// field [`crate::format::partition_schema`] declares for it.
+fn encode_scalar(
+    num_bits: u16,
+    bounds: &Range<f64>,
+    dimension: u32,
+    vectors: &FixedSizeListArray,
+) -> Result<FixedSizeListArray> {
+    let stride = sq_stride(num_bits, dimension)?;
+    let codes = ScalarQuantizer::with_bounds(num_bits, dimension as usize, bounds.clone())
+        .transform::<Float32Type>(vectors)?;
+    Ok(FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::UInt8, false)),
+        stride as i32,
+        codes.as_fixed_size_list().values().clone(),
+        None,
+    )?)
 }
 
 /// Read a partition's code column back into the store a walk measures against.
@@ -333,17 +532,15 @@ pub(crate) fn storage(
     dimension: u32,
     row_ids: &[u64],
     codes: &FixedSizeListArray,
-) -> Result<RabitQuantizationStorage> {
-    let layout = params.layout(dimension)?;
-    if codes.value_length() as usize != layout.stride {
+) -> Result<CodeStore> {
+    let stride = params.stride(dimension)? as usize;
+    if codes.value_length() as usize != stride {
         return Err(Error::corrupt_file_named(
             CODE_COLUMN,
             format!(
-                "Vamana code column is {} bytes a vertex but {} bits over {dimension} dimensions \
-                 are {} bytes",
+                "Vamana code column is {} bytes a vertex but this segment's codes over \
+                 {dimension} dimensions are {stride} bytes",
                 codes.value_length(),
-                params.num_bits,
-                layout.stride
             ),
         ));
     }
@@ -364,13 +561,176 @@ pub(crate) fn storage(
         ));
     }
 
-    let batch = split(params, &layout, dimension, row_ids, codes)?;
-    RabitQuantizationStorage::try_from_batch(
-        batch,
-        &params.quantization(dimension),
-        coding_distance_type(distance_type)?,
-        None,
-    )
+    match params {
+        CodeParams::Rabit {
+            num_bits,
+            rotation_signs,
+        } => {
+            let layout = rabit_layout(*num_bits, dimension)?;
+            let batch = split(*num_bits, &layout, dimension, row_ids, codes)?;
+            Ok(CodeStore::Rabit(Box::new(
+                RabitQuantizationStorage::try_from_batch(
+                    batch,
+                    &rabit_quantization(*num_bits, rotation_signs, dimension),
+                    coding_distance_type(distance_type)?,
+                    None,
+                )?,
+            )))
+        }
+        CodeParams::Scalar { num_bits, bounds } => {
+            let batch = RecordBatch::try_from_iter_with_nullable(vec![
+                (
+                    ROW_ID,
+                    Arc::new(UInt64Array::from(row_ids.to_vec())) as ArrayRef,
+                    false,
+                ),
+                (SQ_CODE_COLUMN, Arc::new(codes.clone()) as ArrayRef, false),
+            ])?;
+            Ok(CodeStore::Scalar(ScalarQuantizationStorage::try_new(
+                *num_bits,
+                coding_distance_type(distance_type)?,
+                bounds.clone(),
+                [batch],
+                None,
+            )?))
+        }
+    }
+}
+
+/// One partition's codes, in whichever of Lance's stores holds this kind.
+///
+/// An enumeration rather than a trait object because [`VectorStore`] is
+/// `Sized` and carries an associated calculator type, so it has no `dyn` form
+/// at all; and rather than a type parameter because the store is held by
+/// [`crate::cache`] behind a `LanceCache`, and a parameter there would spread
+/// into the cache key and every caller that names an entry.
+#[derive(Debug)]
+pub(crate) enum CodeStore {
+    /// Boxed because the two stores differ twelvefold in size, and an enum as
+    /// wide as its largest variant would make every scalar partition carry a
+    /// kilobyte of RaBitQ's scratch. One pointer a probe against that.
+    Rabit(Box<RabitQuantizationStorage>),
+    Scalar(ScalarQuantizationStorage),
+}
+
+impl CodeStore {
+    /// `query_offset` is what [`CodeParams::query_offset`] returned for this
+    /// segment's kind of code, and it is ignored by the kinds that do not ask.
+    pub(crate) fn dist_calculator(
+        &self,
+        routing_query: ArrayRef,
+        query_offset: f32,
+    ) -> CodeCalculator<'_> {
+        match self {
+            Self::Rabit(store) => {
+                CodeCalculator::Rabit(store.dist_calculator(routing_query, query_offset))
+            }
+            Self::Scalar(store) => {
+                CodeCalculator::Scalar(store.dist_calculator(routing_query, query_offset))
+            }
+        }
+    }
+}
+
+impl DeepSizeOf for CodeStore {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        match self {
+            Self::Rabit(store) => store.deep_size_of_children(context),
+            Self::Scalar(store) => store.deep_size_of_children(context),
+        }
+    }
+}
+
+/// One query against one [`CodeStore`].
+///
+/// Every method is forwarded rather than left to the trait's defaults: both
+/// stores override the bulk paths with kernels of their own, and RaBitQ throws
+/// out most of its extra-bit refinement inside `accumulate_topk_with_scratch`.
+/// A forwarding that stopped at `distance` would silently take the slow path in
+/// both and change what the walk is measuring.
+pub(crate) enum CodeCalculator<'a> {
+    Rabit(<RabitQuantizationStorage as VectorStore>::DistanceCalculator<'a>),
+    Scalar(<ScalarQuantizationStorage as VectorStore>::DistanceCalculator<'a>),
+}
+
+impl DistCalculator for CodeCalculator<'_> {
+    fn distance(&self, id: u32) -> f32 {
+        match self {
+            Self::Rabit(calc) => calc.distance(id),
+            Self::Scalar(calc) => calc.distance(id),
+        }
+    }
+
+    fn distance_all(&self, k_hint: usize) -> Vec<f32> {
+        match self {
+            Self::Rabit(calc) => calc.distance_all(k_hint),
+            Self::Scalar(calc) => calc.distance_all(k_hint),
+        }
+    }
+
+    fn distance_all_with_scratch(
+        &self,
+        k_hint: usize,
+        dists: &mut Vec<f32>,
+        u16_scratch: &mut Vec<u16>,
+        u8_scratch: &mut Vec<u8>,
+        u32_scratch: &mut Vec<u32>,
+    ) {
+        match self {
+            Self::Rabit(calc) => {
+                calc.distance_all_with_scratch(k_hint, dists, u16_scratch, u8_scratch, u32_scratch)
+            }
+            Self::Scalar(calc) => {
+                calc.distance_all_with_scratch(k_hint, dists, u16_scratch, u8_scratch, u32_scratch)
+            }
+        }
+    }
+
+    fn prefetch(&self, id: u32) {
+        match self {
+            Self::Rabit(calc) => calc.prefetch(id),
+            Self::Scalar(calc) => calc.prefetch(id),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_id: impl Fn(u32) -> u64,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        u16_scratch: &mut Vec<u16>,
+        u8_scratch: &mut Vec<u8>,
+        u32_scratch: &mut Vec<u32>,
+    ) {
+        match self {
+            Self::Rabit(calc) => calc.accumulate_topk_with_scratch(
+                k,
+                lower_bound,
+                upper_bound,
+                row_id,
+                res,
+                dists,
+                u16_scratch,
+                u8_scratch,
+                u32_scratch,
+            ),
+            Self::Scalar(calc) => calc.accumulate_topk_with_scratch(
+                k,
+                lower_bound,
+                upper_bound,
+                row_id,
+                res,
+                dists,
+                u16_scratch,
+                u8_scratch,
+                u32_scratch,
+            ),
+        }
+    }
 }
 
 /// `|q - c|^2` between a routing query and one partition's centroid.
@@ -390,11 +750,7 @@ pub(crate) fn storage(
 /// either. What it does reach is Lance's own error-bound gate above one bit, and
 /// anything later that treats a coded distance as a number rather than as a
 /// rank - which is why the calibration is a test of its own.
-pub(crate) fn centroid_distance(
-    ivf: &IvfModel,
-    partition_id: u32,
-    routing_query: &ArrayRef,
-) -> Result<f32> {
+fn centroid_distance(ivf: &IvfModel, partition_id: u32, routing_query: &ArrayRef) -> Result<f32> {
     let centroid = ivf.centroid(partition_id as usize).ok_or_else(|| {
         Error::corrupt_file_named(
             INDEX_FILE_NAME,
@@ -500,7 +856,7 @@ fn interleave(coded: &RecordBatch, layout: &Layout, rows: usize) -> Result<Fixed
 /// list's item nullability is part of its type and its loader would reject a
 /// column that merely holds the right bytes.
 fn split(
-    params: &CodeParams,
+    num_bits: u8,
     layout: &Layout,
     dimension: u32,
     row_ids: &[u64],
@@ -562,7 +918,7 @@ fn split(
     ];
     if let (Some(range), Some(values)) = (layout.ex.clone(), ex) {
         fields.push(
-            rabit_ex_code_field(dimension, params.num_bits)?
+            rabit_ex_code_field(dimension, num_bits)?
                 .ok_or_else(|| Error::internal("RaBitQ lost its ex-code field".to_string()))?,
         );
         columns.push(Arc::new(nullable_bytes(values, range.len())?));
@@ -649,7 +1005,7 @@ mod tests {
     #[test]
     fn a_stride_is_the_bits_plus_the_factors() {
         for (num_bits, expected) in [(1u8, 8 + 12), (3, 8 + 16 + 20)] {
-            let params = CodeParams::mint(num_bits, DIMENSION).unwrap();
+            let params = CodeParams::rabit(num_bits, DIMENSION).unwrap();
             assert_eq!(
                 params.stride(DIMENSION).unwrap(),
                 expected,
@@ -662,12 +1018,50 @@ mod tests {
     /// blocked ex-code layout shows up here rather than as an index that grew.
     #[test]
     fn three_bits_are_sixty_eight_bytes_at_d_128() {
-        assert_eq!(CodeParams::mint(3, 128).unwrap().stride(128).unwrap(), 68);
+        assert_eq!(CodeParams::rabit(3, 128).unwrap().stride(128).unwrap(), 68);
+    }
+
+    #[test]
+    fn the_metadata_a_rabit_only_build_wrote_still_reads() {
+        // The exact object the struct that preceded the enum serialised. Written
+        // out rather than produced by serialising, which would prove only that
+        // today's writer agrees with today's reader and nothing about the
+        // indices already on disk.
+        let json = r#"{"num_bits":3,"rotation_signs":[165,60]}"#;
+        let params: CodeParams = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            params,
+            CodeParams::Rabit {
+                num_bits: 3,
+                rotation_signs: vec![0xA5, 0x3C],
+            }
+        );
+        // And writes back what it read, so a maintenance pass rewriting a
+        // segment does not quietly change the shape on disk under it.
+        assert_eq!(serde_json::to_string(&params).unwrap(), json);
+    }
+
+    #[test]
+    fn scalar_metadata_is_not_mistaken_for_a_rotation() {
+        let params = CodeParams::Scalar {
+            num_bits: 8,
+            bounds: 0.5..2.5,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert_eq!(serde_json::from_str::<CodeParams>(&json).unwrap(), params);
+        // The pair is untagged, so what tells the variants apart is that neither
+        // carries the other's field. Naming it here means a field renamed on one
+        // side fails as this test rather than as a segment that reads back as
+        // the wrong kind of code.
+        assert!(
+            json.contains("bounds") && !json.contains("rotation_signs"),
+            "{json}"
+        );
     }
 
     #[test]
     fn a_dimension_rabit_cannot_pack_is_refused() {
-        let error = CodeParams::mint(3, 100).unwrap_err();
+        let error = CodeParams::rabit(3, 100).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("multiple of 8"), "{error}");
     }
@@ -702,6 +1096,13 @@ mod tests {
         centroid: &ArrayRef,
         row_ids: &[u64],
     ) -> RabitQuantizationStorage {
+        let CodeParams::Rabit {
+            num_bits,
+            rotation_signs,
+        } = params
+        else {
+            panic!("the reference storage is RaBitQ's own");
+        };
         let centroid_list = FixedSizeListArray::try_new_from_values(
             centroid.as_primitive::<Float32Type>().clone(),
             DIMENSION as i32,
@@ -712,9 +1113,9 @@ mod tests {
             &residuals,
             DistanceType::L2,
             &RQBuildParams {
-                num_bits: params.num_bits,
+                num_bits: *num_bits,
                 rotation_type: RQRotationType::Fast,
-                rotation: Some(params.quantization(DIMENSION)),
+                rotation: Some(rabit_quantization(*num_bits, rotation_signs, DIMENSION)),
             },
         )
         .unwrap();
@@ -752,7 +1153,7 @@ mod tests {
             .collect::<Vec<_>>();
         RabitQuantizationStorage::try_from_batch(
             coded.project(&kept).unwrap(),
-            &params.quantization(DIMENSION),
+            &rabit_quantization(*num_bits, rotation_signs, DIMENSION),
             DistanceType::L2,
             None,
         )
@@ -768,7 +1169,7 @@ mod tests {
     #[test]
     fn a_blob_and_lances_own_columns_give_the_same_distances() {
         for num_bits in [1u8, 3, 5] {
-            let params = CodeParams::mint(num_bits, DIMENSION).unwrap();
+            let params = CodeParams::rabit(num_bits, DIMENSION).unwrap();
             let (vectors, centroid, row_ids) = sample(7);
             let column = encode(&params, DistanceType::L2, &vectors, &centroid).unwrap();
             assert_eq!(
@@ -814,18 +1215,26 @@ mod tests {
     /// distance against a *number*: the error-bound gate Lance already applies
     /// above one bit, and any future use of one as a bound on whether to expand
     /// a vertex at all.
-    #[test]
-    fn a_coded_distance_estimates_the_real_one() {
-        let params = CodeParams::mint(3, DIMENSION).unwrap();
+    /// The median relative error of a coded distance against the real one.
+    ///
+    /// Written against [`CodeParams`] rather than against RaBitQ because the
+    /// failure it exists for is a term of the estimator left out of the query,
+    /// and each kind of code wants a different one: `|q - c|^2` for RaBitQ and
+    /// nothing at all for scalar codes. The term comes from the production
+    /// helper over a one-partition routing model, so a mistake in it fails here
+    /// rather than only as recall lost somewhere downstream.
+    ///
+    /// `read_as` is what the codes are read back under, which is the same
+    /// parameters for an honest round trip and different ones for the mutation
+    /// that proves the bar is worth anything.
+    fn median_coded_error(written: &CodeParams, read_as: &CodeParams) -> f32 {
         let (vectors, centroid, row_ids) = sample(7);
-        let column = encode(&params, DistanceType::L2, &vectors, &centroid).unwrap();
-        let store = storage(&params, DistanceType::L2, DIMENSION, &row_ids, &column).unwrap();
+        let column = encode(written, DistanceType::L2, &vectors, &centroid).unwrap();
+        let store = storage(read_as, DistanceType::L2, DIMENSION, &row_ids, &column).unwrap();
 
         let (queries, _, _) = sample(31);
         let query =
             queries.values().as_primitive::<Float32Type>().values()[..DIMENSION as usize].to_vec();
-        // Through the production helper, over a one-partition routing model, so
-        // that a mistake in the term itself fails here and not only in recall.
         let key: ArrayRef = Arc::new(Float32Array::from(query.clone()));
         let ivf = IvfModel::new(
             FixedSizeListArray::try_new_from_values(
@@ -835,7 +1244,7 @@ mod tests {
             .unwrap(),
             None,
         );
-        let dist_q_c = centroid_distance(&ivf, 0, &key).unwrap();
+        let dist_q_c = read_as.query_offset(&ivf, 0, &key).unwrap();
         let coded = store.dist_calculator(key, dist_q_c);
 
         let values = vectors.values().as_primitive::<Float32Type>().values();
@@ -852,7 +1261,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         errors.sort_by(f32::total_cmp);
-        let median = errors[errors.len() / 2];
+        errors[errors.len() / 2]
+    }
+
+    #[test]
+    fn a_rabit_coded_distance_estimates_the_real_one() {
+        let params = CodeParams::rabit(3, DIMENSION).unwrap();
+        let median = median_coded_error(&params, &params);
         // Loose on purpose: the bound this pins is "a code is an estimate", and
         // a three-bit code of a 64-dimensional residual is a coarse one. The
         // failure it exists for - a factor left out of the query - is off by the
@@ -864,9 +1279,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_scalar_coded_distance_estimates_the_real_one() {
+        let (vectors, _, _) = sample(7);
+        let params = CodeParams::scalar(8, DIMENSION, &vectors).unwrap();
+        let median = median_coded_error(&params, &params);
+        // Measured 0.00101 on this seeded fixture, against 0.024 for three-bit
+        // RaBitQ: twenty-four times finer, and it should be, because a byte a
+        // dimension over a range this fixture fills is a fine grid and nothing
+        // about the query has to be reconstructed. A bar this close is
+        // affordable only because the fixture is seeded.
+        assert!(
+            median < 0.002,
+            "the median scalar distance is off by {median:.5} of the real one"
+        );
+    }
+
+    #[test]
+    fn scalar_codes_read_under_other_bounds_are_wrong() {
+        let (vectors, _, _) = sample(7);
+        let written = CodeParams::scalar(8, DIMENSION, &vectors).unwrap();
+        let CodeParams::Scalar { num_bits, bounds } = &written else {
+            unreachable!("scalar params are scalar");
+        };
+        let drifted = CodeParams::Scalar {
+            num_bits: *num_bits,
+            bounds: bounds.start..bounds.end * 2.0,
+        };
+        // Not "a little worse": a scalar code carries no record of the range it
+        // was scaled against, so reading it under another one rescales every
+        // dimension and the distance is wrong rather than approximate. This is
+        // the whole reason the bounds travel in the segment metadata and are
+        // inherited by every pass, and it is what makes the bar above mean
+        // something.
+        let median = median_coded_error(&written, &drifted);
+        assert!(
+            median > 1.0,
+            "codes read under bounds twice as wide are off by only {median:.3}, so the bounds are \
+             not reaching the distance at all"
+        );
+    }
+
     /// A rotation drawn from `seed` rather than from the machine.
     ///
-    /// [`CodeParams::mint`] takes a fresh random rotation every call, which is
+    /// [`CodeParams::rabit`] takes a fresh random rotation every call, which is
     /// right for an index and wrong for a test that measures how often an
     /// estimate built on one misses: the answer would be a different number
     /// every run, and any bar tight enough to be worth setting would fail on
@@ -875,7 +1331,7 @@ mod tests {
     fn code_params(num_bits: u8, seed: u64) -> CodeParams {
         let mut rotation_signs = random_fast_rotation_signs(DIMENSION as usize);
         SmallRng::seed_from_u64(seed).fill_bytes(&mut rotation_signs);
-        CodeParams {
+        CodeParams::Rabit {
             num_bits,
             rotation_signs,
         }
@@ -1077,12 +1533,12 @@ mod tests {
     /// not a caller's mistake, and it must not be read as if it were shorter.
     #[test]
     fn a_code_column_of_the_wrong_stride_is_rejected() {
-        let params = CodeParams::mint(3, DIMENSION).unwrap();
+        let params = CodeParams::rabit(3, DIMENSION).unwrap();
         let (vectors, centroid, row_ids) = sample(7);
         let column = encode(&params, DistanceType::L2, &vectors, &centroid).unwrap();
 
         let error = storage(
-            &CodeParams::mint(1, DIMENSION).unwrap(),
+            &CodeParams::rabit(1, DIMENSION).unwrap(),
             DistanceType::L2,
             DIMENSION,
             &row_ids,

@@ -74,12 +74,12 @@ use std::collections::BinaryHeap;
 
 use arrow_array::ArrayRef;
 use lance_core::{Error, Result};
-use lance_index::vector::bq::storage::RabitQuantizationStorage;
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_io::scheduler::IoStats;
 use lance_linalg::distance::DistanceType;
 
+use crate::codes::CodeStore;
 use crate::format::{NEIGHBORS_COLUMN, VECTOR_COLUMN};
 use crate::io::{PartitionFile, read_scattered};
 use crate::partition::{checked_neighbors, neighbor_slots, vectors_of};
@@ -124,7 +124,7 @@ pub(crate) struct Candidate {
 /// scan opens no file at all.
 pub(crate) struct LazyProbe<'a> {
     pub(crate) file: &'a PartitionFile,
-    pub(crate) codes: &'a RabitQuantizationStorage,
+    pub(crate) codes: &'a CodeStore,
     pub(crate) row_ids: &'a [u64],
     pub(crate) medoid: u32,
     pub(crate) max_degree: u32,

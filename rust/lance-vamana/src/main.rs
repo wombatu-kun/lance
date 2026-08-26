@@ -31,6 +31,7 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
+use lance_vamana::codes::CodeSpec;
 use lance_vamana::consolidator::consolidate_index;
 use lance_vamana::inserter::{insert_as_segment, insert_in_place};
 use lance_vamana::merger::merge_index;
@@ -118,8 +119,9 @@ struct BuildArgs {
     rows_per_partition: Option<usize>,
     #[arg(long, value_enum, default_value_t = MetricArg::L2)]
     metric: MetricArg,
-    /// Bits a dimension for the resident code column. Omitted, no codes are
-    /// written and only `--mode exact` can search the index.
+    /// RaBitQ bits a dimension for the resident code column. Omitted, no codes
+    /// are written and only `--mode exact` can search the index. Scalar codes
+    /// are a library option only; nothing but a measurement wants them.
     #[arg(long, value_name = "BITS")]
     code_bits: Option<u8>,
     /// `R`: the fixed width of every vertex's neighbour list.
@@ -356,8 +358,8 @@ async fn build(args: BuildArgs) -> Result<()> {
             alpha: args.alpha,
             seed: args.seed,
         });
-    if let Some(code_bits) = args.code_bits {
-        params = params.with_code_bits(code_bits);
+    if let Some(num_bits) = args.code_bits {
+        params = params.with_codes(CodeSpec::Rabit { num_bits });
     }
 
     let started = Instant::now();
@@ -588,8 +590,8 @@ async fn info(args: InfoArgs) -> Result<()> {
     println!("  build beam     {}", metadata.search_list_size);
     println!("  alpha          {}", metadata.alpha);
     match &metadata.codes {
-        Some(codes) => println!("  code bits      {}", codes.num_bits),
-        None => println!("  code bits      none"),
+        Some(codes) => println!("  codes          {}", codes.spec()),
+        None => println!("  codes          none"),
     }
     println!("  format version {}", metadata.format_version);
     Ok(())

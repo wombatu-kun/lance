@@ -55,11 +55,10 @@ use std::sync::Arc;
 use lance_core::cache::{CacheKey, CacheKeySchema, Context, DeepSizeOf, KeyBuilder, LanceCache};
 use lance_core::{Error, Result};
 use lance_file::reader::CachedFileMetadata;
-use lance_index::vector::bq::storage::RabitQuantizationStorage;
 use object_store::path::Path;
 use uuid::Uuid;
 
-use crate::codes::{self, CODE_COLUMN};
+use crate::codes::{self, CODE_COLUMN, CodeStore};
 use crate::format::{IndexMetadata, NEIGHBORS_COLUMN, ROW_ID_COLUMN};
 use crate::io::{PartitionFile, read_partition_batch};
 use crate::partition::{neighbor_slots, row_ids_from_batch};
@@ -73,13 +72,15 @@ use crate::segment::PartitionEntry;
 /// one without the other would have to read the partition to get the other.
 ///
 /// Sized by [`DeepSizeOf`] rather than by the bytes it was read from, which is
-/// the whole point of that trait here: the codes are stored as one contiguous
+/// the whole point of that trait here: RaBitQ codes are stored as one contiguous
 /// stride a vertex and read back into the column layout Lance's estimator wants,
-/// so the resident form is about 1.7 times the on-disk one at three bits. A
-/// budget in on-disk bytes would quietly hold two thirds of what it was asked to.
+/// so their resident form is about 1.7 times the on-disk one at three bits. A
+/// budget in on-disk bytes would quietly hold two thirds of what it was asked
+/// to. Scalar codes are not repacked and should come back at about one, which is
+/// a thing to check rather than assume.
 pub(crate) struct Resident {
     pub(crate) row_ids: Vec<u64>,
-    pub(crate) codes: RabitQuantizationStorage,
+    pub(crate) codes: CodeStore,
     /// Every vertex's out-edges, `max_degree` slots each and indexed by local
     /// id, when the walk is to steer without reading them.
     ///

@@ -119,7 +119,7 @@ use uuid::Uuid;
 
 use crate::builder::{live_fragments, routing_distance_type, supported_distance_type};
 use crate::cache;
-use crate::codes::{self, CODE_COLUMN, centroid_distance};
+use crate::codes::{self, CODE_COLUMN};
 use crate::format::{
     FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, NEIGHBORS_COLUMN, ROW_ID_COLUMN, RowIdMode,
     VECTOR_COLUMN,
@@ -155,7 +155,7 @@ pub enum WalkMode {
     /// Read the partition whole and measure against its codes, with the
     /// candidate list re-scored exactly before it is answered from.
     ///
-    /// Only for an index built with [`crate::IndexParams::with_code_bits`], and
+    /// Only for an index built with [`crate::IndexParams::with_codes`], and
     /// refused rather than quietly downgraded for one that was not. On its own
     /// it costs a few per cent more comparisons and reads no fewer bytes: it is
     /// [`Self::Lazy`] with the reading left alone, which is the useful arm to
@@ -1088,7 +1088,7 @@ impl VamanaIndex {
         if params.mode.needs_codes() && self.metadata.codes.is_none() {
             return Err(Error::invalid_input(
                 "this Vamana index was built without codes, so it cannot be walked by them; \
-                 rebuild it with IndexParams::with_code_bits"
+                 rebuild it with IndexParams::with_codes"
                     .to_string(),
             ));
         }
@@ -1314,14 +1314,21 @@ impl VamanaIndex {
                 let declared = segment.manifest.metadata();
                 // Computed rather than taken from the ranking above, which is a
                 // routing distance whose scale is `find_partitions`' business.
-                // This one is a term of RaBitQ's estimator, so what it has to be
-                // is unambiguous, and `dimension` flops a probed partition is
+                // What this term is depends on the kind of code the segment
+                // carries, so the segment's own parameters decide it; for RaBitQ
+                // it is `|q - c|^2` and `dimension` flops a probed partition is
                 // nothing beside reading one.
                 let dist_q_c = params
                     .mode
                     .needs_codes()
                     .then(|| {
-                        centroid_distance(segment.manifest.ivf(), *partition_id, routing_query)
+                        let codes = declared.codes.as_ref().ok_or_else(|| {
+                            Error::invalid_input(
+                                "a Vamana coded walk was scheduled for a segment without codes"
+                                    .to_string(),
+                            )
+                        })?;
+                        codes.query_offset(segment.manifest.ivf(), *partition_id, routing_query)
                     })
                     .transpose()?;
                 probes.push(Probe {
