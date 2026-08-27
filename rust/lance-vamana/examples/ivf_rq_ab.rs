@@ -22,14 +22,23 @@
 //! 0), `REFERENCE_POSITION` (`last` or `both`, default `last`), `ARMS`
 //! (`scan`, `walk` or both, default both), `DATASET_DIR` (unset: temporary
 //! directories thrown away at the end), `HNSW_EFS` (unset: no HNSW arm),
-//! `HNSW_NPROBES` (default 1) and `HNSW_URI` (default: the `-p1-hnswsq.lance`
-//! directory beside the others).
+//! `HNSW_NPROBES` (default 1), `HNSW_URI` (default: the `-p1-hnswsq.lance`
+//! directory beside the others) and `IVF_SQ` (default 0).
 //!
 //! `HNSW_EFS` adds Lance's other graph index, `IVF_HNSW_SQ`, as a third arm,
 //! one width sweep per `ef`. It is measured through exactly the code that
 //! measures `IVF_RQ`, phases included, because the two differ only in which
 //! index the same scanner reaches; this example never builds it, so the
 //! directory has to exist already (`examples/hnsw_index.rs` writes it).
+//!
+//! `IVF_SQ=1` adds a fourth arm: Lance's flat `IVF_SQ`, built here on demand in
+//! the `IVF_RQ` arm's own IVF shape - the same partitions probed the same
+//! number of times - so that the quantizer is the only thing between the two.
+//! It carries Lance's shipped `SQBuildParams::default()`, which is the same
+//! eight-bit scalar quantization the `IVF_HNSW_SQ` arm walks over and the same
+//! width this crate's `CODE_KIND=sq` walk steers by. That makes it the flat
+//! control for the question the graph arms leave open: whether a graph buys
+//! anything once a scan is handed the same codes.
 //!
 //! Every earlier sweep in this crate compares the walk against a scan *this
 //! crate* wrote. That scan is the walk's own parts with the graph switched off,
@@ -145,6 +154,7 @@ use lance_index::IndexType;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::flat::storage::FlatFloatStorage;
 use lance_index::vector::ivf::IvfBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
@@ -160,6 +170,7 @@ const ID_COLUMN: &str = "id";
 const VECTOR_FIELD: &str = "vector";
 const VAMANA_INDEX: &str = "vamana_idx";
 const RQ_INDEX: &str = "rq_idx";
+const SQ_INDEX: &str = "sq_idx";
 const DISTANCE_TYPE: DistanceType = DistanceType::L2;
 const K: usize = 10;
 
@@ -907,6 +918,14 @@ async fn main() {
         other => panic!("CODE_KIND is `rq` or `sq`, got `{other}`"),
     };
     let hnsw_efs = env_list_opt("HNSW_EFS");
+    // Lance's flat IVF over eight-bit scalar codes. Deliberately without knobs
+    // of its own: it borrows the `IVF_RQ` arm's partitions and probes so that a
+    // difference between the two is the quantizer and nothing else, and it
+    // takes Lance's shipped quantizer parameters rather than `SQ_BITS`, which
+    // names this crate's codes. Lance has no other width to offer anyway -
+    // `ScalarQuantizer::transform` scales to `u8` whatever it is told.
+    let ivf_sq = env_usize("IVF_SQ", 0) != 0;
+    let sq_params = SQBuildParams::default();
     let hnsw_nprobes = env_usize("HNSW_NPROBES", 1);
     let widths = env_list("WIDTHS", "10,20,30,40,60,80,120,160");
     assert!(
@@ -974,7 +993,11 @@ async fn main() {
     println!(
         "vamana: {vamana_partitions} partitions of about {vamana_rows_per_partition}, \
          {vamana_nprobes} probes | IVF_RQ: {rq_partitions} partitions of about \
-         {rq_rows_per_partition}, {rq_nprobes} probes"
+         {rq_rows_per_partition}, {rq_nprobes} probes{}",
+        match ivf_sq {
+            true => format!(" | IVF_SQ: that same shape on {} bits", sq_params.num_bits),
+            false => String::new(),
+        }
     );
 
     let store = FlatFloatStorage::new(vectors.clone(), DISTANCE_TYPE);
@@ -1013,6 +1036,10 @@ async fn main() {
     let vamana_uri =
         format!("{home}/{prefix}-{rows}-p{vamana_partitions}-r{degree}-{code_suffix}.lance");
     let rq_uri = format!("{home}/{prefix}-{rows}-p{rq_partitions}-rq{code_bits}.lance");
+    let sq_uri = format!(
+        "{home}/{prefix}-{rows}-p{rq_partitions}-ivfsq{}.lance",
+        sq_params.num_bits
+    );
     let hnsw_uri = std::env::var("HNSW_URI")
         .unwrap_or_else(|_| format!("{home}/{prefix}-{rows}-p1-hnswsq.lance"));
 
@@ -1082,7 +1109,40 @@ async fn main() {
         );
     }
 
+    if ivf_sq {
+        if std::fs::metadata(&sq_uri).is_ok() {
+            let dataset = Dataset::open(&sq_uri).await.unwrap();
+            assert_eq!(dataset.count_rows(None).await.unwrap(), rows);
+            println!("reusing the IVF_SQ index at {sq_uri}");
+        } else {
+            let mut dataset = write_dataset(&sq_uri, &vectors).await;
+            let started = Instant::now();
+            dataset
+                .create_index(
+                    &[VECTOR_FIELD],
+                    IndexType::IvfSq,
+                    Some(SQ_INDEX.to_string()),
+                    &VectorIndexParams::with_ivf_sq_params(
+                        DISTANCE_TYPE,
+                        IvfBuildParams::new(rq_partitions as usize),
+                        sq_params.clone(),
+                    ),
+                    false,
+                )
+                .await
+                .unwrap();
+            println!(
+                "IVF_SQ indexed in {:.1}s at {sq_uri}",
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+
     let vamana_positions = Arc::new(positions_by_address(&vamana_dataset).await);
+    let sq_positions = match ivf_sq {
+        false => Arc::new(HashMap::new()),
+        true => Arc::new(positions_by_address(&Dataset::open(&sq_uri).await.unwrap()).await),
+    };
     let rq_positions = Arc::new(positions_by_address(&Dataset::open(&rq_uri).await.unwrap()).await);
     let hnsw_positions = match hnsw_efs.is_empty() {
         true => Arc::new(HashMap::new()),
@@ -1226,6 +1286,15 @@ async fn main() {
         let label = format!("HNSW ef={ef}");
         let points = reference_sweep(&hnsw_uri, &fixture, &widths, &label).await;
         sweeps.push((label, points));
+    }
+
+    if ivf_sq {
+        let fixture = Fixture {
+            positions: &sq_positions,
+            ..rq_fixture
+        };
+        let points = reference_sweep(&sq_uri, &fixture, &widths, "IVF_SQ").await;
+        sweeps.push(("IVF_SQ".to_string(), points));
     }
 
     let rq_points = reference_sweep(&rq_uri, &rq_fixture, &widths, "IVF_RQ refined").await;
