@@ -25,6 +25,14 @@
 //! `HNSW_NPROBES` (default 1), `HNSW_URI` (default: the `-p1-hnswsq.lance`
 //! directory beside the others) and `IVF_SQ` (default 0).
 //!
+//! `LANCE_RQ_PRUNE_STATS=1` is Lance's own knob, not this example's: `IVF_RQ`
+//! tallies how many rows its two-stage estimator threw away on the binary code
+//! alone and reports them through `log`. A binary with no logger installed
+//! drops that silently, so this one installs a logger for exactly that target
+//! when the knob is set - and only then, so that a pass being timed is never
+//! made to write while it is timed. Pair it with
+//! `LANCE_RQ_PRUNE_STATS_INTERVAL=1` to see every scan rather than every 1024th.
+//!
 //! `HNSW_EFS` adds Lance's other graph index, `IVF_HNSW_SQ`, as a third arm,
 //! one width sweep per `ef`. It is measured through exactly the code that
 //! measures `IVF_RQ`, phases included, because the two differ only in which
@@ -173,6 +181,36 @@ const RQ_INDEX: &str = "rq_idx";
 const SQ_INDEX: &str = "sq_idx";
 const DISTANCE_TYPE: DistanceType = DistanceType::L2;
 const K: usize = 10;
+
+/// Prints Lance's RaBitQ prune tallies and nothing else. Deliberately not a
+/// general logger: everything else Lance logs during a pass would land in the
+/// same stdout the measurement's own table goes to.
+struct PruneStatsLogger;
+
+impl log::Log for PruneStatsLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.target() == "lance_index::vector::bq::prune_stats"
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            println!("{}", record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Whether Lance was asked for the tallies, spelled the way Lance spells it so
+/// that one variable cannot switch on the counting and leave the printing off.
+fn prune_stats_asked() -> bool {
+    std::env::var("LANCE_RQ_PRUNE_STATS").is_ok_and(|value| {
+        !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        )
+    })
+}
 
 fn parse_list(name: &str, raw: &str) -> Vec<usize> {
     raw.split(',')
@@ -877,6 +915,13 @@ fn report(label: &str, width: usize, cost: &Cost) {
 
 #[tokio::main]
 async fn main() {
+    if prune_stats_asked() {
+        // `set_logger` over `set_boxed_logger`: the boxed form is behind the
+        // `log` crate's `std` feature, which nothing in this tree turns on.
+        static LOGGER: PruneStatsLogger = PruneStatsLogger;
+        log::set_logger(&LOGGER).unwrap();
+        log::set_max_level(log::LevelFilter::Warn);
+    }
     let dir = std::env::var("SIFT_DIR").expect("set SIFT_DIR to the extracted dataset directory");
     let prefix = std::path::Path::new(&dir)
         .file_name()
