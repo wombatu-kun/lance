@@ -106,6 +106,7 @@ use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
+use lance_vamana::codes::CodeSpec;
 use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode};
 
 #[path = "common/mod.rs"]
@@ -500,8 +501,10 @@ async fn main() {
         assert_eq!(metadata.dimension as usize, dim);
         assert_eq!(metadata.max_degree, degree);
         assert_eq!(
-            metadata.codes.as_ref().map(|codes| codes.num_bits),
-            Some(code_bits)
+            metadata.codes.as_ref().map(|codes| codes.spec()),
+            Some(CodeSpec::Rabit {
+                num_bits: code_bits
+            })
         );
         println!("reusing the index at {uri}");
         dataset
@@ -513,7 +516,9 @@ async fn main() {
             INDEX_NAME,
             &IndexParams::new(VECTOR_FIELD, partitions)
                 .with_distance_type(DISTANCE_TYPE)
-                .with_code_bits(code_bits)
+                .with_codes(CodeSpec::Rabit {
+                    num_bits: code_bits,
+                })
                 .with_graph_params(BuildParams {
                     max_degree: degree,
                     ..Default::default()

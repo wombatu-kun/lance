@@ -664,7 +664,7 @@ async fn a_code_column_gets_its_own_stride_and_disturbs_no_other() {
     let dir = tempfile::tempdir().unwrap();
     let (store, path) = local_store_and_path(&dir, "coded.idx");
     let partition = sample_partition(MAX_DEGREE, VERTICES, DIMENSION);
-    let params = CodeParams::mint(CODE_BITS, DIMENSION).unwrap();
+    let params = CodeParams::rabit(CODE_BITS, DIMENSION).unwrap();
     let stride = params.stride(DIMENSION).unwrap();
     let codes = FixedSizeListArray::try_new(
         Arc::new(Field::new("item", DataType::UInt8, false)),

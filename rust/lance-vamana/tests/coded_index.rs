@@ -24,6 +24,7 @@ use lance::dataset::WriteParams;
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
+use lance_vamana::codes::CodeSpec;
 use lance_vamana::consolidator::consolidate_index;
 use lance_vamana::inserter::{insert_as_segment, insert_in_place};
 use lance_vamana::merger::merge_index;
@@ -44,6 +45,17 @@ const QUERIES: usize = 40;
 /// same recall, which is the whole finding the default rests on.
 const CODE_BITS: u8 = 3;
 
+/// The two kinds a segment can carry, named once.
+///
+/// Scalar codes are four times the bytes and not a working point at all; what
+/// they are for is the comparison against Lance's own `IVF_HNSW_SQ`, which
+/// steers by exactly this representation. Eight bits because Lance quantises to
+/// a byte whatever width it is asked for.
+const RABIT: CodeSpec = CodeSpec::Rabit {
+    num_bits: CODE_BITS,
+};
+const SCALAR: CodeSpec = CodeSpec::Scalar { num_bits: 8 };
+
 /// Partitions large enough that a walk cannot exhaust one, which is the only
 /// regime in which steering matters at all: on a partition a single query
 /// reaches the whole of, every arm scores the same and the comparison is empty.
@@ -55,19 +67,19 @@ fn fixture() -> DatasetFixture {
     }
 }
 
-fn params() -> IndexParams {
+fn params(codes: CodeSpec) -> IndexParams {
     IndexParams::new(VECTOR_COLUMN, PARTITIONS)
         .with_graph_params(BuildParams {
             max_degree: 16,
             search_list_size: 64,
             ..Default::default()
         })
-        .with_code_bits(CODE_BITS)
+        .with_codes(codes)
 }
 
-async fn coded_dataset(uri: &str) -> Dataset {
+async fn coded_dataset(uri: &str, codes: CodeSpec) -> Dataset {
     let mut dataset = fixture().write(uri).await;
-    create_index(&mut dataset, INDEX_NAME, &params())
+    create_index(&mut dataset, INDEX_NAME, &params(codes))
         .await
         .unwrap();
     dataset
@@ -126,11 +138,10 @@ async fn measure(
 /// is merely poor. The bar is therefore relative - within a tenth of what the
 /// same index answers exactly - rather than an absolute recall number that a
 /// broken arm could still clear on an easy fixture.
-#[tokio::test]
-async fn a_coded_walk_lands_where_the_exact_one_does() {
+async fn a_coded_walk_lands_where_the_exact_one_does(codes: CodeSpec) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, codes).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
     let queries = random_vectors(QUERIES, 4242);
@@ -138,7 +149,7 @@ async fn a_coded_walk_lands_where_the_exact_one_does() {
     let exact = measure(&index, &queries, &truth, WalkMode::Exact).await;
     let coded = measure(&index, &queries, &truth, WalkMode::Coded).await;
     println!(
-        "exact: recall@{K}={:.4}, {:.0} comparisons; coded({CODE_BITS} bits): recall@{K}={:.4}, \
+        "exact: recall@{K}={:.4}, {:.0} comparisons; coded({codes}): recall@{K}={:.4}, \
          {:.0} comparisons",
         exact.recall, exact.comparisons, coded.recall, coded.comparisons
     );
@@ -163,6 +174,20 @@ async fn a_coded_walk_lands_where_the_exact_one_does() {
     );
 }
 
+#[tokio::test]
+async fn a_rabit_walk_lands_where_the_exact_one_does() {
+    a_coded_walk_lands_where_the_exact_one_does(RABIT).await;
+}
+
+/// The same bar over scalar codes, which reach the walk by a different route:
+/// no rotation, no residual against the centroid, and no term beside the query.
+/// Nothing here is a working point - it is the representation Lance's own
+/// `IVF_HNSW_SQ` steers by, and this is the test that the walk can be given it.
+#[tokio::test]
+async fn a_scalar_walk_lands_where_the_exact_one_does() {
+    a_coded_walk_lands_where_the_exact_one_does(SCALAR).await;
+}
+
 /// The re-scoring covers the whole candidate list, so the answer's distances are
 /// exact whichever way the walk was steered. A caller comparing a returned
 /// distance against a threshold depends on it.
@@ -170,7 +195,7 @@ async fn a_coded_walk_lands_where_the_exact_one_does() {
 async fn a_coded_answer_carries_exact_distances() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
     let query = &random_vectors(1, 909)[0];
@@ -213,7 +238,7 @@ async fn a_coded_answer_carries_exact_distances() {
 async fn an_exact_walk_does_not_read_the_code_column() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let query = &random_vectors(1, 55)[0];
 
     let mut bytes = Vec::new();
@@ -243,8 +268,8 @@ async fn an_index_without_codes_refuses_the_coded_walk() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut dataset = fixture().write(uri).await;
-    let mut plain = params();
-    plain.code_bits = None;
+    let mut plain = params(RABIT);
+    plain.codes = None;
     create_index(&mut dataset, INDEX_NAME, &plain)
         .await
         .unwrap();
@@ -299,7 +324,9 @@ async fn a_dimension_rabit_cannot_pack_refuses_a_coded_build() {
     let error = create_index(
         &mut dataset,
         INDEX_NAME,
-        &IndexParams::new(VECTOR_COLUMN, 2).with_code_bits(CODE_BITS),
+        &IndexParams::new(VECTOR_COLUMN, 2).with_codes(CodeSpec::Rabit {
+            num_bits: CODE_BITS,
+        }),
     )
     .await
     .unwrap_err();
@@ -320,7 +347,7 @@ async fn a_dimension_rabit_cannot_pack_refuses_a_coded_build() {
 async fn the_maintenance_passes_keep_the_codes_in_step() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut dataset = coded_dataset(uri).await;
+    let mut dataset = coded_dataset(uri, RABIT).await;
     let minted = read_committed_segments(&dataset, INDEX_NAME).await[0]
         .manifest
         .metadata()
@@ -399,7 +426,7 @@ async fn a_cosine_index_walks_by_codes_too() {
     create_index(
         &mut dataset,
         INDEX_NAME,
-        &params().with_distance_type(DistanceType::Cosine),
+        &params(RABIT).with_distance_type(DistanceType::Cosine),
     )
     .await
     .unwrap();

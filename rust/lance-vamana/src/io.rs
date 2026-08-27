@@ -26,7 +26,7 @@ use lance_index::pb;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
+use lance_io::scheduler::{FileScheduler, IoStats, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use prost::Message;
@@ -115,12 +115,15 @@ impl PartitionFile {
     /// `size_bytes` skips the size probe when the caller already knows the
     /// answer - Lance records the size of every file of a committed index in the
     /// dataset manifest, so at query time it always does.
+    /// `stats` records everything read through this file, on top of the
+    /// scheduler's own totals; see [`Self::open_with`].
     pub async fn open(
         scheduler: &Arc<ScanScheduler>,
         path: &Path,
         size_bytes: Option<u64>,
+        stats: Option<&IoStats>,
     ) -> Result<Self> {
-        Self::open_with(scheduler, path, size_bytes, None).await
+        Self::open_with(scheduler, path, size_bytes, None, stats).await
     }
 
     /// Open `path`, taking its layout from `cache` if a query has read it before.
@@ -135,18 +138,30 @@ impl PartitionFile {
         path: &Path,
         size_bytes: Option<u64>,
         cache: &LanceCache,
+        stats: Option<&IoStats>,
     ) -> Result<Self> {
-        Self::open_with(scheduler, path, size_bytes, Some(cache)).await
+        Self::open_with(scheduler, path, size_bytes, Some(cache), stats).await
     }
 
+    /// `stats` is a secondary sink the scheduler records into beside its own
+    /// running totals, which is how a caller measures the bytes of a *scope*
+    /// rather than of an index: the handle is attached before the footer is read
+    /// and is carried by every clone of it, so one sink covers the footer, the
+    /// resident codes and every hop a walk takes. [`Self::project_into`] is how
+    /// the other half of a query gets counted apart from that.
     async fn open_with(
         scheduler: &Arc<ScanScheduler>,
         path: &Path,
         size_bytes: Option<u64>,
         cache: Option<&LanceCache>,
+        stats: Option<&IoStats>,
     ) -> Result<Self> {
         let size = size_bytes.map_or_else(CachedFileSize::unknown, CachedFileSize::new);
         let file = scheduler.open_file(path, &size).await?;
+        let file = match stats {
+            Some(stats) => file.with_io_stats(stats.recorder()),
+            None => file,
+        };
         // Only the cached arm goes near a key, because the uncached one is what
         // every build and maintenance pass takes, and those open a file once
         // each: hashing a path and weighing the metadata would be pure overhead
@@ -203,17 +218,22 @@ impl PartitionFile {
     /// itself, and `try_open` would go back to storage for the footer to be told
     /// so.
     pub async fn project(&self, columns: &[&str]) -> Result<FileReader> {
+        self.project_with(columns, None).await
+    }
+
+    async fn project_with(&self, columns: &[&str], stats: Option<&IoStats>) -> Result<FileReader> {
         let options = FileReaderOptions::default();
         let projection = reader_projection_from_column_names(
             SEGMENT_FILE_VERSION,
             self.reader.schema(),
             columns,
         )?;
+        let file = match stats {
+            Some(stats) => self.file.with_io_stats(stats.recorder()),
+            None => self.file.clone(),
+        };
         FileReader::try_open_with_file_metadata(
-            Arc::new(
-                LanceEncodingsIo::new(self.file.clone())
-                    .with_read_chunk_size(options.read_chunk_size),
-            ),
+            Arc::new(LanceEncodingsIo::new(file).with_read_chunk_size(options.read_chunk_size)),
             self.path.clone(),
             Some(projection),
             Arc::<DecoderPlugins>::default(),
@@ -222,6 +242,18 @@ impl PartitionFile {
             options,
         )
         .await
+    }
+
+    /// [`Self::project`], with the reads it performs recorded into `stats`
+    /// instead of into whatever this file was opened with.
+    ///
+    /// Replacing the sink rather than adding a second one is what makes the two
+    /// halves of a query separable: `FileScheduler::with_io_stats` sets the
+    /// handle rather than appending to a list, so a projection built here is
+    /// counted here and nowhere else. The scheduler's global totals still see
+    /// everything either way.
+    pub async fn project_into(&self, columns: &[&str], stats: &IoStats) -> Result<FileReader> {
+        self.project_with(columns, Some(stats)).await
     }
 
     /// The reader over every column.
@@ -241,7 +273,7 @@ pub async fn open_file(
     columns: Option<&[&str]>,
     size_bytes: Option<u64>,
 ) -> Result<FileReader> {
-    let file = PartitionFile::open(scheduler, path, size_bytes).await?;
+    let file = PartitionFile::open(scheduler, path, size_bytes, None).await?;
     match columns {
         Some(columns) => file.project(columns).await,
         None => Ok(file.whole()),

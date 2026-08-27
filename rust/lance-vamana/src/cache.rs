@@ -36,10 +36,18 @@
 //!   the working set costs is a property of the data: at three bits and
 //!   `d = 128` a vertex is 68 bytes on disk and about 116 in memory, so a
 //!   million rows is 65 MiB read and 110 MiB held.
-//! - **It does not cache the walk.** Edges and vectors are fetched by the walk
-//!   itself, a few hundred rows of a partition per query, and which few hundred
-//!   depends on the query. Caching those would be caching a query's answer, not
-//!   a partition's contents.
+//! - **It does not cache the vectors.** They are fetched by the re-score, a few
+//!   hundred rows of a partition per query, and which few hundred depends on
+//!   the query. Caching those would be caching a query's answer, not a
+//!   partition's contents.
+//!
+//! The edges sit under half of that second argument only: *which* out-edges a
+//! walk reads depends on the query, but the column itself is a partition's
+//! contents in the way the codes are. So holding them is available and off by
+//! default ([`Resident::edges`]) - once the codes are resident, a walk's reads
+//! of that column are all a probe has left besides the re-score - and what it
+//! costs is 256 bytes a vertex at `R = 64` against the 68 a code occupies at
+//! `d = 128`.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -47,36 +55,48 @@ use std::sync::Arc;
 use lance_core::cache::{CacheKey, CacheKeySchema, Context, DeepSizeOf, KeyBuilder, LanceCache};
 use lance_core::{Error, Result};
 use lance_file::reader::CachedFileMetadata;
-use lance_index::vector::bq::storage::RabitQuantizationStorage;
 use object_store::path::Path;
 use uuid::Uuid;
 
-use crate::codes::{self, CODE_COLUMN};
-use crate::format::{IndexMetadata, ROW_ID_COLUMN};
+use crate::codes::{self, CODE_COLUMN, CodeStore};
+use crate::format::{IndexMetadata, NEIGHBORS_COLUMN, ROW_ID_COLUMN};
 use crate::io::{PartitionFile, read_partition_batch};
-use crate::partition::row_ids_from_batch;
+use crate::partition::{neighbor_slots, row_ids_from_batch};
 use crate::segment::PartitionEntry;
 
 /// The part of a partition a lazy walk holds in memory for the whole walk.
 ///
-/// The two together rather than one entry each, because they are read by one
-/// projection and are useless apart: the codes are what the walk steers by and
-/// the row ids are what its answer is made of, and a walk that had one without
-/// the other would have to read the partition to get the other.
+/// The row ids and the codes together rather than one entry each, because they
+/// are read by one projection and are useless apart: the codes are what the walk
+/// steers by and the row ids are what its answer is made of, and a walk that had
+/// one without the other would have to read the partition to get the other.
 ///
 /// Sized by [`DeepSizeOf`] rather than by the bytes it was read from, which is
-/// the whole point of that trait here: the codes are stored as one contiguous
+/// the whole point of that trait here: RaBitQ codes are stored as one contiguous
 /// stride a vertex and read back into the column layout Lance's estimator wants,
-/// so the resident form is about 1.7 times the on-disk one at three bits. A
-/// budget in on-disk bytes would quietly hold two thirds of what it was asked to.
+/// so their resident form is about 1.7 times the on-disk one at three bits. A
+/// budget in on-disk bytes would quietly hold two thirds of what it was asked
+/// to. Scalar codes are not repacked and should come back at about one, which is
+/// a thing to check rather than assume.
 pub(crate) struct Resident {
     pub(crate) row_ids: Vec<u64>,
-    pub(crate) codes: RabitQuantizationStorage,
+    pub(crate) codes: CodeStore,
+    /// Every vertex's out-edges, `max_degree` slots each and indexed by local
+    /// id, when the walk is to steer without reading them.
+    ///
+    /// Absent by default, and the one thing here a query could have fetched for
+    /// itself. What it saves is the walk's own reads and nothing else - after
+    /// the codes are resident those are all that is left of a probe besides the
+    /// re-score - and what it costs is 256 bytes a vertex at `R = 64`, against
+    /// the 68 a code occupies at `d = 128` and the 376 at `d = 960`.
+    pub(crate) edges: Option<Vec<u32>>,
 }
 
 impl DeepSizeOf for Resident {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.row_ids.deep_size_of_children(context) + self.codes.deep_size_of_children(context)
+        self.row_ids.deep_size_of_children(context)
+            + self.codes.deep_size_of_children(context)
+            + self.edges.deep_size_of_children(context)
     }
 }
 
@@ -88,17 +108,24 @@ impl DeepSizeOf for Resident {
 /// of an index that has been appended to. Neither mistake is visible as an
 /// error - the codes of the wrong partition steer a walk to plausible local ids,
 /// and the row ids beside them turn those into plausible row addresses.
+///
+/// So is the third part, for a quieter reason: an entry read without the edges
+/// answers a walk that wanted them, which is not an error at all - the walk
+/// falls back to fetching them a hop at a time and returns the same answer for
+/// more requests. Nothing downstream can see the difference, so the key has to.
 #[derive(Debug)]
 pub(crate) struct ResidentKey {
     pub(crate) segment: Uuid,
     pub(crate) partition_id: u32,
+    pub(crate) edges: bool,
 }
 
 impl CacheKey for ResidentKey {
     type ValueType = Resident;
 
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("{}/{}", self.segment, self.partition_id))
+        let edges = if self.edges { "/e" } else { "" };
+        Cow::Owned(format!("{}/{}{edges}", self.segment, self.partition_id))
     }
 
     fn type_name() -> &'static str {
@@ -106,12 +133,13 @@ impl CacheKey for ResidentKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance-vamana.resident", 1)
+        CacheKeySchema::new("lance-vamana.resident", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_fixed_bytes(self.segment.as_bytes());
         builder.write_u32(self.partition_id);
+        builder.write_bool(self.edges);
     }
 }
 
@@ -145,7 +173,8 @@ impl CacheKey for FileKey<'_> {
     }
 }
 
-/// Read the row ids and the codes of a partition, or take the ones already read.
+/// Read the row ids and the codes of a partition, and its edges when asked for
+/// them, or take the ones already read.
 ///
 /// The one read a lazy walk makes that is proportional to the partition rather
 /// than to what the walk touches, which is what makes it the one worth keeping.
@@ -158,23 +187,31 @@ impl CacheKey for FileKey<'_> {
 /// `None` reads, every time, and does not go near a key. It is not the same as
 /// a cache of capacity zero, which admits an entry before reclaiming it and so
 /// serves the occasional hit out of what is supposed to be nothing.
+///
+/// `resident_edges` carries the graph's degree when the edges are to be held
+/// too, so that a caller cannot ask for them without saying how wide they are.
 pub(crate) async fn resident(
     cache: Option<&LanceCache>,
     segment: Uuid,
     entry: &PartitionEntry,
     file: &PartitionFile,
     metadata: &IndexMetadata,
+    resident_edges: Option<u32>,
 ) -> Result<Arc<Resident>> {
     let params = metadata.codes.as_ref().ok_or_else(|| {
         Error::internal("a Vamana lazy walk was scheduled for a segment without codes".to_string())
     })?;
     let read = || async {
-        // One projection over two columns rather than two reads: the row ids are
-        // three per cent of what the codes weigh, and the walk needs them for
-        // its answer anyway. Reading them lazily instead would be the worse
-        // trade by far - `__row_id` is the one compressed column of a partition
-        // file, so a single scattered row of it drags a two-kilobyte mini-block.
-        let reader = file.project(&[ROW_ID_COLUMN, CODE_COLUMN]).await?;
+        // One projection rather than a read a column: the row ids are three per
+        // cent of what the codes weigh, and the walk needs them for its answer
+        // anyway. Reading them lazily instead would be the worse trade by far -
+        // `__row_id` is the one compressed column of a partition file, so a
+        // single scattered row of it drags a two-kilobyte mini-block.
+        let columns: &[&str] = match resident_edges {
+            Some(_) => &[ROW_ID_COLUMN, CODE_COLUMN, NEIGHBORS_COLUMN],
+            None => &[ROW_ID_COLUMN, CODE_COLUMN],
+        };
+        let reader = file.project(columns).await?;
         let batch = read_partition_batch(&reader, entry.num_rows).await?;
         let row_ids = row_ids_from_batch(&batch)?;
         let codes = codes::storage(
@@ -184,13 +221,22 @@ pub(crate) async fn resident(
             &row_ids,
             &codes::column(&batch)?,
         )?;
-        Ok(Resident { row_ids, codes })
+        let edges = match resident_edges {
+            Some(max_degree) => Some(neighbor_slots(&batch, max_degree)?.to_vec()),
+            None => None,
+        };
+        Ok(Resident {
+            row_ids,
+            codes,
+            edges,
+        })
     };
     match cache {
         Some(cache) => {
             let key = ResidentKey {
                 segment,
                 partition_id: entry.partition_id,
+                edges: resident_edges.is_some(),
             };
             cache.get_or_insert_with_key(key, read).await
         }

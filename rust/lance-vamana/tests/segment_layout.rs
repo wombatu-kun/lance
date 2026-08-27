@@ -545,22 +545,27 @@ async fn copying_between_segments_whose_codes_disagree_is_refused() {
     // Written out rather than minted: this fixture's dimension is not one
     // RaBitQ can pack, and the check under test never looks at a rotation's
     // shape - only at whether the two segments agree about it.
-    let coded = CodeParams {
+    let coded = CodeParams::Rabit {
         num_bits: 3,
         rotation_signs: vec![0xA5, 0x3C],
     };
-    let elsewhere = CodeParams {
+    let elsewhere = CodeParams::Rabit {
+        num_bits: 3,
         rotation_signs: vec![0x5A, 0xC3],
-        ..coded.clone()
     };
-    let wider = CodeParams {
+    let wider = CodeParams::Rabit {
         num_bits: 5,
-        ..coded.clone()
+        rotation_signs: vec![0xA5, 0x3C],
+    };
+    let scalar = CodeParams::Scalar {
+        num_bits: 8,
+        bounds: 0.0..1.0,
     };
 
     for (what, mine, theirs) in [
         ("another rotation", Some(coded.clone()), Some(elsewhere)),
         ("another width", Some(coded.clone()), Some(wider)),
+        ("another kind of code", Some(coded.clone()), Some(scalar)),
         ("no codes at all", Some(coded.clone()), None),
         ("codes we do not have", None, Some(coded)),
     ] {

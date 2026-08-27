@@ -29,7 +29,7 @@ use lance::Dataset;
 use lance_core::cache::LanceCache;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
-use lance_vamana::codes::CodeParams;
+use lance_vamana::codes::{CodeParams, CodeSpec};
 use lance_vamana::query::{QueryResult, SearchParams, VamanaIndex, WalkMode};
 
 mod common;
@@ -41,6 +41,7 @@ const K: usize = 10;
 const BEAM: usize = 30;
 const QUERIES: usize = 40;
 const CODE_BITS: u8 = 3;
+const MAX_DEGREE: u32 = 16;
 
 /// Partitions a single walk cannot exhaust, because a lazy read of a partition
 /// a walk reaches every vertex of has read the partition.
@@ -52,19 +53,27 @@ fn fixture() -> DatasetFixture {
     }
 }
 
-fn params() -> IndexParams {
+/// The two kinds a segment can carry. Scalar codes are here for one reason: the
+/// resident half of a lazy walk holds whichever store the segment's codes need,
+/// and that is a different type for each kind.
+const RABIT: CodeSpec = CodeSpec::Rabit {
+    num_bits: CODE_BITS,
+};
+const SCALAR: CodeSpec = CodeSpec::Scalar { num_bits: 8 };
+
+fn params(codes: CodeSpec) -> IndexParams {
     IndexParams::new(VECTOR_COLUMN, PARTITIONS)
         .with_graph_params(BuildParams {
-            max_degree: 16,
+            max_degree: MAX_DEGREE,
             search_list_size: 64,
             ..Default::default()
         })
-        .with_code_bits(CODE_BITS)
+        .with_codes(codes)
 }
 
-async fn coded_dataset(uri: &str) -> Dataset {
+async fn coded_dataset(uri: &str, codes: CodeSpec) -> Dataset {
     let mut dataset = fixture().write(uri).await;
-    create_index(&mut dataset, INDEX_NAME, &params())
+    create_index(&mut dataset, INDEX_NAME, &params(codes))
         .await
         .unwrap();
     dataset
@@ -133,11 +142,10 @@ async fn measure(
 /// read at the wrong offset, a distance credited to the wrong row, a candidate
 /// list re-scored only as far as `k`) all show up here as an inequality rather
 /// than as a slightly worse recall that could be blamed on the codes.
-#[tokio::test]
-async fn a_hop_of_one_vertex_is_the_coded_walk_exactly() {
+async fn a_hop_of_one_vertex_is_the_coded_walk_exactly(codes: CodeSpec) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, codes).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
     let narrow = search(WalkMode::Lazy).with_beam_width(1);
@@ -160,6 +168,22 @@ async fn a_hop_of_one_vertex_is_the_coded_walk_exactly() {
     }
 }
 
+#[tokio::test]
+async fn a_rabit_hop_of_one_vertex_is_the_coded_walk_exactly() {
+    a_hop_of_one_vertex_is_the_coded_walk_exactly(RABIT).await;
+}
+
+/// The same equality over scalar codes.
+///
+/// Worth its own case rather than trusting the RaBitQ one: the resident half of
+/// a lazy walk holds a different store for each kind, and the query it is handed
+/// carries a term one kind wants and the other ignores. Both walks reading the
+/// same codes by two routes is exactly what this equality pins.
+#[tokio::test]
+async fn a_scalar_hop_of_one_vertex_is_the_coded_walk_exactly() {
+    a_hop_of_one_vertex_is_the_coded_walk_exactly(SCALAR).await;
+}
+
 /// What the mode is for: the same answer off a fraction of the bytes.
 ///
 /// The saving is bounded from below by what stays resident, which at this
@@ -171,7 +195,7 @@ async fn a_hop_of_one_vertex_is_the_coded_walk_exactly() {
 async fn a_lazy_walk_reads_a_fraction_of_the_partition() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 4242);
     let truth = ground_truth(&dataset, &queries).await;
 
@@ -236,7 +260,7 @@ async fn a_lazy_walk_reads_a_fraction_of_the_partition() {
 async fn a_wider_hop_trades_distances_for_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 909);
     let truth = ground_truth(&dataset, &queries).await;
 
@@ -282,7 +306,7 @@ async fn a_wider_hop_trades_distances_for_round_trips() {
 async fn a_lazy_walk_answers_only_live_rows() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut dataset = coded_dataset(uri).await;
+    let mut dataset = coded_dataset(uri, RABIT).await;
     dataset
         .delete("vec IS NOT NULL AND _rowid % 3 = 0")
         .await
@@ -290,19 +314,29 @@ async fn a_lazy_walk_answers_only_live_rows() {
 
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
     let live = common::live_row_ids(&dataset).await;
+    // The answer before the re-score is held to the same rule, and has to be:
+    // it is built from the candidate list, which is where dead vertices are
+    // still walked - they carry the edges that keep the graph connected - so
+    // nothing upstream of the two answers has dropped them yet.
+    let params = search(WalkMode::Lazy).with_report_coded(true);
     for query in random_vectors(8, 77) {
-        let result = index.search(&query, &search(WalkMode::Lazy)).await.unwrap();
-        assert_eq!(
-            result.neighbors.len(),
-            K,
-            "fewer than k live rows came back"
-        );
-        for neighbor in &result.neighbors {
-            assert!(
-                live.contains(&neighbor.row_addr),
-                "row {} was deleted and came back anyway",
-                neighbor.row_addr
+        let result = index.search(&query, &params).await.unwrap();
+        for (what, neighbors) in [
+            ("the answer", &result.neighbors),
+            ("the coded answer", &result.coded_neighbors),
+        ] {
+            assert_eq!(
+                neighbors.len(),
+                K,
+                "{what}: fewer than k live rows came back"
             );
+            for neighbor in neighbors {
+                assert!(
+                    live.contains(&neighbor.row_addr),
+                    "{what}: row {} was deleted and came back anyway",
+                    neighbor.row_addr
+                );
+            }
         }
     }
 }
@@ -312,7 +346,7 @@ async fn a_lazy_walk_answers_only_live_rows() {
 async fn a_lazy_walk_refuses_what_it_cannot_do() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
     let query = &random_vectors(1, 1)[0];
 
@@ -326,8 +360,8 @@ async fn a_lazy_walk_refuses_what_it_cannot_do() {
     let plain = tempfile::tempdir().unwrap();
     let plain_uri = plain.path().to_str().unwrap();
     let mut uncoded = fixture().write(plain_uri).await;
-    let mut without = params();
-    without.code_bits = None;
+    let mut without = params(RABIT);
+    without.codes = None;
     create_index(&mut uncoded, INDEX_NAME, &without)
         .await
         .unwrap();
@@ -389,7 +423,9 @@ async fn a_walk_that_reaches_everything_still_answers() {
                 search_list_size: 16,
                 ..Default::default()
             })
-            .with_code_bits(CODE_BITS),
+            .with_codes(CodeSpec::Rabit {
+                num_bits: CODE_BITS,
+            }),
     )
     .await
     .unwrap();
@@ -431,7 +467,7 @@ async fn a_walk_that_reaches_everything_still_answers() {
 async fn a_flat_scan_that_keeps_everything_is_brute_force() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
     let rows = fixture().indexed_rows();
@@ -497,7 +533,7 @@ async fn a_flat_scan_that_keeps_everything_is_brute_force() {
 async fn a_flat_scan_over_two_segments_is_brute_force() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    coded_dataset(uri).await;
+    coded_dataset(uri, RABIT).await;
     fixture().append(uri).await;
     let mut dataset = Dataset::open(uri).await.unwrap();
     lance_vamana::insert_as_segment(&mut dataset, INDEX_NAME)
@@ -549,7 +585,7 @@ async fn a_flat_scan_over_two_segments_is_brute_force() {
 async fn a_flat_scan_reads_no_edges() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 8888);
     let truth = ground_truth(&dataset, &queries).await;
 
@@ -604,7 +640,7 @@ async fn a_flat_scan_reads_no_edges() {
 async fn a_budget_wider_than_the_candidates_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
     let rows = fixture().indexed_rows();
 
@@ -649,7 +685,7 @@ async fn a_budget_wider_than_the_candidates_changes_nothing() {
 async fn a_budget_spends_the_strides_where_they_are_worth_most() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
     let rows = fixture().indexed_rows();
 
@@ -723,7 +759,7 @@ async fn a_budget_spends_the_strides_where_they_are_worth_most() {
 async fn a_lazy_walk_answers_across_segments() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    coded_dataset(uri).await;
+    coded_dataset(uri, RABIT).await;
     fixture().append(uri).await;
     let mut dataset = Dataset::open(uri).await.unwrap();
     lance_vamana::insert_as_segment(&mut dataset, INDEX_NAME)
@@ -834,7 +870,7 @@ async fn cached(dataset: &Dataset, budget: usize) -> VamanaIndex {
 async fn a_cache_does_not_change_an_answer() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 606);
 
     for mode in [WalkMode::Exact, WalkMode::Coded, WalkMode::Lazy] {
@@ -873,7 +909,7 @@ async fn a_cache_does_not_change_an_answer() {
 async fn a_cache_removes_the_read_the_walk_does_not_choose() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(QUERIES, 4242);
     let params = search(WalkMode::Lazy);
 
@@ -925,9 +961,16 @@ async fn a_cache_removes_the_read_the_walk_does_not_choose() {
 
 /// What a query's codes weigh on disk: every partition of the one segment is
 /// probed, so the rows behind them are the rows of the dataset.
+/// What `__neighbors` weighs across the whole index: a fixed stride of
+/// `max_degree` slots a vertex, so it does not depend on how the rows fell into
+/// partitions.
+fn edge_column_bytes() -> usize {
+    fixture().fragments * fixture().rows_per_fragment * MAX_DEGREE as usize * size_of::<u32>()
+}
+
 fn code_column_bytes() -> usize {
     let dimension = VECTOR_DIM as u32;
-    let stride = CodeParams::mint(CODE_BITS, dimension)
+    let stride = CodeParams::rabit(CODE_BITS, dimension)
         .unwrap()
         .stride(dimension)
         .unwrap() as usize;
@@ -948,7 +991,7 @@ fn code_column_bytes() -> usize {
 async fn two_segments_do_not_share_a_cache_entry() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    coded_dataset(uri).await;
+    coded_dataset(uri, RABIT).await;
     fixture().append(uri).await;
     let mut dataset = Dataset::open(uri).await.unwrap();
     lance_vamana::insert_as_segment(&mut dataset, INDEX_NAME)
@@ -996,7 +1039,7 @@ async fn two_segments_do_not_share_a_cache_entry() {
 async fn a_budget_too_small_for_a_partition_still_answers() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(16, 31337);
     let params = search(WalkMode::Lazy);
 
@@ -1036,7 +1079,7 @@ async fn a_budget_too_small_for_a_partition_still_answers() {
 async fn an_index_holds_nothing_unless_it_is_given_a_cache() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(16, 2718);
     let params = search(WalkMode::Lazy);
 
@@ -1065,7 +1108,7 @@ async fn an_index_holds_nothing_unless_it_is_given_a_cache() {
 async fn a_partition_is_read_once_however_many_queries_want_it() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let queries = random_vectors(8, 1234);
     let params = search(WalkMode::Lazy);
 
@@ -1104,7 +1147,7 @@ async fn a_partition_is_read_once_however_many_queries_want_it() {
 async fn the_budget_counts_the_resident_form_and_not_the_read_one() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = cached(&dataset, BUDGET).await;
     let params = search(WalkMode::Lazy);
     let result = index
@@ -1137,7 +1180,7 @@ async fn the_budget_counts_the_resident_form_and_not_the_read_one() {
 async fn a_lazy_query_is_validated_like_any_other() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let dataset = coded_dataset(uri).await;
+    let dataset = coded_dataset(uri, RABIT).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
     let mut query = random_vectors(1, 8)[0].clone();
@@ -1153,4 +1196,326 @@ async fn a_lazy_query_is_validated_like_any_other() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("dimensions"), "{error}");
+}
+
+/// Holding `__neighbors` across queries changes what a walk reads and must
+/// change nothing else: the same hops in the same order over the same graph, and
+/// so the same answer to the last bit.
+///
+/// The requests are pinned beside the equality because the equality alone would
+/// hold just as well if the flag had done nothing at all.
+#[tokio::test]
+async fn resident_edges_do_not_change_an_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri, RABIT).await;
+    let queries = random_vectors(QUERIES, 1717);
+    let fetching = search(WalkMode::Lazy);
+    let holding = search(WalkMode::Lazy).with_resident_edges(true);
+
+    let index = cached(&dataset, BUDGET).await;
+    replay(&index, &queries, &fetching).await;
+    let (fetched, fetched_cost) = replay(&index, &queries, &fetching).await;
+
+    let index = cached(&dataset, BUDGET).await;
+    replay(&index, &queries, &holding).await;
+    let (held, held_cost) = replay(&index, &queries, &holding).await;
+
+    assert_same(&fetched, &held, "resident edges");
+    assert!(
+        held_cost.requests < fetched_cost.requests,
+        "a walk holding the edges made {:.1} requests against {:.1} fetching them, so the column \
+         was fetched either way and the equality above pins nothing",
+        held_cost.requests,
+        fetched_cost.requests
+    );
+}
+
+/// The two flavours of a resident partition share a segment and a partition id,
+/// so the key has to carry which of them it holds.
+///
+/// Without that, the entry a fetching walk left behind answers one that wanted
+/// the edges held, and that walk silently goes back to fetching a hop at a time
+/// - with a cache hit recorded, the right answer returned and nothing at all to
+/// see in the run.
+#[tokio::test]
+async fn a_partition_held_without_its_edges_does_not_answer_a_walk_that_wants_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri, RABIT).await;
+    let queries = random_vectors(QUERIES, 606);
+    let fetching = search(WalkMode::Lazy);
+    let holding = search(WalkMode::Lazy).with_resident_edges(true);
+
+    let index = cached(&dataset, BUDGET).await;
+    replay(&index, &queries, &fetching).await;
+    let (_, fetched_cost) = replay(&index, &queries, &fetching).await;
+    replay(&index, &queries, &holding).await;
+    let (_, held_cost) = replay(&index, &queries, &holding).await;
+
+    assert!(
+        held_cost.requests < fetched_cost.requests,
+        "after a pass that fetched its edges, a walk asking to hold them still made {:.1} \
+         requests against {:.1}, so it was handed the partition without them",
+        held_cost.requests,
+        fetched_cost.requests
+    );
+}
+
+/// What holding them costs, in the units the budget is spent in.
+///
+/// Exactly the column rather than about it: `__neighbors` is a fixed stride of
+/// `max_degree` slots a vertex, so the resident form has no per-vertex overhead
+/// to hide behind, and a difference that is not the column means something else
+/// was held or something was evicted.
+#[tokio::test]
+async fn holding_the_edges_costs_exactly_the_edge_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri, RABIT).await;
+    let queries = random_vectors(2, 88);
+
+    let fetching = cached(&dataset, BUDGET).await;
+    replay(&fetching, &queries, &search(WalkMode::Lazy)).await;
+    let holding = cached(&dataset, BUDGET).await;
+    replay(
+        &holding,
+        &queries,
+        &search(WalkMode::Lazy).with_resident_edges(true),
+    )
+    .await;
+
+    let without = fetching.cache_stats().await.unwrap();
+    let with = holding.cache_stats().await.unwrap();
+    println!(
+        "{} entries holding {} B, against {} entries holding {} B",
+        with.num_entries, with.size_bytes, without.num_entries, without.size_bytes
+    );
+
+    assert_eq!(
+        with.num_entries, without.num_entries,
+        "the two arms hold a different number of entries, so their sizes are not comparable"
+    );
+    assert_eq!(
+        with.size_bytes - without.size_bytes,
+        edge_column_bytes(),
+        "holding the edges cost {} bytes where the column is {}",
+        with.size_bytes - without.size_bytes,
+        edge_column_bytes()
+    );
+}
+
+/// Sum the two halves of a run of queries, so that a phase split can be held
+/// against what the scheduler counted for the same run.
+fn phases(answers: &[QueryResult]) -> (u64, u64, u64, u64) {
+    answers
+        .iter()
+        .fold((0, 0, 0, 0), |(sb, sr, rb, rr), answer| {
+            (
+                sb + answer.search.bytes_read,
+                sr + answer.search.requests,
+                rb + answer.rescore.bytes_read,
+                rr + answer.rescore.requests,
+            )
+        })
+}
+
+/// Every byte a query reads belongs to exactly one of its two phases.
+///
+/// The two counts come from different places and must agree exactly: one is the
+/// index's own scheduler over the whole run, the other is a sink each query
+/// attached to the files it opened. A read the split does not see - a footer, a
+/// projection built off the wrong handle, a path that opens a file of its own -
+/// is invisible in every other column of every measurement this crate takes, and
+/// shows up here as an inequality.
+///
+/// Both with a cache and without, because the two read different things: an
+/// uncached query re-reads the codes of every partition it probes, a cached one
+/// re-reads none of them, and only the second is the state a measurement is
+/// taken in.
+#[tokio::test]
+async fn the_phases_of_a_query_add_up_to_what_it_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri, RABIT).await;
+    let queries = random_vectors(QUERIES, 4242);
+    let params = search(WalkMode::Lazy)
+        .with_rescore_budget(K)
+        .with_report_coded(true);
+
+    let bare = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let (answers, cost) = replay(&bare, &queries, &params).await;
+    let (search_bytes, _, rescore_bytes, _) = phases(&answers);
+    assert_eq!(
+        search_bytes + rescore_bytes,
+        (cost.bytes * queries.len() as f64) as u64,
+        "an uncached run read {} bytes but accounts for {} + {}",
+        cost.bytes * queries.len() as f64,
+        search_bytes,
+        rescore_bytes
+    );
+
+    let warm = cached(&dataset, BUDGET).await;
+    replay(&warm, &queries, &params).await;
+    let (answers, cost) = replay(&warm, &queries, &params).await;
+    let (search_bytes, _, rescore_bytes, _) = phases(&answers);
+    assert_eq!(
+        search_bytes + rescore_bytes,
+        (cost.bytes * queries.len() as f64) as u64,
+        "a cached run read {} bytes but accounts for {} + {}",
+        cost.bytes * queries.len() as f64,
+        search_bytes,
+        rescore_bytes
+    );
+    // The direction, not just the sum: a split that credited everything to one
+    // phase would satisfy the equality above and say nothing.
+    assert!(
+        rescore_bytes > 0,
+        "a cached run re-scored {} candidates a query and read nothing to do it",
+        K
+    );
+
+    // The same question of the clocks, and the only form of it that is not a
+    // flaky one: the two phases are disjoint stretches of one call, so together
+    // they cannot outlast the call. A second phase timed from the start of the
+    // first would double-count and break this by a factor of nearly two, while
+    // no amount of scheduler noise can.
+    let started = std::time::Instant::now();
+    let answer = warm.search(&queries[0], &params).await.unwrap();
+    let whole = started.elapsed();
+    assert!(
+        answer.search.elapsed + answer.rescore.elapsed <= whole,
+        "the phases of one query took {:?} and {:?}, which is more than the {:?} the call took",
+        answer.search.elapsed,
+        answer.rescore.elapsed,
+        whole
+    );
+}
+
+/// With the codes and the edges resident, a walk reads nothing at all until it
+/// re-scores - and what it then reads is set by the budget rather than by the
+/// queue.
+///
+/// This is the claim every byte figure this crate quotes rests on, and it is the
+/// one the split exists to make checkable. The arm with the edges on disk is
+/// measured beside it because the equality of the two answers is what says the
+/// difference between them is a read and not a different walk.
+#[tokio::test]
+async fn a_walk_that_holds_its_edges_reads_nothing_until_it_re_scores() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri, RABIT).await;
+    let queries = random_vectors(QUERIES, 909);
+    let fetching = search(WalkMode::Lazy).with_rescore_budget(K);
+    let holding = fetching.clone().with_resident_edges(true);
+
+    let index = cached(&dataset, BUDGET).await;
+    replay(&index, &queries, &holding).await;
+    let (held, _) = replay(&index, &queries, &holding).await;
+    let (search_bytes, search_requests, rescore_bytes, _) = phases(&held);
+    assert_eq!(
+        (search_bytes, search_requests),
+        (0, 0),
+        "a warm walk holding its edges still read {search_bytes} bytes in \
+         {search_requests} requests before re-scoring"
+    );
+    assert!(rescore_bytes > 0, "the run re-scored nothing");
+
+    let index = cached(&dataset, BUDGET).await;
+    replay(&index, &queries, &fetching).await;
+    let (fetched, _) = replay(&index, &queries, &fetching).await;
+    let (fetched_search, fetched_requests, fetched_rescore, _) = phases(&fetched);
+    assert!(
+        fetched_search > 0 && fetched_requests > 0,
+        "a warm walk fetching its edges read {fetched_search} bytes in {fetched_requests} \
+         requests, so the two arms are not different reads at all"
+    );
+
+    assert_same(&held, &fetched, "resident edges");
+    assert_eq!(
+        rescore_bytes, fetched_rescore,
+        "the same candidates cost {rescore_bytes} bytes to correct one way and \
+         {fetched_rescore} the other, so the split is charging the edges to the re-score"
+    );
+}
+
+/// The answer before the vectors were read is a different answer, and asking for
+/// it changes nothing about the one the query returns.
+///
+/// Recall cannot make this case: a coded ordering and an exact one over the same
+/// candidates differ by a permutation that recall is nearly blind to, and a
+/// `coded_neighbors` that quietly held the *rescored* answer would score exactly
+/// the same. So the claim is set inequality on a seeded fixture, pinned beside
+/// the two ways it can come back empty.
+#[tokio::test]
+async fn the_coded_answer_is_the_answer_before_the_vectors_were_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri, RABIT).await;
+    let queries = random_vectors(QUERIES, 31337);
+    let asked = search(WalkMode::Lazy)
+        .with_rescore_budget(K * 4)
+        .with_report_coded(true);
+    let index = cached(&dataset, BUDGET).await;
+    replay(&index, &queries, &asked).await;
+    let (answers, _) = replay(&index, &queries, &asked).await;
+
+    let mut differed = 0;
+    for answer in &answers {
+        assert_eq!(
+            answer.coded_neighbors.len(),
+            K,
+            "a coded answer came back {} long",
+            answer.coded_neighbors.len()
+        );
+        let mut rows = answer
+            .coded_neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_addr)
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        let before = rows.len();
+        rows.dedup();
+        assert_eq!(before, rows.len(), "a coded answer returned a row twice");
+
+        let mut exact = answer
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.row_addr)
+            .collect::<Vec<_>>();
+        exact.sort_unstable();
+        if rows != exact {
+            differed += 1;
+        }
+    }
+    assert!(
+        differed > 0,
+        "not one of {QUERIES} queries changed its answer when its candidates were measured \
+         exactly, so the coded answer is the exact one under another name"
+    );
+
+    // Not asked for, and asked for by a mode that has no second half.
+    let (unasked, _) = replay(&index, &queries, &search(WalkMode::Lazy)).await;
+    assert!(
+        unasked
+            .iter()
+            .all(|answer| answer.coded_neighbors.is_empty()),
+        "a query that did not ask for a coded answer was given one"
+    );
+    let (whole, _) = replay(
+        &index,
+        &queries,
+        &search(WalkMode::Coded).with_report_coded(true),
+    )
+    .await;
+    assert!(
+        whole.iter().all(|answer| answer.coded_neighbors.is_empty()),
+        "a mode that holds every vector reported an answer from before a re-score it never makes"
+    );
+    assert!(
+        whole
+            .iter()
+            .all(|answer| answer.rescore == Default::default()),
+        "a mode that never re-scores reported a re-score cost"
+    );
 }

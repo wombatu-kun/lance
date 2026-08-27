@@ -97,6 +97,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -108,7 +109,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, Result};
 use lance_index::vector::storage::{DistCalculator, VectorStore};
-use lance_io::scheduler::{ScanScheduler, ScanStats};
+use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::overlay::DataOverlayFile;
@@ -118,7 +119,7 @@ use uuid::Uuid;
 
 use crate::builder::{live_fragments, routing_distance_type, supported_distance_type};
 use crate::cache;
-use crate::codes::{self, CODE_COLUMN, centroid_distance};
+use crate::codes::{self, CODE_COLUMN};
 use crate::format::{
     FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, NEIGHBORS_COLUMN, ROW_ID_COLUMN, RowIdMode,
     VECTOR_COLUMN,
@@ -154,7 +155,7 @@ pub enum WalkMode {
     /// Read the partition whole and measure against its codes, with the
     /// candidate list re-scored exactly before it is answered from.
     ///
-    /// Only for an index built with [`crate::IndexParams::with_code_bits`], and
+    /// Only for an index built with [`crate::IndexParams::with_codes`], and
     /// refused rather than quietly downgraded for one that was not. On its own
     /// it costs a few per cent more comparisons and reads no fewer bytes: it is
     /// [`Self::Lazy`] with the reading left alone, which is the useful arm to
@@ -253,6 +254,17 @@ pub struct SearchParams {
     /// the phase gate modelled and is deliberately on the low side - what it
     /// should be on a high-latency store is a measurement nobody has taken.
     pub beam_width: usize,
+    /// Whether a [`WalkMode::Lazy`] probe holds the whole `__neighbors` column
+    /// of a partition it opens, rather than fetching a hop's rows at a time.
+    ///
+    /// Off by default, because it is memory the alternative does not spend: 256
+    /// bytes a vertex at `R = 64`, against the 68 a three-bit code occupies at
+    /// `d = 128` and the 376 at `d = 960`. What it buys is every request a walk
+    /// makes before its re-score, which after the codes are resident is every
+    /// request a walk makes at all. It changes no answer - the same hops, the
+    /// same candidate list - and it is ignored by [`WalkMode::Flat`], which
+    /// opens the column never and would only be charged for it.
+    pub resident_edges: bool,
     /// How many candidates a query measures exactly, counted across every
     /// partition it probes rather than within each of them.
     ///
@@ -288,6 +300,14 @@ pub struct SearchParams {
     /// by, and for [`WalkMode::Coded`], which holds every vector already and
     /// would be spending recall on a saving it cannot collect.
     pub rescore_budget: Option<usize>,
+    /// Whether the answer carries [`QueryResult::coded_neighbors`] beside the
+    /// answer itself.
+    ///
+    /// Off by default because it is a second answer rather than a second
+    /// number: the cost fields are two clock reads and a pair of counters, but
+    /// this one ranks and dedups the candidate list again, and only a caller
+    /// asking what the re-score bought has any use for the result.
+    pub report_coded: bool,
 }
 
 impl SearchParams {
@@ -300,7 +320,9 @@ impl SearchParams {
             search_list_size: k.saturating_add(k / 2),
             mode: WalkMode::default(),
             beam_width: 4,
+            resident_edges: false,
             rescore_budget: None,
+            report_coded: false,
         }
     }
 
@@ -324,9 +346,57 @@ impl SearchParams {
         self
     }
 
+    pub fn with_resident_edges(mut self, resident_edges: bool) -> Self {
+        self.resident_edges = resident_edges;
+        self
+    }
+
     pub fn with_rescore_budget(mut self, rescore_budget: usize) -> Self {
         self.rescore_budget = Some(rescore_budget);
         self
+    }
+
+    pub fn with_report_coded(mut self, report_coded: bool) -> Self {
+        self.report_coded = report_coded;
+        self
+    }
+}
+
+/// What one half of a two-phase query cost.
+///
+/// A query of [`WalkMode::Lazy`] or [`WalkMode::Flat`] arrives at a candidate
+/// list by reading codes and then pays for that list by reading vectors, and the
+/// two halves are not the same kind of cost: the first is bounded by the
+/// partition and served by a cache, the second is bounded by
+/// [`SearchParams::rescore_budget`] and is nobody's to keep. One running total
+/// over both cannot say which of them a deployment is actually paying, so the
+/// answer carries them apart.
+///
+/// `elapsed` is wall time inside this query's own future, so under concurrency
+/// it includes the time the future spent waiting to be polled: the two add up to
+/// the query's latency, not to the pass's throughput.
+///
+/// The byte counters are physical, taken off the scheduler after coalescing,
+/// and they are per query rather than per index - each query attaches its own
+/// sink to the partition files it opens. What they cannot see is a read another
+/// query started: two queries missing on the same partition at once share one
+/// load, and it is charged to whichever of them ran the loader.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseCost {
+    pub elapsed: Duration,
+    pub bytes_read: u64,
+    pub iops: u64,
+    pub requests: u64,
+}
+
+impl PhaseCost {
+    fn new(elapsed: Duration, stats: ScanStats) -> Self {
+        Self {
+            elapsed,
+            bytes_read: stats.bytes_read,
+            iops: stats.iops,
+            requests: stats.requests,
+        }
     }
 }
 
@@ -348,6 +418,21 @@ pub struct QueryResult {
     /// finely partitioned index look cheap at exactly the point it stops being.
     pub comparisons: u64,
     pub partitions_read: usize,
+    /// Reaching a candidate list: routing, the partition's layout, the codes
+    /// and row ids a walk steers by, and the out-edges of every vertex it
+    /// expanded. The whole query for the modes that read a partition whole.
+    pub search: PhaseCost,
+    /// Correcting that list: the vectors of the candidates a budget was spent
+    /// on, and the exact distances measured against them. Zero for the modes
+    /// that hold every vector already and never re-score.
+    pub rescore: PhaseCost,
+    /// The `k` this query would have answered with had it stopped after
+    /// [`Self::search`]: the candidate list ranked by its *coded* distances,
+    /// which are estimates, so `distance` here is an estimate too.
+    ///
+    /// Empty unless [`SearchParams::report_coded`] asked for it, and empty for
+    /// the modes that have no separate re-score to stop before.
+    pub coded_neighbors: Vec<Neighbor>,
 }
 
 /// A committed Vamana index, opened for querying.
@@ -838,13 +923,22 @@ impl VamanaIndex {
     }
 
     /// Open one probed partition's file, through the cache if there is one.
-    async fn partition_file(&self, probe: &Probe) -> Result<PartitionFile> {
+    async fn partition_file(&self, probe: &Probe, stats: &IoStats) -> Result<PartitionFile> {
         match &self.cache {
             Some(cache) => {
-                PartitionFile::open_cached(&self.scheduler, &probe.path, probe.size_bytes, cache)
+                PartitionFile::open_cached(
+                    &self.scheduler,
+                    &probe.path,
+                    probe.size_bytes,
+                    cache,
+                    Some(stats),
+                )
+                .await
+            }
+            None => {
+                PartitionFile::open(&self.scheduler, &probe.path, probe.size_bytes, Some(stats))
                     .await
             }
-            None => PartitionFile::open(&self.scheduler, &probe.path, probe.size_bytes).await,
         }
     }
 
@@ -994,7 +1088,7 @@ impl VamanaIndex {
         if params.mode.needs_codes() && self.metadata.codes.is_none() {
             return Err(Error::invalid_input(
                 "this Vamana index was built without codes, so it cannot be walked by them; \
-                 rebuild it with IndexParams::with_code_bits"
+                 rebuild it with IndexParams::with_codes"
                     .to_string(),
             ));
         }
@@ -1043,6 +1137,13 @@ impl VamanaIndex {
             query.clone()
         };
 
+        // One sink a phase, per query rather than per index: the counters the
+        // scheduler keeps are shared by every query in flight, so a split read
+        // off them would be one query's phase minus another's.
+        let search_stats = IoStats::new();
+        let rescore_stats = IoStats::new();
+        let started = Instant::now();
+
         let (probes, mut comparisons) = self.route(&routing_query, routing_type, params)?;
         // Grown as the answers arrive rather than sized up front. Everything
         // available before the first read is a claim: `k` is the caller's, and
@@ -1053,6 +1154,11 @@ impl VamanaIndex {
         // sixty-gigabyte allocation off a number read out of a file.
         let mut found = Vec::new();
         let mut partitions_read = 0usize;
+        // Deferred rather than defaulted: every arm below sets it, and a default
+        // here would let an arm that forgot to report a zero-cost query.
+        let search;
+        let mut rescore = PhaseCost::default();
+        let mut coded_neighbors = Vec::new();
         // Unordered, because the merge sorts everything anyway: ordering would
         // only make a finished partition wait for a slower one that was started
         // earlier, and `buffered` holds those finished results in memory while
@@ -1077,7 +1183,10 @@ impl VamanaIndex {
                 let mut probed = stream::iter(probes)
                     .map({
                         let routing_query = routing_query.clone();
-                        move |probe| self.probe_lazily(probe, routing_query.clone(), params)
+                        let search_stats = &search_stats;
+                        move |probe| {
+                            self.probe_lazily(probe, routing_query.clone(), params, search_stats)
+                        }
                     })
                     .buffer_unordered(PARTITIONS_IN_FLIGHT)
                     .boxed();
@@ -1091,11 +1200,24 @@ impl VamanaIndex {
                 if let Some(budget) = params.rescore_budget {
                     allocate(&mut probings, budget);
                 }
+                // After `allocate` and not before it, so that what this reports
+                // is the answer the query would have given rather than one taken
+                // from candidates it went on to throw away. The two agree while
+                // the budget is at least `k`, which is checked above; taking it
+                // here means they agree by construction rather than by argument.
+                if params.report_coded {
+                    coded_neighbors = coded_answer(&probings, &self.rows, params.k);
+                }
 
+                search = PhaseCost::new(started.elapsed(), search_stats.snapshot());
+                let rescore_started = Instant::now();
                 let mut rescoring = stream::iter(probings)
                     .map({
                         let query = query.clone();
-                        move |probing| self.rescore_probing(probing, query.clone(), params)
+                        let rescore_stats = &rescore_stats;
+                        move |probing| {
+                            self.rescore_probing(probing, query.clone(), params, rescore_stats)
+                        }
                     })
                     .buffer_unordered(PARTITIONS_IN_FLIGHT)
                     .boxed();
@@ -1103,10 +1225,11 @@ impl VamanaIndex {
                     found.extend(walked.neighbors);
                     comparisons = comparisons.saturating_add(walked.comparisons);
                 }
+                rescore = PhaseCost::new(rescore_started.elapsed(), rescore_stats.snapshot());
             }
             WalkMode::Exact | WalkMode::Coded => {
                 let mut walks = stream::iter(probes)
-                    .map(|probe| self.read_probe(probe))
+                    .map(|probe| self.read_probe(probe, &search_stats))
                     .buffer_unordered(PARTITIONS_IN_FLIGHT)
                     .and_then({
                         let query = query.clone();
@@ -1126,6 +1249,9 @@ impl VamanaIndex {
                     found.extend(walked.neighbors);
                     comparisons = comparisons.saturating_add(walked.comparisons);
                 }
+                // Nothing here re-scores, so the whole query is the one phase
+                // and the other stays at zero rather than being left unset.
+                search = PhaseCost::new(started.elapsed(), search_stats.snapshot());
             }
         }
 
@@ -1133,6 +1259,9 @@ impl VamanaIndex {
             neighbors: merge(found, params.k),
             comparisons,
             partitions_read,
+            search,
+            rescore,
+            coded_neighbors,
         })
     }
 
@@ -1185,14 +1314,21 @@ impl VamanaIndex {
                 let declared = segment.manifest.metadata();
                 // Computed rather than taken from the ranking above, which is a
                 // routing distance whose scale is `find_partitions`' business.
-                // This one is a term of RaBitQ's estimator, so what it has to be
-                // is unambiguous, and `dimension` flops a probed partition is
+                // What this term is depends on the kind of code the segment
+                // carries, so the segment's own parameters decide it; for RaBitQ
+                // it is `|q - c|^2` and `dimension` flops a probed partition is
                 // nothing beside reading one.
                 let dist_q_c = params
                     .mode
                     .needs_codes()
                     .then(|| {
-                        centroid_distance(segment.manifest.ivf(), *partition_id, routing_query)
+                        let codes = declared.codes.as_ref().ok_or_else(|| {
+                            Error::invalid_input(
+                                "a Vamana coded walk was scheduled for a segment without codes"
+                                    .to_string(),
+                            )
+                        })?;
+                        codes.query_offset(segment.manifest.ivf(), *partition_id, routing_query)
                     })
                     .transpose()?;
                 probes.push(Probe {
@@ -1348,19 +1484,24 @@ impl VamanaIndex {
         probe: Probe,
         routing_query: ArrayRef,
         params: &SearchParams,
+        stats: &IoStats,
     ) -> Result<Probing> {
         let Some(dist_q_c) = probe.dist_q_c else {
             return Err(Error::internal(
                 "a Vamana lazy walk was scheduled for a segment without codes".to_string(),
             ));
         };
-        let file = self.partition_file(&probe).await?;
+        let file = self.partition_file(&probe, stats).await?;
+        // A scan opens `__neighbors` never, so holding it for one would charge
+        // the arm without a graph for the graph.
+        let hold_edges = params.resident_edges && !matches!(params.mode, WalkMode::Flat);
         let resident = cache::resident(
             self.cache.as_ref(),
             probe.segment,
             &probe.entry,
             &file,
             &self.metadata,
+            hold_edges.then_some(probe.max_degree),
         )
         .await?;
 
@@ -1373,6 +1514,7 @@ impl VamanaIndex {
                 max_degree: probe.max_degree,
                 search_list_size: params.search_list_size,
                 beam_width: params.beam_width,
+                edges: resident.edges.as_deref(),
             };
             match params.mode {
                 WalkMode::Flat => probing.scan(routing_query, dist_q_c),
@@ -1402,6 +1544,7 @@ impl VamanaIndex {
         probing: Probing,
         query: ArrayRef,
         params: &SearchParams,
+        stats: &IoStats,
     ) -> Result<Walked> {
         if probing.candidates.is_empty() {
             return Ok(Walked {
@@ -1415,6 +1558,7 @@ impl VamanaIndex {
             self.metadata.distance_type,
             &probing.candidates,
             query,
+            stats,
         )
         .await?;
         let comparisons = rescored.len() as u64;
@@ -1429,7 +1573,7 @@ impl VamanaIndex {
     /// Projected on the columns the walk will use, so that an index carrying
     /// codes does not pay for them on a query that measures against the vectors:
     /// thirteen per cent of a partition at `d = 128`.
-    async fn read_probe(&self, probe: Probe) -> Result<Probed> {
+    async fn read_probe(&self, probe: Probe, stats: &IoStats) -> Result<Probed> {
         let mut columns = vec![ROW_ID_COLUMN, NEIGHBORS_COLUMN, VECTOR_COLUMN];
         if probe.dist_q_c.is_some() {
             columns.push(CODE_COLUMN);
@@ -1438,7 +1582,7 @@ impl VamanaIndex {
         // for the same reason: the footer is a round trip whatever is read
         // afterwards. What it does *not* take from the cache is the codes, which
         // arrive in this read along with everything else.
-        let file = self.partition_file(&probe).await?;
+        let file = self.partition_file(&probe, stats).await?;
         let reader = file.project(&columns).await?;
         let batch = read_partition_batch(&reader, probe.entry.num_rows).await?;
         let partition = Partition::try_from_batch(&batch)?;
@@ -1490,6 +1634,33 @@ fn answer(candidates: Vec<Neighbor>, rows: &RowFilter, k: usize) -> Result<Vec<N
         .filter(|neighbor| !rows.rejects(neighbor.row_addr))
         .take(k)
         .collect())
+}
+
+/// The `k` a query would have answered with had it stopped before the re-score.
+///
+/// The same answer arrived at the same way - live rows only, each row once,
+/// nearest first - over the *coded* distances the walk steered by instead of
+/// over exact ones. What it is for is the question a final recall number cannot
+/// answer on its own: whether reading the vectors bought anything the codes had
+/// not already found.
+///
+/// It borrows the probes rather than consuming them, because they are about to
+/// be re-scored. This is a second answer taken from the same candidates, not a
+/// diversion of them, and it costs a sort of at most
+/// [`SearchParams::rescore_budget`] elements - which is why
+/// [`SearchParams::report_coded`] gates it rather than the cost fields beside
+/// it.
+fn coded_answer(probings: &[Probing], rows: &RowFilter, k: usize) -> Vec<Neighbor> {
+    let candidates = probings
+        .iter()
+        .flat_map(|probing| probing.candidates.iter())
+        .filter(|candidate| !rows.rejects(candidate.row_addr))
+        .map(|candidate| Neighbor {
+            row_addr: candidate.row_addr,
+            distance: candidate.coded,
+        })
+        .collect::<Vec<_>>();
+    merge(candidates, k)
 }
 
 /// Whether an overlay has replaced indexed values under a segment built at

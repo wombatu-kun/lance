@@ -74,11 +74,12 @@ use std::collections::BinaryHeap;
 
 use arrow_array::ArrayRef;
 use lance_core::{Error, Result};
-use lance_index::vector::bq::storage::RabitQuantizationStorage;
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::storage::{DistCalculator, VectorStore};
+use lance_io::scheduler::IoStats;
 use lance_linalg::distance::DistanceType;
 
+use crate::codes::CodeStore;
 use crate::format::{NEIGHBORS_COLUMN, VECTOR_COLUMN};
 use crate::io::{PartitionFile, read_scattered};
 use crate::partition::{checked_neighbors, neighbor_slots, vectors_of};
@@ -123,7 +124,7 @@ pub(crate) struct Candidate {
 /// scan opens no file at all.
 pub(crate) struct LazyProbe<'a> {
     pub(crate) file: &'a PartitionFile,
-    pub(crate) codes: &'a RabitQuantizationStorage,
+    pub(crate) codes: &'a CodeStore,
     pub(crate) row_ids: &'a [u64],
     pub(crate) medoid: u32,
     pub(crate) max_degree: u32,
@@ -131,6 +132,13 @@ pub(crate) struct LazyProbe<'a> {
     /// How many vertices one hop expands, and therefore how many rows of
     /// `__neighbors` one request asks for.
     pub(crate) beam_width: usize,
+    /// Every vertex's out-edges when [`crate::cache`] is holding the column,
+    /// indexed by local id; `None` asks the file for a hop's rows instead.
+    ///
+    /// A walk given them makes no request of its own at all until the re-score,
+    /// which is the whole of what it changes: the hops it takes and the
+    /// candidates it ends with are the same either way.
+    pub(crate) edges: Option<&'a [u32]>,
 }
 
 impl LazyProbe<'_> {
@@ -181,7 +189,10 @@ impl LazyProbe<'_> {
         list.offer(self.medoid, coded.distance(self.medoid));
 
         let width = self.max_degree as usize;
-        let edges = self.file.project(&[NEIGHBORS_COLUMN]).await?;
+        let reader = match self.edges {
+            Some(_) => None,
+            None => Some(self.file.project(&[NEIGHBORS_COLUMN]).await?),
+        };
         let mut frontier = Vec::with_capacity(self.beam_width);
         loop {
             frontier.clear();
@@ -199,11 +210,25 @@ impl LazyProbe<'_> {
             // which of two equally distant candidates survives a full list.
             frontier.sort_unstable();
 
-            let batch = read_scattered(&edges, &frontier).await?;
-            let slots = neighbor_slots(&batch, self.max_degree)?;
+            let fetched = match &reader {
+                Some(reader) => Some(read_scattered(reader, &frontier).await?),
+                None => None,
+            };
+            let hop = match &fetched {
+                Some(batch) => neighbor_slots(batch, self.max_degree)?,
+                // Never indexed: the arm that reads nothing takes its slots
+                // from the resident column below.
+                None => &[],
+            };
             for (position, vertex) in frontier.iter().enumerate() {
-                let start = position * width;
-                let out_edges = checked_neighbors(&slots[start..start + width], *vertex, num_rows)?;
+                // A request answers in the order it was made, so a vertex's
+                // slots sit at its position in the frontier; the resident
+                // column is in partition order, so they sit at its own id.
+                let slots = match self.edges {
+                    Some(edges) => &edges[*vertex as usize * width..][..width],
+                    None => &hop[position * width..][..width],
+                };
+                let out_edges = checked_neighbors(slots, *vertex, num_rows)?;
                 for neighbor in out_edges {
                     if !scratch.mark(*neighbor) {
                         continue;
@@ -352,12 +377,17 @@ impl LazyProbe<'_> {
 /// The distances it measures are counted by the caller rather than here. A
 /// `&Comparisons` held across the awaits below would make this future `!Send` -
 /// the counter is a `Cell` - and the caller has the length in hand anyway.
+/// `stats` is where the strides this reads are counted. They are the whole
+/// point of the split: a query arrives at its candidates by code and then pays
+/// for them here, and how much of a query is which is not answerable from one
+/// running total.
 pub(crate) async fn rescore(
     file: &PartitionFile,
     dimension: u32,
     distance_type: DistanceType,
     candidates: &[Candidate],
     query: ArrayRef,
+    stats: &IoStats,
 ) -> Result<Vec<Neighbor>> {
     let ids = candidates
         .iter()
@@ -367,7 +397,7 @@ pub(crate) async fn rescore(
         .iter()
         .map(|candidate| candidate.row_addr)
         .collect::<Vec<_>>();
-    let vectors = file.project(&[VECTOR_COLUMN]).await?;
+    let vectors = file.project_into(&[VECTOR_COLUMN], stats).await?;
     let batch = read_scattered(&vectors, &ids).await?;
     let values = vectors_of(&batch, dimension)?;
     let store = flat_storage(&row_addrs, &values, distance_type)?;
