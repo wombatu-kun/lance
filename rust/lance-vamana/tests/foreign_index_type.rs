@@ -154,6 +154,7 @@ async fn commit_foreign_segment(dataset: &mut Dataset) {
         }),
         1,
         dataset_version,
+        vec![],
     );
     dataset
         .commit_existing_index_segments(FOREIGN_INDEX, VECTOR_COLUMN, vec![segment])

@@ -193,6 +193,7 @@ async fn commit_spike_segments_versioned(
                 details.clone(),
                 index_version,
                 dataset_version,
+                vec![],
             )
         })
         .collect::<Vec<_>>();
@@ -267,6 +268,7 @@ async fn q0_1_commit_handwritten_index_directory() {
         details,
         1,
         dataset.manifest.version,
+        vec![],
     );
 
     dataset

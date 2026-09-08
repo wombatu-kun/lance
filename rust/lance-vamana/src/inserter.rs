@@ -391,6 +391,7 @@ pub async fn insert_in_place(dataset: &mut Dataset, index_name: &str) -> Result<
                 }),
                 FORMAT_VERSION as i32,
                 dataset_version,
+                vec![],
             )],
         )
         .await?;

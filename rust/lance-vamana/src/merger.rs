@@ -372,6 +372,7 @@ pub async fn merge_index(dataset: &mut Dataset, index_name: &str) -> Result<Merg
                 }),
                 FORMAT_VERSION as i32,
                 dataset_version,
+                vec![],
             )],
         )
         .await?;

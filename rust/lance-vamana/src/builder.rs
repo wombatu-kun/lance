@@ -387,6 +387,7 @@ pub(crate) async fn build_index_segment_inheriting(
             // and nothing enforced.
             FORMAT_VERSION as i32,
             dataset_version,
+            vec![],
         ),
         stats,
     ))

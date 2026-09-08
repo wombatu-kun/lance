@@ -185,6 +185,7 @@ pub async fn consolidate_index(
             }),
             FORMAT_VERSION as i32,
             dataset_version,
+            vec![],
         ));
         stats.segments_rewritten += 1;
     }

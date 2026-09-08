@@ -2305,7 +2305,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -3143,7 +3143,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -3214,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3257,7 +3257,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrayref",
  "crunchy",
@@ -3267,7 +3267,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3320,6 +3320,7 @@ dependencies = [
  "datafusion-functions",
  "datafusion-physical-expr",
  "futures",
+ "half",
  "jsonb",
  "lance-arrow",
  "lance-core",
@@ -3333,7 +3334,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3342,7 +3343,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3375,7 +3376,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3406,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -3469,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -3491,7 +3492,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3516,7 +3517,11 @@ dependencies = [
  "pin-project",
  "prost",
  "rand 0.9.5",
+ "reqsign-core",
+ "reqsign-file-read-tokio",
+ "reqsign-google",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -3526,7 +3531,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -3540,21 +3545,23 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrow",
  "async-trait",
  "bytes",
  "lance-core",
  "lance-namespace-reqwest-client",
+ "serde",
+ "serde_json",
  "snafu",
 ]
 
 [[package]]
 name = "lance-namespace-reqwest-client"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d06b1fbb5d41f93bc652b61e2872af92e8a6c5f6b4ce8839a8ecfa05365d359"
+checksum = "d8d23e54b1634d5bbb434f8dd33dc3c05f6e58d876a9a27b3b4aef58ddbe11af"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -3566,7 +3573,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3580,7 +3587,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3618,7 +3625,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "11.0.0-beta.14"
+version = "12.0.0-beta.15"
 dependencies = [
  "frostem",
  "icu_segmenter",

@@ -335,6 +335,7 @@ async fn a_partition_disagreeing_with_its_segment_is_refused() {
                     Arc::new(details),
                     FORMAT_VERSION as i32,
                     dataset.manifest.version,
+                    vec![],
                 )],
             )
             .await
@@ -1393,6 +1394,7 @@ async fn commit_a_segment_described_as(
         Arc::new(details),
         version,
         dataset.manifest.version,
+        vec![],
     );
     dataset
         .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![described])
@@ -1457,6 +1459,7 @@ async fn hand_made_segment(dataset: &Dataset, metadata: IndexMetadata) -> IndexS
         }),
         FORMAT_VERSION as i32,
         dataset.manifest.version,
+        vec![],
     )
 }
 
@@ -1990,6 +1993,7 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
                 Arc::new(details),
                 FORMAT_VERSION as i32,
                 dataset.manifest.version,
+                vec![],
             )],
         )
         .await
@@ -2183,6 +2187,7 @@ async fn a_partition_holding_a_non_finite_vector_is_reported_as_corrupt() {
                     Arc::new(details),
                     FORMAT_VERSION as i32,
                     dataset.manifest.version,
+                    vec![],
                 )],
             )
             .await
