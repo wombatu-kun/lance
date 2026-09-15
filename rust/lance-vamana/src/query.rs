@@ -92,8 +92,10 @@
 //! disagree about the vectors they hold or about the codes they were built with.
 //! Each refusal names what to do about it, which is always to rebuild.
 //!
-//! Committing an index also breaks Lance's own vector search on that column -
-//! see the crate README, and the test that pins it.
+//! Lance's own paths do not see a committed index: its scanner answers the column
+//! as if there were none, its listings leave it out, and its default compaction
+//! holds back the fragments the index covers - see the crate README, and the
+//! tests that pin it.
 
 use std::collections::HashMap;
 use std::sync::Arc;

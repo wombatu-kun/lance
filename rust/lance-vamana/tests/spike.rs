@@ -29,6 +29,8 @@ use lance_file::writer::FileWriterOptions;
 use lance_index::INDEX_FILE_NAME;
 use lance_index::IndexType;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+use lance_table::format::IndexMetadata;
+use lance_table::io::manifest::read_manifest_indexes;
 use uuid::Uuid;
 
 const DIM: i32 = 8;
@@ -124,6 +126,26 @@ async fn write_handwritten_index_file(
 
 fn vector_details() -> Arc<prost_types::Any> {
     Arc::new(prost_types::Any::from_msg(&lance_index::pb::VectorIndexDetails::default()).unwrap())
+}
+
+/// Details whose `type_url` no Lance build has a reader for.
+fn unknown_details() -> Arc<prost_types::Any> {
+    Arc::new(prost_types::Any {
+        type_url: "type.googleapis.com/lance.vamana.VamanaIndexDetails".to_string(),
+        value: vec![8, 1],
+    })
+}
+
+/// Segments named `index_name` as the manifest records them, including any that
+/// Lance's own listing leaves out.
+async fn manifest_indices(dataset: &Dataset, index_name: &str) -> Vec<IndexMetadata> {
+    let store = dataset.object_store(None).await.unwrap();
+    read_manifest_indexes(&store, dataset.manifest_location(), dataset.manifest())
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|index| index.name == index_name)
+        .collect()
 }
 
 /// Commit one hand-written segment covering every fragment of the dataset.
@@ -337,23 +359,17 @@ async fn q0_1_extra_partition_files_are_listed() {
     assert_eq!(listed, expected);
 }
 
-/// Q0.1 - which `index_details` survive `retain_supported_indices`?
+/// Q0.1 - which `index_details` survive a reopen, and which does Lance list?
 ///
-/// The version filter reads a max supported version out of the details. An
-/// unknown `type_url` cannot be resolved, and the fallback keeps the index; a
-/// `VectorIndexDetails` resolves to the vector maximum. Both must round-trip, or
-/// an out-of-tree index would vanish on reopen with no error anywhere.
+/// Both must round-trip in the manifest, or an out-of-tree index would vanish on
+/// reopen with no error anywhere. Whether Lance's own listing shows the index is
+/// a separate question since upstream #8529: a `VectorIndexDetails` resolves to a
+/// reader and is listed, an unknown `type_url` has no reader and is left out.
 #[tokio::test]
 async fn q0_1_index_details_variants_survive_reopen() {
-    for (case, details) in [
-        ("vector_details", vector_details()),
-        (
-            "unknown_type_url",
-            Arc::new(prost_types::Any {
-                type_url: "type.googleapis.com/lance.vamana.VamanaIndexDetails".to_string(),
-                value: vec![8, 1],
-            }),
-        ),
+    for (case, details, listed) in [
+        ("vector_details", vector_details(), true),
+        ("unknown_type_url", unknown_details(), false),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -364,38 +380,39 @@ async fn q0_1_index_details_variants_survive_reopen() {
         commit_spike_segment(&mut dataset, "vamana_spike_details", uuid, details).await;
 
         let reopened = Dataset::open(uri).await.unwrap();
-        let committed = reopened
-            .load_indices_by_name("vamana_spike_details")
-            .await
-            .unwrap();
+        let committed = manifest_indices(&reopened, "vamana_spike_details").await;
         assert_eq!(
             committed.len(),
             1,
             "case {case}: index was dropped on reopen"
         );
         assert_eq!(committed[0].uuid, uuid, "case {case}");
+        assert_eq!(
+            !reopened
+                .load_indices_by_name("vamana_spike_details")
+                .await
+                .unwrap()
+                .is_empty(),
+            listed,
+            "case {case}: Lance's own listing"
+        );
     }
 }
 
-/// Q0.1 - the version filter really can swallow an index, and it does so silently.
+/// Q0.1 - a segment Lance cannot read is hidden from its listing, and kept.
 ///
-/// This is the mutation proof for the test above: without it, "the index
-/// survived" would be an assertion that cannot fail. It also pins the asymmetry
-/// that decides which `index_details` an out-of-tree index should write - a
-/// resolvable `type_url` subjects it to a version ceiling it does not control,
-/// an unresolvable one does not.
+/// Two ways to be unreadable: a resolvable type at a version above the build's
+/// ceiling, and a type with no reader at all. Before upstream #8529 only the
+/// first was hidden, and that asymmetry is what decided that an out-of-tree index
+/// should write an unresolvable `type_url`. Since then both are hidden and both
+/// stay in the manifest; the choice now rests on the case the test above pins - a
+/// resolvable type at a supported version is listed, so Lance's scanner would
+/// reach for it.
 #[tokio::test]
-async fn q0_1_future_index_version_is_dropped_silently() {
-    for (case, details, expect_survives) in [
-        ("vector_details", vector_details(), false),
-        (
-            "unknown_type_url",
-            Arc::new(prost_types::Any {
-                type_url: "type.googleapis.com/lance.vamana.VamanaIndexDetails".to_string(),
-                value: vec![8, 1],
-            }),
-            true,
-        ),
+async fn q0_1_an_unreadable_segment_is_hidden_and_kept() {
+    for (case, details) in [
+        ("vector_details", vector_details()),
+        ("unknown_type_url", unknown_details()),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -407,14 +424,20 @@ async fn q0_1_future_index_version_is_dropped_silently() {
             .await;
 
         let reopened = Dataset::open(uri).await.unwrap();
-        let committed = reopened
-            .load_indices_by_name("vamana_spike_future")
-            .await
-            .unwrap();
+        assert!(
+            reopened
+                .load_indices_by_name("vamana_spike_future")
+                .await
+                .unwrap()
+                .is_empty(),
+            "case {case}: Lance lists a segment it cannot read"
+        );
         assert_eq!(
-            !committed.is_empty(),
-            expect_survives,
-            "case {case}: unexpected survival of index_version 999"
+            manifest_indices(&reopened, "vamana_spike_future")
+                .await
+                .len(),
+            1,
+            "case {case}: the manifest lost the segment"
         );
     }
 }
@@ -672,6 +695,74 @@ async fn q0_4_compaction_strands_an_unreadable_index() {
     assert!(
         effective("vamana_compact").is_empty(),
         "an unreadable index is stranded, covering no live fragment"
+    );
+}
+
+/// Q0.4, since upstream #8427 - compaction and an index whose type has no reader.
+///
+/// The default planner holds back every fragment such an index covers: it cannot
+/// remap the index onto rewritten fragments, and rewriting them anyway would leave
+/// the index addressing rows that are gone. A deferred remap still compacts them
+/// and writes a fragment-reuse index. The compaction's own manifest keeps the
+/// segment's coverage as it was built, but the next commit of any kind writes it
+/// remapped through the fragment-reuse index onto the rewritten fragments - rows
+/// an out-of-tree index never read.
+#[tokio::test]
+async fn q0_4_compaction_holds_back_what_an_index_without_a_reader_covers() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = write_vector_dataset(uri, 4, 8).await;
+
+    let uuid = Uuid::new_v4();
+    write_handwritten_index_file(&dataset, uuid, INDEX_FILE_NAME, 2).await;
+    commit_spike_segment(&mut dataset, "vamana_held_back", uuid, unknown_details()).await;
+    let fragments_before = fragment_ids(&dataset);
+
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    let held = compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(held.fragments_removed, 0, "{held:?}");
+
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    let deferred = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(deferred.fragments_removed > 0, "{deferred:?}");
+
+    let after = Dataset::open(uri).await.unwrap();
+    let segments = manifest_indices(&after, "vamana_held_back").await;
+    assert_eq!(
+        segments[0]
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        fragments_before,
+        "the compaction's own manifest must still record the fragments the segment was built over"
+    );
+
+    append_vector_rows(uri, 8).await;
+    let later = Dataset::open(uri).await.unwrap();
+    let remapped = manifest_indices(&later, "vamana_held_back").await[0]
+        .fragment_bitmap
+        .clone()
+        .unwrap();
+    let rewritten = fragment_ids(&after)
+        .into_iter()
+        .collect::<roaring::RoaringBitmap>();
+    assert!(
+        !remapped.is_empty() && remapped.is_subset(&rewritten),
+        "the next commit was expected to write the coverage remapped onto the rewritten \
+         fragments {rewritten:?}, got {remapped:?}"
     );
 }
 

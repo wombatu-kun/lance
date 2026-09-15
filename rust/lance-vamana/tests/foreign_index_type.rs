@@ -5,12 +5,14 @@
 //!
 //! Nothing here builds an index of this crate's own. The segment committed is one
 //! arbitrary file plus an index-details type url Lance does not know, which is
-//! all that any out-of-tree index type has in common, so what breaks is a
-//! property of the missing plugin surface rather than of this crate.
+//! all that any out-of-tree index type has in common, so what happens to it is a
+//! property of Lance rather than of this crate.
 //!
-//! The damage does not stay on the column the foreign index is on: the last
-//! assertions are about a first-party BTree over a different column, whose
-//! maintenance the foreign segment blocks.
+//! Until upstream #8529 the damage did not stay on the column the foreign index
+//! is on: it took `optimize_indices` down for every index of the dataset. Since
+//! then Lance's read paths skip such an index and its write paths keep it. The
+//! assertions pin both halves, on a first-party BTree over a different column
+//! whose maintenance has to commit with the foreign segment in place.
 
 use std::sync::Arc;
 
@@ -26,6 +28,7 @@ use lance_file::writer::FileWriterOptions;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::ObjectStore;
+use lance_table::io::manifest::read_manifest_indexes;
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -40,12 +43,12 @@ const SCALAR_INDEX: &str = "n_idx";
 const INDEX_FILE_NAME: &str = "index.idx";
 
 /// A type url no plugin claims. Lance validates that a segment set agrees on one
-/// (`validate_segment_index_details`) and never that the one it agrees on is a
-/// type Lance can open.
+/// (`validate_segment_index_details`) and, since #8529, leaves an index whose
+/// type has no reader out of its reader-side listing.
 const FOREIGN_DETAILS_TYPE_URL: &str = "type.googleapis.com/example.MyIndexDetails";
 
 #[tokio::test]
-async fn an_index_type_lance_cannot_open_degrades_the_whole_dataset() {
+async fn an_index_type_lance_cannot_open_is_skipped_and_kept() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut dataset = write_rows(uri, 0..64, WriteMode::Create).await;
@@ -60,61 +63,52 @@ async fn an_index_type_lance_cannot_open_degrades_the_whole_dataset() {
         .await
         .unwrap();
 
-    // Rows the BTree has not seen, so `optimize_indices` has real work to do.
+    // Rows the BTree has not seen, so `optimize_indices` has real work to do and
+    // really commits.
     let mut dataset = write_rows(uri, 64..96, WriteMode::Append).await;
-
-    let query = Float32Array::from(vec![0.5f32; DIMENSION as usize]);
-    let nearest = |dataset: &Dataset, use_index: bool| {
-        let mut scanner = dataset.scan();
-        scanner.nearest(VECTOR_COLUMN, &query, 5).unwrap();
-        scanner.use_index(use_index);
-        async move { scanner.try_into_batch().await }
-    };
-
-    assert_eq!(nearest(&dataset, true).await.unwrap().num_rows(), 5);
-    let pending = unindexed_rows(&dataset).await;
-    assert_eq!(pending, 32, "the BTree has to start out with work pending");
-
-    commit_foreign_segment(&mut dataset).await;
-
-    // The scanner picks a vector index by field id alone, without checking that
-    // the index it found is one it can open: `indices.iter().find(|i|
-    // i.fields.contains(&column_id))` in `rust/lance/src/dataset/scanner.rs`.
-    let shadowed = nearest(&dataset, true).await.unwrap_err();
-    assert!(
-        shadowed.to_string().contains("Index Metadata not found"),
-        "expected the vector path to fail on an index it cannot open, got: {shadowed}"
-    );
-    assert_eq!(
-        nearest(&dataset, false).await.unwrap().num_rows(),
-        5,
-        "the exhaustive path is the only escape hatch left, it has to stay open"
-    );
-    dataset.index_statistics(FOREIGN_INDEX).await.unwrap_err();
-
-    // The blast radius. `optimize_indices` walks every index of the dataset and
-    // classifies each as vector by the presence of `index.idx`, so the foreign
-    // segment takes the BTree over `n` down with it.
-    let blocked = dataset
-        .optimize_indices(&Default::default())
-        .await
-        .unwrap_err();
-    assert!(
-        blocked.to_string().contains("Index Metadata not found"),
-        "expected optimizing the BTree to fail because of the foreign segment, got: {blocked}"
-    );
     assert_eq!(
         unindexed_rows(&dataset).await,
-        pending,
-        "the BTree's pending rows are still pending, so the failure lost the work"
+        32,
+        "the BTree has to start out with work pending"
     );
 
-    // Dropping the foreign index restores every one of them, which is what makes
-    // it the cause rather than a coincidence.
-    dataset.drop_index(FOREIGN_INDEX).await.unwrap();
-    assert_eq!(nearest(&dataset, true).await.unwrap().num_rows(), 5);
+    commit_foreign_segment(&mut dataset).await;
+    assert!(
+        manifest_index_names(&dataset)
+            .await
+            .contains(&FOREIGN_INDEX.to_owned())
+    );
+
+    // Read paths skip it: the scanner answers the vector column as if no index
+    // were there, and asking for the foreign index by name finds nothing.
+    let query = Float32Array::from(vec![0.5f32; DIMENSION as usize]);
+    let mut scanner = dataset.scan();
+    scanner.nearest(VECTOR_COLUMN, &query, 5).unwrap();
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 5);
+    let error = dataset.index_statistics(FOREIGN_INDEX).await.unwrap_err();
+    assert!(
+        matches!(error, lance_core::Error::IndexNotFound { .. }),
+        "expected Lance not to see the foreign index, got: {error}"
+    );
+
+    // Write paths keep it: the BTree's maintenance commits, and the manifest that
+    // commit wrote still names the foreign segment.
     dataset.optimize_indices(&Default::default()).await.unwrap();
     assert_eq!(unindexed_rows(&dataset).await, 0);
+    assert!(
+        manifest_index_names(&dataset)
+            .await
+            .contains(&FOREIGN_INDEX.to_owned()),
+        "maintenance of another index erased the foreign one"
+    );
+
+    // Dropping it by name still works, which is how an operator gets rid of one.
+    dataset.drop_index(FOREIGN_INDEX).await.unwrap();
+    assert!(
+        !manifest_index_names(&dataset)
+            .await
+            .contains(&FOREIGN_INDEX.to_owned())
+    );
 }
 
 /// Rows of the BTree's column that the index has not covered yet, which is the
@@ -124,6 +118,18 @@ async fn unindexed_rows(dataset: &Dataset) -> u64 {
     serde_json::from_str::<serde_json::Value>(&stats).unwrap()["num_unindexed_rows"]
         .as_u64()
         .unwrap()
+}
+
+/// Every index name the manifest records, including those Lance's own listing
+/// leaves out.
+async fn manifest_index_names(dataset: &Dataset) -> Vec<String> {
+    let store = dataset.object_store(None).await.unwrap();
+    read_manifest_indexes(&store, dataset.manifest_location(), dataset.manifest())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|index| index.name)
+        .collect()
 }
 
 /// Commit an index segment whose type Lance has no reader for, the way any

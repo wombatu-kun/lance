@@ -536,71 +536,52 @@ async fn a_segment_is_readable_through_the_datasets_own_store() {
     );
 }
 
-/// Committing a Vamana index changes what Lance itself can do with the dataset.
+/// What Lance itself does with a dataset carrying a Vamana index.
 ///
-/// The scanner picks a vector index by field id alone, with no type check, so it
-/// selects our segment and then cannot read it as one of its own; and
-/// `optimize_indices` classifies an index as a vector index by the presence of
-/// `index.idx`, so one unreadable index fails the loop over *every* index.
-///
-/// Neither is a defect in this crate - both follow from there being no way to
-/// register an external vector index type - but both are invisible to any test
-/// that reaches for the exhaustive path with `use_index(false)`, which is every
-/// other test here. Pinned so that an upstream change is noticed rather than
-/// discovered, and so the README cannot drift away from the behaviour.
+/// Until upstream #8529 the scanner picked this segment as the column's vector
+/// index and failed to open it, and `optimize_indices` failed for every index on
+/// the dataset. Since then Lance's read paths skip an index whose details type it
+/// has no reader for, and its write paths carry that index into the manifests
+/// they write. Both halves are pinned: Lance's own calls work without seeing the
+/// index, and the index is unchanged for this crate after they ran.
 #[tokio::test]
-async fn a_committed_index_shadows_lances_own_vector_paths() {
+async fn lance_skips_a_committed_index_and_keeps_it() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let fixture = DatasetFixture::default();
-    let mut dataset = fixture.write(uri).await;
-
-    let query = Float32Array::from(vec![0.5f32; common::VECTOR_DIM as usize]);
-    let nearest = |dataset: &Dataset, use_index: bool| {
-        let mut scanner = dataset.scan();
-        scanner.nearest(VECTOR_COLUMN, &query, 5).unwrap();
-        scanner.use_index(use_index);
-        async move { scanner.try_into_batch().await }
-    };
-
-    assert_eq!(nearest(&dataset, true).await.unwrap().num_rows(), 5);
+    let mut dataset = DatasetFixture::default().write(uri).await;
     create_index(&mut dataset, INDEX_NAME, &params())
         .await
         .unwrap();
+    let committed = committed_segments(&dataset, INDEX_NAME).await.unwrap();
 
-    let shadowed = nearest(&dataset, true).await.unwrap_err();
-    assert!(
-        shadowed.to_string().contains("Index Metadata not found"),
-        "Lance found a way to read our index: {shadowed}"
-    );
-    assert_eq!(
-        nearest(&dataset, false).await.unwrap().num_rows(),
-        5,
-        "the exhaustive path must stay open, it is the documented escape hatch"
-    );
+    let query = Float32Array::from(vec![0.5f32; common::VECTOR_DIM as usize]);
+    let mut scanner = dataset.scan();
+    scanner.nearest(VECTOR_COLUMN, &query, 5).unwrap();
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 5);
 
-    let error = dataset
-        .optimize_indices(&Default::default())
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("Index Metadata not found"));
     let error = dataset.index_statistics(INDEX_NAME).await.unwrap_err();
-    assert!(error.to_string().contains("Index Metadata not found"));
-
-    // Three failures matching one string could all be some fourth thing going
-    // wrong. Dropping the index and watching every one of them recover is what
-    // makes the Vamana segment the cause rather than a coincidence.
-    dataset.drop_index(INDEX_NAME).await.unwrap();
-    assert_eq!(nearest(&dataset, true).await.unwrap().num_rows(), 5);
+    assert!(
+        matches!(error, lance_core::Error::IndexNotFound { .. }),
+        "expected Lance not to see the index, got: {error}"
+    );
     dataset.optimize_indices(&Default::default()).await.unwrap();
 
-    // Everything that does not go looking for a vector index is unaffected.
-    let mut scanner = dataset.scan();
-    scanner.project(&[VECTOR_COLUMN]).unwrap();
+    // `optimize_indices` finds nothing it can work on here and commits nothing,
+    // so the write-path half needs a commit of its own: an append builds the next
+    // manifest from Lance's full index list.
+    let appended = DatasetFixture {
+        seed: 99,
+        ..Default::default()
+    }
+    .append(uri)
+    .await;
+    assert!(appended.version().version > dataset.version().version);
     assert_eq!(
-        scanner.try_into_batch().await.unwrap().num_rows(),
-        fixture.rows()
+        committed_segments(&appended, INDEX_NAME).await.unwrap(),
+        committed,
+        "a Lance commit changed or dropped the segment"
     );
+    VamanaIndex::open(&appended, INDEX_NAME).await.unwrap();
 }
 
 /// A dataset whose vectors are given cell by cell, so a test can put a null

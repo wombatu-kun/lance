@@ -22,7 +22,6 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
-use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::transaction::{
     DataOverlayGroup, Operation, UpdateMode, UpdatedFragmentOffsets,
 };
@@ -49,8 +48,8 @@ use uuid::Uuid;
 
 mod common;
 use common::{
-    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, random_vectors, recall,
-    sample_partition,
+    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, compact_indexed, random_vectors,
+    recall, sample_partition,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
@@ -792,9 +791,7 @@ async fn an_index_over_a_rewritten_fragment_answers_for_none_of_it() {
         .clone();
     assert!(!built_over.is_empty(), "the index covered nothing to start");
 
-    let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
-        .await
-        .unwrap();
+    let metrics = compact_indexed(&mut dataset).await;
     assert!(
         metrics.fragments_removed > 0,
         "nothing was compacted, so this test proves nothing"

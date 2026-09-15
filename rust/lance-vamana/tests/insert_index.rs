@@ -22,7 +22,6 @@ use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
-use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_vamana::build::BuildParams;
@@ -35,8 +34,8 @@ use uuid::Uuid;
 
 mod common;
 use common::{
-    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, live_row_ids, random_vectors,
-    read_committed_segments, recall,
+    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, compact_indexed, live_row_ids,
+    random_vectors, read_committed_segments, recall,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
@@ -448,9 +447,7 @@ async fn a_compacted_dataset_is_repaired_by_indexing_it_again() {
     let mut dataset = indexed_dataset(uri).await;
     let stranded = committed_uuids(&dataset).await[0];
 
-    let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
-        .await
-        .unwrap();
+    let metrics = compact_indexed(&mut dataset).await;
     assert!(
         metrics.fragments_removed > 0,
         "compaction rewrote nothing, so the rest of this proves nothing: {metrics:?}"
@@ -720,9 +717,7 @@ async fn inserting_in_place_refuses_a_segment_whose_fragments_are_gone() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut dataset = indexed_dataset(uri).await;
-    let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
-        .await
-        .unwrap();
+    let metrics = compact_indexed(&mut dataset).await;
     assert!(metrics.fragments_removed > 0, "{metrics:?}");
 
     let mut dataset = Dataset::open(uri).await.unwrap();
@@ -734,4 +729,31 @@ async fn inserting_in_place_refuses_a_segment_whose_fragments_are_gone() {
         error.contains("consolidate the index first"),
         "the refusal does not name the remedy: {error}"
     );
+}
+
+/// The limit of every repair after a compaction: it has to come before any other
+/// commit.
+///
+/// A deferred compaction leaves a fragment-reuse index behind, and the next commit
+/// of any kind writes the segment's coverage remapped through it onto the
+/// rewritten fragments - fragments this segment never read, which
+/// `VamanaIndex::open` refuses. Pinned so that teaching the driver about
+/// fragment-reuse remaps shows up as this test failing.
+#[tokio::test]
+async fn a_commit_after_a_deferred_compaction_leaves_the_index_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_dataset(uri).await;
+    let metrics = compact_indexed(&mut dataset).await;
+    assert!(metrics.fragments_removed > 0, "{metrics:?}");
+    VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect("right after the compaction the index is stranded, not refused");
+
+    let dataset = with_new_rows(uri, 99).await;
+    let error = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("rows it never read"), "{error}");
 }

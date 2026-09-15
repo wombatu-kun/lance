@@ -21,7 +21,6 @@ use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
-use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_vamana::build::BuildParams;
@@ -34,8 +33,8 @@ use uuid::Uuid;
 
 mod common;
 use common::{
-    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, live_row_ids, random_vectors,
-    read_committed_segments, recall,
+    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, compact_indexed, live_row_ids,
+    random_vectors, read_committed_segments, recall,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
@@ -321,9 +320,7 @@ async fn merging_repairs_a_compaction_where_an_in_place_insert_refuses() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut dataset = indexed_dataset(uri).await;
-    let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
-        .await
-        .unwrap();
+    let metrics = compact_indexed(&mut dataset).await;
     assert!(metrics.fragments_removed > 0, "{metrics:?}");
 
     let mut dataset = Dataset::open(uri).await.unwrap();

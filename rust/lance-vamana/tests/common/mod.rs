@@ -15,6 +15,7 @@ use arrow_array::types::{Float32Type, UInt64Type};
 use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
+use lance::dataset::optimize::{CompactionMetrics, CompactionOptions, compact_files};
 use lance::dataset::{WriteMode, WriteParams};
 use lance_vamana::io::{open_file, read_partition, read_segment, scan_scheduler};
 use lance_vamana::partition::{Partition, PartitionGraph};
@@ -174,6 +175,28 @@ pub async fn brute_force(dataset: &Dataset, query: &[f32], k: usize) -> Vec<u64>
         .as_primitive::<UInt64Type>()
         .values()
         .to_vec()
+}
+
+/// Compact the dataset, fragments under a Vamana index included.
+///
+/// Since upstream #8427 Lance's default planner holds back every fragment an
+/// index it has no reader for covers, because it cannot remap that index onto
+/// rewritten fragments, so a default compaction of a fully indexed dataset
+/// rewrites nothing. A deferred remap rewrites them and leaves the index over
+/// fragment ids that are gone, which is the state a compaction test is about -
+/// but only until the next commit, which writes the index's coverage remapped
+/// onto the rewritten fragments and gets the index refused on open.
+pub async fn compact_indexed(dataset: &mut Dataset) -> CompactionMetrics {
+    compact_files(
+        dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap()
 }
 
 /// Every `_rowid` the dataset still has, in scan order.

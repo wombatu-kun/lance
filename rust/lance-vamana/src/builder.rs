@@ -48,21 +48,19 @@ use crate::segment::SegmentManifest;
 
 /// The `type_url` of the details blob that travels with a committed segment.
 ///
-/// Deliberately ours and deliberately unresolvable by Lance. A url Lance can
-/// resolve - `VectorIndexDetails` - puts the segment under a version ceiling
-/// this crate does not control, and a segment above that ceiling disappears
-/// *silently* when the dataset is reopened. An unresolvable one is kept as is.
-/// The payload is empty because the segment's own `index.idx` is the only
-/// source of truth about its contents.
+/// Deliberately ours and deliberately unresolvable by Lance. Since upstream
+/// #8529 a type Lance has no reader for is left out of every listing its read
+/// paths use, and its write paths still carry the segment into each manifest
+/// they write, so the segment is neither used by Lance nor erased by it. A url
+/// Lance can resolve - `VectorIndexDetails` - would put the segment in front of
+/// Lance's scanner, which would try to open it as one of its own. The payload is
+/// empty because the segment's own `index.idx` is the only source of truth about
+/// its contents.
 ///
-/// "Kept as is" rests on one upstream line: `retain_supported_indices` resolves
-/// an unknown url to a maximum supported version of `i32::MAX`, under a comment
-/// reading "If we don't know how to read the index, it isn't supported". The
-/// fail-open is what keeps this crate's segments visible to their own driver -
-/// and if it is ever tightened, `load_indices` will drop the segment with a
-/// warning, `VamanaIndex::open` will report that no such index exists, and a
-/// rebuild will add a *second* segment beside the invisible first rather than
-/// replacing it.
+/// Being invisible has two prices. This crate has to read the manifest itself to
+/// find its own segments ([`crate::query::committed_segments`]), and Lance's
+/// default compaction holds back every fragment such a segment covers, because
+/// it cannot remap an index it cannot read.
 pub const INDEX_DETAILS_TYPE_URL: &str = "type.googleapis.com/lance.vamana.VamanaIndexDetails";
 
 /// Most vectors per centroid the router's k-means will actually train on.

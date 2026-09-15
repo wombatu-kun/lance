@@ -74,53 +74,63 @@ position - `Dataset::take_rows` drops rows it cannot find instead of erroring.
 
 ## What this costs the dataset
 
-**Committing a Vamana index breaks Lance's own vector search on the indexed
-column, and Lance's index maintenance on the whole dataset.** This is not a
-rough edge to be tidied later; it follows from there being no way to register an
-external vector index type with Lance, and it is the reason this crate ships its
-own query driver.
+**Lance does not see a Vamana index, and it keeps one.** Lance's read paths
+leave out any index whose details type has no reader in the running build
+(upstream #8529), while the bookkeeping that writes the next manifest still
+carries such an index along (upstream #8427). A committed Vamana index therefore
+no longer breaks Lance's own vector search or index maintenance, as it did before
+those two changes. What it costs is that Lance cannot use it, cannot report it,
+and will not compact the rows under it.
 
-Measured on a freshly indexed dataset (`a_committed_index_shadows_lances_own_vector_paths`):
+Measured on freshly indexed datasets (`lance_skips_a_committed_index_and_keeps_it`,
+`a_commit_after_a_deferred_compaction_leaves_the_index_refused`,
+`tests/foreign_index_type.rs`, `tests/spike.rs`):
 
-| Call | Before `create_index` | After |
-|---|---|---|
-| `scan().nearest(col, q, k)` | works | **errors**: `Index Metadata not found` |
-| `scan().nearest(...).use_index(false)` | works | works |
-| `optimize_indices()` | works | **errors**, for *every* index on the dataset |
-| `index_statistics(name)` | works | **errors** |
-| plain `scan()` | works | works |
+| Call, with a Vamana index committed | What happens |
+|---|---|
+| `scan().nearest(col, q, k)` | works, as if the column had no index |
+| `optimize_indices()` | works; a commit it makes for another index keeps the Vamana segment |
+| any other commit, e.g. an append | keeps the Vamana segment unchanged |
+| `load_indices()`, `index_statistics(name)` | do not see it: an empty listing, `IndexNotFound` |
+| `drop_index(name)` | removes it |
+| `compact_files` with default options | holds back every fragment the index covers |
+| `compact_files` with `defer_index_remap` | rewrites those fragments and writes a fragment-reuse index; the index is stranded over the old ids |
+| any commit after that | writes the index's coverage remapped onto the rewritten fragments, and `VamanaIndex::open` refuses it from then on |
 
-The mechanism, in both cases, is that Lance decides what an index *is* from the
-column it sits on rather than from anything the index says about itself. The
-scanner picks a vector index by field id alone, with no type check, so it selects
-the Vamana segment and then fails to read it as one of its own. `optimize_indices`
-groups indices the same way - `index_group_is_scalar` asks
-`is_vector_field(field.data_type())` - and propagates the failure out of the loop
-over every index. Renaming `index.idx` would change neither: the file name
-decides nothing here.
+The filter is `index_type_is_known` in `rust/lance/src/index.rs`. Because every
+listing Lance offers goes through it, this crate finds its own segments by
+reading the manifest's index section itself, `query::committed_segments` - and
+without the fragment-reuse remap Lance applies to its own indices, because a
+partition file addresses the rows of the fragments it was built over.
 
 Consequences to plan around:
 
-- Do not put a Vamana index on a column that is also served by a Lance
-  `IVF_HNSW_*` index; whichever appears first in the manifest wins the lookup,
-  and a Vamana segment can shadow a working one.
-- Anything that calls `optimize_indices` on the dataset - including routine
-  maintenance of unrelated scalar indices - will fail while a Vamana index
-  exists. Drop the index, maintain, rebuild.
-- `use_index(false)` is the escape hatch for Lance-side vector queries.
+- Default compaction does not rewrite indexed fragments at all: Lance cannot
+  remap an index it cannot read, so it holds those fragments back and compacts
+  the rest. This is the safe setting for a dataset carrying a Vamana index.
+- **Do not compact such a dataset with `defer_index_remap`** unless the repair
+  follows before anything else commits. The rewrite strands the index, and one
+  `merge_index` call right afterwards repairs it; but the fragment-reuse index
+  the rewrite leaves makes the next commit of any kind credit the Vamana segment
+  with the rewritten fragments, which it never read, and only a rebuild recovers
+  from that. After a partial compaction even the immediate repair is narrower:
+  Lance picks which segments an incoming one replaces by the remapped coverage,
+  so `insert_as_segment` and `consolidate_index` can be refused for orphaning
+  fragments where `merge_index` is not (read in the code, not pinned by a test).
+- Lance's listings and statistics never report a Vamana index; ask this crate
+  (`VamanaIndex::open`, `query::committed_segments`) instead.
 
-A fourth path is broken for a different reason, and it is the only one that
-breaks **writing**. When the manifest a commit starts from predates Lance 0.8.15
-- whose fragment bitmaps could be wrong - or records no writer at all,
-`migrate_indices` recalculates every index's fragment coverage, and it does that
-by *opening* the index. Lance cannot open this format, so the commit fails
-outright. `build_index_segment` therefore refuses such a dataset up front rather
-than after the graph has been built, and names the remedy: one commit by any
-current Lance build rewrites the manifest with a current writer version, and the
-recalculation is gated on the manifest rather than on the age of the data.
-Pinned by `a_dataset_older_than_lances_bitmap_fix_is_refused_before_the_build`
-against the checked-in `test_data/v0.8.14` fixture; without the refusal that test
-fails with `Index with id ... does not exist` after a full build.
+One more path broke **writing**, and the build still refuses it up front. When
+the manifest a commit starts from predates Lance 0.8.15 - whose fragment bitmaps
+could be wrong - or records no writer at all, `migrate_indices` used to
+recalculate every index's fragment coverage by *opening* the index, so the
+commit failed outright. `build_index_segment` refuses such a dataset before the
+graph is built, and names the remedy: one commit by any current Lance build
+rewrites the manifest with a current writer version. Pinned by
+`a_dataset_older_than_lances_bitmap_fix_is_refused_before_the_build` against the
+checked-in `test_data/v0.8.14` fixture. Upstream's `migrate_indices` now skips an
+index it has no reader for, so the refusal may no longer be needed; that was not
+re-measured after the rebase onto 13.0.0-beta.1.
 
 ## What the query path does not do
 
@@ -470,11 +480,14 @@ rather than by the disk, which is why fusing the passes is worth having and is
 not where the money is. Where a partition read is a network round trip the same
 two passes are not 6%.
 
-They also answer compaction, which used to need a rebuild. Compaction strands the
-index over fragments that no longer exist, and the rows it moved are then rows
-this index does not cover - so indexing them again is the whole of the repair,
-and the stranded segment goes with the same commit. That is one `merge_index`
-call, or `consolidate_index` and then `insert_in_place`.
+They also answer compaction, which used to need a rebuild - within limits the
+rebase onto Lance 13 introduced. Lance's default compaction no longer touches
+fragments a Vamana index covers; one asked to with `defer_index_remap` strands
+the index over fragments that no longer exist, and the rows it moved are then
+rows this index does not cover - so indexing them again is the whole of the
+repair, and the stranded segment goes with the same commit. That is one
+`merge_index` call, and it has to be the next commit: see "What this costs the
+dataset" for what any other commit does first.
 
 ## Building
 
@@ -520,6 +533,8 @@ embeds it.
 
 Nothing here runs in Lance's CI, for the same reason. `tests/spike.rs`
 is executable documentation of what Lance's public API permits an external index
-to do, and it is where the two facts this design rests on are pinned - that an
-index with an unresolvable details `type_url` survives a reopen, and that a
-compaction strands an index it cannot read rather than deleting it.
+to do, and it is where the facts this design rests on are pinned - that an index
+with an unresolvable details `type_url` survives a reopen in the manifest while
+Lance's own listing leaves it out, that default compaction holds back what such an
+index covers, and that a compaction with a deferred remap strands it rather than
+deleting it.
