@@ -52,7 +52,6 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::WriteParams;
-use lance::index::DatasetIndexExt;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::ROW_ID;
 use lance_index::vector::flat::storage::FlatFloatStorage;
@@ -60,7 +59,7 @@ use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::consolidator::consolidate_index;
-use lance_vamana::query::{SearchParams, VamanaIndex};
+use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -172,8 +171,7 @@ struct Measured {
 
 /// What the committed index takes on disk, as Lance recorded it at commit.
 async fn index_bytes(dataset: &Dataset) -> u64 {
-    dataset
-        .load_indices_by_name(INDEX_NAME)
+    committed_segments(dataset, INDEX_NAME)
         .await
         .unwrap()
         .iter()

@@ -72,7 +72,6 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::WriteParams;
-use lance::index::DatasetIndexExt;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::ROW_ID;
 use lance_index::vector::bq::RQBuildParams;
@@ -94,6 +93,7 @@ use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::format::INDEX_FILE_NAME;
 use lance_vamana::io::{open_file, read_partition, read_segment, scan_scheduler};
 use lance_vamana::partition::{Partition, PartitionGraph};
+use lance_vamana::query::committed_segments;
 use lance_vamana::search::{Comparisons, SearchResult, SearchScratch, flat_storage, greedy_search};
 use lance_vamana::segment::{PartitionEntry, SegmentManifest};
 use object_store::path::Path;
@@ -957,8 +957,7 @@ async fn granularity(
     );
 
     let ids = ids_by_address(&dataset).await;
-    let committed = dataset
-        .load_indices_by_name(INDEX_NAME)
+    let committed = committed_segments(&dataset, INDEX_NAME)
         .await
         .unwrap()
         .into_iter()

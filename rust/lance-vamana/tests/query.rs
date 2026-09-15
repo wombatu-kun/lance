@@ -43,7 +43,7 @@ use lance_vamana::builder::{
 use lance_vamana::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
 use lance_vamana::io::{SegmentWriter, read_segment, scan_scheduler};
 use lance_vamana::partition::Partition;
-use lance_vamana::query::{SearchParams, VamanaIndex};
+use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -617,7 +617,7 @@ async fn a_narrow_probe_costs_recall_and_buys_work() {
 
 /// How many rows the biggest partition of the committed index holds.
 async fn largest_partition(dataset: &Dataset) -> u64 {
-    let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+    let indices = committed_segments(dataset, INDEX_NAME).await.unwrap();
     let store = dataset.object_store(None).await.unwrap();
     let dir = dataset.indices_dir().join(indices[0].uuid.to_string());
     read_segment(&scan_scheduler(&store), &dir, None)
@@ -1168,7 +1168,7 @@ async fn an_index_whose_vectors_an_overlay_replaced_is_refused() {
     VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
     let dataset = commit_overlay(dataset, 0, &[0, 1, 2], "stale").await;
-    let index = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+    let index = committed_segments(&dataset, INDEX_NAME).await.unwrap();
     assert_eq!(
         index[0].fragment_bitmap.as_ref().map(|b| b.len()),
         Some(small_fixture().fragments as u64),
@@ -1215,7 +1215,7 @@ async fn an_index_inherited_by_a_shallow_clone_is_refused() {
         .await
         .unwrap();
 
-    let inherited = clone.load_indices_by_name(INDEX_NAME).await.unwrap();
+    let inherited = committed_segments(&clone, INDEX_NAME).await.unwrap();
     assert!(
         inherited[0].base_id.is_some(),
         "the clone did not stamp a base id, so this test is not exercising one"

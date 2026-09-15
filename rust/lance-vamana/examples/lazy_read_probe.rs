@@ -47,7 +47,6 @@ use arrow_schema::{Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::WriteParams;
-use lance::index::DatasetIndexExt;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::FileReader;
@@ -58,6 +57,7 @@ use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::format::{INDEX_FILE_NAME, NEIGHBORS_COLUMN, ROW_ID_COLUMN, VECTOR_COLUMN};
 use lance_vamana::io::{open_file, read_partition, read_rows, read_segment, scan_scheduler};
+use lance_vamana::query::committed_segments;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::seq::index::sample;
@@ -188,8 +188,7 @@ async fn main() {
         started.elapsed().as_secs_f64()
     );
 
-    let index = dataset
-        .load_indices_by_name(INDEX_NAME)
+    let index = committed_segments(&dataset, INDEX_NAME)
         .await
         .unwrap()
         .into_iter()

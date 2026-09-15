@@ -33,7 +33,7 @@ use lance_vamana::builder::{
 use lance_vamana::format::INDEX_FILE_NAME;
 use lance_vamana::io::{open_file, read_partition, scan_scheduler};
 use lance_vamana::partition::Partition;
-use lance_vamana::query::VamanaIndex;
+use lance_vamana::query::{VamanaIndex, committed_segments};
 use lance_vamana::segment::SegmentManifest;
 use object_store::path::Path;
 
@@ -89,7 +89,7 @@ async fn a_built_index_survives_reopen() {
 
     // Reopened by URI, so nothing here leans on in-process state.
     let reopened = Dataset::open(uri).await.unwrap();
-    let indices = reopened.load_indices_by_name(INDEX_NAME).await.unwrap();
+    let indices = committed_segments(&reopened, INDEX_NAME).await.unwrap();
     assert_eq!(indices.len(), 1);
     let index = &indices[0];
     assert_eq!(
@@ -136,6 +136,37 @@ async fn a_built_index_survives_reopen() {
             entry.file
         );
     }
+}
+
+/// Lance's own index listing leaves this index out, and the driver has to find
+/// it anyway. Both halves are asserted, so the day upstream lists such an index
+/// again this test is where it shows.
+#[tokio::test]
+async fn an_index_lance_does_not_list_is_still_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = DatasetFixture::default().write(uri).await;
+    create_index(&mut dataset, INDEX_NAME, &params())
+        .await
+        .unwrap();
+
+    let reopened = Dataset::open(uri).await.unwrap();
+    assert!(
+        reopened
+            .load_indices_by_name(INDEX_NAME)
+            .await
+            .unwrap()
+            .is_empty(),
+        "Lance lists an index type it has no reader for again"
+    );
+    assert_eq!(
+        committed_segments(&reopened, INDEX_NAME)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    VamanaIndex::open(&reopened, INDEX_NAME).await.unwrap();
 }
 
 /// The load-bearing test of this stage: what the index stores must be the rows it
@@ -329,7 +360,7 @@ async fn a_build_reports_what_it_cost() {
         manifest.partitions().len(),
         "the build counted partitions the segment does not list"
     );
-    let files = dataset.load_indices_by_name(INDEX_NAME).await.unwrap()[0]
+    let files = committed_segments(&dataset, INDEX_NAME).await.unwrap()[0]
         .files
         .as_ref()
         .expect("the commit records its files")
@@ -368,8 +399,7 @@ async fn a_stable_row_id_dataset_is_refused() {
         .unwrap_err();
     assert!(error.to_string().contains("stable row ids"), "{error}");
     assert!(
-        dataset
-            .load_indices_by_name(INDEX_NAME)
+        committed_segments(&dataset, INDEX_NAME)
             .await
             .unwrap()
             .is_empty(),

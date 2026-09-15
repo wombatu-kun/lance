@@ -16,9 +16,9 @@ use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIter
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
-use lance::index::DatasetIndexExt;
 use lance_vamana::io::{open_file, read_partition, read_segment, scan_scheduler};
 use lance_vamana::partition::{Partition, PartitionGraph};
+use lance_vamana::query::committed_segments;
 use lance_vamana::segment::SegmentManifest;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -199,7 +199,7 @@ pub struct ReadSegment {
 /// Read every committed segment of `index_name` back off disk, in manifest
 /// order.
 pub async fn read_committed_segments(dataset: &Dataset, index_name: &str) -> Vec<ReadSegment> {
-    let indices = dataset.load_indices_by_name(index_name).await.unwrap();
+    let indices = committed_segments(dataset, index_name).await.unwrap();
     let store = dataset.object_store(None).await.unwrap();
     let scheduler = scan_scheduler(&store);
 

@@ -102,7 +102,6 @@ use std::time::{Duration, Instant};
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance::Dataset;
-use lance::index::DatasetIndexExt;
 use lance_core::cache::{CacheStats, LanceCache};
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
@@ -113,6 +112,7 @@ use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::overlay::DataOverlayFile;
+use lance_table::io::manifest::read_manifest_indexes;
 use object_store::path::Path;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use uuid::Uuid;
@@ -610,6 +610,30 @@ struct Probing {
 /// pays for both attempts.
 const PARTITIONS_IN_FLIGHT: usize = 4;
 
+/// Every committed segment named `index_name`, in manifest order.
+///
+/// Read from the manifest's own index section rather than through
+/// `DatasetIndexExt::load_indices_by_name`: since upstream #8529 that view leaves
+/// out every index whose details type has no reader in the Lance build, and
+/// [`crate::builder::INDEX_DETAILS_TYPE_URL`] never has one.
+///
+/// Deliberately without the fragment-reuse remap Lance applies to its own
+/// indices: a partition file holds the row addresses of the fragments it was
+/// built over, so a remapped bitmap would credit it with fragments whose rows it
+/// cannot address.
+pub async fn committed_segments(
+    dataset: &Dataset,
+    index_name: &str,
+) -> Result<Vec<lance_table::format::IndexMetadata>> {
+    let store = dataset.object_store(None).await?;
+    let indices =
+        read_manifest_indexes(&store, dataset.manifest_location(), dataset.manifest()).await?;
+    Ok(indices
+        .into_iter()
+        .filter(|index| index.name == index_name)
+        .collect())
+}
+
 impl VamanaIndex {
     /// Open every segment of `index_name`.
     ///
@@ -620,10 +644,7 @@ impl VamanaIndex {
     /// dropped, its reads are queued to a loop that no longer runs and nothing
     /// ever pops them, so a search hangs rather than failing.
     pub async fn open(dataset: &Dataset, index_name: &str) -> Result<Self> {
-        // `load_indices_by_name` and not `load_index_by_name`: the latter errors
-        // out as soon as an index has more than one segment, which is the normal
-        // state of anything that has ever been appended to.
-        let indices = dataset.load_indices_by_name(index_name).await?;
+        let indices = committed_segments(dataset, index_name).await?;
         if indices.is_empty() {
             return Err(Error::index(format!(
                 "dataset has no index named '{index_name}'"

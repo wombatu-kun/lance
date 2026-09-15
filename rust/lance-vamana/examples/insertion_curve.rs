@@ -58,7 +58,6 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
-use lance::index::DatasetIndexExt;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::ROW_ID;
 use lance_index::vector::flat::storage::FlatFloatStorage;
@@ -67,7 +66,7 @@ use lance_linalg::distance::DistanceType;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::inserter::insert_as_segment;
 use lance_vamana::merger::merge_index;
-use lance_vamana::query::{SearchParams, VamanaIndex};
+use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -150,7 +149,7 @@ async fn ids_by_address(dataset: &Dataset) -> HashMap<u64, u64> {
 /// written afterwards, so a delta of many tiny partitions is paid for by every
 /// later append, delete and open of the dataset.
 async fn index_files(dataset: &Dataset) -> (usize, u64) {
-    let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+    let indices = committed_segments(dataset, INDEX_NAME).await.unwrap();
     let files = indices
         .iter()
         .flat_map(|index| index.files.iter().flatten())

@@ -22,7 +22,7 @@ use lance::index::DatasetIndexExt;
 use lance_core::utils::address::RowAddress;
 use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
 use lance_vamana::consolidator::{ConsolidateStats, consolidate_index};
-use lance_vamana::query::{SearchParams, VamanaIndex};
+use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -55,8 +55,7 @@ fn search() -> SearchParams {
 }
 
 async fn committed_uuids(dataset: &Dataset) -> Vec<Uuid> {
-    dataset
-        .load_indices_by_name(INDEX_NAME)
+    committed_segments(dataset, INDEX_NAME)
         .await
         .unwrap()
         .iter()
