@@ -38,7 +38,6 @@ prost = "0.14.1"
 prost-types = "0.14.1"
 rand = { version = "0.9.1", features = ["small_rng"] }
 roaring = "0.11.4"
-semver = "1.0"
 serde = { version = "^1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.23", features = ["macros", "rt-multi-thread"], optional = true }

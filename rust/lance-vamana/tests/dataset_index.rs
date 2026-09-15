@@ -33,7 +33,7 @@ use lance_vamana::builder::{
 use lance_vamana::format::INDEX_FILE_NAME;
 use lance_vamana::io::{open_file, read_partition, scan_scheduler};
 use lance_vamana::partition::Partition;
-use lance_vamana::query::{VamanaIndex, committed_segments};
+use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
 use lance_vamana::segment::SegmentManifest;
 use object_store::path::Path;
 
@@ -865,17 +865,23 @@ fn copy_fixture(name: &str) -> tempfile::TempDir {
     target
 }
 
-/// The fourth Lance path a Vamana index collides with, and the only one that
-/// breaks *writing* rather than reading.
-///
-/// When the manifest a commit starts from was written before Lance 0.8.15, whose
-/// fragment bitmaps could be wrong, `migrate_indices` recalculates the coverage
-/// of every index - by *opening* it, with `?` and no fallback. Lance cannot open
-/// this format, so the commit fails, and it fails only after the whole graph has
-/// been built. This crate refuses up front and names the remedy, which is one
-/// commit by any current build: the check is on the manifest, not on the data.
+/// A commit that starts from a manifest written before Lance 0.8.15 recalculates
+/// every index's fragment coverage by opening it, which Lance cannot do for this
+/// format. `migrate_indices` skips an index it has no reader for, so the build
+/// commits straight onto such a manifest. The legacy index beside it is repaired
+/// by that same commit, which is what shows the recalculation really ran.
 #[tokio::test]
-async fn a_dataset_older_than_lances_bitmap_fix_is_refused_before_the_build() {
+async fn a_dataset_older_than_lances_bitmap_fix_is_indexed_directly() {
+    async fn legacy_indices_cover_fragment_zero(dataset: &Dataset) -> Vec<bool> {
+        dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|index| index.fragment_bitmap.as_ref().unwrap().contains(0))
+            .collect()
+    }
+
     let fixture = copy_fixture("v0.8.14/corrupt_index");
     let uri = fixture.path().to_str().unwrap();
     let mut dataset = Dataset::open(uri).await.unwrap();
@@ -888,22 +894,47 @@ async fn a_dataset_older_than_lances_bitmap_fix_is_refused_before_the_build() {
             .is_some_and(|parsed| (parsed.major, parsed.minor, parsed.patch) < (0, 8, 15)),
         "the fixture is no longer older than the bitmap fix, so this proves nothing"
     );
+    assert_eq!(
+        legacy_indices_cover_fragment_zero(&dataset).await,
+        vec![false]
+    );
 
-    let params = IndexParams::new("vector", 4);
-    let error = create_index(&mut dataset, INDEX_NAME, &params)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("lance 0.8.14"), "{error}");
-
-    // A commit that changes nothing still rewrites the manifest with a current
-    // writer version, which is all the recalculation is gated on.
-    dataset.delete("false").await.unwrap();
-    create_index(&mut dataset, INDEX_NAME, &params)
+    let fragments = live_fragments(&dataset);
+    create_index(&mut dataset, INDEX_NAME, &IndexParams::new("vector", 4))
         .await
         .unwrap();
-    VamanaIndex::open(&dataset, INDEX_NAME)
+
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    assert_eq!(
+        legacy_indices_cover_fragment_zero(&dataset).await,
+        vec![true],
+        "the build's own commit did not run the recalculation, so it never met the path"
+    );
+    let built = committed_segments(&dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(built.len(), 1);
+    assert_eq!(
+        built[0].fragment_bitmap,
+        Some(fragments.into_iter().collect::<roaring::RoaringBitmap>())
+    );
+
+    let version = dataset.version().version;
+    dataset.delete("false").await.unwrap();
+    let dataset = Dataset::open(uri).await.unwrap();
+    assert!(dataset.version().version > version);
+    let kept = committed_segments(&dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(
+        (kept[0].uuid, &kept[0].fragment_bitmap),
+        (built[0].uuid, &built[0].fragment_bitmap)
+    );
+
+    let answer = VamanaIndex::open(&dataset, INDEX_NAME)
         .await
-        .expect("the index built after the manifest was refreshed must open");
+        .unwrap()
+        .search(&[0.0; 128], &SearchParams::new(10))
+        .await
+        .unwrap();
+    assert_eq!(answer.neighbors.len(), 10);
 }
 
 /// A build is a long stretch of arithmetic with no await anywhere inside it. Run

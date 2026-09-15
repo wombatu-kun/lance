@@ -120,17 +120,14 @@ Consequences to plan around:
 - Lance's listings and statistics never report a Vamana index; ask this crate
   (`VamanaIndex::open`, `query::committed_segments`) instead.
 
-One more path broke **writing**, and the build still refuses it up front. When
-the manifest a commit starts from predates Lance 0.8.15 - whose fragment bitmaps
-could be wrong - or records no writer at all, `migrate_indices` used to
-recalculate every index's fragment coverage by *opening* the index, so the
-commit failed outright. `build_index_segment` refuses such a dataset before the
-graph is built, and names the remedy: one commit by any current Lance build
-rewrites the manifest with a current writer version. Pinned by
-`a_dataset_older_than_lances_bitmap_fix_is_refused_before_the_build` against the
-checked-in `test_data/v0.8.14` fixture. Upstream's `migrate_indices` now skips an
-index it has no reader for, so the refusal may no longer be needed; that was not
-re-measured after the rebase onto 13.0.0-beta.1.
+One more path used to break **writing**. When the manifest a commit starts from
+predates Lance 0.8.15 - whose fragment bitmaps could be wrong - or records no
+writer at all, `migrate_indices` recalculates every index's fragment coverage by
+*opening* the index, and for this format that failed the commit. It now skips an
+index it has no reader for, so a build commits straight onto such a manifest,
+and Lance's own legacy index beside it is still repaired by that same commit.
+Pinned by `a_dataset_older_than_lances_bitmap_fix_is_indexed_directly` against
+the checked-in `test_data/v0.8.14` fixture.
 
 ## What the query path does not do
 

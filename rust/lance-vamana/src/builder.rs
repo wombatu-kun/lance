@@ -32,7 +32,6 @@ use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::{KMeans, KMeansParams, compute_partitions_arrow_array};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_fsl_owned;
-use lance_table::format::WriterVersion;
 use object_store::path::Path;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
@@ -324,22 +323,6 @@ pub(crate) async fn build_index_segment_inheriting(
     fragments: &[u32],
     inherited: Option<Inherited>,
 ) -> Result<(IndexSegment, BuildStats)> {
-    // Refused before the graph is built rather than discovered on the commit
-    // that follows it: Lance would open this index while committing, and cannot.
-    if writer_predates_bitmap_recalculation(dataset) {
-        return Err(Error::not_supported(format!(
-            "Vamana cannot index a dataset whose manifest was written by {}: Lance recalculates \
-             every index's fragment coverage on the next commit, and it does that by opening the \
-             index, which fails for this format. Commit any change with a current Lance build \
-             first - an append or a compaction rewrites the manifest with a current writer \
-             version - and then build the index",
-            dataset.manifest().writer_version.as_ref().map_or(
-                "no recorded writer".to_string(),
-                |version| format!("{} {}", version.library, version.version)
-            )
-        )));
-    }
-
     let field = dataset.schema().field(&params.column).ok_or_else(|| {
         Error::invalid_input(format!(
             "column '{}' does not exist in the dataset",
@@ -389,43 +372,6 @@ pub(crate) async fn build_index_segment_inheriting(
         ),
         stats,
     ))
-}
-
-/// Whether Lance will recompute every index's fragment coverage on the next
-/// commit of this dataset.
-///
-/// It does that by *opening* each index - `migrate_indices` ->
-/// `open_generic_index`, propagated with `?` and no fallback - so for this
-/// crate's segments the commit fails outright. The condition mirrors Lance's own
-/// `must_recalculate_fragment_bitmap`: a manifest with no recorded writer, or
-/// one written by a Lance older than 0.8.15, whose fragment bitmaps could be
-/// corrupt. A manifest written by any other library is left alone by Lance and
-/// so is left alone here.
-///
-/// The version compared is the one on the manifest the commit *starts from*, so
-/// a single commit by a current Lance build clears it permanently.
-fn writer_predates_bitmap_recalculation(dataset: &Dataset) -> bool {
-    predates_bitmap_recalculation(dataset.manifest().writer_version.as_ref())
-}
-
-/// The comparison itself, over the value rather than over a dataset, because a
-/// manifest carrying a prerelease writer is not something this crate's fixtures
-/// can produce and the ordering is exactly where this can go wrong.
-///
-/// `semver::Version` rather than the `(major, minor, patch)` triple: semver
-/// orders a prerelease *below* the release it leads to, so `0.8.15-beta.1` is
-/// old to Lance and would be new to a triple comparison - and this crate would
-/// then build an index over a manifest whose next commit recalculates every
-/// fragment bitmap by opening it.
-fn predates_bitmap_recalculation(version: Option<&WriterVersion>) -> bool {
-    match version {
-        None => true,
-        Some(version) if version.library != "lance" => false,
-        // Unparseable counts as old, which is what Lance concludes too.
-        Some(version) => version
-            .lance_lib_version()
-            .is_none_or(|parsed| parsed < semver::Version::new(0, 8, 15)),
-    }
 }
 
 /// Build one segment into `dir` without committing it.
@@ -975,55 +921,6 @@ mod tests {
 
     use super::*;
     use crate::format::partition_file_name;
-
-    fn written_by(library: &str, version: &str, prerelease: Option<&str>) -> WriterVersion {
-        WriterVersion {
-            library: library.to_string(),
-            version: version.to_string(),
-            prerelease: prerelease.map(str::to_string),
-            build_metadata: None,
-        }
-    }
-
-    /// The version gate is the one thing standing between a build and a commit
-    /// that fails inside Lance, and the case it can get wrong is the one no
-    /// fixture in this crate can produce: semver puts a prerelease *below* the
-    /// release it leads to, so `0.8.15-beta.1` is old to Lance and would be new
-    /// to a comparison of `(major, minor, patch)`.
-    #[test]
-    fn a_prerelease_writer_counts_as_older_than_its_release() {
-        for (version, prerelease, expected, what) in [
-            ("0.8.14", None, true, "older than the fix"),
-            ("0.8.15", None, false, "the fix itself"),
-            ("0.8.15", Some("beta.1"), true, "a prerelease of the fix"),
-            (
-                "0.9.0",
-                Some("rc.1"),
-                false,
-                "a prerelease of a later release",
-            ),
-            ("1.2.3", None, false, "current"),
-        ] {
-            assert_eq!(
-                predates_bitmap_recalculation(Some(&written_by("lance", version, prerelease))),
-                expected,
-                "{what}"
-            );
-        }
-
-        assert!(
-            predates_bitmap_recalculation(None),
-            "a manifest with no recorded writer has to count as old, as it does upstream"
-        );
-        assert!(
-            !predates_bitmap_recalculation(Some(&written_by("something-else", "0.1.0", None))),
-            "Lance leaves another library's manifest alone, and so does this"
-        );
-        assert!(
-            predates_bitmap_recalculation(Some(&written_by("lance", "not a version", None))),
-            "an unparseable version counts as old, as it does upstream"
-        );
-    }
 
     /// A partition whose centroid drew nothing gets no file and no row in the
     /// segment table, and the partitions after it keep their own ids. Writing
