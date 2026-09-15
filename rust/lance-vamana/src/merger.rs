@@ -89,11 +89,11 @@ use crate::segment::PartitionEntry;
 
 /// What bringing an index up to date did, and what it cost.
 ///
-/// `partitions_written`, `partitions_copied` and `partitions_dropped` are
-/// exclusive and between them account for every partition any segment held plus
-/// every one the new rows called for. `partitions_rebuilt` is not a fourth
-/// class: it counts the written ones that had to be built from scratch because
-/// the merged graph came apart.
+/// `partitions_written`, `partitions_copied`, `partitions_readdressed` and
+/// `partitions_dropped` are exclusive and between them account for every
+/// partition any segment held plus every one the new rows called for.
+/// `partitions_rebuilt` is not a fifth class: it counts the written ones that had
+/// to be built from scratch because the merged graph came apart.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MergeStats {
     /// Segments the merge replaced, which is every segment the index had.
@@ -119,6 +119,9 @@ pub struct MergeStats {
     pub partitions_rebuilt: usize,
     /// Partitions nothing happened to, copied across undecoded.
     pub partitions_copied: usize,
+    /// Partitions nothing happened to but a deferred compaction moving their
+    /// rows, written out again at the addresses the rows live at now.
+    pub partitions_readdressed: usize,
     /// Partitions with nothing left in them, given no file and no table row.
     pub partitions_dropped: usize,
     /// Distance computations, across the repairs, the links and the rebuilds.
@@ -268,7 +271,7 @@ pub async fn merge_index(dataset: &mut Dataset, index_name: &str) -> Result<Merg
         && index.num_segments() == 1
         && segments
             .iter()
-            .all(|(_, dead)| dead.iter().all(RoaringBitmap::is_empty))
+            .all(|(segment, dead)| !segment.moved && dead.iter().all(RoaringBitmap::is_empty))
     {
         return Ok(MergeStats::default());
     }
@@ -321,6 +324,12 @@ pub async fn merge_index(dataset: &mut Dataset, index_name: &str) -> Result<Merg
                     .await?;
                 stats.partitions_copied += 1;
             }
+            Folded::Readdressed { partition, medoid } => {
+                writer
+                    .write_partition(partition_id, medoid, &partition)
+                    .await?;
+                stats.partitions_readdressed += 1;
+            }
             Folded::Written {
                 partition,
                 medoid,
@@ -338,7 +347,7 @@ pub async fn merge_index(dataset: &mut Dataset, index_name: &str) -> Result<Merg
             }
         }
     }
-    if stats.partitions_written + stats.partitions_copied == 0 {
+    if stats.partitions_written + stats.partitions_copied + stats.partitions_readdressed == 0 {
         return Err(Error::invalid_input(format!(
             "Vamana cannot merge index '{index_name}': every one of its vertices is deleted and \
              there is nothing unindexed to replace them with, so there would be nothing left to \
@@ -350,10 +359,11 @@ pub async fn merge_index(dataset: &mut Dataset, index_name: &str) -> Result<Merg
     let dataset_version = dataset.manifest.version;
     log::info!(
         "Vamana index '{index_name}' folded {} segments into {uuid}: {} partitions written, {} \
-         copied, {} dropped, {} vertices folded and {} removed",
+         copied, {} readdressed, {} dropped, {} vertices folded and {} removed",
         stats.segments_folded,
         stats.partitions_written,
         stats.partitions_copied,
+        stats.partitions_readdressed,
         stats.partitions_dropped,
         stats.vertices_folded,
         stats.vertices_removed
@@ -471,6 +481,9 @@ enum Folded<'a> {
     /// degree, or the merge refused before reading anything - so they cross over
     /// without being decoded.
     Copied(&'a Segment),
+    /// As [`Self::Copied`], except that a deferred compaction moved its rows,
+    /// so it is written out again at the addresses they live at now.
+    Readdressed { partition: Partition, medoid: u32 },
     Written {
         partition: Partition,
         medoid: u32,
@@ -545,7 +558,8 @@ async fn fold_partition<'a>(
         ));
     }
 
-    if arrivals.is_empty() && sources.len() == 1 && sources[0].dead.is_empty() {
+    let untouched = arrivals.is_empty() && sources.len() == 1 && sources[0].dead.is_empty();
+    if untouched && !sources[0].segment.moved {
         return Ok((folding, Folded::Copied(sources[0].segment)));
     }
 
@@ -558,14 +572,28 @@ async fn fold_partition<'a>(
             source.segment.file_sizes.get(&source.entry.file).copied(),
         )
         .await?;
-        let partition = read_partition(&reader, source.entry.num_rows).await?;
+        let mut partition = read_partition(&reader, source.entry.num_rows).await?;
         check_partition_shape(
             &partition,
             source.entry,
             fold.metadata.max_degree,
             fold.metadata.dimension,
         )?;
+        if source.segment.moved {
+            let rows = fold.index.row_filter().clone();
+            let segment = source.segment.uuid;
+            partition = spawn_cpu(move || rows.readdress(segment, partition)).await?;
+        }
         read.push(partition);
+    }
+    if untouched && let Some(partition) = read.pop() {
+        return Ok((
+            folding,
+            Folded::Readdressed {
+                partition,
+                medoid: sources[0].entry.medoid,
+            },
+        ));
     }
 
     // The graph the others fold into: the largest of them, because linking the

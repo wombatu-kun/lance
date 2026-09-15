@@ -58,6 +58,7 @@ use crate::io::{
     read_row_ids,
 };
 use crate::merge::{Merged, merge_partition};
+use crate::partition::Partition;
 use crate::query::{Segment, VamanaIndex};
 use crate::search::Comparisons;
 use crate::segment::PartitionEntry;
@@ -65,12 +66,12 @@ use crate::segment::PartitionEntry;
 /// What consolidating an index did, and what it cost.
 ///
 /// Every partition of every rewritten segment falls into exactly one of the
-/// first four counters, so they add up to the partitions of those segments.
+/// five partition counters, so they add up to the partitions of those segments.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConsolidateStats {
     /// Segments rewritten and committed in place of their old selves.
     pub segments_rewritten: usize,
-    /// Segments left alone because nothing they hold is deleted.
+    /// Segments left alone because nothing they hold is deleted or has moved.
     pub segments_untouched: usize,
     /// Segments abandoned because every fragment they were built over is gone.
     ///
@@ -86,6 +87,9 @@ pub struct ConsolidateStats {
     pub partitions_rebuilt: usize,
     /// Partitions with nothing deleted in them, copied across as they were.
     pub partitions_copied: usize,
+    /// Partitions with nothing deleted in them whose rows a deferred compaction
+    /// moved, written out again at the addresses the rows live at now.
+    pub partitions_readdressed: usize,
     /// Partitions whose every row was deleted, given no file and no table row.
     pub partitions_dropped: usize,
     /// Vertices that are no longer stored.
@@ -95,6 +99,12 @@ pub struct ConsolidateStats {
 }
 
 /// Rewrite every segment of `index_name` that holds a deleted row, and commit.
+///
+/// A segment whose rows a deferred compaction moved is rewritten too, deleted
+/// rows or not, with every vertex at the address its row lives at now. That is
+/// what lets `cleanup_frag_reuse_index` drop the record of the move: the
+/// rewritten segment no longer needs it, and the one it replaces is what kept
+/// Lance from dropping it.
 ///
 /// There is no threshold here, deliberately: asked to consolidate, this
 /// consolidates. *When* to ask is the caller's, and the answer the measurements
@@ -151,7 +161,7 @@ pub async fn consolidate_index(
         }
 
         let dead = dead_by_partition(&index, segment, io_parallelism).await?;
-        if dead.iter().all(RoaringBitmap::is_empty) {
+        if !segment.moved && dead.iter().all(RoaringBitmap::is_empty) {
             stats.segments_untouched += 1;
             continue;
         }
@@ -237,7 +247,7 @@ pub(crate) async fn dead_by_partition(
                 .await?
                 .iter()
                 .enumerate()
-                .filter(|(_, row_addr)| index.row_filter().rejects(**row_addr))
+                .filter(|(_, row_addr)| index.row_filter().rejects(segment.uuid, **row_addr))
                 .map(|(local_id, _)| local_id as u32)
                 .collect::<RoaringBitmap>(),
         )
@@ -259,7 +269,7 @@ async fn repair_partition(
     dead: &RoaringBitmap,
     metadata: &IndexMetadata,
 ) -> Result<Rewritten> {
-    if dead.is_empty() {
+    if dead.is_empty() && !segment.moved {
         return Ok(Rewritten::Copied);
     }
     if dead.len() == entry.num_rows as u64 {
@@ -273,8 +283,16 @@ async fn repair_partition(
         segment.file_sizes.get(&entry.file).copied(),
     )
     .await?;
-    let partition = read_partition(&reader, entry.num_rows).await?;
+    let mut partition = read_partition(&reader, entry.num_rows).await?;
     check_partition_shape(&partition, entry, metadata.max_degree, metadata.dimension)?;
+    if segment.moved {
+        let rows = index.row_filter().clone();
+        let segment = segment.uuid;
+        partition = spawn_cpu(move || rows.readdress(segment, partition)).await?;
+    }
+    if dead.is_empty() {
+        return Ok(Rewritten::Readdressed(partition));
+    }
 
     // Minutes of arithmetic over a whole segment, and not one await in it, so it
     // runs on the CPU pool rather than on the runtime the scheduler reads
@@ -309,6 +327,9 @@ async fn repair_partition(
 enum Rewritten {
     /// Nothing in it is deleted, so its bytes cross over without being decoded.
     Copied,
+    /// Nothing in it is deleted, but its rows moved, so it is written out again
+    /// with the addresses they live at now.
+    Readdressed(Partition),
     /// Every vertex of it is deleted: no file and no table row.
     /// `consolidate_partition` refuses a partition of nothing rather than
     /// returning one, so that dropping it is a decision taken here and not a
@@ -351,6 +372,12 @@ async fn rewrite_segment(
                     .copy_partition(&segment.dir, &segment.manifest, entry.partition_id)
                     .await?;
                 stats.partitions_copied += 1;
+            }
+            Rewritten::Readdressed(partition) => {
+                writer
+                    .write_partition(entry.partition_id, entry.medoid, &partition)
+                    .await?;
+                stats.partitions_readdressed += 1;
             }
             Rewritten::Dropped => stats.partitions_dropped += 1,
             Rewritten::Repaired {

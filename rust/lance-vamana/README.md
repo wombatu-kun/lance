@@ -80,10 +80,10 @@ leave out any index whose details type has no reader in the running build
 carries such an index along (upstream #8427). A committed Vamana index therefore
 no longer breaks Lance's own vector search or index maintenance, as it did before
 those two changes. What it costs is that Lance cannot use it, cannot report it,
-and will not compact the rows under it.
+and compacts the rows under it only when told to defer the remap.
 
 Measured on freshly indexed datasets (`lance_skips_a_committed_index_and_keeps_it`,
-`a_commit_after_a_deferred_compaction_leaves_the_index_refused`,
+`an_index_follows_its_rows_through_a_deferred_compaction`,
 `tests/foreign_index_type.rs`, `tests/spike.rs`):
 
 | Call, with a Vamana index committed | What happens |
@@ -94,29 +94,45 @@ Measured on freshly indexed datasets (`lance_skips_a_committed_index_and_keeps_i
 | `load_indices()`, `index_statistics(name)` | do not see it: an empty listing, `IndexNotFound` |
 | `drop_index(name)` | removes it |
 | `compact_files` with default options | holds back every fragment the index covers |
-| `compact_files` with `defer_index_remap` | rewrites those fragments and writes a fragment-reuse index; the index is stranded over the old ids |
-| any commit after that | writes the index's coverage remapped onto the rewritten fragments, and `VamanaIndex::open` refuses it from then on |
+| `compact_files` with `defer_index_remap` | rewrites those fragments and records in the fragment-reuse index where every row went; `VamanaIndex::open` follows that record |
+| any commit after that | writes the index's coverage remapped onto the rewritten fragments, which is what the index already answers for |
 
 The filter is `index_type_is_known` in `rust/lance/src/index.rs`. Because every
 listing Lance offers goes through it, this crate finds its own segments by
-reading the manifest's index section itself, `query::committed_segments` - and
-without the fragment-reuse remap Lance applies to its own indices, because a
-partition file addresses the rows of the fragments it was built over.
+reading the manifest's index section itself, `query::committed_segments`, and
+applies the fragment-reuse remap itself - to the manifest's bitmap and to the
+segment's own record of what it read alike, because a partition file addresses
+rows where they were when it was written.
 
 Consequences to plan around:
 
 - Default compaction does not rewrite indexed fragments at all: Lance cannot
   remap an index it cannot read, so it holds those fragments back and compacts
-  the rest. This is the safe setting for a dataset carrying a Vamana index.
-- **Do not compact such a dataset with `defer_index_remap`** unless the repair
-  follows before anything else commits. The rewrite strands the index, and one
-  `merge_index` call right afterwards repairs it; but the fragment-reuse index
-  the rewrite leaves makes the next commit of any kind credit the Vamana segment
-  with the rewritten fragments, which it never read, and only a rebuild recovers
-  from that. After a partial compaction even the immediate repair is narrower:
-  Lance picks which segments an incoming one replaces by the remapped coverage,
-  so `insert_as_segment` and `consolidate_index` can be refused for orphaning
-  fragments where `merge_index` is not (read in the code, not pinned by a test).
+  the rest.
+- Compaction with `defer_index_remap` rewrites them too. The index answers for
+  the moved rows at their new addresses, a dropped row answers for nothing, and
+  a fragment the index covered only part of a rewrite group of is left to the
+  scan of the unindexed fragments, exactly as Lance leaves it for its own
+  indices. `consolidate_index` and `merge_index` write the new addresses into
+  the index, after which `cleanup_frag_reuse_index` can drop the record; until
+  then Lance keeps it, because the segment that needs it is not caught up.
+  `insert_in_place` refuses a segment whose rows moved and names consolidation
+  as the remedy.
+- A compaction bakes a fragment's overlays into the fragment it writes, and on
+  a deferred compaction Lance's own pruning of stale coverage misses that. So
+  for a segment whose rows moved, `VamanaIndex::open` reads the dataset version
+  each such compaction recorded and refuses the index if an overlay had replaced
+  its vectors there, exactly as it refuses a visible overlay. A
+  `cleanup_old_versions` that removes that version before the index is
+  consolidated makes it refuse too, because the question can no longer be
+  answered.
+- A segment committed after a deferred compaction it raced answers for what
+  Lance still credits it with: Lance takes the rewritten fragments out of its
+  coverage at commit. One committed while the compaction was still in flight,
+  from a version at or after the one the compaction read, is counted by
+  `cleanup_frag_reuse_index` as caught up with a move it still depends on; after
+  the next commit and a cleanup, `VamanaIndex::open` refuses it as credited with
+  rows it never read, and only a rebuild recovers it.
 - Lance's listings and statistics never report a Vamana index; ask this crate
   (`VamanaIndex::open`, `query::committed_segments`) instead.
 
@@ -147,14 +163,14 @@ two are meant to say the same thing.
   unindexed remainder; this driver does not. `insert_as_segment` is how they
   stop being invisible.
 - **A fragment the dataset has dropped is answered for by nobody.** A delete that
-  empties a fragment, and a compaction that rewrites one, both take it out of the
-  dataset, and every vertex stored for it becomes unreachable rather than wrong -
-  fragment ids are a high water mark in the manifest, so no stored address can
-  ever come to mean another row. The index narrows itself to what is left and
-  reports the result from `VamanaIndex::covered_fragments`, which is what the
-  unindexed remainder should be computed against. After a compaction the rows
-  are all still in the dataset, in fragments this index does not cover - which
-  makes them ordinary new rows, and `insert_as_segment` brings them back.
+  empties a fragment takes it out of the dataset, and every vertex stored for it
+  becomes unreachable rather than wrong - fragment ids are a high water mark in
+  the manifest, so no stored address can ever come to mean another row. The
+  index narrows itself to what is left and reports the result from
+  `VamanaIndex::covered_fragments`, which is what the unindexed remainder should
+  be computed against. A compaction with `defer_index_remap` is not that case:
+  Lance records where it moved every row, and the index answers for the moved
+  rows at their new addresses.
 - **No predicate prefilter and no refine step.** Both live in Lance's scanner,
   which this driver bypasses.
 - **Nothing is cached between queries unless the index is given a cache.** A
@@ -477,14 +493,13 @@ rather than by the disk, which is why fusing the passes is worth having and is
 not where the money is. Where a partition read is a network round trip the same
 two passes are not 6%.
 
-They also answer compaction, which used to need a rebuild - within limits the
-rebase onto Lance 13 introduced. Lance's default compaction no longer touches
-fragments a Vamana index covers; one asked to with `defer_index_remap` strands
-the index over fragments that no longer exist, and the rows it moved are then
-rows this index does not cover - so indexing them again is the whole of the
-repair, and the stranded segment goes with the same commit. That is one
-`merge_index` call, and it has to be the next commit: see "What this costs the
-dataset" for what any other commit does first.
+Compaction needs none of them to keep answering. Lance's default compaction
+does not touch fragments a Vamana index covers; one asked to with
+`defer_index_remap` records where every row went, and the index follows the
+record. What `consolidate_index` or `merge_index` adds afterwards is writing the
+new addresses into the index - every partition is written out again, and no
+vertex is taken out of a graph or linked back into one for it - so that Lance
+can drop the record.
 
 ## Building
 
@@ -533,5 +548,5 @@ is executable documentation of what Lance's public API permits an external index
 to do, and it is where the facts this design rests on are pinned - that an index
 with an unresolvable details `type_url` survives a reopen in the manifest while
 Lance's own listing leaves it out, that default compaction holds back what such an
-index covers, and that a compaction with a deferred remap strands it rather than
+index covers, and that a compaction with a deferred remap keeps it rather than
 deleting it.

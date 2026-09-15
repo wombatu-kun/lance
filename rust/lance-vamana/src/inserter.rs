@@ -163,21 +163,11 @@ pub struct InsertStats {
 /// outright, because removing its segment would orphan the fragments this call
 /// did not read.
 ///
-/// A compaction is a special case worth naming, because it looks like a
-/// disaster and is not - as long as nothing else commits first. Lance's default
-/// compaction holds back the fragments an index it cannot read covers; one run
-/// with `defer_index_remap` rewrites rows into brand new fragments and strands
-/// the index over fragments the dataset no longer has;
-/// [`VamanaIndex::open`] narrows the coverage to what survived, so the compacted
-/// rows are simply new rows to this call, and the vertices left behind for them
-/// are already rejected from every answer. Indexing then consolidating puts the
-/// index back where it was without a rebuild. Two limits: the fragment-reuse
-/// index such a compaction leaves makes the next commit of any kind credit the
-/// segment with the rewritten fragments, after which [`VamanaIndex::open`]
-/// refuses it; and after a partial compaction Lance picks which segment this
-/// call replaces by that remapped coverage, so the commit can be refused for
-/// orphaning fragments. `merge_index`, as the very next commit, is the repair
-/// that holds in both cases.
+/// A compaction is not new rows. Lance's default compaction holds back the
+/// fragments an index it cannot read covers, and one run with
+/// `defer_index_remap` rewrites them into new fragments and records where every
+/// row went. [`VamanaIndex::open`] follows that record, so the index still
+/// answers for the moved rows and this call finds nothing to index in them.
 ///
 /// Every new row must have a vector. A set of new fragments whose every vector
 /// is null has nothing to index and is refused rather than covered, so a
@@ -298,6 +288,15 @@ pub async fn insert_in_place(dataset: &mut Dataset, index_name: &str) -> Result<
     }
 
     let target = index.base_segment()?;
+    if target.moved {
+        return Err(Error::invalid_input(format!(
+            "Vamana cannot insert into index '{index_name}' in place: a deferred compaction moved \
+             rows segment {} stores, and the partitions an insert copies would carry their old \
+             addresses into a segment that no longer records the move; consolidate the index \
+             first",
+            target.uuid
+        )));
+    }
     let built_over = target
         .manifest
         .metadata()

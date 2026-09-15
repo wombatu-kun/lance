@@ -22,6 +22,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
+use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::transaction::{
     DataOverlayGroup, Operation, UpdateMode, UpdatedFragmentOffsets,
 };
@@ -38,11 +39,13 @@ use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{
     INDEX_DETAILS_TYPE_URL, IndexParams, build_index_segment, build_segment, create_index,
+    live_fragments,
 };
+use lance_vamana::codes::CodeSpec;
 use lance_vamana::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
 use lance_vamana::io::{SegmentWriter, read_segment, scan_scheduler};
 use lance_vamana::partition::Partition;
-use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
+use lance_vamana::query::{Neighbor, SearchParams, VamanaIndex, WalkMode, committed_segments};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -766,67 +769,154 @@ async fn every_answer_resolves_to_the_row_it_names() {
     }
 }
 
-/// A compaction that could not open the index leaves it naming fragments that no
-/// longer exist, and every row address it stored for them is dead. It answers
-/// for none of them, and says so.
-///
-/// The rows are not lost with them: a compaction moves them to fragments this
-/// index does not cover, which is the same position as rows appended after the
-/// build. What the index must not do is hand back the addresses they used to be
-/// at - so the query here has to reach the partitions and come back empty,
-/// rather than be short-circuited by an index that knows it covers nothing.
-///
-/// The compaction is real here, and asserted to be: deleting every row first
-/// would drop the fragments outright and the test would pass without compacting
-/// anything at all.
-#[tokio::test]
-async fn an_index_over_a_rewritten_fragment_answers_for_none_of_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut dataset = indexed_dataset(uri, &small_fixture()).await;
-    let built_over = VamanaIndex::open(&dataset, INDEX_NAME)
-        .await
-        .unwrap()
-        .covered_fragments()
-        .clone();
-    assert!(!built_over.is_empty(), "the index covered nothing to start");
-
-    let metrics = compact_indexed(&mut dataset).await;
-    assert!(
-        metrics.fragments_removed > 0,
-        "nothing was compacted, so this test proves nothing"
-    );
-    assert!(
-        dataset
-            .get_fragments()
-            .iter()
-            .all(|fragment| !built_over.contains(fragment.id() as u32)),
-        "the compaction left an indexed fragment behind, so this test proves less than it says"
-    );
-
-    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
-    assert!(
-        index.covered_fragments().is_empty(),
-        "the index still claims {:?} after every fragment it read was rewritten",
-        index.covered_fragments()
-    );
-
-    let search = SearchParams::new(K)
-        .with_nprobes(PARTITIONS as usize)
-        .with_search_list_size(BEAM);
-    let result = index
-        .search(&random_vectors(1, 4242)[0], &search)
+/// What the dataset holds at each address `neighbors` names, in answer order.
+async fn vectors_at(dataset: &Dataset, neighbors: &[Neighbor]) -> Vec<Vec<f32>> {
+    let addresses = neighbors
+        .iter()
+        .map(|neighbor| neighbor.row_addr)
+        .collect::<Vec<_>>();
+    let taken = dataset
+        .take_rows(
+            &addresses,
+            ProjectionRequest::from_columns([VECTOR_COLUMN, lance_core::ROW_ID], dataset.schema()),
+        )
         .await
         .unwrap();
+    let row_ids = taken[lance_core::ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    let vectors = taken[VECTOR_COLUMN].as_fixed_size_list();
+    let dim = vectors.value_length() as usize;
+    let values = vectors.values().as_primitive::<Float32Type>().values();
+    addresses
+        .iter()
+        .map(|address| {
+            let row = row_ids
+                .iter()
+                .position(|id| id == address)
+                .expect("the answer named a row the dataset does not have");
+            values[row * dim..(row + 1) * dim].to_vec()
+        })
+        .collect()
+}
+
+/// A deferred compaction rewrites every row into new fragments and records where
+/// each one went. The index follows that record: every query finds the same rows
+/// at the same distances, at the addresses they live at now, before and after
+/// the next commit writes the moved coverage into the manifest.
+///
+/// Which row an address is comes from the dataset, by the vector it holds. The
+/// rows deleted before the compaction are the ones it drops, the one kind of move
+/// that maps a row to nothing.
+#[tokio::test]
+async fn an_index_follows_its_rows_through_a_deferred_compaction() {
+    async fn answers(
+        dataset: &Dataset,
+        queries: &[Vec<f32>],
+        modes: &[SearchParams],
+    ) -> Vec<(Vec<Vec<f32>>, Vec<f32>)> {
+        let index = VamanaIndex::open(dataset, INDEX_NAME).await.unwrap();
+        let mut answers = Vec::new();
+        for search in modes {
+            for query in queries {
+                let result = index.search(query, search).await.unwrap();
+                assert_eq!(result.neighbors.len(), K);
+                assert_eq!(
+                    result.coded_neighbors.len(),
+                    if search.report_coded { K } else { 0 }
+                );
+                for neighbors in [&result.neighbors, &result.coded_neighbors] {
+                    answers.push((
+                        vectors_at(dataset, neighbors).await,
+                        neighbors.iter().map(|neighbor| neighbor.distance).collect(),
+                    ));
+                }
+            }
+        }
+        answers
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = small_fixture().write(uri).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &params().with_codes(CodeSpec::Rabit { num_bits: 3 }),
+    )
+    .await
+    .unwrap();
+    dataset.delete("_rowid % 5 == 0").await.unwrap();
+    let built_over = live_fragments(&dataset);
+
+    let queries = random_vectors(4, 4242);
+    let exact = SearchParams::new(K)
+        .with_nprobes(PARTITIONS as usize)
+        .with_search_list_size(BEAM);
+    let modes = [
+        exact.clone(),
+        exact.with_mode(WalkMode::Lazy).with_report_coded(true),
+    ];
+    let before = answers(&dataset, &queries, &modes).await;
+
+    let metrics = compact_indexed(&mut dataset).await;
+    assert!(metrics.fragments_removed > 0, "{metrics:?}");
+    let compacted = live_fragments(&dataset);
+    assert_eq!(compacted.len(), 1);
     assert!(
-        result.partitions_read > 0,
-        "no partition was read, so nothing was filtered and this proves nothing"
+        !built_over.contains(&compacted[0]),
+        "the compaction left an indexed fragment behind, so this test proves less than it says"
+    );
+    assert_eq!(answers(&dataset, &queries, &modes).await, before);
+
+    let mut dataset = DatasetFixture {
+        seed: 99,
+        ..small_fixture()
+    }
+    .append(uri)
+    .await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(
+        index.covered_fragments(),
+        &RoaringBitmap::from_iter([compacted[0]])
+    );
+    assert_eq!(answers(&dataset, &queries, &modes).await, before);
+
+    // A second deferred compaction moves rows the first one moved, from a
+    // manifest the append wrote the first move into. The row deleted first is
+    // one the index has to reject at its new address while the record of the
+    // first move is still there.
+    let deleted = u64::from(RowAddress::new_from_parts(compacted[0], 3));
+    dataset
+        .delete(&format!("_rowid = {deleted}"))
+        .await
+        .unwrap();
+    let before = answers(&dataset, &queries, &modes).await;
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            target_rows_per_fragment: 512,
+            materialize_deletions_threshold: 0.001,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (metrics.fragments_removed, metrics.fragments_added),
+        (1, 1),
+        "{metrics:?}"
     );
     assert!(
-        result.neighbors.is_empty(),
-        "the index answered with {} rows from fragments the dataset no longer has",
-        result.neighbors.len()
+        !live_fragments(&dataset).contains(&compacted[0]),
+        "the second compaction did not rewrite what the first one wrote"
     );
+    assert_eq!(answers(&dataset, &queries, &modes).await, before);
+    dataset.delete("false").await.unwrap();
+    assert_eq!(answers(&dataset, &queries, &modes).await, before);
 }
 
 /// Retention is an ordinary reason for a fragment to disappear: `DELETE WHERE
@@ -1190,6 +1280,180 @@ async fn an_index_whose_vectors_an_overlay_replaced_is_refused() {
     assert!(
         error.to_string().contains("replaced by an overlay"),
         "{error}"
+    );
+}
+
+/// A compaction bakes a fragment's overlays into the fragment it writes, which
+/// then carries none, and on a deferred compaction Lance's own pruning of stale
+/// coverage misses it. The index is refused as it was while the overlay was
+/// still visible, instead of following the move to rows whose vectors changed.
+#[tokio::test]
+async fn an_overlay_a_deferred_compaction_baked_in_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = indexed_dataset(uri, &small_fixture()).await;
+    let mut dataset = commit_overlay(dataset, 0, &[0, 1, 2], "baked").await;
+
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            target_rows_per_fragment: 512,
+            max_overlays_per_fragment: Some(0),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (metrics.fragments_removed, metrics.fragments_added),
+        (1, 1),
+        "{metrics:?}"
+    );
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .all(|fragment| fragment.metadata().overlays.is_empty()),
+        "the overlay outlived the compaction, so the guard for a visible one answers this"
+    );
+    assert_eq!(
+        brute_force_best_distance(&dataset, &vec![9.0f32; VECTOR_DIM as usize]).await,
+        0.0,
+        "the compaction dropped the overlaid values, so stale vectors would be right"
+    );
+
+    let error = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect_err("an index ranking by vectors an overlay replaced must not answer");
+    assert!(
+        error.to_string().contains("replaced by an overlay"),
+        "{error}"
+    );
+}
+
+/// The same overlay, landing on the fragment a first deferred compaction wrote
+/// and baked in by a second one: the moved-from fragment the overlay was on is
+/// only reached by following the first move.
+#[tokio::test]
+async fn an_overlay_baked_in_after_an_earlier_move_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_dataset(uri, &small_fixture()).await;
+    dataset.delete("_rowid = 7").await.unwrap();
+    let first = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            target_rows_per_fragment: 512,
+            materialize_deletions_threshold: 0.001,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (first.fragments_removed, first.fragments_added),
+        (1, 1),
+        "{first:?}"
+    );
+    let moved_into = *live_fragments(&dataset).last().unwrap();
+    assert_ne!(moved_into, 1);
+
+    let mut dataset = commit_overlay(dataset, moved_into as u64, &[0, 1, 2], "later").await;
+    let second = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            target_rows_per_fragment: 512,
+            max_overlays_per_fragment: Some(0),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (second.fragments_removed, second.fragments_added),
+        (1, 1),
+        "{second:?}"
+    );
+    assert!(
+        !live_fragments(&dataset).contains(&moved_into)
+            && dataset
+                .get_fragments()
+                .iter()
+                .all(|fragment| fragment.metadata().overlays.is_empty()),
+        "the second compaction did not bake the overlay in"
+    );
+
+    let error = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .expect_err("an index ranking by vectors an overlay replaced must not answer");
+    assert!(
+        error.to_string().contains("replaced by an overlay"),
+        "{error}"
+    );
+}
+
+/// A build that raced a deferred compaction commits after it, and Lance takes
+/// the fragments the compaction removed out of the new segment's coverage before
+/// the record of the move is ever applied to it. The segment answers for what it
+/// is credited with, and leaves its moved rows to the scan of the unindexed
+/// fragments.
+#[tokio::test]
+async fn a_build_that_raced_a_deferred_compaction_answers_for_what_it_is_credited_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    // The index already there is what makes the compaction record the move.
+    let mut dataset = indexed_dataset(uri, &small_fixture()).await;
+    let (segment, _) = build_index_segment(&dataset, &params(), &live_fragments(&dataset))
+        .await
+        .unwrap();
+
+    dataset.delete("_rowid = 7").await.unwrap();
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            target_rows_per_fragment: 512,
+            materialize_deletions_threshold: 0.001,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (metrics.fragments_removed, metrics.fragments_added),
+        (1, 1),
+        "{metrics:?}"
+    );
+
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    dataset
+        .commit_existing_index_segments("raced", VECTOR_COLUMN, vec![segment])
+        .await
+        .unwrap();
+    let index = VamanaIndex::open(&dataset, "raced").await.unwrap();
+    assert_eq!(index.covered_fragments(), &RoaringBitmap::from_iter([1u32]));
+    let search = SearchParams::new(K)
+        .with_nprobes(PARTITIONS as usize)
+        .with_search_list_size(BEAM);
+    let result = index
+        .search(&random_vectors(1, 313)[0], &search)
+        .await
+        .unwrap();
+    assert!(
+        result.neighbors.len() == K
+            && result
+                .neighbors
+                .iter()
+                .all(|neighbor| RowAddress::from(neighbor.row_addr).fragment_id() == 1),
+        "{:?}",
+        result.neighbors
     );
 }
 

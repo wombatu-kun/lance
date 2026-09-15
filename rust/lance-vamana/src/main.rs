@@ -529,10 +529,12 @@ async fn merge(target: TargetArgs) -> Result<()> {
         stats.vertices_removed
     );
     println!(
-        "partitions: {} written ({} rebuilt), {} copied, {} dropped, {} distance computations",
+        "partitions: {} written ({} rebuilt), {} copied, {} readdressed, {} dropped, {} distance \
+         computations",
         stats.partitions_written,
         stats.partitions_rebuilt,
         stats.partitions_copied,
+        stats.partitions_readdressed,
         stats.partitions_dropped,
         stats.comparisons
     );
@@ -547,11 +549,12 @@ async fn consolidate(target: TargetArgs) -> Result<()> {
         stats.segments_rewritten, stats.segments_untouched, stats.segments_abandoned
     );
     println!(
-        "partitions: {} consolidated ({} rebuilt), {} copied, {} dropped, {} vertices removed, {} \
-         distance computations",
+        "partitions: {} consolidated ({} rebuilt), {} copied, {} readdressed, {} dropped, {} \
+         vertices removed, {} distance computations",
         stats.partitions_consolidated,
         stats.partitions_rebuilt,
         stats.partitions_copied,
+        stats.partitions_readdressed,
         stats.partitions_dropped,
         stats.vertices_removed,
         stats.comparisons

@@ -18,6 +18,7 @@
 use std::collections::HashSet;
 
 use lance::Dataset;
+use lance::dataset::index::frag_reuse::cleanup_frag_reuse_index;
 use lance::index::DatasetIndexExt;
 use lance_core::utils::address::RowAddress;
 use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
@@ -28,7 +29,7 @@ use uuid::Uuid;
 
 mod common;
 use common::{
-    DatasetFixture, VECTOR_COLUMN, brute_force, live_row_ids, random_vectors,
+    DatasetFixture, VECTOR_COLUMN, brute_force, compact_indexed, live_row_ids, random_vectors,
     read_committed_segment, recall,
 };
 
@@ -105,6 +106,55 @@ async fn stored_row_ids(dataset: &Dataset) -> (HashSet<u64>, usize) {
         .flat_map(|partition| partition.graph().row_ids().iter().copied())
         .collect();
     (rows, slots)
+}
+
+/// A deferred compaction that deleted nothing leaves no graph anything to
+/// repair, and consolidation still rewrites the segment: every partition is
+/// written out again at the addresses its rows moved to, which lets Lance forget
+/// the move, after which there is nothing left to consolidate.
+#[tokio::test]
+async fn consolidating_after_a_deferred_compaction_readdresses_every_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_dataset(uri).await;
+    let (_, partitions) = read_committed_segment(&dataset, INDEX_NAME).await;
+    let metrics = compact_indexed(&mut dataset).await;
+    assert!(metrics.fragments_removed > 0, "{metrics:?}");
+
+    let stats = consolidate_index(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(
+        stats,
+        ConsolidateStats {
+            segments_rewritten: 1,
+            partitions_readdressed: partitions.len(),
+            ..Default::default()
+        }
+    );
+
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    assert!(
+        dataset
+            .frag_reuse_index()
+            .await
+            .unwrap()
+            .is_none_or(|remap| remap.is_empty()),
+        "Lance kept the record of the move, so nothing below depends on the rewrite"
+    );
+    let (rows, slots) = stored_row_ids(&dataset).await;
+    let live = live_row_ids(&dataset)
+        .await
+        .into_iter()
+        .collect::<HashSet<_>>();
+    assert_eq!((slots, rows.len()), (live.len(), live.len()));
+    assert_eq!(rows, live);
+    assert_eq!(
+        consolidate_index(&mut dataset, INDEX_NAME).await.unwrap(),
+        ConsolidateStats {
+            segments_untouched: 1,
+            ..Default::default()
+        }
+    );
 }
 
 #[tokio::test]

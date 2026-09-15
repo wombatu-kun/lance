@@ -126,6 +126,10 @@ impl PartitionGraph {
         &self.row_ids
     }
 
+    pub(crate) fn row_ids_mut(&mut self) -> &mut [u64] {
+        &mut self.row_ids
+    }
+
     /// Out-edges of `local_id`, with the padding trimmed off.
     ///
     /// Fallible for the same reason [`Partition::vector`] is: local ids arrive

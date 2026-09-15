@@ -22,20 +22,23 @@ use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
+use lance::dataset::index::frag_reuse::cleanup_frag_reuse_index;
+use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_vamana::build::BuildParams;
-use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
+use lance_vamana::builder::{IndexParams, build_index_segment, create_index, live_fragments};
 use lance_vamana::consolidator::consolidate_index;
 use lance_vamana::inserter::{InsertStats, insert_as_segment, insert_in_place};
+use lance_vamana::merger::merge_index;
 use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 mod common;
 use common::{
-    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, compact_indexed, live_row_ids,
-    random_vectors, read_committed_segments, recall,
+    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, live_row_ids, random_vectors,
+    read_committed_segments, recall,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
@@ -434,55 +437,125 @@ async fn indexing_when_nothing_is_new_commits_nothing() {
     );
 }
 
-/// Compaction strands this index over fragments that no longer exist, and the
-/// README's answer to that used to be a rebuild. It is not: the compacted rows
-/// are new rows like any other, and indexing them puts the index back.
+/// The base segment after a deferred compaction rewrote part of what it covers,
+/// three fragments appended after that, and a delta indexed over them.
 ///
-/// The stranded segment goes with the same commit, without being named in it -
-/// Lance drops an existing segment whose live coverage is empty.
+/// This is where Lance and this crate used to part ways: Lance credits the base
+/// with the fragment the rows moved into, so a delta over that fragment, or a
+/// consolidation that left it out, was refused for orphaning fragments.
+async fn partially_compacted_with_a_delta(uri: &str) -> Dataset {
+    let mut dataset = indexed_dataset(uri).await;
+    // One deleted row makes fragment 0, and only fragment 0, worth rewriting, and
+    // it is the row the rewrite drops.
+    dataset.delete("_rowid = 7").await.unwrap();
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            target_rows_per_fragment: 512,
+            materialize_deletions_threshold: 0.001,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (metrics.fragments_removed, metrics.fragments_added),
+        (1, 1),
+        "{metrics:?}"
+    );
+
+    let compacted = live_fragments(&dataset)
+        .into_iter()
+        .collect::<RoaringBitmap>();
+    let mut dataset = with_new_rows(uri, 99).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(index.covered_fragments(), &compacted);
+
+    let refusal = insert_in_place(&mut dataset, INDEX_NAME)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refusal.contains("deferred compaction") && refusal.contains("consolidate the index first"),
+        "{refusal}"
+    );
+
+    let inserted = insert_as_segment(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(inserted.fragments_indexed, 3, "{inserted:?}");
+    dataset
+}
+
+/// What the repair after such a compaction has to leave behind: every stored
+/// address a live row, once Lance has forgotten the move.
+async fn assert_only_live_rows_once_the_move_is_forgotten(mut dataset: Dataset, uri: &str) {
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    let dataset = Dataset::open(uri).await.unwrap();
+    assert!(
+        dataset
+            .frag_reuse_index()
+            .await
+            .unwrap()
+            .is_none_or(|remap| remap.is_empty()),
+        "Lance kept the record of the move, so nothing below depends on the rewrite"
+    );
+    let (rows, slots) = stored_row_ids(&dataset).await;
+    let live = live_row_ids(&dataset)
+        .await
+        .into_iter()
+        .collect::<HashSet<_>>();
+    assert_eq!((slots, rows.len()), (live.len(), live.len()));
+    assert_eq!(rows, live);
+    assert!(measured_recall(&dataset).await >= 0.95);
+}
+
+/// The index follows the move, so the delta goes through beside the base, and
+/// consolidation writes the moved addresses into the base, after which Lance can
+/// forget the move without the index noticing.
 #[tokio::test]
-async fn a_compacted_dataset_is_repaired_by_indexing_it_again() {
+async fn a_partial_deferred_compaction_leaves_every_repair_open() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut dataset = indexed_dataset(uri).await;
-    let stranded = committed_uuids(&dataset).await[0];
+    let mut dataset = partially_compacted_with_a_delta(uri).await;
 
-    let metrics = compact_indexed(&mut dataset).await;
-    assert!(
-        metrics.fragments_removed > 0,
-        "compaction rewrote nothing, so the rest of this proves nothing: {metrics:?}"
-    );
-    let mut dataset = Dataset::open(uri).await.unwrap();
-
-    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
-    assert!(
-        index.covered_fragments().is_empty(),
-        "compaction was supposed to leave this index covering nothing"
-    );
-    let answer = index
-        .search(&random_vectors(1, 7)[0], &search())
-        .await
-        .unwrap();
-    assert!(
-        answer.neighbors.is_empty(),
-        "a stranded index answered with rows the dataset no longer has"
-    );
-
-    let stats = insert_as_segment(&mut dataset, INDEX_NAME).await.unwrap();
-    assert_eq!(stats.vectors, 3 * 512, "{stats:?}");
-
-    let uuids = committed_uuids(&dataset).await;
+    let consolidated = consolidate_index(&mut dataset, INDEX_NAME).await.unwrap();
     assert_eq!(
-        uuids.len(),
-        1,
-        "the stranded segment outlived the commit that made it unnecessary"
+        (
+            consolidated.segments_rewritten,
+            consolidated.segments_untouched,
+            consolidated.vertices_removed,
+            consolidated.partitions_copied,
+            consolidated.partitions_consolidated + consolidated.partitions_rebuilt,
+        ),
+        (1, 1, 1, 0, 1),
+        "{consolidated:?}"
     );
-    assert_ne!(uuids[0], stranded);
-    let (rows, slots) = stored_row_ids(&dataset).await;
-    let live = live_row_ids(&dataset).await;
-    assert_eq!((slots, rows.len()), (live.len(), live.len()));
-    let after = measured_recall(&dataset).await;
-    assert!(after >= 0.95, "recall after the repair is {after}");
+    assert!(consolidated.partitions_readdressed > 0, "{consolidated:?}");
+    assert_only_live_rows_once_the_move_is_forgotten(dataset, uri).await;
+}
+
+/// Folding the delta into the base reads both into one graph, so the base's
+/// vertices have to be readdressed before they are merged with the delta's, not
+/// only in a partition that is carried across whole.
+#[tokio::test]
+async fn merging_a_partially_compacted_index_readdresses_what_it_folds() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = partially_compacted_with_a_delta(uri).await;
+
+    let merged = merge_index(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(
+        (
+            merged.segments_folded,
+            merged.vertices_removed,
+            merged.partitions_copied,
+        ),
+        (2, 1, 0),
+        "{merged:?}"
+    );
+    assert!(merged.partitions_written > 0, "{merged:?}");
+    assert_only_live_rows_once_the_move_is_forgotten(dataset, uri).await;
 }
 
 /// The base is rewritten, not joined: the index keeps one segment, under a new
@@ -717,43 +790,17 @@ async fn inserting_in_place_refuses_a_segment_whose_fragments_are_gone() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut dataset = indexed_dataset(uri).await;
-    let metrics = compact_indexed(&mut dataset).await;
-    assert!(metrics.fragments_removed > 0, "{metrics:?}");
+    dataset.delete("_rowid < 512").await.unwrap();
+    assert_eq!(live_fragments(&dataset), vec![1, 2]);
 
-    let mut dataset = Dataset::open(uri).await.unwrap();
+    let mut dataset = with_new_rows(uri, 99).await;
     let error = insert_in_place(&mut dataset, INDEX_NAME)
         .await
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("consolidate the index first"),
-        "the refusal does not name the remedy: {error}"
+        error.contains("the dataset no longer has")
+            && error.contains("consolidate the index first"),
+        "the refusal does not name the cause and the remedy: {error}"
     );
-}
-
-/// The limit of every repair after a compaction: it has to come before any other
-/// commit.
-///
-/// A deferred compaction leaves a fragment-reuse index behind, and the next commit
-/// of any kind writes the segment's coverage remapped through it onto the
-/// rewritten fragments - fragments this segment never read, which
-/// `VamanaIndex::open` refuses. Pinned so that teaching the driver about
-/// fragment-reuse remaps shows up as this test failing.
-#[tokio::test]
-async fn a_commit_after_a_deferred_compaction_leaves_the_index_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut dataset = indexed_dataset(uri).await;
-    let metrics = compact_indexed(&mut dataset).await;
-    assert!(metrics.fragments_removed > 0, "{metrics:?}");
-    VamanaIndex::open(&dataset, INDEX_NAME)
-        .await
-        .expect("right after the compaction the index is stranded, not refused");
-
-    let dataset = with_new_rows(uri, 99).await;
-    let error = VamanaIndex::open(&dataset, INDEX_NAME)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("rows it never read"), "{error}");
 }

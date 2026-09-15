@@ -182,10 +182,8 @@ pub async fn brute_force(dataset: &Dataset, query: &[f32], k: usize) -> Vec<u64>
 /// Since upstream #8427 Lance's default planner holds back every fragment an
 /// index it has no reader for covers, because it cannot remap that index onto
 /// rewritten fragments, so a default compaction of a fully indexed dataset
-/// rewrites nothing. A deferred remap rewrites them and leaves the index over
-/// fragment ids that are gone, which is the state a compaction test is about -
-/// but only until the next commit, which writes the index's coverage remapped
-/// onto the rewritten fragments and gets the index refused on open.
+/// rewrites nothing. A deferred remap rewrites them and records where every row
+/// went, and the index follows that record.
 pub async fn compact_indexed(dataset: &mut Dataset) -> CompactionMetrics {
     compact_files(
         dataset,

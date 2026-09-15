@@ -25,7 +25,7 @@ use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
-use lance_vamana::inserter::{insert_as_segment, insert_in_place};
+use lance_vamana::inserter::insert_as_segment;
 use lance_vamana::merger::{MergeStats, merge_index};
 use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
 use roaring::RoaringBitmap;
@@ -306,17 +306,12 @@ async fn merging_takes_out_the_deleted_and_puts_in_the_new_in_one_call() {
     );
 }
 
-/// The state an in-place insert refuses outright, and the whole reason this call
-/// needs no ordering.
-///
-/// A compaction rewrites every row into new fragments and strands the index over
-/// fragments the dataset no longer has. `insert_in_place` will not rewrite such a
-/// segment, because the vertices of a gone fragment would end up under a coverage
-/// that does not name them and nothing would keep them out of an answer. The
-/// merge drops exactly those vertices in the same pass that indexes the rows they
-/// used to stand for.
+/// A deferred compaction moves every row the index stores, and the index follows
+/// the move rather than losing the rows. The merge writes every partition out
+/// again at the new addresses, and nothing is taken out of a graph or linked back
+/// into one to get there.
 #[tokio::test]
-async fn merging_repairs_a_compaction_where_an_in_place_insert_refuses() {
+async fn merging_readdresses_what_a_deferred_compaction_moved() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut dataset = indexed_dataset(uri).await;
@@ -324,25 +319,34 @@ async fn merging_repairs_a_compaction_where_an_in_place_insert_refuses() {
     assert!(metrics.fragments_removed > 0, "{metrics:?}");
 
     let mut dataset = Dataset::open(uri).await.unwrap();
-    let refusal = insert_in_place(&mut dataset, INDEX_NAME)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        refusal.contains("consolidate the index first"),
-        "the fixture is supposed to be the state an in-place insert refuses: {refusal}"
-    );
-
     let stats = merge_index(&mut dataset, INDEX_NAME).await.unwrap();
-    assert_eq!(stats.vertices_removed, ROWS, "{stats:?}");
-    assert_eq!(stats.vectors_inserted, ROWS, "{stats:?}");
-    assert!(stats.partitions_written > 0, "{stats:?}");
+    assert_eq!(
+        (
+            stats.vertices_removed,
+            stats.vectors_inserted,
+            stats.vertices_folded,
+            stats.partitions_written,
+            stats.partitions_copied,
+        ),
+        (0, 0, 0, 0, 0),
+        "{stats:?}"
+    );
+    assert!(stats.partitions_readdressed > 0, "{stats:?}");
 
     assert_eq!(committed_uuids(&dataset).await.len(), 1);
     let (rows, slots) = stored_row_ids(&dataset).await;
-    let live = live_row_ids(&dataset).await;
+    let live = live_row_ids(&dataset)
+        .await
+        .into_iter()
+        .collect::<HashSet<_>>();
     assert_eq!((slots, rows.len()), (live.len(), live.len()));
+    assert_eq!(rows, live);
     assert!(measured_recall(&dataset).await >= 0.95);
+    assert_eq!(
+        merge_index(&mut dataset, INDEX_NAME).await.unwrap(),
+        MergeStats::default(),
+        "the merged segment still depends on the record of the move"
+    );
 }
 
 /// Nothing to do means no commit at all, not an empty one: this is meant to be

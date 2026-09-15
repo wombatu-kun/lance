@@ -25,13 +25,12 @@
 //!   index answers from the fragments it was built over; Lance's scanner would
 //!   scan the remainder. [`crate::inserter::insert_as_segment`] is the remedy.
 //! - **A fragment the dataset has dropped is answered for by nobody.** A delete
-//!   that empties a fragment, and a compaction that rewrites one, both take it
-//!   out of the dataset, and the vertices stored for it are then unreachable
-//!   rather than wrong. The index narrows itself to what is left and says so
-//!   through [`VamanaIndex::covered_fragments`]. After a compaction the rows
-//!   are still there, at new addresses in fragments this index does not cover -
-//!   which is the same situation as rows appended after the build, and has the
-//!   same remedy.
+//!   that empties a fragment takes it out of the dataset, and the vertices
+//!   stored for it are then unreachable rather than wrong. The index narrows
+//!   itself to what is left and says so through
+//!   [`VamanaIndex::covered_fragments`]. A compaction run with
+//!   `defer_index_remap` is not that case: Lance records where it moved every
+//!   row, and the index answers for the moved rows at their new addresses.
 //! - **No predicate prefilter and no refine step.** Both live in the scanner.
 //! - **Nothing is cached between queries unless the index is given a cache.**
 //!   A query keeps a few reads going at once, so its working set is a few
@@ -87,7 +86,9 @@
 //! left, when the dataset has edited a segment's coverage while the fragments
 //! themselves are still there, when it credits a segment with a fragment that
 //! segment never read, when an overlay has replaced the indexed values under
-//! one, when the manifest records a format version this build does not read,
+//! one - a visible overlay, or one a deferred compaction baked into the rows it
+//! moved, which it reads the dataset version that compaction recorded to find -
+//! when the manifest records a format version this build does not read,
 //! when a segment was inherited from another dataset, or when the segments
 //! disagree about the vectors they hold or about the codes they were built with.
 //! Each refusal names what to do about it, which is always to rebuild.
@@ -98,6 +99,7 @@
 //! tests that pin it.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -113,8 +115,10 @@ use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
+use lance_table::format::Fragment;
 use lance_table::format::overlay::DataOverlayFile;
 use lance_table::io::manifest::read_manifest_indexes;
+use lance_table::system_index::frag_reuse::CompactFragReuseIndex;
 use object_store::path::Path;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use uuid::Uuid;
@@ -453,7 +457,8 @@ pub struct VamanaIndex {
     metadata: IndexMetadata,
     segments: Vec<Segment>,
     /// Fragments this index still answers for: what its segments were built
-    /// over, minus what the dataset has since dropped.
+    /// over, followed through any deferred compaction, minus what the dataset
+    /// has since dropped.
     covered: RoaringBitmap,
     /// Which stored vertices must not reach an answer, as of
     /// [`VamanaIndex::open`].
@@ -480,18 +485,73 @@ pub(crate) struct RowFilter {
     /// 2^32 addresses in `deleted`: the `roaring` crate has no run containers,
     /// so a full fragment's worth of addresses would be half a gigabyte.
     missing_fragments: RoaringBitmap,
+    /// `None` unless a deferred compaction moved rows some segment stores.
+    moved: Option<MovedRows>,
+}
+
+/// Where deferred compactions moved the rows of an index, and which fragments
+/// each segment answers for once they have.
+#[derive(Debug)]
+struct MovedRows {
+    remap: Arc<CompactFragReuseIndex>,
+    /// By segment, because a row can move into a fragment another segment
+    /// covers - a delta indexed over it, say - and is still not this one's.
+    coverage: HashMap<Uuid, RoaringBitmap>,
 }
 
 impl RowFilter {
-    pub(crate) fn rejects(&self, row_addr: u64) -> bool {
-        self.missing_fragments
-            .contains(RowAddress::from(row_addr).fragment_id())
-            || self.deleted.contains(row_addr)
+    /// The address a vertex `segment` stores answers under now, or `None` when
+    /// it must not reach an answer.
+    pub(crate) fn admit(&self, segment: Uuid, stored: u64) -> Option<u64> {
+        let current = match &self.moved {
+            None => {
+                if self
+                    .missing_fragments
+                    .contains(RowAddress::from(stored).fragment_id())
+                {
+                    return None;
+                }
+                stored
+            }
+            Some(moved) => {
+                let current = moved.remap.remap_row_id(stored)?;
+                // A group the segment covered only part of moves its rows into a
+                // fragment Lance does not credit the segment with, and leaves
+                // them to whoever scans the unindexed fragments.
+                let fragment_id = RowAddress::from(current).fragment_id();
+                if !moved
+                    .coverage
+                    .get(&segment)
+                    .is_some_and(|coverage| coverage.contains(fragment_id))
+                {
+                    return None;
+                }
+                current
+            }
+        };
+        (!self.deleted.contains(current)).then_some(current)
     }
 
-    /// Whether this filter rejects nothing, so that every stored vertex is live.
+    pub(crate) fn rejects(&self, segment: Uuid, stored: u64) -> bool {
+        self.admit(segment, stored).is_none()
+    }
+
+    /// Whether every stored vertex is live and still at the address it was
+    /// stored under.
     pub(crate) fn is_empty(&self) -> bool {
-        self.deleted.is_empty() && self.missing_fragments.is_empty()
+        self.deleted.is_empty() && self.missing_fragments.is_empty() && self.moved.is_none()
+    }
+
+    /// A partition of `segment` with each vertex at the address it answers under
+    /// now, and a vertex that answers under none left where it was stored.
+    pub(crate) fn readdress(&self, segment: Uuid, partition: Partition) -> Result<Partition> {
+        let (mut graph, vectors) = partition.into_parts();
+        for row_addr in graph.row_ids_mut() {
+            if let Some(current) = self.admit(segment, *row_addr) {
+                *row_addr = current;
+            }
+        }
+        Partition::try_new(graph, vectors)
     }
 }
 
@@ -509,13 +569,18 @@ pub(crate) struct Segment {
     pub(crate) file_sizes: HashMap<String, u64>,
     /// Schema field ids the dataset credits this segment's index row with.
     pub(crate) fields: Vec<i32>,
-    /// What this segment was built over that the dataset still has.
+    /// What the dataset credits this segment with and still has, in the
+    /// fragment ids its rows live under now.
     ///
     /// Narrower than the segment's own `fragments` exactly when a fragment has
-    /// gone; every vertex stored for one of those is already rejected by
-    /// [`RowFilter`], so this is the coverage a rewrite of this segment would be
-    /// committed with.
+    /// gone or is no longer credited to it; every vertex stored for one of those
+    /// is already rejected by [`RowFilter`], so this is the coverage a rewrite of
+    /// this segment would be committed with.
     pub(crate) coverage: RoaringBitmap,
+    /// Whether a deferred compaction moved rows this segment stores, so that a
+    /// rewrite has to write every vertex at [`RowFilter::readdress`]'s address
+    /// rather than copy a partition as it is.
+    pub(crate) moved: bool,
 }
 
 /// What one partition's walk produced, and what it cost.
@@ -555,6 +620,7 @@ struct Probe {
 
 /// One partition read off disk, and what a walk over it needs.
 struct Probed {
+    segment: Uuid,
     partition: Partition,
     medoid: u32,
     /// The code column and `|q - c|^2`, for a walk that runs on codes.
@@ -577,6 +643,7 @@ struct Probed {
 /// downstream needs them - so [`PARTITIONS_IN_FLIGHT`] still bounds what a query
 /// holds of a partition.
 struct Probing {
+    segment: Uuid,
     file: PartitionFile,
     /// What the segment declares the vector width to be, carried so that
     /// re-scoring can check it against what comes back.
@@ -619,10 +686,9 @@ const PARTITIONS_IN_FLIGHT: usize = 4;
 /// out every index whose details type has no reader in the Lance build, and
 /// [`crate::builder::INDEX_DETAILS_TYPE_URL`] never has one.
 ///
-/// Deliberately without the fragment-reuse remap Lance applies to its own
-/// indices: a partition file holds the row addresses of the fragments it was
-/// built over, so a remapped bitmap would credit it with fragments whose rows it
-/// cannot address.
+/// The bitmaps are as the manifest stores them, without the fragment-reuse remap
+/// Lance applies when it lists indices. [`VamanaIndex::open`] applies that remap
+/// itself, to these and to each segment's own record of what it read alike.
 pub async fn committed_segments(
     dataset: &Dataset,
     index_name: &str,
@@ -667,6 +733,7 @@ impl VamanaIndex {
             .map(|fragment| (fragment.id() as u32, fragment.metadata()))
             .collect::<Vec<_>>();
         let scheduler = scan_scheduler(&dataset.object_store(None).await?);
+        let remap = dataset.frag_reuse_index().await?;
 
         // Everything a segment can be refused for without reading it, first:
         // the round trips below are the expensive part of opening an index, and
@@ -737,19 +804,31 @@ impl VamanaIndex {
         let mut segments = Vec::with_capacity(planned.len());
         let mut covered = RoaringBitmap::new();
         let mut missing_fragments = RoaringBitmap::new();
+        let mut history = HashMap::new();
         for ((index, dir, file_sizes, declared), manifest) in planned.into_iter().zip(manifests) {
             // Three records of one thing, and every disagreement between them
-            // means something different. `built_over` is what the segment wrote
+            // means something different. `stored_over` is what the segment wrote
             // about itself and never changes; `declared` is what the dataset
             // credits it with, which Lance edits in place and which never touches
             // the segment's own files; `live` is which fragments the dataset
             // still has at all.
-            let built_over = manifest
+            let stored_over = manifest
                 .metadata()
                 .fragments
                 .iter()
                 .copied()
                 .collect::<RoaringBitmap>();
+            // A deferred compaction moves rows into new fragments and records the
+            // move in the fragment-reuse index, which Lance applies to every
+            // bitmap it lists and persists on its next commit. Both records are
+            // put through it, so that they can be compared in the fragment ids
+            // the rows live under now.
+            let mut built_over = stored_over.clone();
+            let mut credited = declared.clone();
+            if let Some(remap) = &remap {
+                remap.remap_fragment_bitmap(&mut built_over)?;
+                remap.remap_fragment_bitmap(&mut credited)?;
+            }
 
             // Credited with a fragment it never read. Lance widens a bitmap in
             // `register_pure_rewrite_rows_update_frags_in_indices` and in the
@@ -758,14 +837,14 @@ impl VamanaIndex {
             // can produce it - but a bitmap naming a fragment this segment never
             // read is unanswerable either way, and which upstream path widened it
             // is not something a reader can tell.
-            if !(declared - &built_over).is_empty() {
+            if !(&credited - &built_over).is_empty() {
                 return Err(Error::index(format!(
                     "index '{index_name}' segment {} was built over {} fragments but the dataset \
                      credits it with {}, so it is expected to answer for rows it never read; \
                      rebuild the index",
                     index.uuid,
                     built_over.len(),
-                    declared.len()
+                    credited.len()
                 )));
             }
             // Built over a fragment that is still here, but no longer credited
@@ -774,7 +853,12 @@ impl VamanaIndex {
             // deferred commit runs. The fragment ids and every row address
             // survive it, so nothing downstream would notice - the vectors this
             // segment ranks by are simply not the ones the rows now hold.
-            let rewritten = (&built_over - declared) & &live;
+            //
+            // Asked of the records as stored. A fragment a compaction moved is
+            // not still here, and one Lance stopped crediting before it recorded
+            // the move - a build committed after a compaction that raced it - is
+            // narrowed below rather than refused.
+            let rewritten = (&stored_over - declared) & &live;
             if !rewritten.is_empty() {
                 return Err(Error::index(format!(
                     "index '{index_name}' segment {} was built over {} fragments the dataset still \
@@ -796,24 +880,25 @@ impl VamanaIndex {
             // commit drops rewritten fragments from an address-domain index's
             // coverage and leaves the scanner to cover them.
             //
-            // Which of the two got us here - a delete that emptied the fragment,
-            // or a compaction that moved its rows elsewhere - is not something a
-            // reader can tell, and it does not change what this index can do. It
-            // changes what the *caller* should do, so the narrowing is logged and
+            // A compaction the fragment-reuse index recorded is not one of these:
+            // its rows were followed above. What is left is a delete that emptied
+            // the fragment, or a move that record no longer holds, and which of
+            // the two it was does not change what this index can do. It changes
+            // what the *caller* should do, so the narrowing is logged and
             // `covered_fragments` reports the result.
-            let gone = &built_over - &live;
+            let coverage = &credited & &live;
+            let gone = &built_over - &coverage;
             if !gone.is_empty() {
                 log::warn!(
                     "Vamana index '{index_name}' segment {} was built over {} fragments the \
-                     dataset no longer has; it will answer for the remaining {}, and the rows of \
-                     the rest are the caller's to scan",
+                     dataset no longer has or no longer credits it with; it will answer for the \
+                     remaining {}, and the rows of the rest are the caller's to scan",
                     index.uuid,
                     gone.len(),
-                    built_over.len() - gone.len()
+                    coverage.len()
                 );
                 missing_fragments |= gone;
             }
-            let coverage = &built_over & &live;
             covered |= &coverage;
 
             // The checks above ask what the *manifest* says about this
@@ -825,7 +910,7 @@ impl VamanaIndex {
             // pre-overlay vectors and `take_rows` would return the post-overlay
             // ones, with nothing in the answer to show for it.
             if let Some((fragment_id, _)) = overlaid.iter().find(|(fragment_id, fragment)| {
-                declared.contains(*fragment_id)
+                credited.contains(*fragment_id)
                     && overlay_supersedes_segment(
                         &fragment.overlays,
                         &index.fields,
@@ -840,6 +925,18 @@ impl VamanaIndex {
                     index.uuid, index.dataset_version
                 )));
             }
+            let moved = built_over != stored_over;
+            if moved && let Some(remap) = &remap {
+                refuse_overlays_moved_with_rows(
+                    dataset,
+                    index_name,
+                    index,
+                    &stored_over,
+                    remap,
+                    &mut history,
+                )
+                .await?;
+            }
             segments.push(Segment {
                 uuid: index.uuid,
                 dir,
@@ -847,6 +944,7 @@ impl VamanaIndex {
                 file_sizes,
                 fields: index.fields.clone(),
                 coverage,
+                moved,
             });
         }
 
@@ -891,6 +989,15 @@ impl VamanaIndex {
         supported_distance_type(metadata.distance_type)?;
 
         let deleted = deleted_row_addresses(dataset, &covered, store.io_parallelism()).await?;
+        let moved = remap
+            .filter(|_| segments.iter().any(|segment| segment.moved))
+            .map(|remap| MovedRows {
+                remap,
+                coverage: segments
+                    .iter()
+                    .map(|segment| (segment.uuid, segment.coverage.clone()))
+                    .collect(),
+            });
 
         Ok(Self {
             scheduler,
@@ -901,6 +1008,7 @@ impl VamanaIndex {
             rows: Arc::new(RowFilter {
                 deleted,
                 missing_fragments,
+                moved,
             }),
         })
     }
@@ -965,8 +1073,8 @@ impl VamanaIndex {
         }
     }
 
-    /// What this index answers for: every fragment its segments were built over
-    /// that the dataset still has.
+    /// What this index answers for: every fragment its segments were built over,
+    /// followed through any deferred compaction, that the dataset still has.
     ///
     /// The number a caller needs to scan the remainder. It is not the same as
     /// the coverage the segments were built with - a fragment the dataset has
@@ -1011,7 +1119,7 @@ impl VamanaIndex {
         &self.segments
     }
 
-    pub(crate) fn row_filter(&self) -> &RowFilter {
+    pub(crate) fn row_filter(&self) -> &Arc<RowFilter> {
         &self.rows
     }
 
@@ -1043,10 +1151,11 @@ impl VamanaIndex {
     /// Fragments `dataset` has that this index does not answer for.
     ///
     /// Against [`Self::covered_fragments`] rather than against any segment's own
-    /// record, because the two differ exactly when a fragment has gone: one a
-    /// segment was built over and the dataset has since dropped is answered for
-    /// by nobody, and if a compaction rewrote its rows into a new fragment then
-    /// that new fragment belongs in this list.
+    /// record, because the two differ when a fragment has gone and when a
+    /// deferred compaction moved rows: a fragment the dataset has dropped is
+    /// answered for by nobody, and one a compaction moved rows into is answered
+    /// for by the segment they came from - unless that segment covered only part
+    /// of what was compacted with them, in which case it belongs in this list.
     pub(crate) fn unindexed_fragments(&self, dataset: &Dataset) -> Vec<u32> {
         live_fragments(dataset)
             .into_iter()
@@ -1403,6 +1512,7 @@ impl VamanaIndex {
         let k = params.k;
         spawn_cpu(move || {
             let Probed {
+                segment,
                 partition,
                 medoid,
                 coded,
@@ -1479,7 +1589,7 @@ impl VamanaIndex {
                 })
                 .collect::<Vec<_>>();
             Ok(Walked {
-                neighbors: answer(neighbors, &rows, k)?,
+                neighbors: answer(neighbors, &rows, segment, k)?,
                 comparisons: walked.get(),
             })
         })
@@ -1548,6 +1658,7 @@ impl VamanaIndex {
         };
 
         Ok(Probing {
+            segment: probe.segment,
             file,
             dimension: probe.dimension,
             candidates,
@@ -1586,7 +1697,7 @@ impl VamanaIndex {
         .await?;
         let comparisons = rescored.len() as u64;
         Ok(Walked {
-            neighbors: answer(rescored, &self.rows, params.k)?,
+            neighbors: answer(rescored, &self.rows, probing.segment, params.k)?,
             comparisons,
         })
     }
@@ -1615,6 +1726,7 @@ impl VamanaIndex {
             .map(|dist_q_c| Ok::<_, Error>((codes::column(&batch)?, dist_q_c)))
             .transpose()?;
         Ok(Probed {
+            segment: probe.segment,
             partition,
             medoid: probe.entry.medoid,
             coded,
@@ -1628,7 +1740,12 @@ impl VamanaIndex {
 /// separates them is how a candidate list is arrived at, and nothing after that
 /// may differ. `candidates` is nearest first by an *exact* distance whichever
 /// walk produced it, which is what the merge downstream rests on.
-fn answer(candidates: Vec<Neighbor>, rows: &RowFilter, k: usize) -> Result<Vec<Neighbor>> {
+fn answer(
+    candidates: Vec<Neighbor>,
+    rows: &RowFilter,
+    segment: Uuid,
+    k: usize,
+) -> Result<Vec<Neighbor>> {
     // A stored vector that is not finite makes every distance measured against
     // it NaN, and a NaN goes wherever `total_cmp` puts it: a negative one sorts
     // ahead of every real answer, survives the merge and comes back as the
@@ -1654,7 +1771,13 @@ fn answer(candidates: Vec<Neighbor>, rows: &RowFilter, k: usize) -> Result<Vec<N
     // rows" instead of "k rows, some of which the caller will find missing".
     Ok(candidates
         .into_iter()
-        .filter(|neighbor| !rows.rejects(neighbor.row_addr))
+        .filter_map(|neighbor| {
+            rows.admit(segment, neighbor.row_addr)
+                .map(|row_addr| Neighbor {
+                    row_addr,
+                    ..neighbor
+                })
+        })
         .take(k)
         .collect())
 }
@@ -1676,14 +1799,100 @@ fn answer(candidates: Vec<Neighbor>, rows: &RowFilter, k: usize) -> Result<Vec<N
 fn coded_answer(probings: &[Probing], rows: &RowFilter, k: usize) -> Vec<Neighbor> {
     let candidates = probings
         .iter()
-        .flat_map(|probing| probing.candidates.iter())
-        .filter(|candidate| !rows.rejects(candidate.row_addr))
-        .map(|candidate| Neighbor {
-            row_addr: candidate.row_addr,
-            distance: candidate.coded,
+        .flat_map(|probing| {
+            probing
+                .candidates
+                .iter()
+                .map(move |candidate| (probing.segment, candidate))
+        })
+        .filter_map(|(segment, candidate)| {
+            rows.admit(segment, candidate.row_addr)
+                .map(|row_addr| Neighbor {
+                    row_addr,
+                    distance: candidate.coded,
+                })
         })
         .collect::<Vec<_>>();
     merge(candidates, k)
+}
+
+/// Refuse `index` when a deferred compaction that moved its rows had an overlay
+/// to bake into them.
+///
+/// A compaction writes a fragment's overlays into the base data of the fragment
+/// it writes, which then carries none, and on a deferred compaction Lance's own
+/// pruning of stale coverage runs before the move reaches any bitmap and prunes
+/// nothing. So the fragments the segment's rows moved out of are checked as the
+/// compaction read them, at the dataset version it recorded - the same history
+/// read `prune_stale_segment_coverage` makes when an index is committed.
+///
+/// `history` holds the fragments of each version read so far, since every
+/// segment an index had before a compaction was moved by it.
+async fn refuse_overlays_moved_with_rows(
+    dataset: &Dataset,
+    index_name: &str,
+    index: &lance_table::format::IndexMetadata,
+    stored_over: &RoaringBitmap,
+    remap: &CompactFragReuseIndex,
+    history: &mut HashMap<u64, HashMap<u32, Fragment>>,
+) -> Result<()> {
+    let mut moved_through = stored_over.clone();
+    for version in &remap.details.versions {
+        for group in &version.groups {
+            let moved_out = group
+                .old_frags
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .filter(|fragment_id| moved_through.contains(*fragment_id))
+                .collect::<Vec<_>>();
+            if moved_out.is_empty() {
+                continue;
+            }
+            let fragments = match history.entry(version.dataset_version) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let read = dataset
+                        .checkout_version(version.dataset_version)
+                        .await
+                        .map_err(|error| {
+                            Error::index(format!(
+                                "index '{index_name}' segment {} stores rows a deferred compaction \
+                                 moved, and whether that compaction baked an overlay into them can \
+                                 only be read from dataset version {}, which cannot be opened: \
+                                 {error}; rebuild the index",
+                                index.uuid, version.dataset_version
+                            ))
+                        })?;
+                    entry.insert(
+                        read.get_fragments()
+                            .iter()
+                            .map(|fragment| (fragment.id() as u32, fragment.metadata().clone()))
+                            .collect(),
+                    )
+                }
+            };
+            if let Some(fragment_id) = moved_out.into_iter().find(|fragment_id| {
+                fragments.get(fragment_id).is_some_and(|fragment| {
+                    overlay_supersedes_segment(
+                        &fragment.overlays,
+                        &index.fields,
+                        index.dataset_version,
+                        dataset.schema(),
+                    )
+                })
+            }) {
+                return Err(Error::index(format!(
+                    "index '{index_name}' segment {} was built at dataset version {} and fragment \
+                     {fragment_id} had its indexed values replaced by an overlay before a \
+                     compaction at version {} moved its rows, so the vectors it ranks are not the \
+                     ones the rows now hold; rebuild the index",
+                    index.uuid, index.dataset_version, version.dataset_version
+                )));
+            }
+            moved_through.extend(group.new_frags.iter().map(|fragment| fragment.id as u32));
+        }
+    }
+    Ok(())
 }
 
 /// Whether an overlay has replaced indexed values under a segment built at
@@ -1870,6 +2079,11 @@ mod tests {
     use lance_file::version::ConcreteFileVersion;
     use lance_table::format::DataFile;
     use lance_table::format::overlay::OverlayCoverage;
+    use lance_table::system_index::frag_reuse::{
+        FragDigest, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
+    };
+
+    use crate::partition::PartitionGraph;
 
     fn neighbors(pairs: &[(u64, f32)]) -> Vec<Neighbor> {
         pairs
@@ -1990,5 +2204,120 @@ mod tests {
                 "{what}"
             );
         }
+    }
+
+    fn address(fragment_id: u32, offset: u32) -> u64 {
+        u64::from(RowAddress::new_from_parts(fragment_id, offset))
+    }
+
+    /// One compaction that moved rows three ways: fragment 1, four rows with the
+    /// second one deleted, into fragment 10; and fragments 2 and 3, two rows
+    /// each, into fragment 11.
+    fn one_compaction() -> Arc<CompactFragReuseIndex> {
+        let changed = |addresses: &[u64]| {
+            let changed = addresses.iter().copied().collect::<RoaringTreemap>();
+            let mut bytes = Vec::with_capacity(changed.serialized_size());
+            changed.serialize_into(&mut bytes).unwrap();
+            bytes
+        };
+        let digest = |id, physical_rows| FragDigest {
+            id,
+            physical_rows,
+            num_deleted_rows: 0,
+        };
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![
+                    FragReuseGroup {
+                        changed_row_addrs: changed(&[address(1, 0), address(1, 2), address(1, 3)]),
+                        old_frags: vec![digest(1, 4)],
+                        new_frags: vec![digest(10, 3)],
+                    },
+                    FragReuseGroup {
+                        changed_row_addrs: changed(&[
+                            address(2, 0),
+                            address(2, 1),
+                            address(3, 0),
+                            address(3, 1),
+                        ]),
+                        old_frags: vec![digest(2, 2), digest(3, 2)],
+                        new_frags: vec![digest(11, 4)],
+                    },
+                ],
+            }],
+        };
+        Arc::new(CompactFragReuseIndex::try_new(Uuid::new_v4(), details).unwrap())
+    }
+
+    /// Of the second group the segment covered only fragment 2, so Lance credits
+    /// it with neither fragment of that group afterwards, and the row that moved
+    /// from 2 into 11 is left to whoever covers 11 - here a delta indexed over it,
+    /// which stores that row under its own address.
+    #[test]
+    fn a_moved_row_answers_where_it_landed() {
+        let remap = one_compaction();
+        let mut base_coverage = RoaringBitmap::from_iter([1u32, 2, 4]);
+        remap.remap_fragment_bitmap(&mut base_coverage).unwrap();
+        assert_eq!(base_coverage, RoaringBitmap::from_iter([4u32, 10]));
+        let (base, delta) = (Uuid::new_v4(), Uuid::new_v4());
+        let rows = RowFilter {
+            deleted: RoaringTreemap::from_iter([address(10, 0), address(4, 1)]),
+            missing_fragments: RoaringBitmap::from_iter([1u32, 2]),
+            moved: Some(MovedRows {
+                remap,
+                coverage: HashMap::from([
+                    (base, base_coverage),
+                    (delta, RoaringBitmap::from_iter([11u32])),
+                ]),
+            }),
+        };
+        for (segment, stored, expected, what) in [
+            (
+                base,
+                address(1, 0),
+                None,
+                "moved onto an address deleted since",
+            ),
+            (base, address(1, 1), None, "dropped by the compaction"),
+            (base, address(1, 2), Some(address(10, 1)), "moved"),
+            (
+                base,
+                address(2, 1),
+                None,
+                "moved where another segment answers",
+            ),
+            (
+                delta,
+                address(11, 1),
+                Some(address(11, 1)),
+                "stored by that segment",
+            ),
+            (base, address(4, 0), Some(address(4, 0)), "never moved"),
+            (base, address(4, 1), None, "deleted where it was"),
+        ] {
+            assert_eq!(rows.admit(segment, stored), expected, "{what}");
+        }
+
+        let partition = Partition::try_new(
+            PartitionGraph::try_new(
+                4,
+                vec![address(1, 1), address(1, 2), address(4, 0)],
+                vec![vec![1], vec![2], vec![0]],
+            )
+            .unwrap(),
+            FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                2,
+                Arc::new(Float32Array::from(vec![0.0; 6])),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows.readdress(base, partition).unwrap().graph().row_ids(),
+            [address(1, 1), address(10, 1), address(4, 0)]
+        );
     }
 }
