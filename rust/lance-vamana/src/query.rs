@@ -39,7 +39,10 @@
 //!   what changes that, and what it keeps is the part of a partition that does
 //!   not depend on the query: the layout of its file, and for a
 //!   [`WalkMode::Lazy`] walk or a [`WalkMode::Flat`] scan the codes and row ids
-//!   they measure by, which are nine tenths of what such a query reads.
+//!   they measure by, which are nine tenths of what such a query reads. What an
+//!   index keeps without one is scratch rather than data: the visited marks of
+//!   its lazy walks, four bytes a vertex of the largest partition walked, for
+//!   as many walks as have run at once and up to one per core.
 //! - **A partition is read whole unless the walk is told not to.**
 //!   [`WalkMode::Lazy`] keeps the row ids and the codes and fetches the rest as
 //!   it turns out to need it; [`WalkMode::Flat`] keeps the same and fetches even
@@ -135,7 +138,7 @@ use crate::io::{
 };
 use crate::lazy::{self, Candidate, LazyProbe};
 use crate::partition::Partition;
-use crate::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
+use crate::search::{Comparisons, ScratchPool, SearchScratch, flat_storage, greedy_search};
 use crate::segment::{PartitionEntry, SegmentManifest};
 
 /// One answer: where the row is, and how far it was from the query.
@@ -467,6 +470,10 @@ pub struct VamanaIndex {
     /// pool, which takes `'static` work, and the filter has to be applied inside
     /// the walk's own result - before `take(k)`, so that `k` means k live rows.
     rows: Arc<RowFilter>,
+    /// Visited marks for the lazy walks, kept between queries whether or not
+    /// the index has a cache. The walks that read a partition whole allocate
+    /// their own, beside the partition they hold.
+    scratches: ScratchPool,
 }
 
 /// The stored vertices a walk must not return.
@@ -1010,6 +1017,7 @@ impl VamanaIndex {
                 missing_fragments,
                 moved,
             }),
+            scratches: ScratchPool::new(),
         })
     }
 
@@ -1652,7 +1660,8 @@ impl VamanaIndex {
             match params.mode {
                 WalkMode::Flat => probing.scan(routing_query, dist_q_c),
                 WalkMode::Exact | WalkMode::Coded | WalkMode::Lazy => {
-                    probing.walk(routing_query, dist_q_c).await?
+                    let mut scratch = self.scratches.take();
+                    probing.walk(routing_query, dist_q_c, &mut scratch).await?
                 }
             }
         };

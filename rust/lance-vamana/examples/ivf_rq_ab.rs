@@ -477,9 +477,22 @@ async fn measure_vamana(
             .unwrap()
             .with_cache(LanceCache::with_capacity(cache_bytes)),
     );
-    for query in queries.iter().take(warmup) {
-        index.search(query, &params).await.unwrap();
-    }
+    // At the pass's own concurrency: the index keeps a visited-mark scratch for
+    // every walk that has run at once, so a warmup one query at a time would
+    // leave it only as many as one query runs, and the pass would allocate the
+    // rest while timed.
+    futures::stream::iter(queries.iter().take(warmup))
+        .map(|query| {
+            let index = index.clone();
+            let params = params.clone();
+            let query = query.clone();
+            tokio::spawn(async move {
+                index.search(&query, &params).await.unwrap();
+            })
+        })
+        .buffered(concurrency)
+        .for_each(|joined| async move { joined.unwrap() })
+        .await;
 
     let before = index.io_stats();
     let cache_before = index.cache_stats().await;

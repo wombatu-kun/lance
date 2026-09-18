@@ -181,7 +181,10 @@ two are meant to say the same thing.
   layout of its file, and for a lazy walk the codes and row ids it steers by.
   Nothing needs invalidating, because nothing an entry describes can change -
   deleting rows edits no index file, and adding rows or consolidating writes a
-  *new* segment under a new uuid.
+  *new* segment under a new uuid. What an index keeps without a cache is
+  scratch rather than data: the visited marks of its lazy walks, four bytes a
+  vertex of the largest partition walked, for as many walks as have run at once
+  and up to one per core - 48 MB at twelve cores and a million-row partition.
 
   The budget is the caller's to set and is in bytes of *resident* form, which is
   more than the codes weigh on disk: they are stored one contiguous stride a

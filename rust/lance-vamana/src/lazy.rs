@@ -153,6 +153,10 @@ impl LazyProbe<'_> {
     /// from. The raw query does not appear at all - it belongs to the step that
     /// measures exactly, and this one never does.
     ///
+    /// `scratch` can come from any earlier walk, over this partition or
+    /// another: [`SearchScratch::cover`] fits it to this one, and the marks it
+    /// arrives with are retired by [`SearchScratch::begin`].
+    ///
     /// Nothing here is handed to the CPU pool, unlike the walk over a partition
     /// held in memory. It cannot be: the pool takes work that never waits, and
     /// this waits once a hop. What it does instead is stay small between the
@@ -162,6 +166,7 @@ impl LazyProbe<'_> {
         &self,
         routing_query: ArrayRef,
         dist_q_c: f32,
+        scratch: &mut SearchScratch,
     ) -> Result<(Vec<Candidate>, u64)> {
         let num_rows = self.row_ids.len();
         if self.medoid as usize >= num_rows {
@@ -181,7 +186,7 @@ impl LazyProbe<'_> {
 
         let comparisons = Comparisons::default();
         let coded = self.codes.dist_calculator(routing_query, dist_q_c);
-        let mut scratch = SearchScratch::new(num_rows);
+        scratch.cover(num_rows);
         let mut list = SearchList::new(self.search_list_size, num_rows);
         scratch.begin();
         scratch.mark(self.medoid);

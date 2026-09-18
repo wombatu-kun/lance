@@ -8,7 +8,10 @@
 //! runs it to answer. Both want the same thing, so it lives on its own.
 
 use std::cell::Cell;
-use std::sync::Arc;
+use std::fmt;
+use std::num::NonZeroUsize;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array};
 use lance_core::{Error, ROW_ID, Result};
@@ -116,6 +119,116 @@ impl SearchScratch {
             *slot = self.generation;
             true
         }
+    }
+
+    /// Make room for a partition of `num_vertices`.
+    ///
+    /// Too short, the buffer is replaced rather than grown: every mark in it is
+    /// stale by the next [`Self::begin`] anyway, zero is no search's
+    /// generation, and a new buffer is exactly as long as asked for, where a
+    /// grown one would keep amortized headroom for as long as a pool keeps it.
+    pub(crate) fn cover(&mut self, num_vertices: usize) {
+        if self.seen.len() < num_vertices {
+            self.seen = vec![0; num_vertices];
+        }
+    }
+}
+
+/// Visited marks a finished walk hands on to the next one.
+///
+/// A scratch holds a slot for every vertex of the partition it walks, four
+/// megabytes at a million rows, and a new one per walk is that much memory
+/// allocated and zeroed before the first hop, however short the walk. Handed
+/// on, it costs a generation bump instead.
+///
+/// It keeps as many scratches as walks have run at once, up to one per core,
+/// each as long as the largest partition it has served, for the life of the
+/// index and outside any cache budget. A walk over resident edges never waits
+/// while it holds one, so no more are in use together than there are threads
+/// polling queries, which on a default runtime is one per core. A walk that
+/// fetches its edges holds its scratch across reads, and one beyond the cap is
+/// allocated and dropped as before.
+pub(crate) struct ScratchPool {
+    /// A poisoned lock is taken as it is: a push or a pop cannot leave the list
+    /// half-changed.
+    idle: Mutex<Vec<SearchScratch>>,
+    max_idle: usize,
+}
+
+impl ScratchPool {
+    pub(crate) fn new() -> Self {
+        Self {
+            idle: Mutex::default(),
+            // Unknown only where the platform cannot say; one idle scratch
+            // still serves queries that arrive one at a time.
+            max_idle: std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
+        }
+    }
+
+    /// Lend out the scratch handed back last, or an empty one when none is
+    /// idle; the walk sizes it with [`SearchScratch::cover`].
+    pub(crate) fn take(&self) -> PooledScratch<'_> {
+        let idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        PooledScratch {
+            pool: self,
+            scratch: idle.unwrap_or_else(|| SearchScratch::new(0)),
+        }
+    }
+
+    /// Keep `scratch` for the next walk, unless `max_idle` are idle already.
+    fn put(&self, scratch: SearchScratch) {
+        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        if idle.len() < self.max_idle {
+            idle.push(scratch);
+        }
+    }
+}
+
+/// A scratch on loan from a [`ScratchPool`], back in the pool when dropped:
+/// after an error or a cancelled query as much as after an answer.
+pub(crate) struct PooledScratch<'a> {
+    pool: &'a ScratchPool,
+    scratch: SearchScratch,
+}
+
+impl Deref for PooledScratch<'_> {
+    type Target = SearchScratch;
+
+    fn deref(&self) -> &SearchScratch {
+        &self.scratch
+    }
+}
+
+impl DerefMut for PooledScratch<'_> {
+    fn deref_mut(&mut self) -> &mut SearchScratch {
+        &mut self.scratch
+    }
+}
+
+impl Drop for PooledScratch<'_> {
+    fn drop(&mut self) {
+        self.pool
+            .put(std::mem::replace(&mut self.scratch, SearchScratch::new(0)));
+    }
+}
+
+/// Counts rather than contents: a derived one would print every slot of every
+/// idle scratch.
+impl fmt::Debug for ScratchPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        f.debug_struct("ScratchPool")
+            .field("idle", &idle)
+            .field("max_idle", &self.max_idle)
+            .finish()
     }
 }
 
@@ -511,6 +624,103 @@ mod tests {
         }
         assert_eq!(lengths, vec![16, 16, 16]);
         assert_eq!(comparisons.get(), 48);
+    }
+
+    /// A pooled scratch arrives with the marks of whatever it served last, over
+    /// a partition larger or smaller than this one, and has to walk exactly as a
+    /// new one does. One scratch serves the whole run, so what is left idle at
+    /// the end is that one, grown once to the longest path.
+    #[test]
+    fn a_pooled_scratch_walks_like_a_new_one() {
+        let pool = ScratchPool::new();
+        for num_vertices in [4, 16, 8, 16] {
+            let graph = path_graph(num_vertices);
+            let storage = line_storage(num_vertices);
+            let calculator = storage.dist_calculator_from_id(num_vertices as u32 - 1);
+            let walk = |scratch: &mut SearchScratch| {
+                let result =
+                    greedy_search(&graph, &calculator, 0, 4, scratch, &Comparisons::default())
+                        .unwrap();
+                result
+                    .visited
+                    .iter()
+                    .map(|node| node.id)
+                    .collect::<Vec<_>>()
+            };
+
+            let mut pooled = pool.take();
+            pooled.cover(num_vertices);
+            let from_pool = walk(&mut pooled);
+            drop(pooled);
+            assert_eq!(
+                from_pool,
+                walk(&mut SearchScratch::new(num_vertices)),
+                "a pooled scratch walked a path of {num_vertices} differently"
+            );
+        }
+
+        let idle = pool
+            .idle
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|scratch| scratch.seen.len())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            idle,
+            vec![16],
+            "the walks were not handed one scratch between them"
+        );
+    }
+
+    /// Pooled, a scratch outlives its queries: at seven thousand walks a
+    /// second, a thousand queries of seven probes, it runs out of generations
+    /// in a week. The numbering then restarts at 1, which some slot may still
+    /// hold from the first search of all.
+    #[test]
+    fn a_scratch_that_runs_out_of_generations_starts_clean() {
+        let mut scratch = SearchScratch::new(4);
+        scratch.begin();
+        assert!(scratch.mark(2));
+        scratch.generation = u32::MAX;
+        scratch.begin();
+
+        assert_eq!(scratch.generation, 1);
+        assert!(
+            scratch.mark(2),
+            "a mark stamped at generation 1 survived the restart and read as this search's"
+        );
+    }
+
+    /// The pool is worth its lock only if what it is handed is what it hands
+    /// out next, and safe to keep only if it stops at its cap.
+    #[test]
+    fn a_pool_hands_back_what_it_was_given_up_to_its_cap() {
+        let pool = ScratchPool {
+            idle: Mutex::default(),
+            max_idle: 2,
+        };
+        let lent = (0..3)
+            .map(|_| {
+                let mut scratch = pool.take();
+                scratch.cover(16);
+                scratch
+            })
+            .collect::<Vec<_>>();
+        let buffers = lent
+            .iter()
+            .map(|scratch| scratch.seen.as_ptr())
+            .collect::<Vec<_>>();
+        drop(lent);
+
+        assert_eq!(pool.idle.lock().unwrap().len(), 2);
+        let (last, first, fresh) = (pool.take(), pool.take(), pool.take());
+        assert_eq!(last.seen.as_ptr(), buffers[1]);
+        assert_eq!(first.seen.as_ptr(), buffers[0]);
+        assert!(
+            fresh.seen.is_empty(),
+            "an empty pool handed out a scratch someone had used"
+        );
     }
 
     /// A full counter pins itself rather than panicking in a debug build and
