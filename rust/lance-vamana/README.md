@@ -231,6 +231,19 @@ two are meant to say the same thing.
   `SearchParams::with_beam_width` vertices to a request, then the vectors of the
   candidate list in one more.
 
+  A hop of a lazy walk collects every neighbour it has not already seen before it
+  measures any of them, and asks the processor for the code of the one
+  `SearchParams::with_prefetch_ahead` further on while it measures the current
+  one. A code sits at a place in the code array that only the graph knows, so no
+  hardware prefetcher can start that load by itself, and a hop is the one moment
+  every id is in hand at once. Two, which is what Lance's own HNSW asks for at
+  search time. Zero asks for nothing, which is the control for the ask but not
+  for the hop, since a hop collects itself either way. Only scalar codes are
+  asked at all: Lance implements `prefetch` for `ScalarQuantizationStorage` and
+  not for RaBitQ, whose calculator takes the trait's empty default. Every figure
+  below was taken before any of this existed, and the walk they were taken from
+  asked for nothing.
+
   On SIFT1M at 65536 rows a partition, four probes and equal recall
   (`examples/lazy_walk.rs`), that is **18.2 MB a query against 198.6 MB** read
   whole, and **18.6 ms of warm CPU against 130.5 ms** - decoding two hundred

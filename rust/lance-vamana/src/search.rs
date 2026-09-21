@@ -294,6 +294,53 @@ impl SearchList {
         self.list.truncate(self.size);
     }
 
+    /// Measure every id in `ids` and offer it, asking for the code of the one
+    /// `ahead` further on before the current one is measured.
+    ///
+    /// Every id must be a vertex of `calculator`'s store, and must already be
+    /// marked, exactly as [`Self::offer`] requires - this asks for a code at the
+    /// id as well as measuring one, and both index the same array.
+    ///
+    /// The ask is [`DistCalculator::prefetch`], which is a hint and only a hint:
+    /// it changes what the processor has already loaded by the time a distance
+    /// reads it, and it cannot change what the distance is. An eight-bit code
+    /// sits `id * d` bytes into an array holding every code of the partition,
+    /// and the ids of one hop are as unrelated to one another as the graph made
+    /// them, so no hardware prefetcher can guess the next one. What it can be
+    /// told is the whole hop at once, because a hop knows every id it will
+    /// measure before it measures any of them.
+    ///
+    /// `ahead` of zero asks for nothing at all. That is the hint's own control -
+    /// not the walk as it was, which also offered its hop one neighbour at a
+    /// time rather than collecting it first.
+    ///
+    /// An `ahead` at or past the length of a hop degenerates: the whole hop is
+    /// asked for back to back with no distance in between, which is the opposite
+    /// of hiding a load behind work and can evict the lines it just asked for.
+    /// Nothing rejects it, because there is no value at which it stops being
+    /// merely unwise.
+    pub fn offer_all(&mut self, ids: &[u32], calculator: &impl DistCalculator, ahead: usize) {
+        // The first `ahead` codes have no full distance to be loaded behind, so
+        // they are asked for before any measuring starts rather than left out,
+        // which is where Lance's own look-ahead leaves them. The very first is a
+        // wash - it is read immediately after - and is asked for anyway to keep
+        // the rule one ask per code.
+        for id in ids.iter().take(ahead) {
+            calculator.prefetch(*id);
+        }
+        for (position, id) in ids.iter().enumerate() {
+            if ahead != 0 {
+                // Saturating because `ahead` is the caller's number, and a sum
+                // past the end of `usize` says the same thing as a sum past the
+                // end of the slice.
+                if let Some(later) = ids.get(position.saturating_add(ahead)) {
+                    calculator.prefetch(*later);
+                }
+            }
+            self.offer(*id, calculator.distance(*id));
+        }
+    }
+
     /// The nearest vertex whose out-edges have not been followed, marked as
     /// followed.
     ///
@@ -385,6 +432,8 @@ pub fn greedy_search(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use arrow_array::Float32Array;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::flat::storage::FlatFloatStorage;
@@ -392,6 +441,220 @@ mod tests {
     use lance_linalg::distance::DistanceType;
 
     use super::*;
+
+    /// A calculator that writes down what it was asked for, in the order it was
+    /// asked.
+    ///
+    /// A prefetch has no effect a test can see - that is what makes it a hint -
+    /// so what is pinned here is the asking: every code asked for once, and
+    /// asked for the agreed number of distances before the one that reads it.
+    #[derive(Default)]
+    struct Recorder {
+        asked: RefCell<Vec<Ask>>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Ask {
+        Prefetched(u32),
+        Measured(u32),
+    }
+
+    impl DistCalculator for Recorder {
+        fn distance(&self, id: u32) -> f32 {
+            self.asked.borrow_mut().push(Ask::Measured(id));
+            id as f32
+        }
+
+        fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
+            unreachable!("a hop measures the ids it collected, never the partition")
+        }
+
+        fn prefetch(&self, id: u32) {
+            self.asked.borrow_mut().push(Ask::Prefetched(id));
+        }
+    }
+
+    fn only(asked: &[Ask], wanted: fn(&Ask) -> Option<u32>) -> Vec<u32> {
+        asked.iter().filter_map(wanted).collect()
+    }
+
+    fn prefetched(ask: &Ask) -> Option<u32> {
+        match ask {
+            Ask::Prefetched(id) => Some(*id),
+            Ask::Measured(_) => None,
+        }
+    }
+
+    fn measured(ask: &Ask) -> Option<u32> {
+        match ask {
+            Ask::Measured(id) => Some(*id),
+            Ask::Prefetched(_) => None,
+        }
+    }
+
+    /// Every code asked for exactly once, and `ahead` distances before its own.
+    ///
+    /// The gap is the whole point: a code asked for one distance early hides one
+    /// distance of memory latency. Nearer the start of the hop there is less to
+    /// hide behind, which is why the first `ahead` of them are asked for
+    /// together before any measuring - so the gap is `ahead` distances or every
+    /// distance so far, whichever is fewer.
+    #[test]
+    fn a_look_ahead_asks_for_every_code_once_and_early() {
+        let ids: Vec<u32> = (10..20).collect();
+        for ahead in [1, 2, 3, 9] {
+            let recorder = Recorder::default();
+            let mut list = SearchList::new(ids.len(), 64);
+            list.offer_all(&ids, &recorder, ahead);
+            let asked = recorder.asked.into_inner();
+
+            assert_eq!(
+                only(&asked, prefetched),
+                ids,
+                "at a look-ahead of {ahead} the hop did not ask for each of its codes once"
+            );
+            assert_eq!(
+                only(&asked, measured),
+                ids,
+                "at a look-ahead of {ahead} the hop measured something other than what it collected"
+            );
+            for (position, id) in ids.iter().enumerate() {
+                let asked_at = asked
+                    .iter()
+                    .position(|ask| *ask == Ask::Prefetched(*id))
+                    .unwrap();
+                let measured_at = asked
+                    .iter()
+                    .position(|ask| *ask == Ask::Measured(*id))
+                    .unwrap();
+                let between = asked[asked_at..measured_at]
+                    .iter()
+                    .filter(|ask| matches!(ask, Ask::Measured(_)))
+                    .count();
+                assert_eq!(
+                    between,
+                    position.min(ahead),
+                    "at a look-ahead of {ahead}, the code of {id} was asked for {between} \
+                     distances before the one that read it"
+                );
+            }
+        }
+    }
+
+    /// No look-ahead asks for nothing at all.
+    ///
+    /// This is the arm a measurement of the look-ahead compares against, so it
+    /// has to ask for nothing rather than ask for the code it is about to read
+    /// anyway - which on eight-bit codes at `d = 960` would be fifteen wasted
+    /// instructions a neighbour, charged to the control.
+    #[test]
+    fn no_look_ahead_asks_for_nothing() {
+        let ids: Vec<u32> = (10..20).collect();
+        let recorder = Recorder::default();
+        let mut list = SearchList::new(ids.len(), 64);
+        list.offer_all(&ids, &recorder, 0);
+        assert_eq!(
+            recorder.asked.into_inner(),
+            ids.iter().map(|id| Ask::Measured(*id)).collect::<Vec<_>>(),
+        );
+    }
+
+    /// A look-ahead longer than the hop asks for the hop and stops there.
+    ///
+    /// `usize::MAX` included, because the depth is a caller's number and
+    /// `position + ahead` is arithmetic it would otherwise get a say in.
+    #[test]
+    fn a_look_ahead_past_the_hop_is_the_hop() {
+        let ids: Vec<u32> = (10..20).collect();
+        for ahead in [ids.len(), ids.len() + 1, usize::MAX] {
+            let recorder = Recorder::default();
+            let mut list = SearchList::new(ids.len(), 64);
+            list.offer_all(&ids, &recorder, ahead);
+            let asked = recorder.asked.into_inner();
+            assert_eq!(
+                only(&asked, prefetched),
+                ids,
+                "at a look-ahead of {ahead} the hop did not ask for each of its codes once"
+            );
+            assert_eq!(
+                only(&asked, measured),
+                ids,
+                "at a look-ahead of {ahead} the hop measured something other than what it collected"
+            );
+        }
+    }
+
+    /// A calculator that cannot tell its vertices apart.
+    struct Level;
+
+    impl DistCalculator for Level {
+        fn distance(&self, _id: u32) -> f32 {
+            1.0
+        }
+
+        fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
+            unreachable!("a hop measures the ids it collected, never the partition")
+        }
+    }
+
+    /// A full list keeps the first of equals, and a hop is offered in the order
+    /// it was handed.
+    ///
+    /// The walk leans on both. Which of two equally distant vertices survives a
+    /// full list is decided by which was offered first, so a hop that collected
+    /// its ids in some other order would answer differently wherever codes tie -
+    /// and coarse codes tie. Nothing else in the crate pins this: a fixture of
+    /// random vectors never produces two equal distances, so a walk over one
+    /// answers the same whatever order its hops are offered in.
+    #[test]
+    fn a_full_list_keeps_the_first_of_equals() {
+        let ids = [5, 9, 2, 7];
+        let kept = |list: SearchList| {
+            list.into_candidates()
+                .iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>()
+        };
+
+        let mut apart = SearchList::new(2, 16);
+        for id in &ids {
+            apart.offer(*id, Level.distance(*id));
+        }
+        assert_eq!(
+            kept(apart),
+            vec![5, 9],
+            "a full list did not keep the two equals it was offered first"
+        );
+
+        let mut together = SearchList::new(2, 16);
+        together.offer_all(&ids, &Level, 2);
+        assert_eq!(
+            kept(together),
+            vec![5, 9],
+            "a hop was not offered in the order it was handed"
+        );
+    }
+
+    /// Offering a run of ids is offering them one at a time.
+    #[test]
+    fn a_hop_offered_together_is_a_hop_offered_one_at_a_time() {
+        let ids: Vec<u32> = vec![7, 3, 9, 1, 5, 2];
+        let storage = line_storage(16);
+        let calculator = storage.dist_calculator_from_id(4);
+        for ahead in [0, 1, 4] {
+            let mut together = SearchList::new(3, 16);
+            together.offer_all(&ids, &calculator, ahead);
+            let mut apart = SearchList::new(3, 16);
+            for id in &ids {
+                apart.offer(*id, calculator.distance(*id));
+            }
+            assert_eq!(
+                together.into_candidates(),
+                apart.into_candidates(),
+                "a look-ahead of {ahead} changed the list the hop left behind"
+            );
+        }
+    }
 
     /// Vertices on a line at 0, 1, 2, ... so every distance is hand-checkable.
     fn line_storage(num_vertices: usize) -> FlatFloatStorage {

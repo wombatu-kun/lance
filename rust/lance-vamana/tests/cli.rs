@@ -467,12 +467,17 @@ async fn a_build_records_the_parameters_it_was_given() {
 }
 
 /// The one mode no other case reaches.
+///
+/// `--prefetch-ahead` rides along because the report is the only place a caller
+/// can see it: a look-ahead leaves no trace in any counter, so a flag that never
+/// reached `SearchParams` would look exactly like one that did.
 #[tokio::test]
 async fn a_coded_walk_answers_too() {
     let fixture = Fixture::built();
-    let reported = fixture.search(&["--mode", "coded", "--json"]);
+    let reported = fixture.search(&["--mode", "coded", "--prefetch-ahead", "7", "--json"]);
     let reported: Value = serde_json::from_str(&reported).unwrap();
     assert_eq!(reported["settings"]["mode"], "coded");
+    assert_eq!(reported["settings"]["prefetch_ahead"], 7);
     assert_eq!(reported["answers"].as_array().unwrap().len(), QUERIES);
     assert_eq!(reported["answers"][0].as_array().unwrap().len(), K);
 }

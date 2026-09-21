@@ -132,6 +132,9 @@ pub(crate) struct LazyProbe<'a> {
     /// How many vertices one hop expands, and therefore how many rows of
     /// `__neighbors` one request asks for.
     pub(crate) beam_width: usize,
+    /// How many neighbours further on a hop asks for a code while it measures
+    /// the current one: [`crate::SearchParams::prefetch_ahead`].
+    pub(crate) prefetch_ahead: usize,
     /// Every vertex's out-edges when [`crate::cache`] is holding the column,
     /// indexed by local id; `None` asks the file for a hop's rows instead.
     ///
@@ -198,7 +201,14 @@ impl LazyProbe<'_> {
             Some(_) => None,
             None => Some(self.file.project(&[NEIGHBORS_COLUMN]).await?),
         };
-        let mut frontier = Vec::with_capacity(self.beam_width);
+        // Both bounded by the partition as well as by the caller: `beam_width`
+        // is checked against zero and nothing else, `max_degree` is a number off
+        // disk that nothing checks until the first hop reaches `neighbor_slots`,
+        // and neither buffer can hold more than one entry per vertex - a
+        // frontier expands each vertex once and a marked vertex is collected
+        // once.
+        let mut frontier = Vec::with_capacity(self.beam_width.min(num_rows));
+        let mut fresh = Vec::with_capacity(self.beam_width.saturating_mul(width).min(num_rows));
         loop {
             frontier.clear();
             while frontier.len() < self.beam_width {
@@ -225,23 +235,11 @@ impl LazyProbe<'_> {
                 // from the resident column below.
                 None => &[],
             };
-            for (position, vertex) in frontier.iter().enumerate() {
-                // A request answers in the order it was made, so a vertex's
-                // slots sit at its position in the frontier; the resident
-                // column is in partition order, so they sit at its own id.
-                let slots = match self.edges {
-                    Some(edges) => &edges[*vertex as usize * width..][..width],
-                    None => &hop[position * width..][..width],
-                };
-                let out_edges = checked_neighbors(slots, *vertex, num_rows)?;
-                for neighbor in out_edges {
-                    if !scratch.mark(*neighbor) {
-                        continue;
-                    }
-                    comparisons.record(1);
-                    list.offer(*neighbor, coded.distance(*neighbor));
-                }
-            }
+            fresh_neighbours(
+                &frontier, self.edges, hop, width, num_rows, scratch, &mut fresh,
+            )?;
+            comparisons.record(fresh.len() as u64);
+            list.offer_all(&fresh, &coded, self.prefetch_ahead);
         }
 
         let mut candidates = list
@@ -425,4 +423,192 @@ pub(crate) async fn rescore(
         .collect::<Vec<_>>();
     rescored.sort_by(|left, right| left.distance.total_cmp(&right.distance));
     Ok(rescored)
+}
+
+/// The ids of one hop that are worth measuring, in the order the hop offers
+/// them.
+///
+/// A frontier's vertices in the order they were expanded, each contributing the
+/// out-edges this walk has not reached yet, in slot order. A vertex two of them
+/// point at is collected once, at its first mention, because [`SearchScratch`]
+/// has already marked it by the time the second vertex offers it.
+///
+/// Its own function because nothing above it can pin the order. A look-ahead
+/// leaves no trace in any counter, and a fixture of random vectors never
+/// produces two equal distances - so a walk over one answers the same whatever
+/// order its hops are offered in, and the concatenation across a frontier is
+/// exactly the part of a hop no integration test can guard.
+///
+/// `edges` holds every vertex's out-edges by local id when the column is
+/// resident; otherwise `hop` holds the frontier's rows in the order they were
+/// asked for.
+pub(crate) fn fresh_neighbours(
+    frontier: &[u32],
+    edges: Option<&[u32]>,
+    hop: &[u32],
+    width: usize,
+    num_rows: usize,
+    scratch: &mut SearchScratch,
+    fresh: &mut Vec<u32>,
+) -> Result<()> {
+    fresh.clear();
+    for (position, vertex) in frontier.iter().enumerate() {
+        // A request answers in the order it was made, so a vertex's slots sit at
+        // its position in the frontier; the resident column is in partition
+        // order, so they sit at its own id.
+        let slots = match edges {
+            Some(edges) => &edges[*vertex as usize * width..][..width],
+            None => &hop[position * width..][..width],
+        };
+        let out_edges = checked_neighbors(slots, *vertex, num_rows)?;
+        fresh.extend(
+            out_edges
+                .iter()
+                .copied()
+                .filter(|neighbor| scratch.mark(*neighbor)),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::format::NO_NEIGHBOR;
+
+    use super::*;
+
+    const WIDTH: usize = 4;
+    const VERTICES: usize = 16;
+
+    /// Edge rows of [`WIDTH`] slots each, tail-padded the way a partition pads.
+    fn rows(of: &[&[u32]]) -> Vec<u32> {
+        let mut slots = vec![NO_NEIGHBOR; of.len() * WIDTH];
+        for (row, neighbors) in of.iter().enumerate() {
+            slots[row * WIDTH..][..neighbors.len()].copy_from_slice(neighbors);
+        }
+        slots
+    }
+
+    fn collected(frontier: &[u32], edges: &[u32], scratch: &mut SearchScratch) -> Vec<u32> {
+        let mut fresh = Vec::new();
+        fresh_neighbours(
+            frontier,
+            Some(edges),
+            &[],
+            WIDTH,
+            VERTICES,
+            scratch,
+            &mut fresh,
+        )
+        .unwrap();
+        fresh
+    }
+
+    /// A hop is every vertex's neighbours, vertex by vertex, slot by slot.
+    ///
+    /// The order is what decides which of two equally distant candidates
+    /// survives a full list, so a hop that concatenated its vertices the other
+    /// way round, or read a vertex's slots backwards, would answer differently
+    /// wherever codes tie. Nothing above this can see that: a walk only offers
+    /// what it collects, and tied distances do not occur in a fixture of random
+    /// vectors.
+    #[test]
+    fn a_hop_is_its_frontier_in_order_and_each_vertex_in_slot_order() {
+        let mut edges = vec![NO_NEIGHBOR; VERTICES * WIDTH];
+        edges[2 * WIDTH..][..3].copy_from_slice(&[7, 5, 9]);
+        edges[3 * WIDTH..][..2].copy_from_slice(&[1, 4]);
+        let mut scratch = SearchScratch::new(VERTICES);
+        scratch.begin();
+        assert_eq!(
+            collected(&[2, 3], &edges, &mut scratch),
+            vec![7, 5, 9, 1, 4]
+        );
+    }
+
+    /// A vertex two of the hop's vertices point at is collected once, where it
+    /// was first mentioned.
+    #[test]
+    fn a_neighbour_of_two_vertices_is_collected_at_its_first_mention() {
+        let mut edges = vec![NO_NEIGHBOR; VERTICES * WIDTH];
+        edges[2 * WIDTH..][..2].copy_from_slice(&[7, 5]);
+        edges[3 * WIDTH..][..2].copy_from_slice(&[5, 4]);
+        let mut scratch = SearchScratch::new(VERTICES);
+        scratch.begin();
+        assert_eq!(collected(&[2, 3], &edges, &mut scratch), vec![7, 5, 4]);
+    }
+
+    /// What an earlier hop reached is not collected again.
+    #[test]
+    fn a_vertex_an_earlier_hop_reached_is_not_collected_again() {
+        let mut edges = vec![NO_NEIGHBOR; VERTICES * WIDTH];
+        edges[2 * WIDTH..][..3].copy_from_slice(&[7, 5, 9]);
+        let mut scratch = SearchScratch::new(VERTICES);
+        scratch.begin();
+        assert!(scratch.mark(5));
+        assert_eq!(collected(&[2], &edges, &mut scratch), vec![7, 9]);
+    }
+
+    /// The two ways of holding a hop's edges collect the same ids.
+    ///
+    /// A resident column is indexed by local id and a fetched hop by position in
+    /// the request, which is the one place the two arms of the walk differ. The
+    /// frontier is deliberately out of its own order here, so a fetched hop that
+    /// indexed by id, or a resident column that indexed by position, would not
+    /// agree with the other.
+    #[test]
+    fn the_resident_column_and_a_fetched_hop_collect_the_same_ids() {
+        let resident = rows(&[
+            &[],
+            &[],
+            &[7, 5, 9],
+            &[1, 4],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        ]);
+        let frontier = [3, 2];
+        // The rows a request for that frontier would answer with, in the order
+        // it asked for them.
+        let fetched = rows(&[&[1, 4], &[7, 5, 9]]);
+
+        let mut held = SearchScratch::new(VERTICES);
+        held.begin();
+        let mut from_column = Vec::new();
+        fresh_neighbours(
+            &frontier,
+            Some(&resident),
+            &[],
+            WIDTH,
+            VERTICES,
+            &mut held,
+            &mut from_column,
+        )
+        .unwrap();
+
+        let mut read = SearchScratch::new(VERTICES);
+        read.begin();
+        let mut from_request = Vec::new();
+        fresh_neighbours(
+            &frontier,
+            None,
+            &fetched,
+            WIDTH,
+            VERTICES,
+            &mut read,
+            &mut from_request,
+        )
+        .unwrap();
+
+        assert_eq!(from_column, vec![1, 4, 7, 5, 9]);
+        assert_eq!(from_column, from_request);
+    }
 }

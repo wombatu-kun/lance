@@ -266,6 +266,38 @@ pub struct SearchParams {
     /// the phase gate modelled and is deliberately on the low side - what it
     /// should be on a high-latency store is a measurement nobody has taken.
     pub beam_width: usize,
+    /// How many neighbours further on a hop of a [`WalkMode::Lazy`] walk asks
+    /// the processor for a code while it measures the current one.
+    ///
+    /// A hop knows every id it will measure before it measures any of them, and
+    /// a code sits at a place in the code array that only the graph knows, so
+    /// the load is one no hardware prefetcher can start by itself. Telling it
+    /// early is free where the code was resident anyway and is a memory latency
+    /// hidden where it was not.
+    ///
+    /// **Only scalar codes are asked.** The ask is
+    /// `DistCalculator::prefetch`, and of the stores this crate can hold only
+    /// `ScalarQuantizationStorage` implements it; `RabitDistCalculator` inherits
+    /// the trait's empty default, so on [`crate::codes::CodeSpec::Rabit`] - the
+    /// default kind - every depth is a call that returns. A RaBitQ code is not
+    /// one run of bytes either: the binary code, the blocked extended code and
+    /// two factor arrays are four places a vertex has to be fetched from, which
+    /// is presumably why Lance never wrote one.
+    ///
+    /// Two, which is what Lance's own HNSW asks for at search time
+    /// (`hnsw/builder.rs`, `search_basic` passes `Some(2)`). Zero asks for
+    /// nothing, which is the control for the ask itself - though not for the
+    /// walk as it was before this existed, which also offered its hop one
+    /// neighbour at a time. The depth that pays is a measurement and not a
+    /// constant: it has to cover the memory latency of one code without asking
+    /// for more cache lines than the processor can have in flight, and an
+    /// eight-bit code is two cache lines at `d = 128` against fifteen at
+    /// `d = 960`.
+    ///
+    /// Ignored by the walks that hold a whole partition, which measure it in
+    /// one sweep the hardware predicts on its own, and by [`WalkMode::Flat`],
+    /// which does the same.
+    pub prefetch_ahead: usize,
     /// Whether a [`WalkMode::Lazy`] probe holds the whole `__neighbors` column
     /// of a partition it opens, rather than fetching a hop's rows at a time.
     ///
@@ -332,6 +364,7 @@ impl SearchParams {
             search_list_size: k.saturating_add(k / 2),
             mode: WalkMode::default(),
             beam_width: 4,
+            prefetch_ahead: 2,
             resident_edges: false,
             rescore_budget: None,
             report_coded: false,
@@ -355,6 +388,11 @@ impl SearchParams {
 
     pub fn with_beam_width(mut self, beam_width: usize) -> Self {
         self.beam_width = beam_width;
+        self
+    }
+
+    pub fn with_prefetch_ahead(mut self, prefetch_ahead: usize) -> Self {
+        self.prefetch_ahead = prefetch_ahead;
         self
     }
 
@@ -1690,6 +1728,7 @@ impl VamanaIndex {
                 max_degree: probe.max_degree,
                 search_list_size: params.search_list_size,
                 beam_width: params.beam_width,
+                prefetch_ahead: params.prefetch_ahead,
                 edges: resident.edges.as_deref(),
             };
             match params.mode {

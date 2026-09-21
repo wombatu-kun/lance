@@ -172,6 +172,10 @@ struct SearchArgs {
     /// `W`: vertices one hop of a lazy walk expands at a time.
     #[arg(short = 'W', long, default_value_t = 4, value_name = "N")]
     beam_width: usize,
+    /// Neighbours ahead of the one being measured whose code a lazy hop asks
+    /// the processor for. Zero asks for nothing.
+    #[arg(long, default_value_t = 2, value_name = "N")]
+    prefetch_ahead: usize,
     /// Candidates measured exactly, counted across every partition a query
     /// probes rather than within each of them.
     #[arg(long, value_name = "N")]
@@ -406,7 +410,8 @@ async fn search(args: SearchArgs) -> Result<()> {
     let mut params = SearchParams::new(args.k)
         .with_nprobes(args.nprobes)
         .with_mode(args.mode.into())
-        .with_beam_width(args.beam_width);
+        .with_beam_width(args.beam_width)
+        .with_prefetch_ahead(args.prefetch_ahead);
     if let Some(search_list_size) = args.search_list_size {
         params = params.with_search_list_size(search_list_size);
     }
@@ -447,6 +452,7 @@ async fn search(args: SearchArgs) -> Result<()> {
             nprobes: params.nprobes,
             search_list_size: params.search_list_size,
             beam_width: params.beam_width,
+            prefetch_ahead: params.prefetch_ahead,
             rescore_budget: params.rescore_budget,
             cache_mb: args.cache_mb,
             warmup: args.warmup.min(queries.len()),
@@ -833,6 +839,7 @@ struct Settings {
     nprobes: usize,
     search_list_size: usize,
     beam_width: usize,
+    prefetch_ahead: usize,
     rescore_budget: Option<usize>,
     cache_mb: usize,
     warmup: usize,
@@ -870,8 +877,12 @@ impl SearchReport {
         }
         let settings = &self.settings;
         print!(
-            "{} probes, mode {}, L = {}, W = {}",
-            settings.nprobes, settings.mode, settings.search_list_size, settings.beam_width
+            "{} probes, mode {}, L = {}, W = {}, look-ahead {}",
+            settings.nprobes,
+            settings.mode,
+            settings.search_list_size,
+            settings.beam_width,
+            settings.prefetch_ahead
         );
         if let Some(budget) = settings.rescore_budget {
             print!(", budget {budget}");

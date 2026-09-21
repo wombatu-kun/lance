@@ -23,7 +23,12 @@
 //! (`scan`, `walk` or both, default both), `DATASET_DIR` (unset: temporary
 //! directories thrown away at the end), `HNSW_EFS` (unset: no HNSW arm),
 //! `HNSW_NPROBES` (default 1), `HNSW_URI` (default: the `-p1-hnswsq.lance`
-//! directory beside the others) and `IVF_SQ` (default 0).
+//! directory beside the others), `IVF_SQ` (default 0) and `PREFETCH_AHEAD`
+//! (default 2; zero asks for nothing, so one binary carries the ask's own
+//! control - but not a control for the collect-then-measure hop it also
+//! carries, which is the previous commit's binary). `PREFETCH_AHEAD` reaches an
+//! instruction only under `CODE_KIND=sq`: RaBitQ's calculator has no
+//! `prefetch`.
 //!
 //! `LANCE_RQ_PRUNE_STATS=1` is Lance's own knob, not this example's: `IVF_RQ`
 //! tallies how many rows its two-stage estimator threw away on the binary code
@@ -449,6 +454,7 @@ async fn measure_vamana(
     budget: usize,
     mode: WalkMode,
     beam_width: usize,
+    prefetch_ahead: usize,
 ) -> Cost {
     let Fixture {
         queries,
@@ -468,6 +474,7 @@ async fn measure_vamana(
         .with_search_list_size(list_size)
         .with_mode(mode)
         .with_beam_width(beam_width)
+        .with_prefetch_ahead(prefetch_ahead)
         .with_resident_edges(resident_edges)
         .with_report_coded(true)
         .with_rescore_budget(budget);
@@ -1012,6 +1019,10 @@ async fn main() {
          the point measures a shorter list than its label claims"
     );
     let beam_width = env_usize("BEAM_WIDTH", 4);
+    // Neighbours ahead of the one being measured whose code a lazy hop asks the
+    // processor for. Zero asks for nothing, so one pass carries the ask's own
+    // control. Only `CODE_KIND=sq` reaches a real prefetch.
+    let prefetch_ahead = env_usize("PREFETCH_AHEAD", 2);
     let cache_bytes = env_usize("CACHE_MB", 4096) << 20;
     let target = env_usize("TARGET", 95) as f64 / 100.0;
     let warmup = env_usize("WARMUP", num_queries).min(num_queries);
@@ -1325,6 +1336,7 @@ async fn main() {
                     point.budget,
                     mode,
                     beam_width,
+                    prefetch_ahead,
                 )
                 .await;
                 report(&label, point.axis, &cost);

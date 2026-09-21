@@ -154,17 +154,27 @@ async fn a_hop_of_one_vertex_is_the_coded_walk_exactly(codes: CodeSpec) {
             .search(&query, &search(WalkMode::Coded))
             .await
             .unwrap();
-        let lazy = index.search(&query, &narrow).await.unwrap();
-        assert_eq!(
-            lazy.neighbors, coded.neighbors,
-            "a hop of one vertex answered differently from the walk it is supposed to be"
-        );
-        assert_eq!(
-            lazy.comparisons, coded.comparisons,
-            "the two walks measured a different number of distances, so they did not walk the \
-             same graph"
-        );
-        assert_eq!(lazy.partitions_read, coded.partitions_read);
+        // Both look-aheads, because the whole-partition walk is the only code
+        // here that never learned about them: it offers its neighbours one at a
+        // time where the lazy hop now collects them first, so this is also what
+        // pins that restructuring.
+        for ahead in [0, 2] {
+            let lazy = index
+                .search(&query, &narrow.clone().with_prefetch_ahead(ahead))
+                .await
+                .unwrap();
+            assert_eq!(
+                lazy.neighbors, coded.neighbors,
+                "a hop of one vertex at a look-ahead of {ahead} answered differently from the \
+                 walk it is supposed to be"
+            );
+            assert_eq!(
+                lazy.comparisons, coded.comparisons,
+                "the two walks measured a different number of distances, so they did not walk \
+                 the same graph"
+            );
+            assert_eq!(lazy.partitions_read, coded.partitions_read);
+        }
     }
 }
 
@@ -1209,6 +1219,47 @@ async fn a_lazy_query_is_validated_like_any_other() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("dimensions"), "{error}");
+}
+
+/// Asking for a code before the distance that reads it is a hint, and a hint
+/// cannot change an answer.
+///
+/// Every depth against zero: one, the default two, a depth past any hop this
+/// fixture produces, and `usize::MAX`. Both ways of reaching the edges, because
+/// a hop collects its ids from a different place in each.
+///
+/// Scalar codes, and that is the whole reason this case exists rather than the
+/// RaBitQ one: `ScalarQuantizationStorage` is the only store this crate can hold
+/// that implements `prefetch` at all, so on RaBitQ every depth would be a call
+/// that returns and the case would be asserting that nothing changes nothing.
+///
+/// What it cannot pin, unlike `resident_edges_do_not_change_an_answer` below, is
+/// that the depth arrived: a look-ahead leaves no trace in any counter, so a
+/// walk that ignored the knob would pass this too. The knob reaching the hop is
+/// read off `query.rs` and off `offer_all`'s own cases, not off this.
+#[tokio::test]
+async fn a_look_ahead_does_not_change_an_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri, SCALAR).await;
+    let queries = random_vectors(QUERIES, 2129);
+
+    for resident in [false, true] {
+        let index = cached(&dataset, BUDGET).await;
+        let none = search(WalkMode::Lazy)
+            .with_resident_edges(resident)
+            .with_prefetch_ahead(0);
+        let (without, _) = replay(&index, &queries, &none).await;
+        for ahead in [1, 2, 64, usize::MAX] {
+            let (with, _) =
+                replay(&index, &queries, &none.clone().with_prefetch_ahead(ahead)).await;
+            assert_same(
+                &without,
+                &with,
+                &format!("a look-ahead of {ahead}, resident edges {resident}"),
+            );
+        }
+    }
 }
 
 /// Holding `__neighbors` across queries changes what a walk reads and must
