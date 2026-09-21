@@ -178,7 +178,14 @@ two are meant to say the same thing.
   rather than every partition it probes - and by default the next query pays for
   those same partitions again. `VamanaIndex::with_cache(LanceCache)` changes
   that, and holds the part of a partition that does not depend on the query: the
-  layout of its file, and for a lazy walk the codes and row ids it steers by.
+  open file itself, the layout that came with it, and for a lazy walk the codes
+  and row ids it steers by. The open files are capped at 64 entries and sit
+  outside the cache's byte budget; over the cap the least recently used one is
+  dropped and the next query that wants it opens it again. The cap is on entries
+  rather than on descriptors: an entry costs two once a re-score has read through
+  it on local storage, a query holds a handle per probe whatever the cap says,
+  and each held entry also pins the footer its reader was built from, which the
+  cache can then evict without reclaiming anything.
   Nothing needs invalidating, because nothing an entry describes can change -
   deleting rows edits no index file, and adding rows or consolidating writes a
   *new* segment under a new uuid. What an index keeps without a cache is
@@ -377,7 +384,21 @@ two are meant to say the same thing.
   candidates and read nothing; the query keeps the nearest `budget` of them
   across every probe, ranked by coded distance and tie-broken on the row address
   so that the order the probes happen to finish in cannot change the answer; only
-  then are vectors fetched. At equal recall, with the budget set to `L`:
+  then are vectors fetched. Those vectors are fetched by byte offset rather than
+  decoded: `__vector` is a non-nullable full-zip column, so row `r` starts at
+  `data_buf_position + r * dimension * 4`, and `crate::raw` reads that arithmetic
+  out of the footer Lance already parsed and asks the scheduler for the ranges
+  directly. The bytes and the reads are identical to the decoder's - the ranges
+  are the ones its own full-zip scheduler would have built - and what is skipped
+  is a projected reader, a decode engine and a task per batch for twenty rows. On
+  local storage it goes one step further and `pread`s those ranges off a
+  descriptor the index already holds, coalescing them the way the scheduler
+  would so that the byte, read and request counts stay the same; that trades the
+  scheduler's queue and its hop onto the blocking pool for a read on the calling
+  thread, which is a microsecond warm and about a hundred cold. A file that
+  fails any of the layout's checks, or one on a store that is not local, is read
+  the old way. At equal
+  recall, with the budget set to `L`:
 
   | | 8192 rows, 7 probes | 65536 rows, 4 probes |
   |---|---|---|

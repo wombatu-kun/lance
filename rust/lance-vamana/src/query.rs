@@ -133,8 +133,11 @@ use crate::format::{
     FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, NEIGHBORS_COLUMN, ROW_ID_COLUMN, RowIdMode,
     VECTOR_COLUMN,
 };
+use lance_io::object_store::ObjectStore;
+
 use crate::io::{
-    PartitionFile, check_partition_shape, read_partition_batch, read_segment, scan_scheduler,
+    OPEN_FILES, OpenFiles, PartitionFile, check_partition_shape, read_partition_batch,
+    read_segment, scan_scheduler,
 };
 use crate::lazy::{self, Candidate, LazyProbe};
 use crate::partition::Partition;
@@ -474,6 +477,15 @@ pub struct VamanaIndex {
     /// the index has a cache. The walks that read a partition whole allocate
     /// their own, beside the partition they hold.
     scratches: ScratchPool,
+    /// Partition files this index has open, shared by the queries that probe
+    /// them. Empty for an index with no cache, which reads rather than holds.
+    files: OpenFiles,
+    /// Kept to tell a local file from a remote one, which decides whether a
+    /// re-score reads through the scheduler or straight off the disk.
+    store: Arc<ObjectStore>,
+    /// What this index has read without going through its scheduler, which is
+    /// the only place those bytes are counted.
+    direct: Arc<IoStats>,
 }
 
 /// The stored vertices a walk must not return.
@@ -739,7 +751,8 @@ impl VamanaIndex {
             .filter(|fragment| !fragment.metadata().overlays.is_empty())
             .map(|fragment| (fragment.id() as u32, fragment.metadata()))
             .collect::<Vec<_>>();
-        let scheduler = scan_scheduler(&dataset.object_store(None).await?);
+        let store = dataset.object_store(None).await?;
+        let scheduler = scan_scheduler(&store);
         let remap = dataset.frag_reuse_index().await?;
 
         // Everything a segment can be refused for without reading it, first:
@@ -1018,6 +1031,9 @@ impl VamanaIndex {
                 moved,
             }),
             scratches: ScratchPool::new(),
+            files: OpenFiles::new(OPEN_FILES),
+            store,
+            direct: Arc::new(IoStats::new()),
         })
     }
 
@@ -1061,24 +1077,36 @@ impl VamanaIndex {
         Some(cache.stats().await)
     }
 
-    /// Open one probed partition's file, through the cache if there is one.
+    /// Open one probed partition's file, or take the one this index already has
+    /// open, with this query's sink bound onto it.
+    ///
+    /// Files are held only by an index that was given a cache. An index that was
+    /// not is documented to read every time rather than almost every time, and a
+    /// held file holds its footer with it, which is most of what "every time"
+    /// was about.
     async fn partition_file(&self, probe: &Probe, stats: &IoStats) -> Result<PartitionFile> {
-        match &self.cache {
-            Some(cache) => {
-                PartitionFile::open_cached(
-                    &self.scheduler,
-                    &probe.path,
-                    probe.size_bytes,
-                    cache,
-                    Some(stats),
-                )
-                .await
-            }
-            None => {
-                PartitionFile::open(&self.scheduler, &probe.path, probe.size_bytes, Some(stats))
-                    .await
-            }
+        let Some(cache) = &self.cache else {
+            return PartitionFile::open(
+                &self.scheduler,
+                &probe.path,
+                probe.size_bytes,
+                Some(stats),
+            )
+            .await;
+        };
+        if let Some(open) = self.files.get(&probe.path, stats) {
+            return Ok(open);
         }
+        let opened = PartitionFile::open_cached(
+            &self.scheduler,
+            &probe.path,
+            probe.size_bytes,
+            cache,
+            Some(stats),
+        )
+        .await?
+        .with_local_reads(&self.store, &self.direct);
+        Ok(self.files.put(&probe.path, opened, stats))
     }
 
     /// What this index answers for: every fragment its segments were built over,
@@ -1111,9 +1139,16 @@ impl VamanaIndex {
     /// Every byte this index has read since it was opened.
     ///
     /// Taken off the index's own scheduler rather than off a tracker wrapped
-    /// around the store, which under-counts a local read.
+    /// around the store, which under-counts a local read - plus the re-scores
+    /// that read straight off the disk, which the scheduler never sees.
     pub fn io_stats(&self) -> ScanStats {
-        self.scheduler.stats()
+        let scheduled = self.scheduler.stats();
+        let direct = self.direct.snapshot();
+        ScanStats {
+            iops: scheduled.iops + direct.iops,
+            requests: scheduled.requests + direct.requests,
+            bytes_read: scheduled.bytes_read + direct.bytes_read,
+        }
     }
 
     /// What opening the index established about its segments, for the one

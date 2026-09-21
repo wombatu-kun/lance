@@ -861,11 +861,17 @@ async fn cached(dataset: &Dataset, budget: usize) -> VamanaIndex {
 
 /// A cache changes what a query reads and must change nothing else.
 ///
-/// All three modes, because two of them take the cache in different amounts:
-/// the whole-partition walks keep only the layout of a file they have opened
-/// before, while a lazy walk also keeps what it steers by. Both runs of the
-/// cached arm are compared, so the answer is pinned against the read that
+/// All three modes, because they take the cache in different amounts: the
+/// whole-partition walks keep the file they have opened before and the layout
+/// that came with it, while a lazy walk also keeps what it steers by. Both runs
+/// of the cached arm are compared, so the answer is pinned against the read that
 /// populated the cache as well as against the index that has none.
+///
+/// The guard is on bytes and not on cache hits. An index that holds a partition
+/// file holds its footer inside it, so a second query that probes the same
+/// partition never looks the layout up again - a whole-partition walk can
+/// therefore be perfectly warm with a hit count of zero. What warmth actually
+/// claims is that the second pass re-read less, and that is what is asserted.
 #[tokio::test]
 async fn a_cache_does_not_change_an_answer() {
     let dir = tempfile::tempdir().unwrap();
@@ -879,14 +885,21 @@ async fn a_cache_does_not_change_an_answer() {
         let (uncached, _) = replay(&plain, &queries, &params).await;
 
         let index = cached(&dataset, BUDGET).await;
-        let (cold, _) = replay(&index, &queries, &params).await;
-        let (warm, _) = replay(&index, &queries, &params).await;
+        let (cold, cold_cost) = replay(&index, &queries, &params).await;
+        let (warm, warm_cost) = replay(&index, &queries, &params).await;
 
         assert_same(&uncached, &cold, &format!("{mode:?}, first pass"));
         assert_same(&uncached, &warm, &format!("{mode:?}, second pass"));
         assert!(
-            index.cache_stats().await.unwrap().hits > 0,
-            "{mode:?}: the cache served nothing, so the equality above proves nothing"
+            warm_cost.bytes < cold_cost.bytes,
+            "{mode:?}: the warm pass re-read as much as the cold one, {:.0} bytes a query \
+             against {:.0}, so the equality above proves nothing",
+            warm_cost.bytes,
+            cold_cost.bytes
+        );
+        assert!(
+            index.cache_stats().await.unwrap().num_entries > 0,
+            "{mode:?}: the cache holds nothing, so nothing was shared through it"
         );
     }
 }

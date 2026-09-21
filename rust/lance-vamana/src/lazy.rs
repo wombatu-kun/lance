@@ -402,9 +402,14 @@ pub(crate) async fn rescore(
         .iter()
         .map(|candidate| candidate.row_addr)
         .collect::<Vec<_>>();
-    let vectors = file.project_into(&[VECTOR_COLUMN], stats).await?;
-    let batch = read_scattered(&vectors, &ids).await?;
-    let values = vectors_of(&batch, dimension)?;
+    let values = match file.read_vectors(&ids, dimension, stats).await? {
+        Some(values) => values,
+        None => {
+            let vectors = file.project_into(&[VECTOR_COLUMN], stats).await?;
+            let batch = read_scattered(&vectors, &ids).await?;
+            vectors_of(&batch, dimension)?
+        }
+    };
     let store = flat_storage(&row_addrs, &values, distance_type)?;
     let exact = store.dist_calculator(query, 0.0);
 

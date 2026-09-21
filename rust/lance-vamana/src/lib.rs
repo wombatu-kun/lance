@@ -25,6 +25,7 @@ pub mod merge;
 pub mod merger;
 pub mod partition;
 pub mod query;
+mod raw;
 pub mod search;
 pub mod segment;
 

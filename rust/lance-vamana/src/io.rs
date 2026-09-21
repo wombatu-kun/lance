@@ -7,8 +7,9 @@
 //! so every file we write is an ordinary Lance file that Lance's own reader can
 //! open. Nothing in this module needs the `lance` crate.
 
+use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_array::{FixedSizeListArray, RecordBatch};
 use arrow_select::concat::concat_batches;
@@ -25,6 +26,7 @@ use lance_file::writer::FileWriterOptions;
 use lance_index::pb;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_io::ReadBatchParams;
+use lance_io::local::to_local_path;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, IoStats, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -34,10 +36,11 @@ use prost::Message;
 use crate::cache::FileKey;
 use crate::codes::encode;
 use crate::format::{
-    INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, index_schema,
-    partition_file_name,
+    INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, VECTOR_COLUMN,
+    index_schema, partition_file_name,
 };
 use crate::partition::{Partition, row_ids_from_batch};
+use crate::raw::{self, VectorLayout};
 use crate::segment::{PartitionEntry, SegmentManifest};
 
 /// The file format every file in a segment is written in.
@@ -107,6 +110,56 @@ pub struct PartitionFile {
     /// The unprojected reader: where the file metadata every projection is built
     /// from comes from, and the answer when a caller wants every column.
     reader: FileReader,
+    /// Where the vectors are, worked out from the footer the first time a
+    /// re-score asks and shared by every clone of this file afterwards.
+    /// `None` inside the cell means this file is not addressable and the
+    /// decoder has to do the reading.
+    vectors: Arc<OnceLock<Option<VectorLayout>>>,
+    /// How this file re-scores when its store is one whose objects are local
+    /// files and a caller asked for that. See [`Self::with_local_reads`].
+    local: Option<LocalReads>,
+}
+
+/// A partition file open for reading without going through the scheduler.
+///
+/// The scheduler's job on a local file is to bound how many reads are in flight
+/// and to move each one onto the blocking pool. For a re-score neither buys
+/// anything: it wants twenty ranges of a few kilobytes that the page cache
+/// almost always holds, and it pays a queue, a task and a wakeup for each of
+/// them. Reading them here costs one `pread` each and no hop at all.
+///
+/// What it costs instead is honesty about where the read happens: a `pread` of a
+/// page the kernel does not have blocks the thread it runs on, which is a tokio
+/// worker. Warm that is about a microsecond; cold it is about a hundred. The
+/// path that would make this unconditionally safe is running the whole resident
+/// query off the runtime, which is a change of its own.
+#[derive(Clone)]
+struct LocalReads {
+    /// The scheduler's own coalescing parameters, kept so that reading by hand
+    /// moves the same bytes in the same number of reads.
+    block_size: u64,
+    max_iop_size: u64,
+    /// Where these reads are added to the index's running totals. The scheduler
+    /// keeps its own and never sees these, so an index that did not keep them
+    /// here would report less than it read.
+    totals: Arc<IoStats>,
+    /// Opened on the first re-score and shared by every clone of this file.
+    /// Lazily, for two reasons: the whole-partition modes never re-score and
+    /// would hold a descriptor for nothing, and opening one is a blocking call
+    /// that has no business on a runtime worker.
+    file: Arc<OnceLock<std::fs::File>>,
+}
+
+/// Fill `buf` from `offset`, whatever the platform calls it.
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+#[cfg(not(unix))]
+fn read_at(_file: &std::fs::File, _buf: &mut [u8], _offset: u64) -> std::io::Result<()> {
+    // Unreachable: `with_local_reads` binds no file off Unix.
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 impl PartitionFile {
@@ -208,6 +261,8 @@ impl PartitionFile {
             path: path.clone(),
             file,
             reader,
+            vectors: Arc::new(OnceLock::new()),
+            local: None,
         })
     }
 
@@ -256,9 +311,325 @@ impl PartitionFile {
         self.project_with(columns, Some(stats)).await
     }
 
+    /// A clone of this file whose reads are recorded into `stats` rather than
+    /// into wherever this one records.
+    ///
+    /// The whole file, not one projection of it: [`Self::project_into`] rebinds
+    /// a single reader, which is what separates the two halves of a query, while
+    /// this rebinds the handle every projection is built from, which is what
+    /// lets one open file be shared by queries that must not be counted
+    /// together. Cheap in both directions - each of the two handles clones a few
+    /// `Arc`s and reuses the footer, so nothing is re-read and nothing is
+    /// rebuilt.
+    pub fn with_io_stats(&self, stats: &IoStats) -> Self {
+        Self {
+            path: self.path.clone(),
+            file: self.file.with_io_stats(stats.recorder()),
+            reader: self.reader.with_io_stats(stats.recorder()),
+            vectors: self.vectors.clone(),
+            local: self.local.clone(),
+        }
+    }
+
+    /// The reader every projection of this file is built from.
+    #[cfg(test)]
+    pub(crate) fn reader(&self) -> &FileReader {
+        &self.reader
+    }
+
+    /// Open this file a second time for reading directly, if `store` is local
+    /// storage and the platform has positional reads.
+    ///
+    /// A builder step rather than part of opening, because only a query wants
+    /// it: a build or a maintenance pass reads whole columns once, where the
+    /// scheduler's queueing is what it is for. Failure to open is not an error -
+    /// the file is already open through the scheduler, and that is the path this
+    /// one is an optimisation of.
+    ///
+    /// `totals` is the caller's running count of everything read off the
+    /// scheduler, which it has to add to whatever the scheduler reports.
+    ///
+    /// `has_direct_local_paths` and not `is_local`, because that is the
+    /// predicate Lance's own reader dispatch turns on: a local store rooted
+    /// below `/` addresses its objects relative to that root, and
+    /// `to_local_path` would name an absolute path somewhere else entirely. The
+    /// failure would be silent rather than loud - a descriptor on another inode,
+    /// read at this file's offsets. `file+uring` is left out for the opposite
+    /// reason: a caller who configured io_uring asked for the scheduler, and
+    /// substituting synchronous reads would undo what they chose.
+    pub(crate) fn with_local_reads(mut self, store: &ObjectStore, totals: &Arc<IoStats>) -> Self {
+        if cfg!(unix) && store.has_direct_local_paths() && !store.prefers_lite_scheduler() {
+            self.local = Some(LocalReads {
+                block_size: store.block_size() as u64,
+                max_iop_size: store.max_iop_size(),
+                totals: totals.clone(),
+                file: Arc::new(OnceLock::new()),
+            });
+        }
+        self
+    }
+
+    /// The descriptor a re-score reads through, opened the first time one asks.
+    ///
+    /// `None` when this file has none to open or opening it failed, both of
+    /// which mean the scheduler reads the same bytes instead. The open runs off
+    /// the worker: it is a blocking syscall, and Lance's own local reader takes
+    /// the same care with the same call.
+    async fn local_reads(&self) -> Option<(&LocalReads, &std::fs::File)> {
+        let local = self.local.as_ref()?;
+        if local.file.get().is_none() {
+            let path = to_local_path(&self.path);
+            if let Ok(Ok(opened)) =
+                tokio::task::spawn_blocking(move || std::fs::File::open(path)).await
+            {
+                // The loser of a race drops its descriptor here rather than
+                // publishing a second one.
+                let _ = local.file.set(opened);
+            }
+        }
+        Some((local, local.file.get()?))
+    }
+
+    /// Whether this file will read its vectors off the disk itself. Says
+    /// nothing about whether it has opened the descriptor yet - it does that on
+    /// the first re-score.
+    #[cfg(test)]
+    pub(crate) fn reads_locally(&self) -> bool {
+        self.local.is_some()
+    }
+
+    /// The vectors of `rows`, fetched by byte offset instead of decoded.
+    ///
+    /// `Ok(None)` when this file's vector column is not addressable, or when it
+    /// is not the width the segment declares - both mean the caller has to read
+    /// the ordinary way, and the second of them is left to the decoder on
+    /// purpose, so that a mismatched width is reported by the check that has
+    /// always reported it.
+    ///
+    /// The bytes still go through the scheduler, so they are coalesced, counted
+    /// and throttled exactly as the decoder's would be: what is skipped is the
+    /// decoder, not the reading. `rows` must ascend, which the scheduler
+    /// requires and a candidate list already satisfies.
+    pub(crate) async fn read_vectors(
+        &self,
+        rows: &[u32],
+        dimension: u32,
+        stats: &IoStats,
+    ) -> Result<Option<FixedSizeListArray>> {
+        let Some(layout) = self
+            .vectors
+            .get_or_init(|| VectorLayout::of(&self.reader, VECTOR_COLUMN))
+        else {
+            return Ok(None);
+        };
+        if layout.items() != u64::from(dimension) || layout.stride() != u64::from(dimension) * 4 {
+            return Ok(None);
+        }
+        let wanted = layout.ranges(rows)?;
+        let Some((local, _)) = self.local_reads().await else {
+            let chunks = self
+                .file
+                .with_io_stats(stats.recorder())
+                .submit_request(wanted, 0)
+                .await?;
+            return raw::vectors(chunks.iter().map(|chunk| chunk.as_ref()), dimension).map(Some);
+        };
+
+        let reads = raw::coalesced(&wanted, local.block_size, local.max_iop_size);
+
+        // One hop for the whole batch. The reads are blocking syscalls and there
+        // can be one per candidate, which without a re-score budget is the whole
+        // search list - leaving that on a runtime worker would hold it through
+        // every one of them with nowhere to yield.
+        let descriptor = local.file.clone();
+        let batch = reads.clone();
+        let blocks = tokio::task::spawn_blocking(move || {
+            let Some(file) = descriptor.get() else {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            };
+            batch
+                .iter()
+                .map(|read| {
+                    let mut block = vec![0u8; (read.end - read.start) as usize];
+                    read_at(file, &mut block, read.start).map(|()| block)
+                })
+                .collect::<std::io::Result<Vec<_>>>()
+        })
+        .await
+        .map_err(|source| Error::io(format!("Vamana re-score read was cancelled: {source}")))?
+        .map_err(|source| {
+            Error::io(format!(
+                "Vamana could not read {reads:?} of {}: {source}",
+                self.path
+            ))
+        })?;
+
+        // Counted here because nothing else counts them at all: these bytes never
+        // reach the scheduler, so the query's own sink and the index's running
+        // total both have to be told by hand. After the reads and not before, so
+        // that a read that failed is not charged to an index for the rest of its
+        // life - the scheduler charges first and would have, but a number that
+        // survives its own failure is worse than one that matches it.
+        stats.record_request(&reads);
+        local.totals.record_request(&reads);
+
+        let slices = raw::slices(&wanted, &reads, &blocks)?;
+        raw::vectors(slices.iter().map(|slice| slice.as_ref()), dimension).map(Some)
+    }
+
     /// The reader over every column.
     pub fn whole(self) -> FileReader {
         self.reader
+    }
+}
+
+/// How many partition files an index keeps open at once.
+///
+/// A descriptor is a real resource and an index can hold thousands of
+/// partitions, so this is a cap and not a count. What it caps is entries, and an
+/// entry can cost two descriptors rather than one: the reader's, and - once a
+/// re-score has run against it on local storage - the one it `pread`s through.
+/// Nor is the pool the only holder. A query keeps a handle per probe until its
+/// re-score is done, so `nprobes` times the queries in flight are open whatever
+/// this says, and evicting an entry a query still holds releases nothing until
+/// that query finishes.
+///
+/// The number wants to be at least the *distinct partitions* the queries in
+/// flight probe between them, which is `nprobes` times their number, not
+/// `PARTITIONS_IN_FLIGHT` times it. Below that the queries evict each other's
+/// handles and every probe misses, which costs what every probe cost before this
+/// existed. Sixty-four covers a server answering a dozen queries over a handful
+/// of partitions each; an index partitioned finely enough to probe dozens at a
+/// time wants more, and a caller cannot say so yet.
+pub const OPEN_FILES: usize = 64;
+
+/// The partition files an index has open, shared by every query that probes
+/// them.
+///
+/// Opening one is not a read and so is not bounded by anything a read is bounded
+/// by: `ScanScheduler::open_file` on local storage is
+/// `spawn_blocking(File::open)`, a hop through the blocking pool and a real
+/// `open(2)`, and a query paid it once for every partition it probed. The footer
+/// that comes with it has been shared through the cache since the cache existed;
+/// the descriptor never was.
+///
+/// It also pins what the handle holds, which is more than a descriptor: the
+/// footer the reader was built from is an `Arc<CachedFileMetadata>` shared with
+/// the cache, so the cache can evict its entry and reclaim nothing. A few
+/// kilobytes a file at the partition sizes this crate is written for, tens of
+/// megabytes for sixty-four files of a million 960-wide rows.
+///
+/// A handle is stored with the sink of whichever query opened it still bound on,
+/// and that sink is never used again: every handout rebinds
+/// ([`PartitionFile::with_io_stats`] replaces the recorder rather than adding
+/// one), and the raw handle never leaves this type. Storing it that way rather
+/// than sink-free keeps the accounting exactly where it was - the query that
+/// opens a file pays for its footer, the queries that share it pay for nothing -
+/// so a query's two phases still add up to what the scheduler counted for it
+/// even when a handle is evicted and opened again mid-run.
+pub(crate) struct OpenFiles {
+    cap: usize,
+    inner: Mutex<Opened>,
+}
+
+#[derive(Default)]
+struct Opened {
+    files: HashMap<Path, Handle>,
+    /// Stamped onto a handle whenever it is looked up, so the smallest stamp is
+    /// the least recently used.
+    tick: u64,
+}
+
+struct Handle {
+    file: Arc<PartitionFile>,
+    used: u64,
+}
+
+impl std::fmt::Debug for OpenFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = self.inner.lock().map(|open| open.files.len()).ok();
+        f.debug_struct("OpenFiles")
+            .field("cap", &self.cap)
+            .field("held", &held)
+            .finish()
+    }
+}
+
+impl OpenFiles {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            inner: Mutex::new(Opened::default()),
+        }
+    }
+
+    /// The open file for `path` with `stats` bound onto it, if this index still
+    /// holds one.
+    pub(crate) fn get(&self, path: &Path, stats: &IoStats) -> Option<PartitionFile> {
+        let mut open = self.inner.lock().ok()?;
+        open.tick += 1;
+        let tick = open.tick;
+        let handle = open.files.get_mut(path)?;
+        handle.used = tick;
+        Some(handle.file.with_io_stats(stats))
+    }
+
+    /// Hold `file` for the queries after this one, and return the handle they
+    /// will all share, with `stats` bound onto it.
+    ///
+    /// Keeps what is already held under `path` when there is one rather than
+    /// replacing it: two queries that miss on the same partition at the same
+    /// moment both open the file, and the loser's handle is dropped here so that
+    /// both of them read through one descriptor rather than two.
+    pub(crate) fn put(&self, path: &Path, file: PartitionFile, stats: &IoStats) -> PartitionFile {
+        // Both of these hold descriptors, and both are dropped after the guard
+        // goes out of scope: closing a file on a slow mount inside the lock
+        // would stall every other query's lookup behind it.
+        let mut loser = None;
+        let mut evicted = Vec::new();
+        let shared = {
+            let Ok(mut open) = self.inner.lock() else {
+                return file;
+            };
+            open.tick += 1;
+            let tick = open.tick;
+            match open.files.get_mut(path) {
+                Some(handle) => {
+                    handle.used = tick;
+                    let shared = handle.file.with_io_stats(stats);
+                    loser = Some(file);
+                    shared
+                }
+                None => {
+                    let held = Arc::new(file);
+                    let shared = held.with_io_stats(stats);
+                    open.files.insert(
+                        path.clone(),
+                        Handle {
+                            file: held,
+                            used: tick,
+                        },
+                    );
+                    // After the insert, so the handle just taken is the newest
+                    // and cannot be the one evicted.
+                    while open.files.len() > self.cap {
+                        let Some(stalest) = open
+                            .files
+                            .iter()
+                            .min_by_key(|(_, handle)| handle.used)
+                            .map(|(path, _)| path.clone())
+                        else {
+                            break;
+                        };
+                        evicted.extend(open.files.remove(&stalest));
+                    }
+                    shared
+                }
+            }
+        };
+        drop(loser);
+        drop(evicted);
+        shared
     }
 }
 
@@ -851,4 +1222,139 @@ fn validate_ivf_model(proto: &pb::Ivf) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::Float32Array;
+    use arrow_schema::{DataType, Field};
+
+    use crate::partition::PartitionGraph;
+
+    const DIMENSION: i32 = 3;
+
+    fn sample_partition() -> Partition {
+        let graph =
+            PartitionGraph::try_new(2, vec![100, 200, 300], vec![vec![1], vec![2], vec![0]])
+                .unwrap();
+        let values = (0..graph.len() as i32 * DIMENSION)
+            .map(|value| value as f32)
+            .collect::<Vec<_>>();
+        let vectors = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            DIMENSION,
+            Arc::new(Float32Array::from(values)),
+            None,
+        )
+        .unwrap();
+        Partition::try_new(graph, vectors).unwrap()
+    }
+
+    /// One partition file on disk, and the scheduler to read it through.
+    async fn written(dir: &tempfile::TempDir, name: &str) -> (Arc<ScanScheduler>, Path) {
+        let store = Arc::new(ObjectStore::local());
+        let path = Path::from_absolute_path(dir.path().join(name)).unwrap();
+        write_partition(&store, &path, &sample_partition(), None)
+            .await
+            .unwrap();
+        (scan_scheduler(&store), path)
+    }
+
+    async fn open(scheduler: &Arc<ScanScheduler>, path: &Path) -> PartitionFile {
+        PartitionFile::open(scheduler, path, None, None)
+            .await
+            .unwrap()
+    }
+
+    /// The handle held under `path`, by identity rather than by value: what the
+    /// pool is for is that everyone gets the *same* open file.
+    fn held(files: &OpenFiles, path: &Path) -> Option<Arc<PartitionFile>> {
+        let open = files.inner.lock().unwrap();
+        open.files.get(path).map(|handle| handle.file.clone())
+    }
+
+    #[tokio::test]
+    async fn a_held_file_is_handed_out_rather_than_opened_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (scheduler, path) = written(&dir, "part_00000.idx").await;
+        let files = OpenFiles::new(4);
+        let stats = IoStats::new();
+
+        assert!(
+            files.get(&path, &stats).is_none(),
+            "an empty pool handed out a file it was never given"
+        );
+        files.put(&path, open(&scheduler, &path).await, &stats);
+
+        let first = held(&files, &path).unwrap();
+        assert!(files.get(&path, &stats).is_some());
+        let after = held(&files, &path).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &after),
+            "a lookup replaced the handle instead of handing it out"
+        );
+    }
+
+    /// Two queries that miss on the same partition at the same moment both open
+    /// the file. Only one of the two descriptors may survive, and it has to be
+    /// the one already published, or the loser's callers read through a handle
+    /// nobody else can reach.
+    #[tokio::test]
+    async fn a_second_open_of_one_path_keeps_the_first_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (scheduler, path) = written(&dir, "part_00000.idx").await;
+        let files = OpenFiles::new(4);
+        let stats = IoStats::new();
+
+        files.put(&path, open(&scheduler, &path).await, &stats);
+        let first = held(&files, &path).unwrap();
+        files.put(&path, open(&scheduler, &path).await, &stats);
+        let after = held(&files, &path).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first, &after),
+            "the second open displaced the handle the first one published"
+        );
+        assert_eq!(files.inner.lock().unwrap().files.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_least_recently_used_handle_goes_when_the_cap_is_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (scheduler, first) = written(&dir, "part_00000.idx").await;
+        let (_, second) = written(&dir, "part_00001.idx").await;
+        let (_, third) = written(&dir, "part_00002.idx").await;
+        let files = OpenFiles::new(2);
+        let stats = IoStats::new();
+
+        files.put(&first, open(&scheduler, &first).await, &stats);
+        files.put(&second, open(&scheduler, &second).await, &stats);
+        assert_eq!(
+            files.inner.lock().unwrap().files.len(),
+            2,
+            "the pool evicted before it was over its cap"
+        );
+
+        // Make the first the freshly used one, so eviction by insertion order
+        // and eviction by use pick different handles.
+        assert!(files.get(&first, &stats).is_some());
+        files.put(&third, open(&scheduler, &third).await, &stats);
+
+        let open_now = files.inner.lock().unwrap();
+        assert_eq!(open_now.files.len(), 2, "the pool grew past its cap");
+        assert!(
+            open_now.files.contains_key(&first),
+            "the handle used most recently was evicted"
+        );
+        assert!(
+            open_now.files.contains_key(&third),
+            "the handle just taken was evicted"
+        );
+        assert!(
+            !open_now.files.contains_key(&second),
+            "the stalest handle survived"
+        );
+    }
 }
