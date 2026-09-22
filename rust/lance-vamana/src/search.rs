@@ -83,10 +83,15 @@ impl Comparisons {
 /// The visited marks are the only allocation that scales with the partition,
 /// and a build runs one search per vertex, so they are stamped with a
 /// generation counter and reused instead of reallocated per search.
+///
+/// A byte a vertex rather than four. A stamp only has to tell this search from
+/// the ones before it, and every byte the marks do not take is cache the codes
+/// a walk reads can have. The price is clearing the whole buffer once every 255
+/// searches instead of once every four billion.
 #[derive(Debug)]
 pub struct SearchScratch {
-    seen: Vec<u32>,
-    generation: u32,
+    seen: Vec<u8>,
+    generation: u8,
 }
 
 impl SearchScratch {
@@ -101,8 +106,10 @@ impl SearchScratch {
     pub(crate) fn begin(&mut self) {
         self.generation = match self.generation.checked_add(1) {
             Some(next) => next,
-            // Four billion searches later the stamps stop being unique, so the
-            // marks are cleared once and numbering restarts.
+            // 255 searches later the stamps stop being unique, so the marks
+            // are cleared once and numbering restarts. All of them, not the
+            // partition's share: a pooled buffer is as long as the largest
+            // partition it has served, and the next one may read its tail.
             None => {
                 self.seen.fill(0);
                 1
@@ -136,10 +143,11 @@ impl SearchScratch {
 
 /// Visited marks a finished walk hands on to the next one.
 ///
-/// A scratch holds a slot for every vertex of the partition it walks, four
-/// megabytes at a million rows, and a new one per walk is that much memory
+/// A scratch holds a slot for every vertex of the partition it walks, a
+/// megabyte at a million rows, and a new one per walk is that much memory
 /// allocated and zeroed before the first hop, however short the walk. Handed
-/// on, it costs a generation bump instead.
+/// on, it costs a generation bump instead, and one hand-on in 255 a clear of the
+/// whole buffer when the generation runs out.
 ///
 /// It keeps as many scratches as walks have run at once, up to one per core,
 /// each as long as the largest partition it has served, for the life of the
@@ -256,6 +264,12 @@ struct Entry {
 pub struct SearchList {
     list: Vec<Entry>,
     size: usize,
+    /// Every entry before this one has been expanded.
+    ///
+    /// A walk expands nearest first, so the expanded entries gather at the
+    /// front. An entry lands among them only by being nearer than one of them,
+    /// and moves this back to where it landed.
+    cursor: usize,
 }
 
 impl SearchList {
@@ -268,6 +282,7 @@ impl SearchList {
         Self {
             list: Vec::with_capacity(search_list_size.min(num_vertices).saturating_add(1)),
             size: search_list_size,
+            cursor: 0,
         }
     }
 
@@ -276,8 +291,21 @@ impl SearchList {
     /// Nothing here checks whether `id` is already in the list: a caller must
     /// have marked it in its [`SearchScratch`] first, which is what makes a
     /// vertex measured once and offered once.
+    ///
+    /// A full list turns away a vertex no nearer than its back before searching
+    /// for a place: the search would put it after every entry it is no nearer
+    /// than, which is past the end, and most of what a walk offers once its
+    /// list has filled is exactly that.
     pub fn offer(&mut self, id: u32, distance: f32) {
         let distance = OrderedFloat(distance);
+        if self.list.len() >= self.size
+            && self
+                .list
+                .last()
+                .is_some_and(|back| back.node.dist <= distance)
+        {
+            return;
+        }
         let at = self
             .list
             .partition_point(|entry| entry.node.dist <= distance);
@@ -292,6 +320,15 @@ impl SearchList {
             },
         );
         self.list.truncate(self.size);
+        self.cursor = self.cursor.min(at);
+        // Truncating cuts a list back only when it was full before the insert,
+        // so never below the cursor.
+        debug_assert!(
+            self.cursor <= self.list.len(),
+            "a search list's cursor {} ran past its {} entries",
+            self.cursor,
+            self.list.len()
+        );
     }
 
     /// Measure every id in `ids` and offer it, asking for the code of the one
@@ -347,9 +384,16 @@ impl SearchList {
     /// Called `n` times in a row without an [`Self::offer`] between them, it
     /// yields the `n` nearest unexpanded vertices - which is exactly the
     /// frontier a lazy hop fetches in one request.
+    ///
+    /// The search starts at the cursor rather than at the front, past entries
+    /// that are all expanded already.
     pub fn next_unexpanded(&mut self) -> Option<OrderedNode> {
-        let position = self.list.iter().position(|entry| !entry.expanded)?;
+        let position = self.cursor
+            + self.list[self.cursor..]
+                .iter()
+                .position(|entry| !entry.expanded)?;
         self.list[position].expanded = true;
+        self.cursor = position + 1;
         Some(self.list[position].node.clone())
     }
 
@@ -433,12 +477,16 @@ pub fn greedy_search(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::HashSet;
 
     use arrow_array::Float32Array;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::flat::storage::FlatFloatStorage;
     use lance_index::vector::storage::VectorStore;
     use lance_linalg::distance::DistanceType;
+    use rand::rngs::SmallRng;
+    use rand::seq::SliceRandom;
+    use rand::{Rng, SeedableRng};
 
     use super::*;
 
@@ -936,16 +984,16 @@ mod tests {
         );
     }
 
-    /// Pooled, a scratch outlives its queries: at seven thousand walks a
-    /// second, a thousand queries of seven probes, it runs out of generations
-    /// in a week. The numbering then restarts at 1, which some slot may still
-    /// hold from the first search of all.
+    /// A one-byte generation runs out every 255 walks, which at seven thousand
+    /// walks a second - a thousand queries of seven probes - is every 36
+    /// milliseconds. The numbering then restarts at 1, which some slot may
+    /// still hold from 255 walks before.
     #[test]
     fn a_scratch_that_runs_out_of_generations_starts_clean() {
         let mut scratch = SearchScratch::new(4);
         scratch.begin();
         assert!(scratch.mark(2));
-        scratch.generation = u32::MAX;
+        scratch.generation = u8::MAX;
         scratch.begin();
 
         assert_eq!(scratch.generation, 1);
@@ -995,5 +1043,341 @@ mod tests {
         comparisons.record(u64::MAX - 1);
         comparisons.record(7);
         assert_eq!(comparisons.get(), u64::MAX);
+    }
+
+    /// [`SearchList`] as it was before it learned to turn a candidate away at
+    /// the back and to resume at a cursor: a binary search on every offer and a
+    /// scan from the front on every expansion.
+    ///
+    /// Kept here rather than trusted to the walks, because the walk over a
+    /// partition in memory and the lazy walk both go through the one
+    /// `SearchList`, so a change to it that alters an answer alters both
+    /// answers alike, and the test comparing the two walks cannot see it.
+    struct PlainList {
+        list: Vec<(OrderedNode, bool)>,
+        size: usize,
+    }
+
+    impl PlainList {
+        fn new(size: usize) -> Self {
+            Self {
+                list: Vec::new(),
+                size,
+            }
+        }
+
+        fn offer(&mut self, id: u32, distance: f32) {
+            let distance = OrderedFloat(distance);
+            let at = self.list.partition_point(|(node, _)| node.dist <= distance);
+            if at >= self.size {
+                return;
+            }
+            self.list
+                .insert(at, (OrderedNode::new(id, distance), false));
+            self.list.truncate(self.size);
+        }
+
+        fn next_unexpanded(&mut self) -> Option<OrderedNode> {
+            let position = self.list.iter().position(|(_, expanded)| !expanded)?;
+            self.list[position].1 = true;
+            Some(self.list[position].0.clone())
+        }
+    }
+
+    /// A node down to the bits of its distance: `OrderedFloat` derives its
+    /// equality, under which a NaN is not equal to itself.
+    fn bits(node: OrderedNode) -> (u32, u32) {
+        (node.id, node.dist.0.to_bits())
+    }
+
+    fn held(list: &SearchList) -> Vec<(u32, u32, bool)> {
+        list.list
+            .iter()
+            .map(|entry| (entry.node.id, entry.node.dist.0.to_bits(), entry.expanded))
+            .collect()
+    }
+
+    fn plainly_held(list: &PlainList) -> Vec<(u32, u32, bool)> {
+        list.list
+            .iter()
+            .map(|(node, expanded)| (node.id, node.dist.0.to_bits(), *expanded))
+            .collect()
+    }
+
+    /// Every offer and every expansion leaves a list exactly as it left the
+    /// plain one, including where distances tie, run negative or are not
+    /// numbers at all.
+    ///
+    /// Ties are the case that matters. A full list keeps the first of equals,
+    /// so a list that turned a candidate away one comparison early or late
+    /// would keep a different one - and coarse codes tie all the time.
+    #[test]
+    fn a_list_keeps_and_expands_exactly_what_a_plain_list_does() {
+        const DISTANCES: [f32; 9] = [
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            2.0,
+            3.0,
+            f32::INFINITY,
+            f32::NAN,
+            -f32::NAN,
+        ];
+        let mut rng = SmallRng::seed_from_u64(7);
+        for size in [0, 1, 2, 3, 5, 64, usize::MAX] {
+            for sequence in 0..150 {
+                let mut list = SearchList::new(size, 256);
+                let mut plain = PlainList::new(size);
+                for step in 0..100 {
+                    if rng.random_bool(0.7) {
+                        let id = rng.random_range(0..256);
+                        let distance = DISTANCES[rng.random_range(0..DISTANCES.len())];
+                        list.offer(id, distance);
+                        plain.offer(id, distance);
+                    } else {
+                        // Four in a row as well as one, because a lazy hop
+                        // takes its whole frontier with no offer in between.
+                        let expansions = if rng.random_bool(0.25) { 4 } else { 1 };
+                        for _ in 0..expansions {
+                            assert_eq!(
+                                list.next_unexpanded().map(bits),
+                                plain.next_unexpanded().map(bits),
+                                "L = {size}, sequence {sequence}, step {step}: the lists expanded \
+                                 different vertices"
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        held(&list),
+                        plainly_held(&plain),
+                        "L = {size}, sequence {sequence}, step {step}: the lists hold different \
+                         entries"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A calculator that reads every distance off a table.
+    struct Table(Vec<f32>);
+
+    impl DistCalculator for Table {
+        fn distance(&self, id: u32) -> f32 {
+            self.0[id as usize]
+        }
+
+        fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
+            self.0.clone()
+        }
+    }
+
+    /// A graph the write path accepts, chosen at random: out-edges distinct,
+    /// none a self-edge, degrees anywhere from zero to `max_degree`.
+    fn random_graph(num_vertices: usize, max_degree: usize, rng: &mut SmallRng) -> PartitionGraph {
+        let adjacency = (0..num_vertices as u32)
+            .map(|vertex| {
+                let mut others = (0..num_vertices as u32)
+                    .filter(|other| *other != vertex)
+                    .collect::<Vec<_>>();
+                others.shuffle(rng);
+                others.truncate(rng.random_range(0..=max_degree));
+                others
+            })
+            .collect();
+        PartitionGraph::try_new(
+            max_degree as u32,
+            (0..num_vertices as u64).collect(),
+            adjacency,
+        )
+        .unwrap()
+    }
+
+    /// What a walk leaves: its list, the vertices it expanded in order, and the
+    /// distances it measured.
+    type Walk = (Vec<(u32, u32)>, Vec<(u32, u32)>, u64);
+
+    /// Algorithm 1 written again from nothing [`greedy_search`] uses: the plain
+    /// list, and a set for the marks.
+    fn reference_walk(
+        graph: &PartitionGraph,
+        table: &Table,
+        entry_point: u32,
+        search_list_size: usize,
+    ) -> Walk {
+        let mut reached = HashSet::from([entry_point]);
+        let mut list = PlainList::new(search_list_size);
+        list.offer(entry_point, table.distance(entry_point));
+        let mut comparisons = 1;
+        let mut visited = Vec::new();
+        while let Some(node) = list.next_unexpanded() {
+            visited.push(bits(node.clone()));
+            for neighbor in graph.neighbors(node.id).unwrap() {
+                if reached.insert(*neighbor) {
+                    comparisons += 1;
+                    list.offer(*neighbor, table.distance(*neighbor));
+                }
+            }
+        }
+        let candidates = list.list.into_iter().map(|(node, _)| bits(node)).collect();
+        (candidates, visited, comparisons)
+    }
+
+    fn walk(
+        graph: &PartitionGraph,
+        table: &Table,
+        entry_point: u32,
+        search_list_size: usize,
+        scratch: &mut SearchScratch,
+    ) -> Walk {
+        scratch.cover(graph.len());
+        let comparisons = Comparisons::default();
+        let result = greedy_search(
+            graph,
+            table,
+            entry_point,
+            search_list_size,
+            scratch,
+            &comparisons,
+        )
+        .unwrap();
+        (
+            result.candidates.into_iter().map(bits).collect(),
+            result.visited.into_iter().map(bits).collect(),
+            comparisons.get(),
+        )
+    }
+
+    /// A walk is the reference walk, on distances drawn to tie and on one
+    /// scratch handed from walk to walk the way a pool hands it on.
+    ///
+    /// This is what a build rests on as much as a query: the prune that shapes
+    /// the graph works from the vertices a walk expanded, in the order it
+    /// expanded them.
+    ///
+    /// The partitions come in a random order rather than smallest first. In
+    /// that order the buffer grows to the largest early and every later walk of
+    /// a smaller one leaves stamps of other walks in its tail, where smallest
+    /// first would hand each size a fresh buffer; and there are enough walks
+    /// for the generation to run out twice.
+    #[test]
+    fn a_walk_is_the_reference_walk_where_distances_tie() {
+        const DISTANCES: [f32; 5] = [-1.0, 0.0, 1.0, 1.0, 2.0];
+        let mut rng = SmallRng::seed_from_u64(11);
+        let mut partitions = Vec::new();
+        for num_vertices in [1, 2, 3, 17, 64] {
+            for _ in 0..24 {
+                let graph = random_graph(num_vertices, 4, &mut rng);
+                let table = Table(
+                    (0..num_vertices)
+                        .map(|_| DISTANCES[rng.random_range(0..DISTANCES.len())])
+                        .collect(),
+                );
+                let entry_point = rng.random_range(0..num_vertices as u32);
+                partitions.push((graph, table, entry_point));
+            }
+        }
+        let mut walks = (0..partitions.len())
+            .flat_map(|partition| {
+                [1, 2, 4, 16, usize::MAX].map(|search_list_size| (partition, search_list_size))
+            })
+            .collect::<Vec<_>>();
+        walks.shuffle(&mut rng);
+        assert!(
+            walks.len() > 2 * usize::from(u8::MAX),
+            "{} walks are too few for a one-byte generation to run out twice",
+            walks.len()
+        );
+
+        let mut scratch = SearchScratch::new(0);
+        for (partition, search_list_size) in walks {
+            let (graph, table, entry_point) = &partitions[partition];
+            assert_eq!(
+                walk(graph, table, *entry_point, search_list_size, &mut scratch),
+                reference_walk(graph, table, *entry_point, search_list_size),
+                "a walk over {} vertices at L = {search_list_size} left a different list, \
+                 expanded a different sequence or measured a different number of distances",
+                graph.len()
+            );
+        }
+    }
+
+    /// A walk that lands on the wrap of the generation is the reference walk,
+    /// with stamps from 255 walks before still in the tail of the buffer; and
+    /// so is a walk a whole cycle after a wrap, over slots nothing has stamped
+    /// since the wrap cleared them.
+    ///
+    /// The first walk stamps all of a large partition at generation 1, the next
+    /// 254 touch only the three slots at the front of the buffer, and the large
+    /// partition is walked again at the moment the generation runs out: a wrap
+    /// that restarted the numbering without clearing would read every vertex
+    /// past the third as reached already. Then the small partition takes the
+    /// next wrap and a whole cycle more, and the large one is walked at the last
+    /// generation: a wrap that cleared to anything but zero would read the
+    /// slots it cleared as stamped by that generation.
+    #[test]
+    fn a_walk_on_the_wrap_of_the_generation_is_the_reference_walk() {
+        const LARGE: usize = 64;
+        let large = path_graph(LARGE);
+        let small = path_graph(3);
+        let large_table = Table((0..LARGE).map(|vertex| (vertex % 4) as f32).collect());
+        let small_table = Table(vec![0.0; 3]);
+        let mut scratch = SearchScratch::new(0);
+        let small_walks = |scratch: &mut SearchScratch, count: usize| {
+            for _ in 0..count {
+                walk(&small, &small_table, 0, usize::MAX, scratch);
+            }
+        };
+
+        let first = walk(&large, &large_table, 0, usize::MAX, &mut scratch);
+        assert_eq!(
+            first.1.len(),
+            LARGE,
+            "the first walk did not stamp the whole large partition, so the wrap has nothing \
+             stale to trip over"
+        );
+        small_walks(&mut scratch, 254);
+        assert_eq!(
+            scratch.generation,
+            u8::MAX,
+            "the walks did not bring the generation to its last value"
+        );
+        assert_eq!(
+            scratch.seen.len(),
+            LARGE,
+            "the small walks replaced the buffer, so its tail holds nothing stale"
+        );
+        let wrapped = walk(&large, &large_table, 0, usize::MAX, &mut scratch);
+        assert_eq!(
+            scratch.generation, 1,
+            "the walk after the last generation did not restart the numbering"
+        );
+        assert_eq!(
+            wrapped,
+            reference_walk(&large, &large_table, 0, usize::MAX),
+            "the walk on the wrap left a different list, expanded a different sequence or \
+             measured a different number of distances"
+        );
+
+        // 254 walks to the last generation and one more to wrap, all of them
+        // leaving the large partition's slots as the wrap cleared them.
+        small_walks(&mut scratch, 255);
+        assert_eq!(
+            scratch.generation, 1,
+            "the small partition did not take the second wrap"
+        );
+        small_walks(&mut scratch, 253);
+        let a_cycle_later = walk(&large, &large_table, 0, usize::MAX, &mut scratch);
+        assert_eq!(
+            scratch.generation,
+            u8::MAX,
+            "the large partition was not walked at the last generation of the cycle"
+        );
+        assert_eq!(
+            a_cycle_later,
+            reference_walk(&large, &large_table, 0, usize::MAX),
+            "a walk a whole cycle after a wrap left a different list, expanded a different \
+             sequence or measured a different number of distances"
+        );
     }
 }

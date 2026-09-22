@@ -41,7 +41,7 @@
 //!   [`WalkMode::Lazy`] walk or a [`WalkMode::Flat`] scan the codes and row ids
 //!   they measure by, which are nine tenths of what such a query reads. What an
 //!   index keeps without one is scratch rather than data: the visited marks of
-//!   its lazy walks, four bytes a vertex of the largest partition walked, for
+//!   its lazy walks, one byte a vertex of the largest partition walked, for
 //!   as many walks as have run at once and up to one per core.
 //! - **A partition is read whole unless the walk is told not to.**
 //!   [`WalkMode::Lazy`] keeps the row ids and the codes and fetches the rest as

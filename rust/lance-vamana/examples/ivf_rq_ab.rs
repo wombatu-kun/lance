@@ -26,9 +26,9 @@
 //! directory beside the others), `IVF_SQ` (default 0) and `PREFETCH_AHEAD`
 //! (default 2; zero asks for nothing, so one binary carries the ask's own
 //! control - but not a control for the collect-then-measure hop it also
-//! carries, which is the previous commit's binary). `PREFETCH_AHEAD` reaches an
-//! instruction only under `CODE_KIND=sq`: RaBitQ's calculator has no
-//! `prefetch`.
+//! carries, which is the binary of `8dbf79752`, before the look-ahead).
+//! `PREFETCH_AHEAD` reaches an instruction only under `CODE_KIND=sq`: RaBitQ's
+//! calculator has no `prefetch`.
 //!
 //! `LANCE_RQ_PRUNE_STATS=1` is Lance's own knob, not this example's: `IVF_RQ`
 //! tallies how many rows its two-stage estimator threw away on the binary code

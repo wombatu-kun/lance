@@ -1072,7 +1072,7 @@ async fn a_budget_too_small_for_a_partition_still_answers() {
     // Eviction is not immediate. Moka admits an entry whatever it weighs and
     // reclaims it when it next runs its housekeeping, and a quick enough run of
     // queries outpaces that entirely: left to itself, two passes here once made
-    // 128 lookups and missed 15 of them. So the housekeeping is run after every
+    // 132 lookups and missed 15 of them. So the housekeeping is run after every
     // query - `size` runs it before counting - which is what makes the budget
     // bind between queries rather than whenever the cache gets round to it.
     let budget = LanceCache::with_capacity(1024);
@@ -1092,12 +1092,22 @@ async fn a_budget_too_small_for_a_partition_still_answers() {
     assert_same(&uncached, &passes[0], "a budget of 1 KiB, first pass");
     assert_same(&uncached, &passes[1], "a budget of 1 KiB, second pass");
 
+    // Hits rather than misses, because misses count the first look at each
+    // file's layout too, and four of those would cover for four partitions
+    // served from what the budget could not hold.
     let stats = index.cache_stats().await.unwrap();
+    assert_eq!(
+        stats.hits,
+        0,
+        "a budget of 1 KiB served {} of {} lookups from what it could not hold",
+        stats.hits,
+        stats.hits + stats.misses
+    );
     let rereads = (passes.len() * queries.len() * PARTITIONS as usize) as u64;
     assert!(
         stats.misses >= rereads,
-        "{} lookups missed over two passes of {} queries probing {PARTITIONS} partitions, so a \
-         budget of 1 KiB kept some partition from one query to the next",
+        "{} lookups over two passes of {} queries probing {PARTITIONS} partitions are fewer \
+         than one a partition a query",
         stats.misses,
         queries.len()
     );

@@ -189,9 +189,9 @@ two are meant to say the same thing.
   Nothing needs invalidating, because nothing an entry describes can change -
   deleting rows edits no index file, and adding rows or consolidating writes a
   *new* segment under a new uuid. What an index keeps without a cache is
-  scratch rather than data: the visited marks of its lazy walks, four bytes a
+  scratch rather than data: the visited marks of its lazy walks, one byte a
   vertex of the largest partition walked, for as many walks as have run at once
-  and up to one per core - 48 MB at twelve cores and a million-row partition.
+  and up to one per core - 12 MB at twelve cores and a million-row partition.
 
   The budget is the caller's to set and is in bytes of *resident* form, which is
   more than the codes weigh on disk: they are stored one contiguous stride a
@@ -239,10 +239,11 @@ two are meant to say the same thing.
   every id is in hand at once. Two, which is what Lance's own HNSW asks for at
   search time. Zero asks for nothing, which is the control for the ask but not
   for the hop, since a hop collects itself either way. Only scalar codes are
-  asked at all: Lance implements `prefetch` for `ScalarQuantizationStorage` and
-  not for RaBitQ, whose calculator takes the trait's empty default. Every figure
-  below was taken before any of this existed, and the walk they were taken from
-  asked for nothing.
+  asked for: Lance implements `prefetch` for `ScalarQuantizationStorage` and not
+  for RaBitQ, whose calculator takes the trait's empty default. Every figure
+  below was taken before any of this existed, and before a full search list
+  turned candidates away at its back: the walk they were taken from asked for
+  nothing and searched for a place on every offer.
 
   On SIFT1M at 65536 rows a partition, four probes and equal recall
   (`examples/lazy_walk.rs`), that is **18.2 MB a query against 198.6 MB** read

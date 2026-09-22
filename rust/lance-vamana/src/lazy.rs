@@ -431,7 +431,9 @@ pub(crate) async fn rescore(
 /// A frontier's vertices in the order they were expanded, each contributing the
 /// out-edges this walk has not reached yet, in slot order. A vertex two of them
 /// point at is collected once, at its first mention, because [`SearchScratch`]
-/// has already marked it by the time the second vertex offers it.
+/// has already marked it by the time the second vertex offers it. So is a
+/// vertex one row lists twice, which a partition read back from disk may do:
+/// the read path does not reject a repeat, because a walk skips it anyway.
 ///
 /// Its own function because nothing above it can pin the order. A look-ahead
 /// leaves no trace in any counter, and a fixture of random vectors never
@@ -535,6 +537,18 @@ mod tests {
         let mut scratch = SearchScratch::new(VERTICES);
         scratch.begin();
         assert_eq!(collected(&[2, 3], &edges, &mut scratch), vec![7, 5, 4]);
+    }
+
+    /// A vertex one row lists twice is collected once, where it was first
+    /// listed - which a collection that read every mark before writing any
+    /// would get wrong.
+    #[test]
+    fn a_row_that_lists_a_vertex_twice_collects_it_once() {
+        let mut edges = vec![NO_NEIGHBOR; VERTICES * WIDTH];
+        edges[2 * WIDTH..][..4].copy_from_slice(&[7, 5, 7, 9]);
+        let mut scratch = SearchScratch::new(VERTICES);
+        scratch.begin();
+        assert_eq!(collected(&[2], &edges, &mut scratch), vec![7, 5, 9]);
     }
 
     /// What an earlier hop reached is not collected again.
