@@ -1053,11 +1053,11 @@ async fn two_segments_do_not_share_a_cache_entry() {
 /// A budget that cannot hold one partition, which is the deployment the lazy
 /// read exists for taken to its limit.
 ///
-/// Everything is evicted as fast as it is inserted, so every query re-reads
-/// every partition - and has to answer exactly what it would have answered with
-/// room to spare. This is the path where a cached `Arc` is dropped between the
-/// read and the next use of it, which is the one way a caching bug can look like
-/// a memory bug rather than a wrong answer.
+/// Everything is evicted before the next query, so every query re-reads every
+/// partition - and has to answer exactly what it would have answered with room
+/// to spare. This is the path where a cached `Arc` is dropped between the read
+/// and the next use of it, which is the one way a caching bug can look like a
+/// memory bug rather than a wrong answer.
 #[tokio::test]
 async fn a_budget_too_small_for_a_partition_still_answers() {
     let dir = tempfile::tempdir().unwrap();
@@ -1069,22 +1069,35 @@ async fn a_budget_too_small_for_a_partition_still_answers() {
     let plain = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
     let (uncached, _) = replay(&plain, &queries, &params).await;
 
-    let index = cached(&dataset, 1024).await;
-    let (first, _) = replay(&index, &queries, &params).await;
-    let (second, _) = replay(&index, &queries, &params).await;
-    assert_same(&uncached, &first, "a budget of 1 KiB, first pass");
-    assert_same(&uncached, &second, "a budget of 1 KiB, second pass");
+    // Eviction is not immediate. Moka admits an entry whatever it weighs and
+    // reclaims it when it next runs its housekeeping, and a quick enough run of
+    // queries outpaces that entirely: left to itself, two passes here once made
+    // 128 lookups and missed 15 of them. So the housekeeping is run after every
+    // query - `size` runs it before counting - which is what makes the budget
+    // bind between queries rather than whenever the cache gets round to it.
+    let budget = LanceCache::with_capacity(1024);
+    let index = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .unwrap()
+        .with_cache(budget.clone());
+    let mut passes = Vec::new();
+    for _ in 0..2 {
+        let mut answers = Vec::with_capacity(queries.len());
+        for query in &queries {
+            answers.push(index.search(query, &params).await.unwrap());
+            budget.size().await;
+        }
+        passes.push(answers);
+    }
+    assert_same(&uncached, &passes[0], "a budget of 1 KiB, first pass");
+    assert_same(&uncached, &passes[1], "a budget of 1 KiB, second pass");
 
-    // Misses rather than bytes: eviction is not immediate. Moka admits an entry
-    // whatever it weighs and reclaims it when it next runs its housekeeping, so
-    // a partition read a moment ago can still be served from a budget it does
-    // not fit in - which makes the budget a bound on what is held for long
-    // rather than a bound at any instant.
     let stats = index.cache_stats().await.unwrap();
+    let rereads = (passes.len() * queries.len() * PARTITIONS as usize) as u64;
     assert!(
-        stats.misses > queries.len() as u64,
-        "{} lookups missed over two passes of {} queries, so a budget of 1 KiB held everything it \
-         was given",
+        stats.misses >= rereads,
+        "{} lookups missed over two passes of {} queries probing {PARTITIONS} partitions, so a \
+         budget of 1 KiB kept some partition from one query to the next",
         stats.misses,
         queries.len()
     );
