@@ -404,15 +404,28 @@ two are meant to say the same thing.
   out of the footer Lance already parsed and asks the scheduler for the ranges
   directly. The bytes and the reads are identical to the decoder's - the ranges
   are the ones its own full-zip scheduler would have built - and what is skipped
-  is a projected reader, a decode engine and a task per batch for twenty rows. On
-  local storage it goes one step further and `pread`s those ranges off a
-  descriptor the index already holds, coalescing them the way the scheduler
-  would so that the byte, read and request counts stay the same; that trades the
-  scheduler's queue and its hop onto the blocking pool for a read on the calling
-  thread, which is a microsecond warm and about a hundred cold. A file that
-  fails any of the layout's checks, or one on a store that is not local, is read
-  the old way. At equal
-  recall, with the budget set to `L`:
+  is a projected reader, a decode engine and a task per batch for twenty rows.
+  For an index with a cache, on local storage, it goes one step further and
+  reads those ranges off a descriptor the index already holds, coalescing them
+  the way the scheduler would so that the byte, read and request counts stay the
+  same. It reads each of them on the calling thread whenever the page cache
+  holds it and the filesystem accepts the flag - asked with `RWF_NOWAIT`, so
+  that a read the kernel would have to wait for is refused rather than waited
+  on - and sends only the refused ones to the blocking pool, in one trip per
+  partition. The trip is what a warm re-score is spared: it costs two wakeups -
+  a pool thread, then a runtime worker to carry the query on - where reading in
+  place costs none. With resident edges the search before it reads nothing
+  through the scheduler, so the pool thread has slept through the whole walk;
+  measured that way with a budget of twenty, one query in flight, the re-score
+  fell from 83-130 us to 30-45 us from `d = 128` to `d = 960`, and at twelve in
+  flight to 0.39-0.64 of what it was. A walk that fetches its edges keeps the
+  pool busy on every hop, and there reading in place was not measured. A
+  batch over a megabyte goes to the pool whole, and so does every batch on a
+  Unix other than Linux; off Unix the scheduler reads them. A file that fails
+  any of the layout's checks is decoded as before; one on a store that is not
+  local or configured for io_uring, or any file of an index given no cache, has
+  its ranges read through the scheduler. At equal recall, with the budget set to
+  `L`, and timed while the decoder still did the reading:
 
   | | 8192 rows, 7 probes | 65536 rows, 4 probes |
   |---|---|---|

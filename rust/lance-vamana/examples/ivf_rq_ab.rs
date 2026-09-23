@@ -141,6 +141,18 @@
 //! therefore the arm's recall *before* any re-score, printed as `coded`, and it
 //! is the same number at every width - the top `k` of a coded list does not
 //! depend on how much of the list is kept.
+//!
+//! **Where the re-score read, as a comment.** Under each measured row of this
+//! crate's arm a line starting `#` says how many of the pass's re-score reads
+//! the page cache served on the thread that asked, and how many went to the
+//! blocking pool in how many trips. On a warm local index on Linux the second
+//! and third numbers should be zero, unless one partition's share of the budget
+//! is over a megabyte (273 vectors at `d = 960`), and a run that claims the
+//! re-score was read in place has to show it there. The trip that opens a
+//! partition file's descriptor - the first time a re-score reads it, and again
+//! after the open-file cap evicts it - is not counted. It is a comment rather
+//! than a column so that every log parser written before it still reads the
+//! table, and it carries no `=`, which the header's knobs are parsed by.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -173,7 +185,7 @@ use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::codes::CodeSpec;
-use lance_vamana::query::{Neighbor, SearchParams, VamanaIndex, WalkMode};
+use lance_vamana::query::{Neighbor, RescoreReads, SearchParams, VamanaIndex, WalkMode};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -455,7 +467,7 @@ async fn measure_vamana(
     mode: WalkMode,
     beam_width: usize,
     prefetch_ahead: usize,
-) -> Cost {
+) -> (Cost, RescoreReads) {
     let Fixture {
         queries,
         truth,
@@ -502,6 +514,7 @@ async fn measure_vamana(
         .await;
 
     let before = index.io_stats();
+    let reads_before = index.rescore_reads();
     let cache_before = index.cache_stats().await;
     let cpu_before = cpu_micros();
     let started = Instant::now();
@@ -554,6 +567,7 @@ async fn measure_vamana(
     let micros = started.elapsed().as_micros() as f64;
     let cpu = cpu_micros() - cpu_before;
     let after = index.io_stats();
+    let reads_after = index.rescore_reads();
     let (hit_ratio, loads, held_bytes) = match (cache_before, index.cache_stats().await) {
         (Some(before), Some(after)) => {
             let hits = after.hits - before.hits;
@@ -583,7 +597,7 @@ async fn measure_vamana(
     );
 
     let queries = queries.len() as f64;
-    Cost {
+    let cost = Cost {
         recall: totals.recall / queries,
         bytes: bytes / queries,
         iops: (after.iops - before.iops) as f64 / queries,
@@ -599,7 +613,8 @@ async fn measure_vamana(
         rescore_micros: totals.rescore_micros / queries,
         search_bytes: totals.search_bytes / queries,
         rescore_bytes: totals.rescore_bytes / queries,
-    }
+    };
+    (cost, reads_after.since(&reads_before))
 }
 
 /// What one query of this crate's arm reported, and what a pass sums them into.
@@ -1329,7 +1344,7 @@ async fn main() {
             let label = format!("vamana {name}{}", curve.suffix);
             let mut measured = Vec::with_capacity(curve.points.len());
             for point in &curve.points {
-                let cost = measure_vamana(
+                let (cost, reads) = measure_vamana(
                     &vamana_dataset,
                     &vamana_fixture,
                     point.list_size,
@@ -1340,6 +1355,10 @@ async fn main() {
                 )
                 .await;
                 report(&label, point.axis, &cost);
+                println!(
+                    "# re-score reads of the row above: {} in place, {} handed off in {} trips",
+                    reads.in_place, reads.handed_off, reads.trips
+                );
                 measured.push((point.axis, cost));
             }
             sweeps.push((label, measured));

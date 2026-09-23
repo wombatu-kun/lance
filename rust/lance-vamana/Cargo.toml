@@ -43,6 +43,14 @@ serde_json = "1"
 tokio = { version = "1.23", features = ["macros", "rt-multi-thread"] }
 uuid = { version = "1.2", features = ["v4"] }
 
+# A re-score reads its vectors on the thread that asked whenever the page cache
+# can hand them over without waiting for the data, and `RWF_NOWAIT` - a flag of
+# `preadv2`, which the standard library does not expose - is how it asks. Already
+# in the build through `tempfile`, which lance-core and lance-io depend on, so it
+# adds no package.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = "1.1.4"
+
 [features]
 # On by default so the binary builds without a flag; a consumer embedding only
 # the library turns it off with `default-features = false` and compiles no clap.
@@ -62,3 +70,8 @@ required-features = ["cli"]
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1.23", features = ["macros", "rt-multi-thread"] }
+
+# The `fs` feature, for the tests' `fadvise`: to put a file out of the page
+# cache.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }

@@ -40,6 +40,7 @@ use crate::format::{
     index_schema, partition_file_name,
 };
 use crate::partition::{Partition, row_ids_from_batch};
+use crate::query::RescoreReads;
 use crate::raw::{self, VectorLayout};
 use crate::segment::{PartitionEntry, SegmentManifest};
 
@@ -126,23 +127,44 @@ pub struct PartitionFile {
 /// and to move each one onto the blocking pool. For a re-score neither buys
 /// anything: it wants twenty ranges of a few kilobytes that the page cache
 /// almost always holds, and it pays a queue, a task and a wakeup for each of
-/// them. Reading them here costs one `pread` each and no hop at all.
+/// them.
 ///
-/// What it costs instead is honesty about where the read happens: a `pread` of a
-/// page the kernel does not have blocks the thread it runs on, which is a tokio
-/// worker. Warm that is about a microsecond; cold it is about a hundred. The
-/// path that would make this unconditionally safe is running the whole resident
-/// query off the runtime, which is a change of its own.
+/// So it reads each of them itself, on the thread that asked, whenever the page
+/// cache can hand the bytes over - which is what `RWF_NOWAIT` asks of the
+/// kernel, a read at a time. The flag is a promise not to wait for the data,
+/// not a promise never to block: a read the page cache misses can still start
+/// its own readahead, and read the file's block map to do it, before it is
+/// refused. A refusal does not stop the reads after it from being tried.
+///
+/// A read the kernel refuses goes to the blocking pool, because a `pread` of a
+/// page the kernel does not have blocks the thread it runs on until the device
+/// answers - about a hundred microseconds on an NVMe drive, milliseconds on a
+/// disk or a network volume - and the thread that asked is a tokio worker.
+/// Every such read of one batch goes in one trip, and so does a whole batch
+/// larger than [`IN_PLACE_BYTES`]. Other Unixes have no such flag, and every
+/// batch there takes the trip; off Unix a file never reads locally at all.
+///
+/// The trip is not free even for a page the cache holds, and sparing it is the
+/// whole reason for reading in place: it wakes a pool thread and then a runtime
+/// worker, where a read in place wakes nobody, and the pool thread has slept
+/// through the search whenever that read nothing through the scheduler.
+/// Measured on 23 September 2026 with resident edges, a budget of twenty and a
+/// warm local NVMe: with one query in flight a re-score fell from 83-130 us to
+/// 30-45 us from `d = 128` to `d = 960`, and it stopped growing with the length
+/// of the walk before it, as it had while every batch took the trip. At twelve
+/// queries in flight it fell to 0.39-0.64 of what it was.
 #[derive(Clone)]
 struct LocalReads {
     /// The scheduler's own coalescing parameters, kept so that reading by hand
     /// moves the same bytes in the same number of reads.
     block_size: u64,
     max_iop_size: u64,
-    /// Where these reads are added to the index's running totals. The scheduler
-    /// keeps its own and never sees these, so an index that did not keep them
-    /// here would report less than it read.
-    totals: Arc<IoStats>,
+    /// The most one batch reads in place: [`IN_PLACE_BYTES`] on Linux and zero
+    /// elsewhere, where nothing can be asked without waiting and every batch
+    /// goes to the blocking pool untried. A field so that a test can move it.
+    in_place_bytes: u64,
+    /// Where these reads are counted: see [`DirectReads`].
+    direct: Arc<DirectReads>,
     /// Opened on the first re-score and shared by every clone of this file.
     /// Lazily, for two reasons: the whole-partition modes never re-score and
     /// would hold a descriptor for nothing, and opening one is a blocking call
@@ -150,7 +172,71 @@ struct LocalReads {
     file: Arc<OnceLock<std::fs::File>>,
 }
 
+/// What an index read off its own descriptors rather than through its
+/// scheduler.
+///
+/// `totals` is every such read, whichever thread made it. The scheduler keeps
+/// its own counts and never sees these, so an index that did not keep them here
+/// would report less than it read. `handed_off` is the part of `totals` that
+/// went to the blocking pool - a split of them, never an addition to them - and
+/// a request there is one trip to the pool.
+#[derive(Debug)]
+pub(crate) struct DirectReads {
+    pub(crate) totals: IoStats,
+    pub(crate) handed_off: IoStats,
+}
+
+impl Default for DirectReads {
+    fn default() -> Self {
+        Self {
+            totals: IoStats::new(),
+            handed_off: IoStats::new(),
+        }
+    }
+}
+
+impl DirectReads {
+    /// The reads counted here, split by the thread that made them.
+    ///
+    /// The two counters are read one after the other, so while a re-score is in
+    /// flight the split can be off by that re-score's batch; between passes it
+    /// is exact.
+    pub(crate) fn split(&self) -> RescoreReads {
+        let totals = self.totals.snapshot();
+        let handed_off = self.handed_off.snapshot();
+        RescoreReads {
+            in_place: totals.iops.saturating_sub(handed_off.iops),
+            handed_off: handed_off.iops,
+            trips: handed_off.requests,
+        }
+    }
+}
+
+/// The most one partition's share of a re-score reads on the thread that asked
+/// for it.
+///
+/// A query re-scoring several partitions is held to it once for each, one after
+/// another on the worker polling them. A batch the page cache holds costs a copy
+/// a byte whichever thread copies it, so the only question is which. For a
+/// re-score with a budget of twenty - at most twenty vectors in one partition's
+/// batch, 10 to 77 kB from `d = 128` to `d = 960` - it is the thread that asked:
+/// the copy takes microseconds, and the trip to the blocking pool, which wakes
+/// two threads to do it, cost such a batch 53-85 us more than reading it in
+/// place did with one query in flight (see [`LocalReads`]). Without a budget a
+/// probe re-scores its whole search list and several probes re-score at once:
+/// on the blocking pool they copy in parallel, where in place they would copy
+/// one after another on one worker, which then answers nothing else until they
+/// are done.
+/// A megabyte is over thirteen twenty-vector batches at `d = 960`, or 273
+/// vectors, short of a whole search list of a few hundred; at `d = 128` it is
+/// 2048 vectors, so there even an unbudgeted re-score is read in place.
+const IN_PLACE_BYTES: u64 = 1 << 20;
+
 /// Fill `buf` from `offset`, whatever the platform calls it.
+///
+/// Blocking, so it runs on the blocking pool: it is what a read that
+/// [`read_now`] could not serve falls back to, and what reads every batch over
+/// [`IN_PLACE_BYTES`].
 #[cfg(unix)]
 fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
@@ -160,6 +246,45 @@ fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result
 fn read_at(_file: &std::fs::File, _buf: &mut [u8], _offset: u64) -> std::io::Result<()> {
     // Unreachable: `with_local_reads` binds no file off Unix.
     Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// Fill `buf` from `offset` if the page cache can do it without waiting for
+/// the data, and say whether it did.
+///
+/// `false` hands the read to [`read_at`], which reads it again from the start
+/// into a buffer of its own: anything already copied into `buf` is thrown away
+/// with it, so a partial copy never has to be trusted.
+#[cfg(target_os = "linux")]
+fn read_now(file: &std::fs::File, buf: &mut [u8], offset: u64) -> bool {
+    let wanted = buf.len();
+    let outcome = rustix::io::preadv2(
+        file,
+        &mut [std::io::IoSliceMut::new(buf)],
+        offset,
+        rustix::io::ReadWriteFlags::NOWAIT,
+    );
+    filled(outcome, wanted)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_now(_file: &std::fs::File, _buf: &mut [u8], _offset: u64) -> bool {
+    false
+}
+
+/// Whether a `preadv2` that came back with `outcome` served all `wanted`
+/// bytes.
+///
+/// Only a full count is served. A short one is a range the page cache holds only
+/// part of, or one that runs past the end of the file, which the blocking read
+/// then reports; and `0` is also how kernels 5.9 and 5.10 answered a miss
+/// instead of with `EAGAIN`. Every error is "not served" as well rather than an
+/// error of its own - a filesystem that refuses the flag, a kernel older than
+/// 4.14, a sandbox that refuses the call, a signal, a disk fault - because the
+/// blocking read that follows asks the same question again and reports whatever
+/// is really wrong exactly as it always has.
+#[cfg(target_os = "linux")]
+fn filled(outcome: rustix::io::Result<usize>, wanted: usize) -> bool {
+    matches!(outcome, Ok(read) if read == wanted)
 }
 
 impl PartitionFile {
@@ -346,8 +471,9 @@ impl PartitionFile {
     /// the file is already open through the scheduler, and that is the path this
     /// one is an optimisation of.
     ///
-    /// `totals` is the caller's running count of everything read off the
-    /// scheduler, which it has to add to whatever the scheduler reports.
+    /// `direct` is where the caller counts everything this file reads without
+    /// its scheduler, and which of it went to the blocking pool; the caller has
+    /// to add the first to whatever the scheduler reports.
     ///
     /// `has_direct_local_paths` and not `is_local`, because that is the
     /// predicate Lance's own reader dispatch turns on: a local store rooted
@@ -357,12 +483,21 @@ impl PartitionFile {
     /// read at this file's offsets. `file+uring` is left out for the opposite
     /// reason: a caller who configured io_uring asked for the scheduler, and
     /// substituting synchronous reads would undo what they chose.
-    pub(crate) fn with_local_reads(mut self, store: &ObjectStore, totals: &Arc<IoStats>) -> Self {
+    pub(crate) fn with_local_reads(
+        mut self,
+        store: &ObjectStore,
+        direct: &Arc<DirectReads>,
+    ) -> Self {
         if cfg!(unix) && store.has_direct_local_paths() && !store.prefers_lite_scheduler() {
             self.local = Some(LocalReads {
                 block_size: store.block_size() as u64,
                 max_iop_size: store.max_iop_size(),
-                totals: totals.clone(),
+                in_place_bytes: if cfg!(target_os = "linux") {
+                    IN_PLACE_BYTES
+                } else {
+                    0
+                },
+                direct: direct.clone(),
                 file: Arc::new(OnceLock::new()),
             });
         }
@@ -406,15 +541,35 @@ impl PartitionFile {
     /// purpose, so that a mismatched width is reported by the check that has
     /// always reported it.
     ///
-    /// The bytes still go through the scheduler, so they are coalesced, counted
-    /// and throttled exactly as the decoder's would be: what is skipped is the
-    /// decoder, not the reading. `rows` must ascend, which the scheduler
+    /// The bytes are coalesced and counted exactly as the scheduler's would be,
+    /// whoever reads them: the scheduler, unless this file was bound by
+    /// [`Self::with_local_reads`] and could open its descriptor, and that
+    /// descriptor when it was - see [`LocalReads`] for which thread does that.
+    /// What is skipped is the decoder. `rows` must ascend, which the scheduler
     /// requires and a candidate list already satisfies.
     pub(crate) async fn read_vectors(
         &self,
         rows: &[u32],
         dimension: u32,
         stats: &IoStats,
+    ) -> Result<Option<FixedSizeListArray>> {
+        self.read_vectors_with(rows, dimension, stats, read_now)
+            .await
+    }
+
+    /// [`Self::read_vectors`], trying each read with `in_place` on the calling
+    /// thread before anything goes to the blocking pool - unless the batch is
+    /// over the in-place limit, when none is tried.
+    ///
+    /// Only a test passes anything but [`read_now`]: which reads the page cache
+    /// can serve is the kernel's business, and a test that wants a particular
+    /// mix of them has to decide it itself.
+    async fn read_vectors_with(
+        &self,
+        rows: &[u32],
+        dimension: u32,
+        stats: &IoStats,
+        in_place: impl Fn(&std::fs::File, &mut [u8], u64) -> bool,
     ) -> Result<Option<FixedSizeListArray>> {
         let Some(layout) = self
             .vectors
@@ -426,7 +581,7 @@ impl PartitionFile {
             return Ok(None);
         }
         let wanted = layout.ranges(rows)?;
-        let Some((local, _)) = self.local_reads().await else {
+        let Some((local, file)) = self.local_reads().await else {
             let chunks = self
                 .file
                 .with_io_stats(stats.recorder())
@@ -436,42 +591,73 @@ impl PartitionFile {
         };
 
         let reads = raw::coalesced(&wanted, local.block_size, local.max_iop_size);
+        let planned = reads.iter().map(|read| read.end - read.start).sum::<u64>();
 
-        // One hop for the whole batch. The reads are blocking syscalls and there
-        // can be one per candidate, which without a re-score budget is the whole
-        // search list - leaving that on a runtime worker would hold it through
-        // every one of them with nowhere to yield.
-        let descriptor = local.file.clone();
-        let batch = reads.clone();
-        let blocks = tokio::task::spawn_blocking(move || {
-            let Some(file) = descriptor.get() else {
-                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
-            };
-            batch
-                .iter()
-                .map(|read| {
-                    let mut block = vec![0u8; (read.end - read.start) as usize];
-                    read_at(file, &mut block, read.start).map(|()| block)
-                })
-                .collect::<std::io::Result<Vec<_>>>()
-        })
-        .await
-        .map_err(|source| Error::io(format!("Vamana re-score read was cancelled: {source}")))?
-        .map_err(|source| {
-            Error::io(format!(
-                "Vamana could not read {reads:?} of {}: {source}",
-                self.path
-            ))
-        })?;
+        // Every read the page cache serves is done here and now; the rest are
+        // handed off below, and so is the whole of a batch over the limit.
+        let mut blocks = vec![Vec::new(); reads.len()];
+        let pending = if planned > local.in_place_bytes {
+            (0..reads.len()).collect::<Vec<_>>()
+        } else {
+            let mut pending = Vec::new();
+            for (index, (read, block)) in reads.iter().zip(&mut blocks).enumerate() {
+                block.resize((read.end - read.start) as usize, 0);
+                if !in_place(file, block, read.start) {
+                    pending.push(index);
+                }
+            }
+            pending
+        };
+
+        // One trip for all of them. Each is a blocking syscall, and there can be
+        // one per candidate, which without a re-score budget is the whole search
+        // list - leaving that on a runtime worker would hold it through every one
+        // of them with nowhere to yield.
+        let handed = pending
+            .iter()
+            .map(|&index| reads[index].clone())
+            .collect::<Vec<_>>();
+        if !handed.is_empty() {
+            let descriptor = local.file.clone();
+            let batch = handed.clone();
+            let fetched = tokio::task::spawn_blocking(move || {
+                let Some(file) = descriptor.get() else {
+                    return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+                };
+                batch
+                    .iter()
+                    .map(|read| {
+                        let mut block = vec![0u8; (read.end - read.start) as usize];
+                        read_at(file, &mut block, read.start).map(|()| block)
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()
+            })
+            .await
+            .map_err(|source| Error::io(format!("Vamana re-score read was cancelled: {source}")))?
+            .map_err(|source| {
+                Error::io(format!(
+                    "Vamana could not read {reads:?} of {}: {source}",
+                    self.path
+                ))
+            })?;
+            for (&index, block) in pending.iter().zip(fetched) {
+                blocks[index] = block;
+            }
+        }
 
         // Counted here because nothing else counts them at all: these bytes never
         // reach the scheduler, so the query's own sink and the index's running
-        // total both have to be told by hand. After the reads and not before, so
-        // that a read that failed is not charged to an index for the rest of its
-        // life - the scheduler charges first and would have, but a number that
-        // survives its own failure is worse than one that matches it.
+        // total both have to be told by hand, and told the same reads whichever
+        // thread made them. After the reads and not before, so that a read that
+        // failed is not charged to an index for the rest of its life - the
+        // scheduler charges first and would have, but a number that survives its
+        // own failure is worse than one that matches it. The trip is counted
+        // only when there was one: an empty request still counts as a request.
         stats.record_request(&reads);
-        local.totals.record_request(&reads);
+        local.direct.totals.record_request(&reads);
+        if !handed.is_empty() {
+            local.direct.handed_off.record_request(&handed);
+        }
 
         let slices = raw::slices(&wanted, &reads, &blocks)?;
         raw::vectors(slices.iter().map(|slice| slice.as_ref()), dimension).map(Some)
@@ -488,7 +674,7 @@ impl PartitionFile {
 /// A descriptor is a real resource and an index can hold thousands of
 /// partitions, so this is a cap and not a count. What it caps is entries, and an
 /// entry can cost two descriptors rather than one: the reader's, and - once a
-/// re-score has run against it on local storage - the one it `pread`s through.
+/// re-score has run against it on local storage - the one it reads through.
 /// Nor is the pool the only holder. A query keeps a handle per probe until its
 /// re-score is done, so `nprobes` times the queries in flight are open whatever
 /// this says, and evicting an entry a query still holds releases nothing until
@@ -1228,8 +1414,11 @@ fn validate_ivf_model(proto: &pb::Ivf) -> Result<()> {
 mod tests {
     use super::*;
 
-    use arrow_array::Float32Array;
+    use std::cell::RefCell;
+
+    use arrow_array::{Array, Float32Array};
     use arrow_schema::{DataType, Field};
+    use futures::FutureExt;
 
     use crate::partition::PartitionGraph;
 
@@ -1356,5 +1545,494 @@ mod tests {
             !open_now.files.contains_key(&second),
             "the stalest handle survived"
         );
+    }
+
+    /// Every value of `vectors`, in order.
+    fn values(vectors: &FixedSizeListArray) -> Vec<f32> {
+        vectors
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    /// What `sample_partition` holds, row after row.
+    fn every_value() -> Vec<f32> {
+        (0..3 * DIMENSION).map(|value| value as f32).collect()
+    }
+
+    /// `sample_partition` opened for local reads, split so finely that two of
+    /// its reads cut a vector in half.
+    ///
+    /// The three vectors are adjacent, so they coalesce into one 36-byte run,
+    /// and a run longer than `max_iop_size` is cut into equal pieces that know
+    /// nothing about where a vector ends: at 8 that is five reads of 7, 7, 7, 7
+    /// and 8 bytes, the second and the fourth across a boundary. A read handed
+    /// off from the middle of a vector has to land back in the middle of it.
+    ///
+    /// The in-place limit is checked as [`PartitionFile::with_local_reads`]
+    /// set it and then set to [`IN_PLACE_BYTES`] everywhere, so that the reads
+    /// a test hands its own page cache are tried on every platform.
+    #[cfg(unix)]
+    async fn split_local(dir: &tempfile::TempDir) -> (PartitionFile, Arc<DirectReads>) {
+        let (scheduler, path) = written(dir, "part_00000.idx").await;
+        let direct = Arc::new(DirectReads::default());
+        let mut file = open(&scheduler, &path)
+            .await
+            .with_local_reads(&ObjectStore::local(), &direct);
+        let local = file
+            .local
+            .as_mut()
+            .expect("a file on local storage did not take the local path");
+        let expected = if cfg!(target_os = "linux") {
+            IN_PLACE_BYTES
+        } else {
+            0
+        };
+        assert_eq!(
+            local.in_place_bytes, expected,
+            "a file bound for local reads was given the wrong in-place limit"
+        );
+        local.in_place_bytes = IN_PLACE_BYTES;
+        local.max_iop_size = 8;
+        (file, direct)
+    }
+
+    /// The reads a fake page cache was asked for, checked to be the split the
+    /// tests are written against before anything is claimed about them.
+    fn assert_split(asked: &[Range<u64>]) {
+        const STRIDE: u64 = DIMENSION as u64 * 4;
+        assert_eq!(
+            asked.len(),
+            5,
+            "the batch was not split into five reads: {asked:?}"
+        );
+        let start = asked[0].start;
+        for (read, boundary) in [(1, start + STRIDE), (3, start + 2 * STRIDE)] {
+            assert!(
+                asked[read].start < boundary && boundary < asked[read].end,
+                "read {read}, {:?}, does not cut the vector boundary at {boundary}, so the \
+                 fixture no longer tests a vector handed off in halves",
+                asked[read]
+            );
+        }
+    }
+
+    /// A byte that makes a vector read as about minus three times ten to the
+    /// minus sixteen, which no row of `sample_partition` holds.
+    const POISON: u8 = 0xA5;
+
+    /// A page cache that holds every read but the ones `refused` names, by the
+    /// order they are asked for in, and writes down every read it is asked for.
+    ///
+    /// A refused read has its buffer filled with [`POISON`] before it is turned
+    /// down, so anything that trusts a refused buffer answers with numbers no
+    /// row holds.
+    fn cache_refusing<'a>(
+        refused: &'a [usize],
+        asked: &'a RefCell<Vec<Range<u64>>>,
+    ) -> impl Fn(&std::fs::File, &mut [u8], u64) -> bool + 'a {
+        move |file, buf, offset| {
+            let call = {
+                let mut asked = asked.borrow_mut();
+                asked.push(offset..offset + buf.len() as u64);
+                asked.len() - 1
+            };
+            if refused.contains(&call) {
+                buf.fill(POISON);
+                return false;
+            }
+            read_at(file, buf, offset).is_ok()
+        }
+    }
+
+    /// Only a read that filled its whole buffer was served.
+    ///
+    /// Everything else is handed to the blocking read, errors included, so the
+    /// error a caller sees is still the one that read reports. A short count is
+    /// a range the page cache holds only part of or one past the end of the
+    /// file, and a zero is also how two kernels answered a miss.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_is_served_only_when_it_filled_the_buffer() {
+        use rustix::io::Errno;
+
+        assert!(filled(Ok(12), 12));
+        for short in [11, 1, 0] {
+            assert!(
+                !filled(Ok(short), 12),
+                "{short} of 12 bytes was taken as served"
+            );
+        }
+        for errno in [
+            Errno::AGAIN,
+            Errno::OPNOTSUPP,
+            Errno::INVAL,
+            Errno::NOSYS,
+            Errno::PERM,
+            Errno::INTR,
+            Errno::IO,
+        ] {
+            assert!(!filled(Err(errno), 12), "{errno:?} was taken as served");
+        }
+    }
+
+    /// Refused reads go to the blocking pool in one trip and come back where
+    /// they were asked for.
+    ///
+    /// Two refused out of five, both cut across a vector, so a merge that
+    /// appended rather than placed, placed in reverse, or trusted a refused
+    /// buffer gives values out of order or out of the fixture. The counts are
+    /// pinned as well: the query and the index are charged every read exactly
+    /// once whichever thread made it, the two refused reads are one trip, and
+    /// the split the index reports adds them up to that.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refused_reads_go_in_one_trip_and_land_where_they_were_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, direct) = split_local(&dir).await;
+        let stats = IoStats::new();
+        let asked = RefCell::new(Vec::new());
+
+        let read = file
+            .read_vectors_with(
+                &[0, 1, 2],
+                DIMENSION as u32,
+                &stats,
+                cache_refusing(&[1, 3], &asked),
+            )
+            .await
+            .unwrap()
+            .expect("a file this crate wrote must be addressable");
+
+        assert_split(&asked.borrow());
+        assert_eq!(values(&read), every_value());
+        for (who, counted) in [
+            ("the query", stats.snapshot()),
+            ("the index", direct.totals.snapshot()),
+        ] {
+            assert_eq!(
+                (counted.bytes_read, counted.iops, counted.requests),
+                (36, 5, 1),
+                "{who} was charged {counted:?} for one request of five reads"
+            );
+        }
+        let handed = direct.handed_off.snapshot();
+        assert_eq!(
+            (handed.bytes_read, handed.iops, handed.requests),
+            (14, 2, 1),
+            "two refused reads of seven bytes went to the pool as {handed:?}"
+        );
+        assert_eq!(
+            direct.split(),
+            RescoreReads {
+                in_place: 3,
+                handed_off: 2,
+                trips: 1
+            }
+        );
+    }
+
+    /// A batch the page cache holds never leaves the thread that asked.
+    ///
+    /// Not a counter's word for it: the read is polled once, outside any
+    /// runtime, and has to finish in that one poll. A batch that went to the
+    /// blocking pool - even an empty one - cannot even be handed over there,
+    /// let alone come back within the poll. The first read of the file happens
+    /// inside the runtime, because it opens the descriptor, and that is a trip
+    /// of its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_batch_the_page_cache_holds_never_leaves_the_thread() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (file, direct) = runtime.block_on(split_local(&dir));
+        let stats = IoStats::new();
+        let asked = RefCell::new(Vec::new());
+        runtime
+            .block_on(file.read_vectors_with(
+                &[0, 1, 2],
+                DIMENSION as u32,
+                &stats,
+                cache_refusing(&[], &asked),
+            ))
+            .unwrap()
+            .unwrap();
+        assert_split(&asked.borrow());
+
+        let asked = RefCell::new(Vec::new());
+        let read = file
+            .read_vectors_with(
+                &[0, 1, 2],
+                DIMENSION as u32,
+                &stats,
+                cache_refusing(&[], &asked),
+            )
+            .now_or_never()
+            .expect("a batch the page cache holds waited on something")
+            .unwrap()
+            .unwrap();
+
+        assert_split(&asked.borrow());
+        assert_eq!(values(&read), every_value());
+        let handed = direct.handed_off.snapshot();
+        assert_eq!(
+            (handed.bytes_read, handed.iops, handed.requests),
+            (0, 0, 0),
+            "a batch served in place was counted as handed off: {handed:?}"
+        );
+        assert_eq!(
+            direct.split(),
+            RescoreReads {
+                in_place: 10,
+                handed_off: 0,
+                trips: 0
+            }
+        );
+    }
+
+    /// A batch over the limit goes to the blocking pool whole, with not one read
+    /// tried in place; a batch exactly at the limit is read in place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_batch_over_the_limit_is_handed_off_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut file, direct) = split_local(&dir).await;
+
+        file.local.as_mut().unwrap().in_place_bytes = 35;
+        let asked = RefCell::new(Vec::new());
+        let read = file
+            .read_vectors_with(
+                &[0, 1, 2],
+                DIMENSION as u32,
+                &IoStats::new(),
+                cache_refusing(&[], &asked),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            asked.borrow().is_empty(),
+            "a 36-byte batch over a limit of 35 was tried in place: {:?}",
+            asked.borrow()
+        );
+        assert_eq!(values(&read), every_value());
+        let handed = direct.handed_off.snapshot();
+        assert_eq!(
+            (handed.bytes_read, handed.iops, handed.requests),
+            (36, 5, 1),
+            "a batch over the limit went to the pool as {handed:?}"
+        );
+        assert_eq!(
+            direct.split(),
+            RescoreReads {
+                in_place: 0,
+                handed_off: 5,
+                trips: 1
+            }
+        );
+
+        file.local.as_mut().unwrap().in_place_bytes = 36;
+        let asked = RefCell::new(Vec::new());
+        file.read_vectors_with(
+            &[0, 1, 2],
+            DIMENSION as u32,
+            &IoStats::new(),
+            cache_refusing(&[], &asked),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_split(&asked.borrow());
+        assert_eq!(
+            direct.split(),
+            RescoreReads {
+                in_place: 5,
+                handed_off: 5,
+                trips: 1
+            },
+            "a batch exactly at the limit was handed off"
+        );
+    }
+
+    /// Whether an `RWF_NOWAIT` read of the first byte of the file at `path` is
+    /// served.
+    ///
+    /// Asked of the kernel directly and never through the code under test, so
+    /// that code which stopped reading in place cannot talk a test into
+    /// skipping the assertions that would catch it. The callers ask it of a
+    /// file they have just written, which the page cache holds: anything but a
+    /// served read means a filesystem, kernel or sandbox that refuses the flag.
+    #[cfg(target_os = "linux")]
+    fn serves_without_waiting(path: &std::path::Path) -> bool {
+        let file = std::fs::File::open(path).unwrap();
+        let mut byte = [0u8; 1];
+        matches!(
+            rustix::io::preadv2(
+                &file,
+                &mut [std::io::IoSliceMut::new(&mut byte)],
+                0,
+                rustix::io::ReadWriteFlags::NOWAIT,
+            ),
+            Ok(1)
+        )
+    }
+
+    /// Whether this machine refuses a read of a page the page cache has just
+    /// dropped, asked of a file written for the purpose beside `dir`'s others.
+    ///
+    /// A sibling rather than the file a test reads, because asking starts the
+    /// readahead that would put the page back. Some machines never refuse: a
+    /// device that completes a read before the call returns, or a filesystem
+    /// whose pages are the file.
+    #[cfg(target_os = "linux")]
+    fn refuses_a_dropped_page(dir: &std::path::Path) -> bool {
+        let path = dir.join("dropped");
+        std::fs::write(&path, [7u8; 4096]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        file.sync_all().unwrap();
+        rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed).unwrap();
+        let mut page = [0u8; 4096];
+        !matches!(
+            rustix::io::preadv2(
+                &file,
+                &mut [std::io::IoSliceMut::new(&mut page)],
+                0,
+                rustix::io::ReadWriteFlags::NOWAIT,
+            ),
+            Ok(4096)
+        )
+    }
+
+    /// On a file the page cache holds, the real read serves everything in
+    /// place: the premise of reading in place at all, checked on whatever
+    /// filesystem the test directory is on.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_warm_file_is_read_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let (scheduler, path) = written(&dir, "part_00000.idx").await;
+        let local_path = dir.path().join("part_00000.idx");
+        if !serves_without_waiting(&local_path) {
+            eprintln!(
+                "skipped: the filesystem under {} cannot be asked to read without waiting",
+                dir.path().display()
+            );
+            return;
+        }
+        let direct = Arc::new(DirectReads::default());
+        let file = open(&scheduler, &path)
+            .await
+            .with_local_reads(&ObjectStore::local(), &direct);
+
+        let read = file
+            .read_vectors(&[0, 1, 2], DIMENSION as u32, &IoStats::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(values(&read), every_value());
+        let totals = direct.totals.snapshot();
+        assert!(
+            totals.iops > 0,
+            "nothing was read at all, so nothing was read in place"
+        );
+        assert_eq!(
+            direct.split(),
+            RescoreReads {
+                in_place: totals.iops,
+                handed_off: 0,
+                trips: 0
+            },
+            "a warm file was handed off"
+        );
+    }
+
+    /// On a file the page cache has dropped, the real read is refused in place
+    /// and handed off rather than waited for, and still comes back right.
+    ///
+    /// Not skipped on a filesystem that refuses the flag outright: there every
+    /// read is handed off too, which is exactly what this asserts.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_cold_file_is_handed_off_rather_than_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let (scheduler, path) = written(&dir, "part_00000.idx").await;
+        if !refuses_a_dropped_page(dir.path()) {
+            eprintln!(
+                "skipped: this machine serves a page the page cache has dropped without \
+                 waiting, so nothing under {} can be refused",
+                dir.path().display()
+            );
+            return;
+        }
+        let direct = Arc::new(DirectReads::default());
+        let file = open(&scheduler, &path)
+            .await
+            .with_local_reads(&ObjectStore::local(), &direct);
+        // Written back first, because only a clean page can be dropped.
+        let handle = std::fs::File::open(dir.path().join("part_00000.idx")).unwrap();
+        handle.sync_all().unwrap();
+        rustix::fs::fadvise(&handle, 0, None, rustix::fs::Advice::DontNeed).unwrap();
+
+        let read = file
+            .read_vectors(&[0, 1, 2], DIMENSION as u32, &IoStats::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(values(&read), every_value());
+        let totals = direct.totals.snapshot();
+        assert_eq!(
+            direct.split(),
+            RescoreReads {
+                in_place: 0,
+                handed_off: totals.iops,
+                trips: 1
+            },
+            "a file out of the page cache was read in place"
+        );
+    }
+
+    /// A read the file cannot satisfy fails as it always has, naming the file,
+    /// and charges nobody - rather than being taken for a miss that is then
+    /// answered out of a buffer nobody filled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_past_the_end_is_an_error_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, direct) = split_local(&dir).await;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("part_00000.idx"))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let stats = IoStats::new();
+
+        let error = file
+            .read_vectors(&[0, 1, 2], DIMENSION as u32, &stats)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("could not read") && message.contains("part_00000.idx"),
+            "{message}"
+        );
+        for (who, counted) in [
+            ("the query", stats.snapshot()),
+            ("the index", direct.totals.snapshot()),
+            ("the hand-off", direct.handed_off.snapshot()),
+        ] {
+            assert_eq!(
+                (counted.iops, counted.requests),
+                (0, 0),
+                "{who} was charged {counted:?} for a read that failed"
+            );
+        }
     }
 }

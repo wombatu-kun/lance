@@ -417,7 +417,7 @@ mod tests {
     use object_store::path::Path;
 
     use crate::format::VECTOR_COLUMN;
-    use crate::io::{PartitionFile, read_scattered, scan_scheduler, write_partition};
+    use crate::io::{DirectReads, PartitionFile, read_scattered, scan_scheduler, write_partition};
     use crate::partition::{Partition, PartitionGraph, vectors_of};
 
     /// Wide enough that Lance's 8 MiB page flush lands inside a fixture a test
@@ -806,7 +806,7 @@ mod tests {
         let local = PartitionFile::open(&scheduler, &path, None, None)
             .await
             .unwrap()
-            .with_local_reads(&store, &Arc::new(IoStats::new()))
+            .with_local_reads(&store, &Arc::new(DirectReads::default()))
             .read_vectors(&wanted, WIDE, &local_stats)
             .await
             .unwrap()
@@ -850,7 +850,7 @@ mod tests {
         assert!(
             !opened(&dir, 8, NARROW)
                 .await
-                .with_local_reads(&store, &Arc::new(IoStats::new()))
+                .with_local_reads(&store, &Arc::new(DirectReads::default()))
                 .reads_locally(),
             "a file on a memory store took the local path"
         );
@@ -858,7 +858,7 @@ mod tests {
         assert!(
             opened(&dir, 8, NARROW)
                 .await
-                .with_local_reads(&local, &Arc::new(IoStats::new()))
+                .with_local_reads(&local, &Arc::new(DirectReads::default()))
                 .reads_locally(),
             "a file on local storage did not take the local path, so every local \
              read below is a scheduled one"

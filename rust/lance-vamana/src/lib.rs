@@ -39,5 +39,5 @@ pub use inserter::{InsertStats, insert_as_segment, insert_in_place};
 pub use merge::{Merged, Newcomers, merge_partition};
 pub use merger::{MergeStats, merge_index};
 pub use partition::{Partition, PartitionGraph};
-pub use query::{Neighbor, QueryResult, SearchParams, VamanaIndex};
+pub use query::{Neighbor, QueryResult, RescoreReads, SearchParams, VamanaIndex};
 pub use segment::{PartitionEntry, SegmentManifest};

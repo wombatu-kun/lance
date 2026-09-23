@@ -1407,6 +1407,32 @@ fn phases(answers: &[QueryResult]) -> (u64, u64, u64, u64) {
         })
 }
 
+/// Whether an `RWF_NOWAIT` read of a byte just written where the tests keep
+/// their datasets is served.
+///
+/// Asked of a file written there for the purpose and never through the index,
+/// so that an index which stopped reading in place cannot talk the test into
+/// skipping the assertion that would catch it. The byte was just written, so
+/// the page cache holds it: anything but a served read means a filesystem,
+/// kernel or sandbox that refuses the flag.
+#[cfg(target_os = "linux")]
+fn serves_without_waiting() -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("probe");
+    std::fs::write(&path, b"x").unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let mut byte = [0u8; 1];
+    matches!(
+        rustix::io::preadv2(
+            &file,
+            &mut [std::io::IoSliceMut::new(&mut byte)],
+            0,
+            rustix::io::ReadWriteFlags::NOWAIT,
+        ),
+        Ok(1)
+    )
+}
+
 /// Every byte a query reads belongs to exactly one of its two phases.
 ///
 /// The two counts come from different places and must agree exactly: one is the
@@ -1444,7 +1470,9 @@ async fn the_phases_of_a_query_add_up_to_what_it_read() {
 
     let warm = cached(&dataset, BUDGET).await;
     replay(&warm, &queries, &params).await;
+    let reads_before = warm.rescore_reads();
     let (answers, cost) = replay(&warm, &queries, &params).await;
+    let reads_after = warm.rescore_reads();
     let (search_bytes, _, rescore_bytes, _) = phases(&answers);
     assert_eq!(
         search_bytes + rescore_bytes,
@@ -1461,6 +1489,33 @@ async fn the_phases_of_a_query_add_up_to_what_it_read() {
         "a cached run re-scored {} candidates a query and read nothing to do it",
         K
     );
+
+    // Every re-score read of a cached index on local storage is one it made off
+    // its own descriptor, on the thread that asked or on the blocking pool, so
+    // the split of them has to add up to what the queries were charged.
+    #[cfg(unix)]
+    {
+        let reads = reads_after.since(&reads_before);
+        let charged = answers
+            .iter()
+            .map(|answer| answer.rescore.iops)
+            .sum::<u64>();
+        assert_eq!(
+            reads.in_place + reads.handed_off,
+            charged,
+            "the re-scores split their reads as {reads:?}, but the queries were charged {charged}"
+        );
+        // And on a warm index, where the filesystem can be asked, none of them
+        // left the thread that asked.
+        #[cfg(target_os = "linux")]
+        if serves_without_waiting() {
+            assert_eq!(
+                (reads.handed_off, reads.trips),
+                (0, 0),
+                "a warm index handed re-score reads to the blocking pool: {reads:?} of {charged}"
+            );
+        }
+    }
 
     // The same question of the clocks, and the only form of it that is not a
     // flaky one: the two phases are disjoint stretches of one call, so together

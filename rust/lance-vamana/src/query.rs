@@ -136,7 +136,7 @@ use crate::format::{
 use lance_io::object_store::ObjectStore;
 
 use crate::io::{
-    OPEN_FILES, OpenFiles, PartitionFile, check_partition_shape, read_partition_batch,
+    DirectReads, OPEN_FILES, OpenFiles, PartitionFile, check_partition_shape, read_partition_batch,
     read_segment, scan_scheduler,
 };
 use crate::lazy::{self, Candidate, LazyProbe};
@@ -450,6 +450,43 @@ impl PhaseCost {
     }
 }
 
+/// Where an index's re-scores read their vectors: see
+/// [`VamanaIndex::rescore_reads`].
+///
+/// Counted in reads as the scheduler would have made them, after coalescing, so
+/// `in_place + handed_off` is the part of [`VamanaIndex::io_stats`] iops that
+/// re-scores read off the index's own descriptors - all of the re-score's share
+/// for an index with a cache, on local storage, on Unix, unless a partition's
+/// vectors could not be addressed and were decoded instead. Cumulative since
+/// the index was opened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RescoreReads {
+    /// Served by the page cache on the thread that asked for them.
+    pub in_place: u64,
+    /// Read on the blocking pool: the page cache did not hold all of the read,
+    /// the partition's batch was over a megabyte, or the read could not be
+    /// asked for without waiting - a platform other than Linux, a kernel older
+    /// than 4.14, or a filesystem or sandbox that refuses `RWF_NOWAIT`.
+    pub handed_off: u64,
+    /// Trips to the blocking pool to read: one for each partition's batch that
+    /// handed off anything, however much, so up to one per probe a query
+    /// re-scores. The trip that opens a file's descriptor - on its first
+    /// re-score, and again after the open-file cap evicts it - is not counted.
+    pub trips: u64,
+}
+
+impl RescoreReads {
+    /// What was read between `earlier` and this snapshot, both taken from one
+    /// index between passes.
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            in_place: self.in_place.saturating_sub(earlier.in_place),
+            handed_off: self.handed_off.saturating_sub(earlier.handed_off),
+            trips: self.trips.saturating_sub(earlier.trips),
+        }
+    }
+}
+
 /// What a query found, and what it cost to find it.
 ///
 /// The cost travels with the answer rather than being logged, because recall
@@ -518,12 +555,14 @@ pub struct VamanaIndex {
     /// Partition files this index has open, shared by the queries that probe
     /// them. Empty for an index with no cache, which reads rather than holds.
     files: OpenFiles,
-    /// Kept to tell a local file from a remote one, which decides whether a
-    /// re-score reads through the scheduler or straight off the disk.
+    /// Kept to tell a local file from a remote one, which - for an index with a
+    /// cache - decides whether a re-score reads through the scheduler or off the
+    /// index's own descriptors.
     store: Arc<ObjectStore>,
     /// What this index has read without going through its scheduler, which is
-    /// the only place those bytes are counted.
-    direct: Arc<IoStats>,
+    /// the only place those bytes are counted, and which of those reads went to
+    /// the blocking pool.
+    direct: Arc<DirectReads>,
 }
 
 /// The stored vertices a walk must not return.
@@ -1071,7 +1110,7 @@ impl VamanaIndex {
             scratches: ScratchPool::new(),
             files: OpenFiles::new(OPEN_FILES),
             store,
-            direct: Arc::new(IoStats::new()),
+            direct: Arc::new(DirectReads::default()),
         })
     }
 
@@ -1178,15 +1217,33 @@ impl VamanaIndex {
     ///
     /// Taken off the index's own scheduler rather than off a tracker wrapped
     /// around the store, which under-counts a local read - plus the re-scores
-    /// that read straight off the disk, which the scheduler never sees.
+    /// read off the index's own descriptors, in place or on the blocking pool,
+    /// which the scheduler never sees.
     pub fn io_stats(&self) -> ScanStats {
         let scheduled = self.scheduler.stats();
-        let direct = self.direct.snapshot();
+        let direct = self.direct.totals.snapshot();
         ScanStats {
             iops: scheduled.iops + direct.iops,
             requests: scheduled.requests + direct.requests,
             bytes_read: scheduled.bytes_read + direct.bytes_read,
         }
+    }
+
+    /// Which thread read the vectors this index's re-scores asked for, since it
+    /// was opened.
+    ///
+    /// The reads [`Self::io_stats`] adds to its scheduler's, split by who made
+    /// them. With the partition files in the page cache none should be handed
+    /// off, so a count here then means a batch over a megabyte, a filesystem or
+    /// sandbox that refuses to read without waiting, or a platform other than
+    /// Linux. Zero throughout for an index not given a cache
+    /// ([`Self::with_cache`]), one whose store is not local or reads through
+    /// io_uring, or one off Unix: each of those re-scores through its
+    /// scheduler. Take it between passes, and difference two of them with
+    /// [`RescoreReads::since`]: the counters are read one after the other, so
+    /// while queries are in flight the split can be off by a batch.
+    pub fn rescore_reads(&self) -> RescoreReads {
+        self.direct.split()
     }
 
     /// What opening the index established about its segments, for the one
