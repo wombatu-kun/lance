@@ -533,6 +533,18 @@ pub(crate) fn storage(
     row_ids: &[u64],
     codes: &FixedSizeListArray,
 ) -> Result<CodeStore> {
+    // Checked here, once, for both kinds: RaBitQ's split reads the items as
+    // bytes unconditionally, and a column of another item type at the same
+    // width would otherwise panic there rather than be reported.
+    if codes.value_type() != DataType::UInt8 {
+        return Err(Error::corrupt_file_named(
+            CODE_COLUMN,
+            format!(
+                "Vamana code column holds {} items, but a code is bytes",
+                codes.value_type()
+            ),
+        ));
+    }
     let stride = params.stride(dimension)? as usize;
     if codes.value_length() as usize != stride {
         return Err(Error::corrupt_file_named(
@@ -995,6 +1007,7 @@ mod tests {
 
     use std::collections::BinaryHeap;
 
+    use arrow_array::Int8Array;
     use lance_index::vector::storage::{DistCalculator, VectorStore};
     use rand::rngs::SmallRng;
     use rand::{Rng, RngCore, SeedableRng};
@@ -1547,6 +1560,42 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }));
         assert!(error.to_string().contains("bytes a vertex"), "{error}");
+    }
+
+    /// A code column of another item type is a corrupt file for either kind of
+    /// code, even at exactly the width this segment's codes have.
+    ///
+    /// The width is right on purpose, so that nothing but the item type is
+    /// wrong: RaBitQ's split reads the items as bytes without asking and would
+    /// panic, and Lance's scalar store refuses them with an index error that
+    /// names neither the column nor the file.
+    #[test]
+    fn a_code_column_of_other_items_is_rejected() {
+        for params in [
+            CodeParams::rabit(3, DIMENSION).unwrap(),
+            CodeParams::Scalar {
+                num_bits: 8,
+                bounds: 0.0..1.0,
+            },
+        ] {
+            let stride = params.stride(DIMENSION).unwrap() as usize;
+            let (_, _, row_ids) = sample(7);
+            let column = FixedSizeListArray::try_new_from_values(
+                Int8Array::from(vec![0i8; ROWS * stride]),
+                stride as i32,
+            )
+            .unwrap();
+
+            let error =
+                storage(&params, DistanceType::L2, DIMENSION, &row_ids, &column).unwrap_err();
+            assert!(
+                matches!(error, Error::CorruptFile { .. }),
+                "{params:?}: {error}"
+            );
+            assert!(error.to_string().contains(CODE_COLUMN), "{error}");
+            // The type found, not the one wanted: `UInt8` contains `Int8`.
+            assert!(error.to_string().contains("holds Int8 items"), "{error}");
+        }
     }
 
     #[test]
