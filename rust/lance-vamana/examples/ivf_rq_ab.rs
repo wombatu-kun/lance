@@ -30,6 +30,14 @@
 //! `PREFETCH_AHEAD` reaches an instruction only under `CODE_KIND=sq`: RaBitQ's
 //! calculator has no `prefetch`.
 //!
+//! `STOP_MARGINS` (unset: none) adds a second curve for every budget of
+//! `BUDGETS`: the walk stopped by a margin (`SearchParams::stop_margin`) rather
+//! than by its list, one point per margin, each with its list capped at
+//! `STOP_CAP` (required with them). Its rows are called `vamana walk margin
+//! b=N` and print the margin in the axis column to four places, which each
+//! margin has to print exactly. A pass may carry that curve alone, with
+//! `QUEUES` unset. `QUEUES` and `STOP_MARGINS` are given in ascending order.
+//!
 //! `LANCE_RQ_PRUNE_STATS=1` is Lance's own knob, not this example's: `IVF_RQ`
 //! tallies how many rows its two-stage estimator threw away on the binary code
 //! alone and reports them through `log`. A binary with no logger installed
@@ -153,6 +161,14 @@
 //! after the open-file cap evicts it - is not counted. It is a comment rather
 //! than a column so that every log parser written before it still reads the
 //! table, and it carries no `=`, which the header's knobs are parsed by.
+//!
+//! **What the walk did, as a second comment.** Under that line another,
+//! starting `# work of the row above:`, gives the distances a query measured -
+//! mean, median, 99th percentile and most - and the mean recall of the tenth
+//! of queries that scored worst. A stop margin spends distances unevenly on
+//! purpose, so the mean alone cannot say what the slowest queries paid, and one
+//! mean recall can hide two spreads of it. Both are exact counts that repeat
+//! from pass to pass to the digit.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -251,6 +267,21 @@ fn env_list(name: &str, fallback: &str) -> Vec<usize> {
 fn env_list_opt(name: &str) -> Vec<usize> {
     match std::env::var(name) {
         Ok(raw) if !raw.trim().is_empty() => parse_list(name, &raw),
+        _ => Vec::new(),
+    }
+}
+
+/// An unset or empty variable is no fractions at all, like [`env_list_opt`].
+fn env_fractions(name: &str) -> Vec<f32> {
+    match std::env::var(name) {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .split(',')
+            .map(|item| {
+                item.trim()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{name} must be a comma-separated list of numbers"))
+            })
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -355,7 +386,7 @@ fn cpu_micros() -> f64 {
 ///
 /// `false` says the narrowest width already cleared the target, so what comes
 /// back is an upper bound and the true crossing is off the bottom of the grid.
-fn at_recall(points: &[(usize, Cost)], target: f64) -> Option<(Cost, bool)> {
+fn at_recall(points: &[(String, Cost)], target: f64) -> Option<(Cost, bool)> {
     let first = points.first()?;
     if first.1.recall >= target {
         return Some((first.1, false));
@@ -462,12 +493,11 @@ struct Fixture<'a> {
 async fn measure_vamana(
     dataset: &Dataset,
     fixture: &Fixture<'_>,
-    list_size: usize,
-    budget: usize,
+    point: &Point,
     mode: WalkMode,
     beam_width: usize,
     prefetch_ahead: usize,
-) -> (Cost, RescoreReads) {
+) -> (Cost, RescoreReads, Work) {
     let Fixture {
         queries,
         truth,
@@ -483,13 +513,17 @@ async fn measure_vamana(
     } = *fixture;
     let params = SearchParams::new(K)
         .with_nprobes(nprobes)
-        .with_search_list_size(list_size)
+        .with_search_list_size(point.list_size)
         .with_mode(mode)
         .with_beam_width(beam_width)
         .with_prefetch_ahead(prefetch_ahead)
         .with_resident_edges(resident_edges)
         .with_report_coded(true)
-        .with_rescore_budget(budget);
+        .with_rescore_budget(point.budget);
+    let params = match point.stop_margin {
+        Some(margin) => params.with_stop_margin(margin),
+        None => params,
+    };
     let index = Arc::new(
         VamanaIndex::open(dataset, VAMANA_INDEX)
             .await
@@ -556,14 +590,21 @@ async fn measure_vamana(
                     rescore_micros: result.rescore.elapsed.as_micros() as f64,
                     search_bytes: result.search.bytes_read as f64,
                     rescore_bytes: result.rescore.bytes_read as f64,
+                    comparisons: result.comparisons,
                 }
             })
         })
         .buffered(concurrency)
-        .fold(Reported::default(), |totals, reported| async move {
-            totals.plus(&reported.unwrap())
-        })
+        .fold(
+            (Reported::default(), Vec::with_capacity(queries.len())),
+            |(totals, mut each), reported| async move {
+                let reported = reported.unwrap();
+                each.push((reported.comparisons, reported.recall));
+                (totals.plus(&reported), each)
+            },
+        )
         .await;
+    let (totals, each) = totals;
     let micros = started.elapsed().as_micros() as f64;
     let cpu = cpu_micros() - cpu_before;
     let after = index.io_stats();
@@ -614,7 +655,43 @@ async fn measure_vamana(
         search_bytes: totals.search_bytes / queries,
         rescore_bytes: totals.rescore_bytes / queries,
     };
-    (cost, reads_after.since(&reads_before))
+    (cost, reads_after.since(&reads_before), Work::of(&each))
+}
+
+/// What the queries of one row measured one by one, where [`Cost`] has only
+/// their mean.
+struct Work {
+    mean: f64,
+    median: u64,
+    p99: u64,
+    most: u64,
+    /// The mean recall of the tenth of queries that scored worst.
+    worst_tenth: f64,
+}
+
+impl Work {
+    /// `each` is a query's distance count and recall; it is never empty, since
+    /// a pass answers at least one query.
+    fn of(each: &[(u64, f64)]) -> Self {
+        let mut distances = each.iter().map(|(count, _)| *count).collect::<Vec<_>>();
+        distances.sort_unstable();
+        let mut recalls = each.iter().map(|(_, recall)| *recall).collect::<Vec<_>>();
+        recalls.sort_by(f64::total_cmp);
+        // Nearest rank: the smallest count at least that share of the queries
+        // did not exceed.
+        let rank = |share: f64| {
+            let at = (share * distances.len() as f64).ceil() as usize;
+            distances[at.clamp(1, distances.len()) - 1]
+        };
+        let tenth = recalls.len().div_ceil(10);
+        Self {
+            mean: distances.iter().sum::<u64>() as f64 / distances.len() as f64,
+            median: rank(0.5),
+            p99: rank(0.99),
+            most: distances[distances.len() - 1],
+            worst_tenth: recalls[..tenth].iter().sum::<f64>() / tenth as f64,
+        }
+    }
 }
 
 /// What one query of this crate's arm reported, and what a pass sums them into.
@@ -631,6 +708,7 @@ struct Reported {
     rescore_micros: f64,
     search_bytes: f64,
     rescore_bytes: f64,
+    comparisons: u64,
 }
 
 impl Reported {
@@ -643,6 +721,7 @@ impl Reported {
             rescore_micros: self.rescore_micros + other.rescore_micros,
             search_bytes: self.search_bytes + other.search_bytes,
             rescore_bytes: self.rescore_bytes + other.rescore_bytes,
+            comparisons: self.comparisons + other.comparisons,
         }
     }
 }
@@ -859,7 +938,7 @@ async fn reference_sweep(
     fixture: &Fixture<'_>,
     widths: &[usize],
     label: &str,
-) -> Vec<(usize, Cost)> {
+) -> Vec<(String, Cost)> {
     // Lance spends one knob where this crate spends two, so its two phases are
     // two runs rather than two counters: with `refine_factor` unset the scan
     // reads no original vector at all, which makes that run exactly this arm's
@@ -880,7 +959,7 @@ async fn reference_sweep(
         "the unrefined reference answered nothing, so the split would report a recall of zero \
          before the re-score as though that were a measurement"
     );
-    report(&format!("{label} coded"), K, &bare);
+    report(&format!("{label} coded"), &K.to_string(), &bare);
 
     let mut points = Vec::with_capacity(widths.len());
     for width in widths {
@@ -898,19 +977,20 @@ async fn reference_sweep(
         // noise floor rather than that it cost nothing.
         cost.rescore_micros = cost.latency_micros - bare.latency_micros;
         cost.rescore_bytes = cost.bytes - bare.bytes;
-        report(label, *width, &cost);
-        points.push((*width, cost));
+        report(label, &width.to_string(), &cost);
+        points.push((width.to_string(), cost));
     }
     points
 }
 
-/// One point of a vamana sweep: what the axis column reads, and the pair of
-/// knobs it stands for. The two sweeps differ only in which of them moves.
-#[derive(Clone, Copy)]
+/// One point of a vamana sweep: what the axis column reads, and the knobs it
+/// stands for. The sweeps differ only in which of them moves.
 struct Point {
-    axis: usize,
+    /// A width or a queue, or a margin to four places.
+    axis: String,
     list_size: usize,
     budget: usize,
+    stop_margin: Option<f32>,
 }
 
 /// One curve: the points along its axis, and what its label is called after the
@@ -918,11 +998,14 @@ struct Point {
 struct Curve {
     suffix: String,
     points: Vec<Point>,
+    /// A curve of stop margins, which only the walk stops by: a scan has no
+    /// walk to stop, and the crate refuses it one.
+    walk_only: bool,
 }
 
-fn report(label: &str, width: usize, cost: &Cost) {
+fn report(label: &str, axis: &str, cost: &Cost) {
     println!(
-        "{label:<22} {width:>6} {:>8.4} {:>8.4} {:>12.0} {:>11.0} {:>11.0} {:>8.0} {:>9.1} \
+        "{label:<22} {axis:>6} {:>8.4} {:>8.4} {:>12.0} {:>11.0} {:>11.0} {:>8.0} {:>9.1} \
          {:>10.0} {:>8.0} {:>10.0} {:>11.0} {:>9.0} {:>6.2} {:>6.0} {:>8}",
         cost.recall,
         cost.coded_recall,
@@ -1016,10 +1099,54 @@ async fn main() {
     let list_scales = env_list("LIST_SCALES", "1");
     let budgets = env_list_opt("BUDGETS");
     let queues = env_list_opt("QUEUES");
+    let stop_margins = env_fractions("STOP_MARGINS");
+    let stop_cap = env_usize("STOP_CAP", 0);
     assert_eq!(
         budgets.is_empty(),
-        queues.is_empty(),
-        "BUDGETS and QUEUES name one sweep between them: set both or neither"
+        queues.is_empty() && stop_margins.is_empty(),
+        "BUDGETS names the budgets QUEUES and STOP_MARGINS sweep at: set it with either of them, \
+         and not alone"
+    );
+    // In ascending order because the interpolation onto the bar takes the first
+    // pair of points either side of it in the order given.
+    assert!(
+        queues.windows(2).all(|pair| pair[0] < pair[1]),
+        "QUEUES {queues:?} must be ascending, or the bar is interpolated over the wrong pair"
+    );
+    assert!(
+        stop_margins.windows(2).all(|pair| pair[0] < pair[1]),
+        "STOP_MARGINS {stop_margins:?} must be ascending, or the bar is interpolated over the \
+         wrong pair"
+    );
+    assert!(
+        stop_margins
+            .iter()
+            .all(|margin| margin.is_finite() && margin.is_sign_positive()),
+        "every stop margin must be a finite fraction of at least zero, not {stop_margins:?}"
+    );
+    assert!(
+        stop_margins.is_empty() || budgets.iter().all(|budget| stop_cap >= *budget),
+        "STOP_MARGINS needs STOP_CAP, a list cap no shorter than any budget: a margin keeps the \
+         nearest budget of candidates whatever their distance, and the crate refuses a cap below \
+         that"
+    );
+    assert!(
+        !stop_margins.is_empty() || stop_cap == 0,
+        "STOP_CAP caps only the rows of STOP_MARGINS, and none were given"
+    );
+    // Four places is what the axis column prints, so a margin it cannot print
+    // exactly would put in the log a value other than the one that ran.
+    let margin_axes = stop_margins
+        .iter()
+        .map(|margin| format!("{margin:.4}"))
+        .collect::<Vec<_>>();
+    assert!(
+        stop_margins
+            .iter()
+            .zip(&margin_axes)
+            .all(|(margin, axis)| axis.parse::<f32>() == Ok(*margin)),
+        "STOP_MARGINS {stop_margins:?} print as {margin_axes:?} at four places, which is not the \
+         margin every row would have run at"
     );
     assert!(
         budgets.iter().all(|budget| *budget >= K),
@@ -1052,6 +1179,13 @@ async fn main() {
         matches!(reference_position.as_str(), "last" | "both"),
         "REFERENCE_POSITION is `last` or `both`, not {reference_position:?}"
     );
+
+    if !stop_margins.is_empty() {
+        println!(
+            "walk stop margins {} at a list cap of {stop_cap}",
+            margin_axes.join(",")
+        );
+    }
 
     let vectors = FixedSizeListArray::try_new_from_values(
         Float32Array::from(base[..rows * dim].to_vec()),
@@ -1263,7 +1397,13 @@ async fn main() {
         "\n{:<22} {:>6} {:>8} {:>8} {:>12} {:>11} {:>11} {:>8} {:>9} {:>10} {:>8} {:>10} \
          {:>11} {:>9} {:>6} {:>6} {:>8}",
         "arm",
-        if budgets.is_empty() { "width" } else { "queue" },
+        if budgets.is_empty() {
+            "width"
+        } else if queues.is_empty() {
+            "margin"
+        } else {
+            "queue"
+        },
         "recall",
         "coded",
         "bytes",
@@ -1298,6 +1438,10 @@ async fn main() {
         })
         .collect::<Vec<_>>();
     assert!(!arms.is_empty(), "ARMS must name at least one arm");
+    assert!(
+        stop_margins.is_empty() || arms.iter().any(|(mode, _)| *mode == WalkMode::Lazy),
+        "STOP_MARGINS stop the walk, and ARMS does not name it"
+    );
 
     let curves: Vec<Curve> = if budgets.is_empty() {
         list_scales
@@ -1310,56 +1454,86 @@ async fn main() {
                 points: widths
                     .iter()
                     .map(|width| Point {
-                        axis: *width,
+                        axis: width.to_string(),
                         list_size: width * scale,
                         budget: *width,
+                        stop_margin: None,
                     })
                     .collect(),
+                walk_only: false,
             })
             .collect()
     } else {
         budgets
             .iter()
-            .map(|budget| Curve {
-                suffix: format!(" b={budget}"),
-                points: queues
-                    .iter()
-                    .map(|queue| Point {
-                        axis: *queue,
-                        list_size: *queue,
-                        budget: *budget,
-                    })
-                    .collect(),
+            .flat_map(|budget| {
+                let queued = (!queues.is_empty()).then(|| Curve {
+                    suffix: format!(" b={budget}"),
+                    points: queues
+                        .iter()
+                        .map(|queue| Point {
+                            axis: queue.to_string(),
+                            list_size: *queue,
+                            budget: *budget,
+                            stop_margin: None,
+                        })
+                        .collect(),
+                    walk_only: false,
+                });
+                let stopped = (!stop_margins.is_empty()).then(|| Curve {
+                    suffix: format!(" margin b={budget}"),
+                    points: stop_margins
+                        .iter()
+                        .zip(&margin_axes)
+                        .map(|(margin, axis)| Point {
+                            axis: axis.clone(),
+                            list_size: stop_cap,
+                            budget: *budget,
+                            stop_margin: Some(*margin),
+                        })
+                        .collect(),
+                    walk_only: true,
+                });
+                queued.into_iter().chain(stopped)
             })
             .collect()
     };
 
-    let mut sweeps: Vec<(String, Vec<(usize, Cost)>)> = Vec::with_capacity(curves.len() * 2 + 2);
+    let mut sweeps: Vec<(String, Vec<(String, Cost)>)> = Vec::with_capacity(curves.len() * 2 + 2);
     if reference_position == "both" {
         let points = reference_sweep(&rq_uri, &rq_fixture, &widths, "IVF_RQ early").await;
         sweeps.push(("IVF_RQ early".to_string(), points));
     }
     for curve in &curves {
         for (mode, name) in arms.iter().copied() {
+            if curve.walk_only && mode != WalkMode::Lazy {
+                continue;
+            }
             let label = format!("vamana {name}{}", curve.suffix);
             let mut measured = Vec::with_capacity(curve.points.len());
             for point in &curve.points {
-                let (cost, reads) = measure_vamana(
+                let (cost, reads, work) = measure_vamana(
                     &vamana_dataset,
                     &vamana_fixture,
-                    point.list_size,
-                    point.budget,
+                    point,
                     mode,
                     beam_width,
                     prefetch_ahead,
                 )
                 .await;
-                report(&label, point.axis, &cost);
+                report(&label, &point.axis, &cost);
+                // The re-score line first: parsers written before the work line
+                // read it as the line under the row.
                 println!(
                     "# re-score reads of the row above: {} in place, {} handed off in {} trips",
                     reads.in_place, reads.handed_off, reads.trips
                 );
-                measured.push((point.axis, cost));
+                println!(
+                    "# work of the row above: distances a query mean {:.3}, p50 {}, p99 {}, max \
+                     {}; worst tenth of queries at recall {:.4}",
+                    work.mean, work.median, work.p99, work.most, work.worst_tenth
+                );
+                measured.push((point.axis.clone(), cost));
             }
             sweeps.push((label, measured));
         }

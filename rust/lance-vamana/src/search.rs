@@ -251,6 +251,42 @@ struct Entry {
     expanded: bool,
 }
 
+/// When a walk stops before its list runs out of vertices to expand: once none
+/// of them is among its `rank` nearest candidates or nearer than `1 + margin`
+/// times the length to the `rank`-th, which is adaptive beam search
+/// (Al-Jazzazi et al., NeurIPS 2025) with `gamma = margin` and `k = rank`.
+///
+/// `keep` is the other half, and a walk that re-scores needs both: the nearest
+/// `keep` candidates stay in the list whatever their distance, because they are
+/// what the re-score is owed. It is at least `rank`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct StopRule {
+    pub(crate) margin: f32,
+    pub(crate) rank: usize,
+    pub(crate) keep: usize,
+}
+
+/// A [`StopRule`] as a list applies it.
+#[derive(Debug, Clone, Copy)]
+struct Margin {
+    rank: usize,
+    keep: usize,
+    /// `(1 + margin)^2`: the rule is about lengths, and every distance a walk
+    /// measures here is a squared one - or, over RaBitQ codes, an estimate of
+    /// one, which can fall below zero. There the bar sits below the `rank`-th,
+    /// nothing past it is expanded whatever the margin, and a wider margin
+    /// lowers the bar rather than raising it.
+    factor: f32,
+    /// `factor` times the distance of the entry at `rank - 1`, set the moment
+    /// the list is that long and read only once it is.
+    ///
+    /// It only ever falls, because the entry it is taken from can only be
+    /// replaced by a nearer one, and that is what makes it safe to throw away
+    /// what lies beyond it: a candidate the bar has passed over now stays
+    /// passed over.
+    bar: OrderedFloat,
+}
+
 /// `L`: the beam a walk keeps, nearest first.
 ///
 /// Shared rather than written twice because there are two walks over it and they
@@ -270,6 +306,14 @@ pub struct SearchList {
     /// front. An entry lands among them only by being nearer than one of them,
     /// and moves this back to where it landed.
     cursor: usize,
+    /// The walk's [`StopRule`], if it has one; `None` expands until nothing
+    /// in the list is left unexpanded.
+    ///
+    /// With one, every entry at or past `keep` is nearer than the bar. So an
+    /// entry the rule would not expand can only sit between `rank` and `keep`,
+    /// and the list is always the front of the plain list fed the same offers
+    /// under the same cap, with nothing cut.
+    margin: Option<Margin>,
 }
 
 impl SearchList {
@@ -283,6 +327,40 @@ impl SearchList {
             list: Vec::with_capacity(search_list_size.min(num_vertices).saturating_add(1)),
             size: search_list_size,
             cursor: 0,
+            margin: None,
+        }
+    }
+
+    /// A list that stops its walk by `stop`, capped at `search_list_size`.
+    ///
+    /// The cap still binds: an entry past it is dropped however near the bar
+    /// it is, so a walk that means to follow the rule needs a cap it never
+    /// reaches. The caller checks `1 <= rank <= keep <= search_list_size`.
+    pub(crate) fn with_margin(
+        search_list_size: usize,
+        num_vertices: usize,
+        stop: StopRule,
+    ) -> Self {
+        debug_assert!(
+            1 <= stop.rank && stop.rank <= stop.keep && stop.keep <= search_list_size,
+            "a stop rule at rank {} keeping {} does not fit a list of {search_list_size}",
+            stop.rank,
+            stop.keep
+        );
+        let widened = 1.0 + stop.margin;
+        debug_assert!(
+            (widened * widened).is_finite(),
+            "a stop margin of {} has no finite square to measure a bar by",
+            stop.margin
+        );
+        Self {
+            margin: Some(Margin {
+                rank: stop.rank,
+                keep: stop.keep,
+                factor: widened * widened,
+                bar: OrderedFloat(f32::INFINITY),
+            }),
+            ..Self::new(search_list_size, num_vertices)
         }
     }
 
@@ -296,6 +374,14 @@ impl SearchList {
     /// for a place: the search would put it after every entry it is no nearer
     /// than, which is past the end, and most of what a walk offers once its
     /// list has filled is exactly that.
+    ///
+    /// A list with a [`StopRule`] also turns away a vertex that would land past
+    /// its `keep` nearest and is not nearer than the bar, and cuts off every
+    /// entry past `keep` that is not nearer than it either: the one an insert
+    /// pushes past `keep`, and those a falling bar has passed over. The rule
+    /// would never expand them, the re-score never sees them, and the bar only
+    /// falls, so none of them can come back into play. Among equals at `keep`
+    /// the first offered stays, as it does at the cap.
     pub fn offer(&mut self, id: u32, distance: f32) {
         let distance = OrderedFloat(distance);
         if self.list.len() >= self.size
@@ -303,6 +389,13 @@ impl SearchList {
                 .list
                 .last()
                 .is_some_and(|back| back.node.dist <= distance)
+        {
+            return;
+        }
+        if let Some(margin) = &self.margin
+            && self.list.len() >= margin.keep
+            && margin.bar <= distance
+            && self.list[margin.keep - 1].node.dist <= distance
         {
             return;
         }
@@ -321,8 +414,21 @@ impl SearchList {
         );
         self.list.truncate(self.size);
         self.cursor = self.cursor.min(at);
-        // Truncating cuts a list back only when it was full before the insert,
-        // so never below the cursor.
+        if let Some(margin) = &mut self.margin {
+            if at < margin.rank && self.list.len() >= margin.rank {
+                margin.bar = OrderedFloat(margin.factor * self.list[margin.rank - 1].node.dist.0);
+            }
+            // An insert before `keep` pushes the entry at `keep - 1` past it,
+            // and a new bar may have passed over some of those already there.
+            if at < margin.keep && self.list.len() > margin.keep {
+                let nearer =
+                    self.list[margin.keep..].partition_point(|entry| entry.node.dist < margin.bar);
+                self.list.truncate(margin.keep + nearer);
+            }
+        }
+        // Truncating to the cap cuts a list back only when it was full before
+        // the insert, and cutting to the bar only past `keep`, beyond the
+        // insert - so neither ever cuts below the cursor.
         debug_assert!(
             self.cursor <= self.list.len(),
             "a search list's cursor {} ran past its {} entries",
@@ -387,11 +493,24 @@ impl SearchList {
     ///
     /// The search starts at the cursor rather than at the front, past entries
     /// that are all expanded already.
+    ///
+    /// With a [`StopRule`] it is also `None` when that vertex is one the rule
+    /// does not expand: past the `rank` nearest and not nearer than the bar.
+    /// Every unexpanded vertex after it is no nearer, so that is where the walk
+    /// stops - until an offer lands a nearer one.
     pub fn next_unexpanded(&mut self) -> Option<OrderedNode> {
         let position = self.cursor
             + self.list[self.cursor..]
                 .iter()
                 .position(|entry| !entry.expanded)?;
+        if let Some(margin) = &self.margin
+            && position >= margin.rank
+            && margin.bar <= self.list[position].node.dist
+        {
+            // Everything before it is expanded, so the cursor may wait there.
+            self.cursor = position;
+            return None;
+        }
         self.list[position].expanded = true;
         self.cursor = position + 1;
         Some(self.list[position].node.clone())
@@ -1378,6 +1497,269 @@ mod tests {
             reference_walk(&large, &large_table, 0, usize::MAX),
             "a walk a whole cycle after a wrap left a different list, expanded a different \
              sequence or measured a different number of distances"
+        );
+    }
+
+    /// [`PlainList`] ruled by a [`StopRule`] straight from its definition:
+    /// nothing is thrown away, and the rule is consulted only when a vertex is
+    /// asked for - expand the nearest unexpanded one if it is among the `rank`
+    /// nearest or nearer than `(1 + margin)^2` times the `rank`-th's distance.
+    struct RuledList {
+        plain: PlainList,
+        rank: usize,
+        keep: usize,
+        factor: f32,
+    }
+
+    impl RuledList {
+        fn new(size: usize, stop: StopRule) -> Self {
+            Self {
+                plain: PlainList::new(size),
+                rank: stop.rank,
+                keep: stop.keep,
+                factor: (1.0 + stop.margin).powi(2),
+            }
+        }
+
+        fn offer(&mut self, id: u32, distance: f32) {
+            self.plain.offer(id, distance);
+        }
+
+        fn bar(&self) -> Option<OrderedFloat> {
+            self.plain
+                .list
+                .get(self.rank - 1)
+                .map(|(node, _)| OrderedFloat(self.factor * node.dist.0))
+        }
+
+        fn next_unexpanded(&mut self) -> Option<OrderedNode> {
+            let position = self.plain.list.iter().position(|(_, expanded)| !expanded)?;
+            let beyond = self
+                .bar()
+                .is_some_and(|bar| bar <= self.plain.list[position].0.dist);
+            if position >= self.rank && beyond {
+                return None;
+            }
+            self.plain.list[position].1 = true;
+            Some(self.plain.list[position].0.clone())
+        }
+
+        /// What the rule has any use for: the nearest `keep`, and after them
+        /// whatever is nearer than the bar.
+        fn kept(&self) -> Vec<(u32, u32, bool)> {
+            let held = plainly_held(&self.plain);
+            let cut = match self.bar() {
+                Some(bar) if held.len() > self.keep => {
+                    self.keep
+                        + self.plain.list[self.keep..]
+                            .iter()
+                            .take_while(|(node, _)| node.dist < bar)
+                            .count()
+                }
+                _ => held.len(),
+            };
+            held[..cut].to_vec()
+        }
+    }
+
+    /// A list with a stop rule keeps the front of what the ruled plain list
+    /// holds, and expands exactly what the rule allows, after every offer and
+    /// every expansion.
+    ///
+    /// The front and not the whole: a list may throw away what the rule has no
+    /// use for, and what it keeps has to be exactly the rest, or a candidate
+    /// the re-score is owed - or one the walk should still expand - went
+    /// missing. At a margin of zero it also expands exactly what the plain list
+    /// of length `rank` does, whatever it keeps, and at `rank == keep` it is
+    /// that list entry for entry: the walk as it was.
+    ///
+    /// The distances are chosen so that bars of 1.5625, 2.25 and 4 times one of
+    /// them land exactly on another, and so exercise the strict side of every
+    /// comparison. They are finite, as every distance a walk measures is.
+    #[test]
+    fn a_list_with_a_stop_rule_is_the_front_of_the_list_it_rules() {
+        const DISTANCES: [f32; 12] = [
+            -1.0, 0.0, 0.5, 1.0, 2.0, 2.25, 4.0, 4.5, 6.25, 9.0, 16.0, 25.0,
+        ];
+        let mut rng = SmallRng::seed_from_u64(13);
+        // Where each half of the rule acted in the list itself: a stop with
+        // unexpanded entries still held, and an insert that did not lengthen a
+        // list the cap had room in. A fixture that never reached one of them
+        // would pass the comparisons below without testing it.
+        let (mut stopped, mut cut) = (0usize, 0usize);
+        for (rank, keep) in [(1, 1), (1, 3), (2, 5), (3, 3), (5, 16), (16, 16)] {
+            for size in [keep, keep + 1, 64, usize::MAX] {
+                for margin in [0.0f32, 0.25, 0.5, 1.0] {
+                    let stop = StopRule { margin, rank, keep };
+                    for sequence in 0..20 {
+                        let mut list = SearchList::with_margin(size, 256, stop);
+                        let mut ruled = RuledList::new(size, stop);
+                        let mut plain = (margin == 0.0).then(|| PlainList::new(rank));
+                        for step in 0..100 {
+                            let context = || {
+                                format!(
+                                    "rank {rank}, keep {keep}, L = {size}, margin {margin}, \
+                                     sequence {sequence}, step {step}"
+                                )
+                            };
+                            if rng.random_bool(0.7) {
+                                let id = rng.random_range(0..256);
+                                let distance = DISTANCES[rng.random_range(0..DISTANCES.len())];
+                                let before = held(&list);
+                                list.offer(id, distance);
+                                let after = held(&list);
+                                cut += usize::from(
+                                    after != before
+                                        && after.len() <= before.len()
+                                        && before.len() < size,
+                                );
+                                ruled.offer(id, distance);
+                                if let Some(plain) = plain.as_mut() {
+                                    plain.offer(id, distance);
+                                }
+                            } else {
+                                let expansions = if rng.random_bool(0.25) { 4 } else { 1 };
+                                for _ in 0..expansions {
+                                    let expected = ruled.next_unexpanded().map(bits);
+                                    let expanded = list.next_unexpanded().map(bits);
+                                    stopped += usize::from(
+                                        expanded.is_none()
+                                            && list.list.iter().any(|entry| !entry.expanded),
+                                    );
+                                    assert_eq!(
+                                        expanded,
+                                        expected,
+                                        "{}: the lists expanded different vertices",
+                                        context()
+                                    );
+                                    if let Some(plain) = plain.as_mut() {
+                                        assert_eq!(
+                                            plain.next_unexpanded().map(bits),
+                                            expected,
+                                            "{}: a margin of zero expanded what the list of \
+                                             length rank does not",
+                                            context()
+                                        );
+                                    }
+                                }
+                            }
+                            let kept = ruled.kept();
+                            assert_eq!(
+                                held(&list),
+                                kept,
+                                "{}: the lists hold different entries",
+                                context()
+                            );
+                            if let Some(plain) = plain.as_ref().filter(|_| rank == keep) {
+                                assert_eq!(
+                                    plainly_held(plain),
+                                    kept,
+                                    "{}: a margin of zero kept what the list of that length \
+                                     does not",
+                                    context()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            stopped > 0 && cut > 0,
+            "the list stopped {stopped} walks with entries left and cut {cut} times, so one half \
+             of the rule was never exercised"
+        );
+    }
+
+    /// Algorithm 1 with a stop rule, one vertex at a time: what a lazy walk of
+    /// width one does with its list.
+    fn ruled_walk(
+        graph: &PartitionGraph,
+        table: &Table,
+        entry_point: u32,
+        stop: StopRule,
+        search_list_size: usize,
+    ) -> (Vec<u32>, u64) {
+        let mut scratch = SearchScratch::new(graph.len());
+        scratch.begin();
+        scratch.mark(entry_point);
+        let mut list = SearchList::with_margin(search_list_size, graph.len(), stop);
+        list.offer(entry_point, table.distance(entry_point));
+        let mut comparisons = 1;
+        let mut expanded = Vec::new();
+        while let Some(node) = list.next_unexpanded() {
+            expanded.push(node.id);
+            for neighbor in graph.neighbors(node.id).unwrap() {
+                if scratch.mark(*neighbor) {
+                    comparisons += 1;
+                    list.offer(*neighbor, table.distance(*neighbor));
+                }
+            }
+        }
+        (expanded, comparisons)
+    }
+
+    /// A wider margin walks on from where a narrower one stopped: the same
+    /// vertices expanded in the same order, then more, and never fewer
+    /// distances.
+    ///
+    /// This is what makes a sweep over the margin a sweep over one walk's
+    /// stopping points rather than over different walks, so that recall and
+    /// work move one way along it. It holds for one vertex a hop, under any cap
+    /// both walks share - one just past `keep` binds all the time here - and for
+    /// distances of at least zero: below zero a wider margin puts the bar lower,
+    /// not higher.
+    #[test]
+    fn a_wider_margin_walks_on_from_where_a_narrower_one_stopped() {
+        const DISTANCES: [f32; 6] = [0.0, 1.0, 1.0, 2.0, 3.0, 5.0];
+        let mut rng = SmallRng::seed_from_u64(17);
+        let mut further = 0usize;
+        for num_vertices in [2, 17, 64, 200] {
+            for _ in 0..24 {
+                let graph = random_graph(num_vertices, 4, &mut rng);
+                let table = Table(
+                    (0..num_vertices)
+                        .map(|_| DISTANCES[rng.random_range(0..DISTANCES.len())])
+                        .collect(),
+                );
+                let entry_point = rng.random_range(0..num_vertices as u32);
+                for (rank, keep) in [(1, 1), (2, 4), (5, 5)] {
+                    for size in [keep + 1, usize::MAX] {
+                        let mut narrower: Option<(Vec<u32>, u64)> = None;
+                        for margin in [0.0f32, 0.25, 1.0, 4.0] {
+                            let walked = ruled_walk(
+                                &graph,
+                                &table,
+                                entry_point,
+                                StopRule { margin, rank, keep },
+                                size,
+                            );
+                            if let Some((expanded, comparisons)) = &narrower {
+                                assert!(
+                                    walked.0.starts_with(expanded),
+                                    "over {num_vertices} vertices at rank {rank}, L = {size}, \
+                                     margin {margin} expanded {:?} where a narrower margin \
+                                     expanded {expanded:?}",
+                                    walked.0
+                                );
+                                assert!(
+                                    walked.1 >= *comparisons,
+                                    "margin {margin} measured {} distances against \
+                                     {comparisons} for a narrower one",
+                                    walked.1
+                                );
+                                further += usize::from(walked.0.len() > expanded.len());
+                            }
+                            narrower = Some(walked);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            further > 0,
+            "no wider margin ever expanded more than a narrower one, so the fixture never let the \
+             margin decide anything"
         );
     }
 }

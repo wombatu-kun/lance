@@ -84,7 +84,7 @@ use crate::format::{NEIGHBORS_COLUMN, VECTOR_COLUMN};
 use crate::io::{PartitionFile, read_scattered};
 use crate::partition::{checked_neighbors, neighbor_slots, vectors_of};
 use crate::query::Neighbor;
-use crate::search::{Comparisons, SearchList, SearchScratch, flat_storage};
+use crate::search::{Comparisons, SearchList, SearchScratch, StopRule, flat_storage};
 
 /// A vertex a walk or a scan kept, before anything exact has been measured
 /// against it.
@@ -142,6 +142,10 @@ pub(crate) struct LazyProbe<'a> {
     /// which is the whole of what it changes: the hops it takes and the
     /// candidates it ends with are the same either way.
     pub(crate) edges: Option<&'a [u32]>,
+    /// When the walk stops with unexpanded candidates still in its list:
+    /// [`crate::SearchParams::stop_margin`]. `None` walks until nothing in the
+    /// list is left to expand. A scan never reads it.
+    pub(crate) stop: Option<StopRule>,
 }
 
 impl LazyProbe<'_> {
@@ -190,7 +194,10 @@ impl LazyProbe<'_> {
         let comparisons = Comparisons::default();
         let coded = self.codes.dist_calculator(routing_query, dist_q_c);
         scratch.cover(num_rows);
-        let mut list = SearchList::new(self.search_list_size, num_rows);
+        let mut list = match self.stop {
+            None => SearchList::new(self.search_list_size, num_rows),
+            Some(stop) => SearchList::with_margin(self.search_list_size, num_rows, stop),
+        };
         scratch.begin();
         scratch.mark(self.medoid);
         comparisons.record(1);

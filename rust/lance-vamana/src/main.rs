@@ -164,7 +164,8 @@ struct SearchArgs {
     #[arg(long, default_value_t = 1, value_name = "N")]
     nprobes: usize,
     /// `L`: how wide a search list a walk keeps, or how many candidates a scan
-    /// keeps out of the whole partition. Defaults to `k + k/2`.
+    /// keeps out of the whole partition. Defaults to `k + k/2`. With
+    /// `--stop-margin` it is a cap instead.
     #[arg(short = 'L', long, value_name = "N")]
     search_list_size: Option<usize>,
     #[arg(long, value_enum, default_value_t = ModeArg::Exact)]
@@ -180,6 +181,12 @@ struct SearchArgs {
     /// probes rather than within each of them.
     #[arg(long, value_name = "N")]
     rescore_budget: Option<usize>,
+    /// How far past its `k`-th candidate a lazy walk goes on expanding, as a
+    /// fraction of that candidate's length. Unset walks until its list has
+    /// nothing left to expand. Set, `-L` becomes a cap, which must be at least
+    /// `--rescore-budget`.
+    #[arg(long, value_name = "F")]
+    stop_margin: Option<f32>,
     /// Megabytes of partition codes to keep across queries. Zero holds nothing.
     #[arg(long, default_value_t = 0, value_name = "MB")]
     cache_mb: usize,
@@ -418,6 +425,9 @@ async fn search(args: SearchArgs) -> Result<()> {
     if let Some(budget) = args.rescore_budget {
         params = params.with_rescore_budget(budget);
     }
+    if let Some(margin) = args.stop_margin {
+        params = params.with_stop_margin(margin);
+    }
 
     for query in queries.iter().take(args.warmup) {
         index.search(query, &params).await?;
@@ -454,6 +464,7 @@ async fn search(args: SearchArgs) -> Result<()> {
             beam_width: params.beam_width,
             prefetch_ahead: params.prefetch_ahead,
             rescore_budget: params.rescore_budget,
+            stop_margin: params.stop_margin,
             cache_mb: args.cache_mb,
             warmup: args.warmup.min(queries.len()),
         },
@@ -841,6 +852,7 @@ struct Settings {
     beam_width: usize,
     prefetch_ahead: usize,
     rescore_budget: Option<usize>,
+    stop_margin: Option<f32>,
     cache_mb: usize,
     warmup: usize,
 }
@@ -886,6 +898,9 @@ impl SearchReport {
         );
         if let Some(budget) = settings.rescore_budget {
             print!(", budget {budget}");
+        }
+        if let Some(margin) = settings.stop_margin {
+            print!(", stop margin {margin}");
         }
         if settings.cache_mb > 0 {
             print!(", cache {} MB", settings.cache_mb);

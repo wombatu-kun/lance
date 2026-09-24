@@ -309,6 +309,135 @@ async fn a_wider_hop_trades_distances_for_round_trips() {
     );
 }
 
+/// The degenerate margin: at zero, keeping no more than `k`, a walk expands its
+/// nearest `k` and stops - which is the walk whose list is `k` long, down to
+/// the last distance.
+///
+/// An equality rather than a recall bar, because the margin rewrites when every
+/// lazy walk stops, and a walk that stopped one vertex early or late would
+/// still score well. The cap is ten times `k` so that a list ignoring the
+/// margin would walk much further, and that is checked as well: without it
+/// the equality would also hold for a walk that never read the margin. Edges
+/// are held resident, which changes no hop and spares the wide walk a read a
+/// vertex.
+async fn a_margin_of_zero_is_the_walk_at_k(codes: CodeSpec) {
+    const NARROW: usize = 20;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri, codes).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+
+    let at_k = SearchParams::new(NARROW)
+        .with_nprobes(PARTITIONS as usize)
+        .with_mode(WalkMode::Lazy)
+        .with_resident_edges(true)
+        .with_search_list_size(NARROW)
+        .with_rescore_budget(NARROW);
+    let capped = at_k.clone().with_search_list_size(10 * NARROW);
+    let mut further = 0;
+    for width in [1, 4] {
+        for query in random_vectors(8, 4343) {
+            let fixed = index
+                .search(&query, &at_k.clone().with_beam_width(width))
+                .await
+                .unwrap();
+            let ruled = index
+                .search(
+                    &query,
+                    &capped.clone().with_beam_width(width).with_stop_margin(0.0),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                ruled.neighbors, fixed.neighbors,
+                "at a width of {width}, a margin of zero answered differently from the walk at \
+                 L = k"
+            );
+            assert_eq!(
+                ruled.comparisons, fixed.comparisons,
+                "at a width of {width}, a margin of zero measured a different number of distances \
+                 from the walk at L = k"
+            );
+            let unruled = index
+                .search(&query, &capped.clone().with_beam_width(width))
+                .await
+                .unwrap();
+            further += usize::from(unruled.comparisons > fixed.comparisons);
+        }
+    }
+    assert!(
+        further > 0,
+        "the cap never let a walk without the margin go further than L = k, so nothing showed that \
+         the margin was what stopped it"
+    );
+}
+
+#[tokio::test]
+async fn a_rabit_margin_of_zero_is_the_walk_at_k() {
+    a_margin_of_zero_is_the_walk_at_k(RABIT).await;
+}
+
+#[tokio::test]
+async fn a_scalar_margin_of_zero_is_the_walk_at_k() {
+    a_margin_of_zero_is_the_walk_at_k(SCALAR).await;
+}
+
+/// A wider margin never measures fewer distances, query by query, and measures
+/// more for some; and at zero it measures exactly what the walk at `L = k`
+/// does, though it keeps twice that for the budget.
+///
+/// One vertex a hop and a cap no list reaches, which is when a wider margin
+/// walks on from where a narrower one stopped (`search::tests`): so every
+/// probe's count can only grow, and a query's with it. The budget holds the
+/// re-score at twenty candidates whatever the walks keep. The equality at zero
+/// is what pins the bar to the `k`-th candidate rather than the budget-th: at
+/// zero the walk expands its `k` nearest and stops. Scalar codes, because their
+/// distances are squared lengths and never below zero; a RaBitQ estimate can
+/// be, and below zero a wider margin lowers the bar.
+#[tokio::test]
+async fn a_wider_margin_never_walks_less() {
+    // The whole dataset, so that no partition's list can reach it.
+    const CAP: usize = 8192;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri, SCALAR).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+
+    let base = search(WalkMode::Lazy)
+        .with_beam_width(1)
+        .with_resident_edges(true)
+        .with_rescore_budget(20);
+    let capped = base.clone().with_search_list_size(CAP);
+    let mut grew = 0;
+    for query in random_vectors(8, 5151) {
+        let mut counts = Vec::new();
+        for margin in [0.0f32, 0.05, 0.15, 0.4] {
+            let result = index
+                .search(&query, &capped.clone().with_stop_margin(margin))
+                .await
+                .unwrap();
+            counts.push(result.comparisons);
+        }
+        assert!(
+            counts.windows(2).all(|pair| pair[0] <= pair[1]),
+            "margins 0, 0.05, 0.15 and 0.4 measured {counts:?} distances, and a wider one fewer"
+        );
+        let at_k = index
+            .search(&query, &base.clone().with_search_list_size(K))
+            .await
+            .unwrap();
+        assert_eq!(
+            counts[0], at_k.comparisons,
+            "a margin of zero measured a different number of distances from the walk at L = k"
+        );
+        grew += usize::from(counts[3] > counts[0]);
+    }
+    assert!(
+        grew > 0,
+        "no query measured more at a margin of 0.4 than at 0, so the margin never reached the walk"
+    );
+}
+
 /// Deleted rows are walked and not answered, the same as every other mode - and
 /// the lazy walk has its own reason to get this wrong, because the row ids it
 /// filters by are the one column it reads whole.
@@ -347,6 +476,27 @@ async fn a_lazy_walk_answers_only_live_rows() {
                     neighbor.row_addr
                 );
             }
+        }
+    }
+
+    // A stop margin with no budget re-scores whatever the list kept, dead
+    // vertices included, so a list that kept only its nearest `k` would answer
+    // with the live ones among them and come back short. One probe, so that no
+    // other partition's candidates can make up the difference.
+    let ruled = search(WalkMode::Lazy).with_nprobes(1).with_stop_margin(0.0);
+    for query in random_vectors(8, 78) {
+        let result = index.search(&query, &ruled).await.unwrap();
+        assert_eq!(
+            result.neighbors.len(),
+            K,
+            "a walk stopped by a margin, with no budget, came back short of k live rows"
+        );
+        for neighbor in &result.neighbors {
+            assert!(
+                live.contains(&neighbor.row_addr),
+                "row {} was deleted and a walk stopped by a margin answered with it",
+                neighbor.row_addr
+            );
         }
     }
 }
@@ -404,6 +554,52 @@ async fn a_lazy_walk_refuses_what_it_cannot_do() {
         .unwrap_err();
     assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
     assert!(error.to_string().contains("smaller than k"), "{error}");
+
+    // A margin that cannot say how far a walk goes: below zero, or no number.
+    // The last is finite, but its (1 + margin)^2 is not.
+    for margin in [-0.1, f32::NAN, f32::INFINITY, 1e20] {
+        let error = index
+            .search(query, &search(WalkMode::Lazy).with_stop_margin(margin))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("finite fraction"), "{error}");
+    }
+    // Refused rather than ignored by the walks that do not stop by it, and by
+    // the scan, which has no walk to stop.
+    for mode in [WalkMode::Exact, WalkMode::Coded, WalkMode::Flat] {
+        let error = index
+            .search(query, &search(mode).with_stop_margin(0.1))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("does not stop by it"), "{error}");
+    }
+    // And a cap that would cut candidates the re-score is owed.
+    let error = index
+        .search(
+            query,
+            &search(WalkMode::Lazy)
+                .with_rescore_budget(BEAM + 1)
+                .with_stop_margin(0.1),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(
+        error.to_string().contains("caps each walk's list below"),
+        "{error}"
+    );
+    // A cap exactly as long as the budget holds everything the margin keeps.
+    index
+        .search(
+            query,
+            &search(WalkMode::Lazy)
+                .with_rescore_budget(BEAM)
+                .with_stop_margin(0.1),
+        )
+        .await
+        .unwrap();
 }
 
 /// A beam wider than the partition, which is the case the mode is *not* for.

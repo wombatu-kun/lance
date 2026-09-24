@@ -157,7 +157,8 @@ two are meant to say the same thing.
 - **Fewer than `k` rows come back when a probed partition is mostly deleted.**
   Deleted vertices are still walked - they carry the edges that hold the graph
   together - but they are dropped from the answer, and a walk only produces
-  `search_list_size` candidates to draw from.
+  `search_list_size` candidates to draw from, of which a query with a
+  `rescore_budget` re-scores that many.
 - **Rows added after the build are invisible** until they are indexed. The index
   answers from the fragments it was built over. Lance's scanner would scan the
   unindexed remainder; this driver does not. `insert_as_segment` is how they
@@ -244,6 +245,22 @@ two are meant to say the same thing.
   below was taken before any of this existed, and before a full search list
   turned candidates away at its back: the walk they were taken from asked for
   nothing and searched for a place on every offer.
+
+  A lazy walk can also stop where its query says rather than where its list
+  does. With `SearchParams::with_stop_margin(gamma)` it goes on expanding only
+  while some candidate is among its `k` nearest or nearer than `1 + gamma`
+  times the length to the `k`-th - the rule of adaptive beam search
+  (Al-Jazzazi et al., NeurIPS 2025) - so a query whose neighbours stand clear
+  of the rest stops soon after finding them, and one crowded by near-equals
+  walks on. The walk still keeps what the re-score is owed, and
+  `search_list_size` becomes a cap on its list. Unset, a walk runs until its
+  list has nothing left to expand, as it always has. Measured on SIFT,
+  GloVe-200, Cohere and GIST at one partition and at their recall bars (0.99,
+  0.85, 0.98, 0.95), against the list length that reaches the same bar, the
+  margin's search phase took 0.92 / 0.72 / 0.74 / 0.86 of the list's time with
+  one query in flight and 0.91 / 0.74 / 0.73 / 0.86 with twelve, for 5-24%
+  fewer distances; the slowest percentile of its queries measured 1.1-1.7
+  times as many.
 
   On SIFT1M at 65536 rows a partition, four probes and equal recall
   (`examples/lazy_walk.rs`), that is **18.2 MB a query against 198.6 MB** read

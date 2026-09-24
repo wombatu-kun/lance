@@ -20,7 +20,8 @@
 //! - **Fewer than `k` rows come back when a probed partition is mostly
 //!   deleted.** Deleted vertices are still walked - they carry the edges that
 //!   hold the graph together - but they are dropped from the answer, and a walk
-//!   only ever produces `search_list_size` candidates to draw from.
+//!   only ever produces `search_list_size` candidates to draw from, of which a
+//!   query with a [`SearchParams::rescore_budget`] re-scores that many.
 //! - **Rows added after the build are invisible** until they are indexed. The
 //!   index answers from the fragments it was built over; Lance's scanner would
 //!   scan the remainder. [`crate::inserter::insert_as_segment`] is the remedy.
@@ -141,7 +142,9 @@ use crate::io::{
 };
 use crate::lazy::{self, Candidate, LazyProbe};
 use crate::partition::Partition;
-use crate::search::{Comparisons, ScratchPool, SearchScratch, flat_storage, greedy_search};
+use crate::search::{
+    Comparisons, ScratchPool, SearchScratch, StopRule, flat_storage, greedy_search,
+};
 use crate::segment::{PartitionEntry, SegmentManifest};
 
 /// One answer: where the row is, and how far it was from the query.
@@ -252,6 +255,9 @@ pub struct SearchParams {
     pub nprobes: usize,
     /// `L`: how wide a search list each graph walk keeps, and how many
     /// candidates a [`WalkMode::Flat`] scan keeps out of the whole partition.
+    ///
+    /// With [`Self::stop_margin`] set it is a cap instead: the margin decides
+    /// how far a walk goes, and this only how long its list may grow.
     pub search_list_size: usize,
     /// What the walk measures its distances against.
     pub mode: WalkMode,
@@ -344,6 +350,52 @@ pub struct SearchParams {
     /// by, and for [`WalkMode::Coded`], which holds every vector already and
     /// would be spending recall on a saving it cannot collect.
     pub rescore_budget: Option<usize>,
+    /// How far past its `k`-th nearest candidate a [`WalkMode::Lazy`] walk goes
+    /// on expanding, as a fraction of that candidate's length: the `gamma` of
+    /// adaptive beam search (Al-Jazzazi et al., NeurIPS 2025).
+    ///
+    /// `None` walks until its search list has nothing left to expand, which is
+    /// how far [`Self::search_list_size`] reaches for every query alike - so a
+    /// list long enough for the hardest queries a caller tuned it on is spent
+    /// on every easy one too. `Some(gamma)` stops a walk once none of its
+    /// unexpanded candidates is among its `k` nearest or nearer than `1 + gamma`
+    /// times the length to the `k`-th. A query whose neighbours stand clear of
+    /// everything else stops soon after finding them; one crowded by
+    /// near-equals walks further. The distances a walk measures are squared
+    /// lengths, so the bar is `(1 + gamma)^2` times the `k`-th's distance - or,
+    /// over RaBitQ codes, an estimate of one, which can fall below zero: there
+    /// the bar sits below the `k`-th, and the walk expands its nearest `k` and
+    /// stops whatever the margin.
+    ///
+    /// Each walk keeps the candidates the re-score is owed whatever their
+    /// distance - its nearest [`Self::rescore_budget`], or everything its list
+    /// holds without a budget - and past those only what is nearer than the
+    /// bar. The list length stops being the knob and becomes a cap, which must
+    /// hold the budget, and past which a candidate is dropped however near the
+    /// bar it is: a walk meant to follow the margin wants a cap it never
+    /// reaches.
+    ///
+    /// At zero a walk expands its nearest `k` and stops, so with a budget of
+    /// `k` it is exactly the walk at a `search_list_size` of `k`.
+    ///
+    /// Measured on four million-vector datasets at one partition, `R = 70`,
+    /// eight-bit scalar codes, resident edges and a budget of 20
+    /// (`examples/ivf_rq_ab.rs`), each at its recall bar against the list
+    /// length that reaches the same bar: SIFT at 0.99 (a margin of 0.058
+    /// against `L = 44`), GloVe-200 at 0.85 (0.042 against 162), Cohere at 0.98
+    /// (0.034 against 47.5) and GIST at 0.95 (0.039 against 78). The margin
+    /// measured 5, 22, 24 and 13 per cent fewer distances, and its search phase
+    /// took 0.92, 0.72, 0.74 and 0.86 of the list's time with one query in
+    /// flight and 0.91, 0.74, 0.73 and 0.86 with twelve. The price is the
+    /// slowest queries: the 99th percentile measured 1.1 to 1.7 times the
+    /// distances. The margin a bar needs depends on the data, as a list length
+    /// does.
+    ///
+    /// Refused for every mode but [`WalkMode::Lazy`] rather than ignored, since
+    /// no other mode stops by it; and refused when it is negative, not finite,
+    /// or so wide that `(1 + gamma)^2` is not finite, or when
+    /// `search_list_size` is shorter than the budget.
+    pub stop_margin: Option<f32>,
     /// Whether the answer carries [`QueryResult::coded_neighbors`] beside the
     /// answer itself.
     ///
@@ -367,6 +419,7 @@ impl SearchParams {
             prefetch_ahead: 2,
             resident_edges: false,
             rescore_budget: None,
+            stop_margin: None,
             report_coded: false,
         }
     }
@@ -404,6 +457,22 @@ impl SearchParams {
     pub fn with_rescore_budget(mut self, rescore_budget: usize) -> Self {
         self.rescore_budget = Some(rescore_budget);
         self
+    }
+
+    pub fn with_stop_margin(mut self, stop_margin: f32) -> Self {
+        self.stop_margin = Some(stop_margin);
+        self
+    }
+
+    /// The rule [`Self::stop_margin`] stands for, as a walk applies it: the
+    /// bar hangs off the `k`-th candidate, and the walk keeps what the re-score
+    /// is owed.
+    pub(crate) fn stop_rule(&self) -> Option<StopRule> {
+        self.stop_margin.map(|margin| StopRule {
+            margin,
+            rank: self.k,
+            keep: self.rescore_budget.unwrap_or(self.search_list_size),
+        })
     }
 
     pub fn with_report_coded(mut self, report_coded: bool) -> Self {
@@ -1352,6 +1421,33 @@ impl VamanaIndex {
                 )));
             }
         }
+        if let Some(stop) = params.stop_rule() {
+            if params.mode != WalkMode::Lazy {
+                return Err(Error::invalid_input(format!(
+                    "stop_margin was set for {:?}, which does not stop by it: only a \
+                     WalkMode::Lazy walk does",
+                    params.mode
+                )));
+            }
+            // A square that overflows would make the bar over a zero distance
+            // not a number, and which way that sorts is the platform's choice.
+            let widened = 1.0 + stop.margin;
+            if !stop.margin.is_finite() || stop.margin < 0.0 || !(widened * widened).is_finite() {
+                return Err(Error::invalid_input(format!(
+                    "stop_margin {} is not a finite fraction of at least zero with a finite \
+                     (1 + stop_margin)^2, so it cannot say how far past its k-th candidate a \
+                     walk goes on",
+                    stop.margin
+                )));
+            }
+            if params.search_list_size < stop.keep {
+                return Err(Error::invalid_input(format!(
+                    "stop_margin keeps the rescore_budget of {} candidates in every walk, but \
+                     search_list_size {} caps each walk's list below that",
+                    stop.keep, params.search_list_size
+                )));
+            }
+        }
         // Refused rather than answered exactly. A caller asking for a coded
         // walk is asking about cost, and quietly giving them a walk that reads
         // every vector would be an answer to a different question.
@@ -1787,6 +1883,7 @@ impl VamanaIndex {
                 beam_width: params.beam_width,
                 prefetch_ahead: params.prefetch_ahead,
                 edges: resident.edges.as_deref(),
+                stop: params.stop_rule(),
             };
             match params.mode {
                 WalkMode::Flat => probing.scan(routing_query, dist_q_c),
@@ -2269,6 +2366,38 @@ mod tests {
         let params = SearchParams::new(usize::MAX);
         assert_eq!(params.search_list_size, usize::MAX);
         assert!(params.search_list_size >= params.k);
+    }
+
+    /// The rule a margin stands for: the bar hangs off the `k`-th candidate,
+    /// and a walk keeps what the re-score is owed - the budget's worth, or
+    /// everything its list holds without one.
+    ///
+    /// Pinned here because nothing downstream can tell the numbers apart: a
+    /// walk that measured the bar off the budget-th, or kept only `k`, would
+    /// still answer, just from a different stopping point.
+    #[test]
+    fn a_margin_hangs_off_k_and_keeps_what_the_re_score_is_owed() {
+        let params = SearchParams::new(10).with_search_list_size(300);
+        assert_eq!(params.stop_rule(), None);
+        assert_eq!(
+            params.clone().with_stop_margin(0.25).stop_rule(),
+            Some(StopRule {
+                margin: 0.25,
+                rank: 10,
+                keep: 300
+            })
+        );
+        assert_eq!(
+            params
+                .with_rescore_budget(20)
+                .with_stop_margin(0.25)
+                .stop_rule(),
+            Some(StopRule {
+                margin: 0.25,
+                rank: 10,
+                keep: 20
+            })
+        );
     }
 
     /// A struct column with a vector leaf, so field ids exist on both sides of a

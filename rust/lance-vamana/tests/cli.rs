@@ -403,41 +403,91 @@ async fn the_whole_lifecycle_runs_from_a_file_of_vectors() {
     );
 }
 
+/// A lazy walk with a stop margin rides along: the one mode that stops by it.
+/// A margin that never reached `SearchParams` would still answer, and quite
+/// possibly with the same rows, so what pins it is the report - the setting,
+/// the distances a query measured, which move with the margin, and the text
+/// line.
 #[tokio::test]
 async fn a_search_answers_what_the_library_answers() {
     let fixture = Fixture::built();
-    let reported = fixture.search(&["--mode", "flat", "--rescore-budget", "12", "--json"]);
-    let reported: Value = serde_json::from_str(&reported).unwrap();
-    let answers = reported["answers"].as_array().unwrap();
-    assert_eq!(answers.len(), QUERIES, "every query must be answered");
-
     let dataset = Dataset::open(&fixture.dataset).await.unwrap();
     let index = VamanaIndex::open(&dataset, "idx").await.unwrap();
-    let params = SearchParams::new(K)
+    let flat = SearchParams::new(K)
         .with_nprobes(PARTITIONS)
         .with_search_list_size(32)
         .with_mode(WalkMode::Flat)
         .with_rescore_budget(12);
+    let ruled = flat
+        .clone()
+        .with_mode(WalkMode::Lazy)
+        .with_stop_margin(0.25);
 
-    for (query, answers) in fixture.query_vectors.iter().zip(answers) {
-        let expected = index.search(query, &params).await.unwrap();
-        let expected = expected
-            .neighbors
-            .iter()
-            .map(|neighbor| neighbor.row_addr)
-            .collect::<Vec<_>>();
-        let reported = answers
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|answer| answer["row_addr"].as_u64().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(reported.len(), K, "a query must answer with k neighbours");
+    for (flags, params, margin) in [
+        (
+            vec!["--mode", "flat", "--rescore-budget", "12", "--json"],
+            flat,
+            Value::Null,
+        ),
+        (
+            vec![
+                "--mode",
+                "lazy",
+                "--rescore-budget",
+                "12",
+                "--stop-margin",
+                "0.25",
+                "--json",
+            ],
+            ruled,
+            Value::from(0.25),
+        ),
+    ] {
+        let reported: Value = serde_json::from_str(&fixture.search(&flags)).unwrap();
+        assert_eq!(reported["settings"]["stop_margin"], margin, "{flags:?}");
+        let answers = reported["answers"].as_array().unwrap();
+        assert_eq!(answers.len(), QUERIES, "every query must be answered");
+
+        let mut comparisons = 0u64;
+        for (query, answers) in fixture.query_vectors.iter().zip(answers) {
+            let expected = index.search(query, &params).await.unwrap();
+            comparisons += expected.comparisons;
+            let expected = expected
+                .neighbors
+                .iter()
+                .map(|neighbor| neighbor.row_addr)
+                .collect::<Vec<_>>();
+            let reported = answers
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|answer| answer["row_addr"].as_u64().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(reported.len(), K, "a query must answer with k neighbours");
+            assert_eq!(
+                reported, expected,
+                "the command line must answer what the call it wraps answers, given {flags:?}"
+            );
+        }
         assert_eq!(
-            reported, expected,
-            "the command line must answer what the call it wraps answers"
+            reported["per_query"]["comparisons"].as_f64().unwrap(),
+            comparisons as f64 / QUERIES as f64,
+            "the command line measured other distances than the call it wraps, given {flags:?}"
         );
     }
+
+    let table = fixture.search(&[
+        "--mode",
+        "lazy",
+        "--rescore-budget",
+        "12",
+        "--stop-margin",
+        "0.25",
+    ]);
+    assert!(
+        table.contains(", stop margin 0.25"),
+        "the table does not say the margin it walked by: {table}"
+    );
 }
 
 /// Every argument must reach the index, not just the ones with a default.
@@ -600,6 +650,21 @@ async fn what_the_index_cannot_do_is_refused() {
         "8",
     ]);
     assert!(error.contains("which cannot spend it"), "{error}");
+
+    // A margin is refused rather than ignored by a walk that does not stop by
+    // it, and the default mode is one.
+    let error = refused(&[
+        "search",
+        "--dataset",
+        &fixture.dataset,
+        "--index-name",
+        "idx",
+        "--vector",
+        &zeroes,
+        "--stop-margin",
+        "0.1",
+    ]);
+    assert!(error.contains("does not stop by it"), "{error}");
 
     let error = refused(&[
         "search",
