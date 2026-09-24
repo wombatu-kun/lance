@@ -171,6 +171,7 @@
 //! from pass to pass to the digit.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -181,7 +182,6 @@ use arrow_array::{
     UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use futures::StreamExt;
 use lance::Dataset;
 use lance::dataset::WriteParams;
 use lance::dataset::builder::DatasetBuilder;
@@ -488,6 +488,51 @@ struct Fixture<'a> {
     ef: Option<usize>,
 }
 
+/// Runs `query(i)` for every `i` in `0..count` from `concurrency` clients and
+/// returns what the calls returned, in no particular order.
+///
+/// A client is a task of its own, so that the clients run in parallel rather
+/// than interleave on the one task that would poll them as bare futures, and it
+/// takes the next `i` the moment its last call returns. A task spawned per query
+/// as another finishes refills its slot only once the driver has been woken to
+/// spawn it and an idle worker woken to run it, and with every worker busy those
+/// wake-ups are a real share of a query of a few hundred microseconds: at twelve
+/// in flight they held the walk to about eight queries running while Lance's
+/// slower queries ran eleven.
+async fn run_clients<Query, Answer>(
+    count: usize,
+    concurrency: usize,
+    query: Query,
+) -> Vec<Answer::Output>
+where
+    Query: Fn(usize) -> Answer + Clone + Send + 'static,
+    Answer: Future + Send + 'static,
+    Answer::Output: Send + 'static,
+{
+    let next = Arc::new(AtomicUsize::new(0));
+    let clients = (0..concurrency)
+        .map(|_| {
+            let next = Arc::clone(&next);
+            let query = query.clone();
+            tokio::spawn(async move {
+                let mut answers = Vec::new();
+                loop {
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    if at >= count {
+                        break answers;
+                    }
+                    answers.push(query(at).await);
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut answers = Vec::with_capacity(count);
+    for client in clients {
+        answers.extend(client.await.unwrap());
+    }
+    answers
+}
+
 /// This crate's own arms, both with one pooled budget of exact distances:
 /// `Flat` throws the graph away, `Lazy` walks it.
 async fn measure_vamana(
@@ -530,42 +575,38 @@ async fn measure_vamana(
             .unwrap()
             .with_cache(LanceCache::with_capacity(cache_bytes)),
     );
+    let queries: Arc<[Vec<f32>]> = Arc::from(queries);
+    let truth: Arc<[Vec<u64>]> = Arc::from(truth);
     // At the pass's own concurrency: the index keeps a visited-mark scratch for
     // every walk that has run at once, so a warmup one query at a time would
     // leave it only as many as one query runs, and the pass would allocate the
     // rest while timed.
-    futures::stream::iter(queries.iter().take(warmup))
-        .map(|query| {
-            let index = index.clone();
-            let params = params.clone();
-            let query = query.clone();
-            tokio::spawn(async move {
-                index.search(&query, &params).await.unwrap();
-            })
-        })
-        .buffered(concurrency)
-        .for_each(|joined| async move { joined.unwrap() })
-        .await;
+    run_clients(warmup.min(queries.len()), concurrency, {
+        let (index, params, queries) = (index.clone(), params.clone(), Arc::clone(&queries));
+        move |at| {
+            let (index, params, queries) = (index.clone(), params.clone(), Arc::clone(&queries));
+            async move {
+                index.search(&queries[at], &params).await.unwrap();
+            }
+        }
+    })
+    .await;
 
     let before = index.io_stats();
     let reads_before = index.rescore_reads();
     let cache_before = index.cache_stats().await;
     let cpu_before = cpu_micros();
     let started = Instant::now();
-    let totals = futures::stream::iter(queries.iter().zip(truth))
-        .map(|(query, exact)| {
-            let index = index.clone();
-            let params = params.clone();
-            let positions = Arc::clone(positions);
-            let query = query.clone();
-            let exact = exact.clone();
-            // A task per query rather than a future per query: `buffered` alone
-            // interleaves futures on the one task polling them, and both modes
-            // here keep their arithmetic on that task, so bare futures would run
-            // the queries one after another and report it as concurrency.
-            tokio::spawn(async move {
+    let reports = run_clients(queries.len(), concurrency, {
+        let (index, params, positions) = (index.clone(), params.clone(), Arc::clone(positions));
+        let (queries, truth) = (Arc::clone(&queries), Arc::clone(&truth));
+        move |at| {
+            let (index, params, positions) =
+                (index.clone(), params.clone(), Arc::clone(&positions));
+            let (queries, truth) = (Arc::clone(&queries), Arc::clone(&truth));
+            async move {
                 let call = Instant::now();
-                let result = index.search(&query, &params).await.unwrap();
+                let result = index.search(&queries[at], &params).await.unwrap();
                 let latency = call.elapsed().as_micros() as f64;
                 let addresses = |neighbors: &[Neighbor]| {
                     neighbors
@@ -583,8 +624,8 @@ async fn measure_vamana(
                     result.coded_neighbors.len()
                 );
                 Reported {
-                    recall: recall_of(&addresses(&result.neighbors), &exact),
-                    coded_recall: recall_of(&addresses(&result.coded_neighbors), &exact),
+                    recall: recall_of(&addresses(&result.neighbors), &truth[at]),
+                    coded_recall: recall_of(&addresses(&result.coded_neighbors), &truth[at]),
                     latency_micros: latency,
                     search_micros: result.search.elapsed.as_micros() as f64,
                     rescore_micros: result.rescore.elapsed.as_micros() as f64,
@@ -592,21 +633,17 @@ async fn measure_vamana(
                     rescore_bytes: result.rescore.bytes_read as f64,
                     comparisons: result.comparisons,
                 }
-            })
-        })
-        .buffered(concurrency)
-        .fold(
-            (Reported::default(), Vec::with_capacity(queries.len())),
-            |(totals, mut each), reported| async move {
-                let reported = reported.unwrap();
-                each.push((reported.comparisons, reported.recall));
-                (totals.plus(&reported), each)
-            },
-        )
-        .await;
-    let (totals, each) = totals;
+            }
+        }
+    })
+    .await;
     let micros = started.elapsed().as_micros() as f64;
     let cpu = cpu_micros() - cpu_before;
+    let totals = reports.iter().fold(Reported::default(), Reported::plus);
+    let each = reports
+        .iter()
+        .map(|reported| (reported.comparisons, reported.recall))
+        .collect::<Vec<_>>();
     let after = index.io_stats();
     let reads_after = index.rescore_reads();
     let (hit_ratio, loads, held_bytes) = match (cache_before, index.cache_stats().await) {
@@ -697,8 +734,8 @@ impl Work {
 /// What one query of this crate's arm reported, and what a pass sums them into.
 ///
 /// A pass sums rather than averages because the average is one division at the
-/// end, and because a per-query struct is what a `fold` over spawned tasks can
-/// carry without a lock.
+/// end, and because a per-query struct is what a client task can hand back
+/// without a lock.
 #[derive(Default)]
 struct Reported {
     recall: f64,
@@ -811,36 +848,38 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
         counts.misses += summary.index_cache_misses() as u64;
     });
 
+    let queries: Arc<[Vec<f32>]> = Arc::from(queries);
+    let truth: Arc<[Vec<u64>]> = Arc::from(truth);
     let cpu_before = cpu_micros();
     let started = Instant::now();
-    let recall = futures::stream::iter(queries.iter().zip(truth))
-        .map(|(query, exact)| {
-            let dataset = dataset.clone();
-            let positions = Arc::clone(positions);
-            let callback = callback.clone();
-            let query = query.clone();
-            let exact = exact.clone();
-            tokio::spawn(async move {
+    let answers = run_clients(queries.len(), concurrency, {
+        let (dataset, positions) = (dataset.clone(), Arc::clone(positions));
+        let (queries, truth) = (Arc::clone(&queries), Arc::clone(&truth));
+        move |at| {
+            let (dataset, positions) = (dataset.clone(), Arc::clone(&positions));
+            let (queries, truth, callback) =
+                (Arc::clone(&queries), Arc::clone(&truth), callback.clone());
+            async move {
                 let call = Instant::now();
                 let addresses =
-                    rq_neighbors(&dataset, &query, nprobes, ef, refine, Some(callback)).await;
+                    rq_neighbors(&dataset, &queries[at], nprobes, ef, refine, Some(callback)).await;
                 let latency = call.elapsed().as_micros() as f64;
                 let found = addresses
                     .iter()
                     .map(|address| positions[address])
                     .collect::<Vec<_>>();
-                (recall_of(&found, &exact), latency)
-            })
-        })
-        .buffered(concurrency)
-        .fold((0.0f64, 0.0f64), |(recall, latency), joined| async move {
-            let (hits, took) = joined.unwrap();
-            (recall + hits, latency + took)
-        })
-        .await;
-    let (recall, latency) = recall;
+                (recall_of(&found, &truth[at]), latency)
+            }
+        }
+    })
+    .await;
     let micros = started.elapsed().as_micros() as f64;
     let cpu = cpu_micros() - cpu_before;
+    let (recall, latency) = answers
+        .iter()
+        .fold((0.0, 0.0), |(recall, latency), (hits, took)| {
+            (recall + hits, latency + took)
+        });
 
     let counts = counts.lock().unwrap();
     let lookups = counts.hits + counts.misses;
@@ -902,22 +941,22 @@ async fn measure_rq_plan(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) 
             .unwrap();
     }
 
+    let queries: Arc<[Vec<f32>]> = Arc::from(queries);
     let cpu_before = cpu_micros();
     let started = Instant::now();
-    futures::stream::iter(queries.iter())
-        .map(|query| {
-            let dataset = dataset.clone();
-            let query = query.clone();
-            tokio::spawn(async move {
-                rq_scanner(&dataset, &query, nprobes, ef, refine, None)
+    run_clients(queries.len(), concurrency, {
+        let (dataset, queries) = (dataset.clone(), Arc::clone(&queries));
+        move |at| {
+            let (dataset, queries) = (dataset.clone(), Arc::clone(&queries));
+            async move {
+                rq_scanner(&dataset, &queries[at], nprobes, ef, refine, None)
                     .create_plan()
                     .await
                     .unwrap();
-            })
-        })
-        .buffered(concurrency)
-        .fold((), |(), joined| async move { joined.unwrap() })
-        .await;
+            }
+        }
+    })
+    .await;
     let queries = queries.len() as f64;
     (
         started.elapsed().as_micros() as f64 / queries,
