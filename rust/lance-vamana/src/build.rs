@@ -17,7 +17,7 @@ use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 
 use crate::format::{IndexMetadata, MAX_PARTITION_ROWS};
-use crate::insert::{InsertScratch, Linking, insert_point};
+use crate::insert::{InsertScratch, Linking, ResidentVectors, insert_point};
 use crate::partition::PartitionGraph;
 use crate::search::Comparisons;
 
@@ -73,6 +73,29 @@ impl Default for BuildParams {
 /// the crate's own position on it is that varying a seed is a deliberate act -
 /// so maintenance takes the one it is given and stays reproducible.
 pub const MAINTENANCE_SEED: u64 = 42;
+
+/// How many neighbours ahead a build's search asks for a vector while it
+/// measures the current one: [`crate::search::greedy_search_with_lookahead`].
+/// Changes no graph, only when the loads start.
+///
+/// Two, as a query asks, but a constant of its own: a query measures eight-bit
+/// codes of two to fifteen cache lines and a build full vectors of eight to
+/// sixty, so one depth need not suit both. Asking for [`BUILD_PREFETCH_LINES`]
+/// lines, 4 measured within 1.7% of 2 on every benchmark dataset and 1 up to
+/// 3.7% slower, on SIFT.
+pub const BUILD_PREFETCH_AHEAD: usize = 2;
+
+/// How many cache lines of a vector a build's search asks for, stepping from
+/// its start, through [`crate::search::LeadingLines`]: all of a SIFT vector,
+/// the first eight of a longer one.
+///
+/// Eight had the best geometric mean of the search's time per distance over
+/// SIFT, GloVe-200, Cohere and GIST - every tenth vector of each, one core of
+/// an i7-8750H - among 2, 4, 8, 16 and 32 lines and whole vectors: 0.743,
+/// 0.681, 0.909 and 0.910 of the time of the search that asks for nothing. Two
+/// lines measured 0.877 and 0.885 on Cohere and GIST, slightly better there,
+/// and 0.911 on SIFT.
+pub const BUILD_PREFETCH_LINES: usize = 8;
 
 impl BuildParams {
     /// The parameters a maintenance pass must work at, read off the segment it
@@ -158,11 +181,13 @@ pub fn build_partition<S: VectorStore>(
 
     let mut scratch = InsertScratch::new(num_vertices as usize, params.max_degree);
     let mut order = (0..num_vertices).collect::<Vec<_>>();
+    let resident = ResidentVectors::of(store);
 
     for alpha in [1.0, params.alpha] {
         let linking = Linking {
             alpha,
             search_list_size: params.search_list_size,
+            vectors: resident.as_ref(),
         };
         order.shuffle(&mut rng);
         for point in &order {
@@ -1817,6 +1842,7 @@ mod tests {
             let linking = Linking {
                 alpha,
                 search_list_size: params.search_list_size,
+                vectors: None,
             };
             order.shuffle(&mut rng);
             for point in &order {
@@ -1945,6 +1971,7 @@ mod tests {
         let linking = Linking {
             alpha: params.alpha,
             search_list_size: params.search_list_size,
+            vectors: None,
         };
         let mut order = (OLD as u32..(OLD + NEW) as u32).collect::<Vec<_>>();
         order.shuffle(&mut SmallRng::seed_from_u64(params.seed));

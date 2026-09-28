@@ -154,10 +154,10 @@ async fn a_hop_of_one_vertex_is_the_coded_walk_exactly(codes: CodeSpec) {
             .search(&query, &search(WalkMode::Coded))
             .await
             .unwrap();
-        // Both look-aheads, because the whole-partition walk is the only code
-        // here that never learned about them: it offers its neighbours one at a
-        // time where the lazy hop now collects them first, so this is also what
-        // pins that restructuring.
+        // Both look-aheads, because the query's whole-partition walk,
+        // `greedy_search`, is the only code here that never learned about them:
+        // it offers its neighbours one at a time where the lazy hop now collects
+        // them first, so this is also what pins that restructuring.
         for ahead in [0, 2] {
             let lazy = index
                 .search(&query, &narrow.clone().with_prefetch_ahead(ahead))
@@ -1448,8 +1448,8 @@ async fn a_lazy_query_is_validated_like_any_other() {
 /// a hop collects its ids from a different place in each.
 ///
 /// Scalar codes, and that is the whole reason this case exists rather than the
-/// RaBitQ one: `ScalarQuantizationStorage` is the only store this crate can hold
-/// that implements `prefetch` at all, so on RaBitQ every depth would be a call
+/// RaBitQ one: `ScalarQuantizationStorage` is the only code store this crate can
+/// hold that implements `prefetch` at all, so on RaBitQ every depth would be a call
 /// that returns and the case would be asserting that nothing changes nothing.
 ///
 /// What it cannot pin, unlike `resident_edges_do_not_change_an_answer` below, is

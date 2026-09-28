@@ -589,6 +589,19 @@ can drop the record.
   `performance` power profile, over every tenth vector of SIFT1M, GloVe-200,
   Cohere and GIST1M and over all of SIFT1M (`R = 70`, `L = 100`): builds 1.05x,
   1.90x, 1.37x, 1.41x and 1.08x faster.
+- A build's search asks the processor for the vector of the neighbour two
+  further on while it measures the current one, and for its first eight cache
+  lines only. A whole vector asked for ahead pays while the vector is short and
+  costs once it is long: 0.74 of the search's time per distance on SIFT1M's
+  8-line vectors, but 1.10 and 1.16 on Cohere's 48 and GIST1M's 60; why was not
+  measured. The graph comes out the same bit for bit. Timed with
+  `examples/build_profile.rs`, which takes the old search and the new one in
+  turn within one build, on one pinned core under the `performance` power
+  profile, over every tenth vector of SIFT1M, GloVe-200, Cohere and GIST1M and
+  over all of SIFT1M (`R = 70`, `L = 100`): the search took 0.74, 0.68, 0.91,
+  0.91 and 0.73 of its time per distance. Whole builds one way against the
+  other, over every tenth vector of GloVe-200 and GIST1M, came out 1.28x and
+  1.09x faster.
 - `L2` and `Cosine` only. Cosine normalises the vectors it stores, so what the
   index holds is not bit-identical to the dataset's column. `Dot` is refused: see
   `supported_distance_type` for why.

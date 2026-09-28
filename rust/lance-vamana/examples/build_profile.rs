@@ -19,17 +19,36 @@
 //! Both must build the same graph, byte for byte, and the gates below hold them to
 //! that.
 //!
+//! Inside an arm, each insertion's search walks one of the ways `PREFETCH` names,
+//! chosen per insertion: `old` is `greedy_search`, which measures each neighbour as
+//! it marks it and asks for nothing; a number is `greedy_search_with_lookahead` at
+//! that depth, asking through Lance's own `prefetch`, which names every line of
+//! the vector, and `0` collects each hop like the rest but asks for nothing. The
+//! rest ask through the crate's `LeadingLines` at that depth: `2l4` for the first
+//! four lines of the vector, `2all` for every line, the control that the crate's
+//! ask is Lance's where they name the same lines; and `build` is the build's own
+//! search, `LeadingLines` at `BUILD_PREFETCH_AHEAD` and `BUILD_PREFETCH_LINES`.
+//! Every walk expands the same vertices, so the graph does not depend on which
+//! insertion took which, and the gates hold it to that too. Taking them in turn
+//! within one build rather than one build each is what makes the comparison
+//! paired: every walk takes insertions from every stretch of the build, under the
+//! same clock and the same other load on the core. The order is a fresh
+//! permutation of the walks every `len(PREFETCH)` insertions, drawn from a
+//! generator of its own seeded by `WALK_SEED` (default 7), so the build's
+//! insertion order does not move.
+//!
 //! ```text
 //! cd rust/lance-vamana
 //! cargo build --profile release-no-lto --example build_profile
-//! INDEX=~/vamana-runs/sift-1000000-p1-r70-sq8.lance STRIDE=10 REPRUNE=both OUT=profile.json \
+//! INDEX=~/vamana-runs/sift-1000000-p1-r70-sq8.lance STRIDE=10 PREFETCH=old,build OUT=profile.json \
 //!     target/release-no-lto/examples/build_profile
 //! ```
 //!
 //! `STRIDE` (default 1) builds over every `STRIDE`-th vertex; at 1 every arm's graph
 //! and medoid must also equal the stored ones. `REPRUNE` is `incremental` (default),
 //! `full`, `both` or `both-reversed` (both arms, in that order, whose graphs must be
-//! identical), or `none` for the gate alone. `GATE_STRIDE` (default 100) is the
+//! identical), or `none` for the gate alone. `PREFETCH` (default `build`, the
+//! build's own walk) lists the walks, comma-separated. `GATE_STRIDE` (default 100) is the
 //! subset on which every arm is first checked against `build_partition`,
 //! `GATE_ROUNDS` (default 2) times; at 1 `build_partition` must also build the
 //! stored graph. `BUCKETS` (default 20) slices each pass into a timeline. `OUT` receives
@@ -41,7 +60,7 @@ use std::io::Write;
 use std::time::Instant;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{UInt32Type, UInt64Type};
+use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, FixedSizeListArray, UInt32Array};
 use lance::Dataset;
 use lance_index::vector::flat::storage::FlatFloatStorage;
@@ -49,13 +68,18 @@ use lance_index::vector::graph::{OrderedFloat, OrderedNode};
 use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::PartitionGraph;
-use lance_vamana::build::{BuildParams, build_partition, medoid, robust_prune};
+use lance_vamana::build::{
+    BUILD_PREFETCH_AHEAD, BUILD_PREFETCH_LINES, BuildParams, build_partition, medoid, robust_prune,
+};
 use lance_vamana::format::{
     INDEX_FILE_NAME, IndexMetadata, NEIGHBORS_COLUMN, NO_NEIGHBOR, ROW_ID_COLUMN, VECTOR_COLUMN,
 };
 use lance_vamana::io::{PartitionFile, read_partition_batch, read_segment, scan_scheduler};
 use lance_vamana::query::committed_segments;
-use lance_vamana::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
+use lance_vamana::search::{
+    Comparisons, LeadingLines, SearchScratch, flat_storage, greedy_search,
+    greedy_search_with_lookahead,
+};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
@@ -174,10 +198,12 @@ async fn load(dataset: &Dataset, with_edges: bool) -> Stored {
     }
 }
 
-/// The flat store over every `stride`-th stored vertex, in local-id order.
-fn store_of(stored: &Stored, stride: usize) -> FlatFloatStorage {
+/// The flat store over every `stride`-th stored vertex, in local-id order, and the
+/// vectors it was built from.
+fn store_of(stored: &Stored, stride: usize) -> (FlatFloatStorage, FixedSizeListArray) {
     if stride == 1 {
-        return flat_storage(&stored.row_ids, &stored.vectors, DistanceType::L2).unwrap();
+        let store = flat_storage(&stored.row_ids, &stored.vectors, DistanceType::L2).unwrap();
+        return (store, stored.vectors.clone());
     }
     let rows = (0..stored.row_ids.len() as u32)
         .step_by(stride)
@@ -190,7 +216,106 @@ fn store_of(stored: &Stored, stride: usize) -> FlatFloatStorage {
         .iter()
         .map(|row| stored.row_ids[*row as usize])
         .collect::<Vec<_>>();
-    flat_storage(&row_ids, &vectors, DistanceType::L2).unwrap()
+    let store = flat_storage(&row_ids, &vectors, DistanceType::L2).unwrap();
+    (store, vectors)
+}
+
+/// Every vector `store` holds, as the one slice its distances read.
+///
+/// Checked against the store itself at both ends: the ask of `LeadingLines` has to
+/// name the lines the distance is about to read, and a slice of another copy of
+/// the same vectors would ask for the right data at the wrong address.
+fn vector_values<'a>(vectors: &'a FixedSizeListArray, store: &FlatFloatStorage) -> &'a [f32] {
+    let dimension = vectors.value_length() as usize;
+    let values = vectors.values().as_primitive::<Float32Type>().values();
+    assert_eq!(values.len(), store.len() * dimension);
+    for id in [0, store.len() - 1] {
+        let read = store.vector(id as u32);
+        assert_eq!(
+            read.as_primitive::<Float32Type>().values().as_ptr(),
+            values[id * dimension..].as_ptr(),
+            "the store reads vector {id} from another buffer than the one it was built from"
+        );
+    }
+    values
+}
+
+/// How one insertion's search walks. Every walk expands the same vertices in the
+/// same order, so a build can take a different one at each insertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    /// `greedy_search`: each neighbour measured as it is marked, nothing asked.
+    Old,
+    /// `greedy_search_with_lookahead` at this depth, asking through the store:
+    /// Lance's own ask, every line of the vector.
+    Ahead(usize),
+    /// `greedy_search_with_lookahead` at this depth, asking through the crate's
+    /// `LeadingLines` for at most the first `lines` lines of the vector.
+    Lines { ahead: usize, lines: usize },
+    /// What `build_partition` does: `Lines` at `BUILD_PREFETCH_AHEAD` and
+    /// `BUILD_PREFETCH_LINES`.
+    Build,
+}
+
+/// `old`, a depth (`2`), a depth asking through `LeadingLines` for the first few
+/// lines (`2l4`) or for every line (`2all`), and `build`.
+impl std::fmt::Display for Walk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Old => write!(f, "old"),
+            Self::Ahead(ahead) => write!(f, "{ahead}"),
+            Self::Lines {
+                ahead,
+                lines: usize::MAX,
+            } => write!(f, "{ahead}all"),
+            Self::Lines { ahead, lines } => write!(f, "{ahead}l{lines}"),
+            Self::Build => write!(f, "build"),
+        }
+    }
+}
+
+fn parse_walks(spec: &str) -> Vec<Walk> {
+    let walks = spec
+        .split(',')
+        .map(|walk| {
+            let walk = walk.trim();
+            let number = |digits: &str| {
+                digits.parse::<usize>().unwrap_or_else(|_| {
+                    panic!(
+                        "PREFETCH: {walk} is not old, build, <depth>, <depth>all or \
+                         <depth>l<lines>"
+                    )
+                })
+            };
+            let parsed = if walk == "old" {
+                Walk::Old
+            } else if walk == "build" {
+                Walk::Build
+            } else if let Some(ahead) = walk.strip_suffix("all") {
+                Walk::Lines {
+                    ahead: number(ahead),
+                    lines: usize::MAX,
+                }
+            } else if let Some((ahead, lines)) = walk.split_once('l') {
+                Walk::Lines {
+                    ahead: number(ahead),
+                    lines: number(lines),
+                }
+            } else {
+                Walk::Ahead(number(walk))
+            };
+            assert_eq!(
+                parsed.to_string(),
+                walk,
+                "PREFETCH: {walk} is written {parsed} here, so it would be reported as that"
+            );
+            parsed
+        })
+        .collect::<Vec<_>>();
+    for (at, walk) in walks.iter().enumerate() {
+        assert!(!walks[..at].contains(walk), "PREFETCH names {walk} twice");
+    }
+    walks
 }
 
 /// How a back-edge into a full list is settled.
@@ -271,10 +396,15 @@ struct Pass {
     end: f64,
     total: Tally,
     timeline: Vec<Tally>,
+    /// The insertions each walk took, in the order of `Profiled::walks`.
+    by_walk: Vec<Tally>,
+    /// The same, slice by slice: `[slice][walk]`.
+    timeline_by_walk: Vec<Vec<Tally>>,
 }
 
 struct Profiled {
     arm: Reprune,
+    walks: Vec<Walk>,
     graph: PartitionGraph,
     medoid: u32,
     randomize_nanos: u64,
@@ -469,15 +599,18 @@ fn reprune_incremental(
     Checked::Pruned(kept)
 }
 
-/// `insert.rs::insert_point`, with a timer and a counter around each phase.
+/// `insert.rs::insert_point`, with a timer and a counter around each phase, and
+/// its search walking as `walk` says.
 #[allow(clippy::too_many_arguments)]
 fn insert(
     graph: &mut PartitionGraph,
     store: &FlatFloatStorage,
+    values: &[f32],
     scratch: &mut SearchScratch,
     edges: &mut Vec<u32>,
     stable: &mut [bool],
     arm: Reprune,
+    walk: Walk,
     alpha: f32,
     search_list_size: usize,
     point: u32,
@@ -491,16 +624,49 @@ fn insert(
 
     let searched = Instant::now();
     let from_point = store.dist_calculator_from_id(point);
-    let mut candidates = greedy_search(
-        graph,
-        &from_point,
-        entry_point,
-        search_list_size,
-        scratch,
-        &searching,
-    )
-    .unwrap()
-    .visited;
+    let found = match walk {
+        Walk::Old => greedy_search(
+            graph,
+            &from_point,
+            entry_point,
+            search_list_size,
+            scratch,
+            &searching,
+        ),
+        Walk::Ahead(ahead) => greedy_search_with_lookahead(
+            graph,
+            &from_point,
+            entry_point,
+            search_list_size,
+            ahead,
+            scratch,
+            &searching,
+        ),
+        Walk::Lines { ahead, lines } => greedy_search_with_lookahead(
+            graph,
+            &LeadingLines::new(&from_point, values, values.len() / store.len(), lines),
+            entry_point,
+            search_list_size,
+            ahead,
+            scratch,
+            &searching,
+        ),
+        Walk::Build => greedy_search_with_lookahead(
+            graph,
+            &LeadingLines::new(
+                &from_point,
+                values,
+                values.len() / store.len(),
+                BUILD_PREFETCH_LINES,
+            ),
+            entry_point,
+            search_list_size,
+            BUILD_PREFETCH_AHEAD,
+            scratch,
+            &searching,
+        ),
+    };
+    let mut candidates = found.unwrap().visited;
     let pruned = Instant::now();
     tally.expansions += candidates.len() as u64;
     pruning.record(graph.neighbors(point).unwrap().len() as u64);
@@ -595,11 +761,19 @@ fn insert(
     tally.back_distances += linking.get();
 }
 
-/// `build.rs::build_partition`, one timed insertion at a time.
+/// The default seed of the walks' order, which is not the build's: a draw from
+/// the build's generator would move its insertion order.
+const WALK_SEED: u64 = 7;
+
+/// `build.rs::build_partition`, one timed insertion at a time, each walking as the
+/// next of a fresh permutation of `walks` says.
+#[allow(clippy::too_many_arguments)]
 fn profiled_build(
     store: &FlatFloatStorage,
+    values: &[f32],
     params: &BuildParams,
     arm: Reprune,
+    walks: &[Walk],
     buckets: usize,
     origin: Instant,
     verbose: bool,
@@ -623,13 +797,19 @@ fn profiled_build(
     // Random lists are nobody's prune output.
     let mut stable = vec![false; num_vertices as usize];
     let mut order = (0..num_vertices).collect::<Vec<_>>();
+    let mut walk_rng = SmallRng::seed_from_u64(env_usize("WALK_SEED", WALK_SEED as usize) as u64);
+    let mut turn = (0..walks.len()).collect::<Vec<_>>();
     let mut passes = Vec::with_capacity(2);
     for alpha in [1.0, params.alpha] {
         order.shuffle(&mut rng);
         let start = origin.elapsed().as_secs_f64();
-        let mut timeline = vec![Tally::default(); buckets];
+        let mut timeline = vec![vec![Tally::default(); walks.len()]; buckets];
         let mut current = 0;
         for (at, point) in order.iter().enumerate() {
+            if at % walks.len() == 0 {
+                turn.shuffle(&mut walk_rng);
+            }
+            let walk = turn[at % walks.len()];
             let bucket = at * buckets / order.len();
             if verbose && bucket != current {
                 println!(
@@ -643,15 +823,17 @@ fn profiled_build(
             insert(
                 &mut graph,
                 store,
+                values,
                 &mut scratch,
                 &mut edges,
                 &mut stable,
                 arm,
+                walks[walk],
                 alpha,
                 params.search_list_size,
                 *point,
                 medoid,
-                &mut timeline[bucket],
+                &mut timeline[bucket][walk],
             );
         }
         let end = origin.elapsed().as_secs_f64();
@@ -663,19 +845,28 @@ fn profiled_build(
             );
         }
         let mut total = Tally::default();
-        for slice in &timeline {
-            total.add(slice);
+        let mut by_walk = vec![Tally::default(); walks.len()];
+        let mut all_walks = vec![Tally::default(); buckets];
+        for (slice, walked) in timeline.iter().enumerate() {
+            for (walk, tally) in walked.iter().enumerate() {
+                total.add(tally);
+                by_walk[walk].add(tally);
+                all_walks[slice].add(tally);
+            }
         }
         passes.push(Pass {
             alpha,
             start,
             end,
             total,
-            timeline,
+            timeline: all_walks,
+            by_walk,
+            timeline_by_walk: timeline,
         });
     }
     Profiled {
         arm,
+        walks: walks.to_vec(),
         graph,
         medoid,
         randomize_nanos,
@@ -794,6 +985,108 @@ fn print_passes(profiled: &Profiled) {
     }
 }
 
+fn walk_list(walks: &[Walk]) -> String {
+    walks
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Each walk's search against the reference walk's, which is `old` when it is
+/// among them and the first named otherwise: nanoseconds per search distance per
+/// pass and over both, and the same ratio slice by slice; then the whole
+/// insertion's time, every phase, per insertion - a walk can leave the prune
+/// and the back-edges that follow it a different cache to work in.
+///
+/// The slices are what make it a paired comparison. Every slice holds insertions
+/// of every walk from the same stretch of the build, so a ratio within one is
+/// taken at one stage of the build, one clock and one load on the core; the
+/// spread of the slices' ratios is the comparison's noise and what drift is left
+/// within a slice.
+fn print_walks(profiled: &Profiled) {
+    let walks = &profiled.walks;
+    if walks.len() < 2 {
+        return;
+    }
+    let reference = walks
+        .iter()
+        .position(|walk| *walk == Walk::Old)
+        .unwrap_or(0);
+    let per = |tally: &Tally| tally.search_nanos as f64 / tally.search_distances.max(1) as f64;
+    let whole = |tally: &Tally| {
+        (tally.search_nanos + tally.own_nanos + tally.back_nanos) as f64
+            / tally.insertions.max(1) as f64
+    };
+    println!(
+        "  walks {} interleaved per insertion, against {}",
+        walk_list(walks),
+        walks[reference]
+    );
+    println!(
+        "  {:<5} {:>6} {:>10} {:>9} {:>13} {:>7} {:>7} {:>10} {:>6} {:>6} {:>6} {:>9} {:>7}",
+        "pass",
+        "walk",
+        "insertions",
+        "search s",
+        "search dist",
+        "ns/s",
+        "ratio",
+        "slices <1",
+        "min",
+        "median",
+        "max",
+        "us/ins",
+        "ratio"
+    );
+    let scopes = profiled
+        .passes
+        .iter()
+        .enumerate()
+        .map(|(at, pass)| (format!("{}", at + 1), vec![pass]))
+        .chain(std::iter::once((
+            "all".to_string(),
+            profiled.passes.iter().collect::<Vec<_>>(),
+        )));
+    for (name, passes) in scopes {
+        let mut totals = vec![Tally::default(); walks.len()];
+        for pass in &passes {
+            for (walk, tally) in pass.by_walk.iter().enumerate() {
+                totals[walk].add(tally);
+            }
+        }
+        for (walk, total) in totals.iter().enumerate() {
+            let mut slices = passes
+                .iter()
+                .flat_map(|pass| pass.timeline_by_walk.iter())
+                .filter(|slice| {
+                    slice[walk].search_distances > 0 && slice[reference].search_distances > 0
+                })
+                .map(|slice| per(&slice[walk]) / per(&slice[reference]))
+                .collect::<Vec<_>>();
+            slices.sort_by(f64::total_cmp);
+            let below = slices.iter().filter(|ratio| **ratio < 1.0).count();
+            let at = |position: usize| slices.get(position).copied().unwrap_or(f64::NAN);
+            println!(
+                "  {name:<5} {:>6} {:>10} {:>9.1} {:>13} {:>7.1} {:>7.4} {:>4} of {:<3} {:>6.3} {:>6.3} {:>6.3} {:>9.1} {:>7.4}",
+                walks[walk].to_string(),
+                total.insertions,
+                seconds(total.search_nanos),
+                total.search_distances,
+                per(total),
+                per(total) / per(&totals[reference]),
+                below,
+                slices.len(),
+                at(0),
+                at(slices.len() / 2),
+                at(slices.len().saturating_sub(1)),
+                whole(total) / 1e3,
+                whole(total) / whole(&totals[reference]),
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let origin = Instant::now();
@@ -819,6 +1112,7 @@ async fn main() {
         "REPRUNE=none checks build_partition against the stored index alone, which takes \
          GATE_STRIDE=1 and at least one GATE_ROUNDS"
     );
+    let walks = parse_walks(&std::env::var("PREFETCH").unwrap_or_else(|_| "build".to_string()));
 
     let head = git_head();
     println!("git {head}");
@@ -828,21 +1122,27 @@ async fn main() {
     let params = BuildParams::maintenance(&stored.metadata);
     let loaded = origin.elapsed().as_secs_f64();
     println!(
-        "loaded {} vectors of {} in {loaded:.1} s; R {}, L {}, alpha {}, seed {}; stored medoid {}; arms {arms:?}",
+        "loaded {} vectors of {} in {loaded:.1} s; R {}, L {}, alpha {}, seed {}; stored medoid {}; \
+         arms {arms:?}; walks {} (`build` asks {BUILD_PREFETCH_LINES} lines {BUILD_PREFETCH_AHEAD} ahead); \
+         walk seed {}",
         stored.row_ids.len(),
         stored.metadata.dimension,
         params.max_degree,
         params.search_list_size,
         params.alpha,
         params.seed,
-        stored.medoid
+        stored.medoid,
+        walk_list(&walks),
+        env_usize("WALK_SEED", WALK_SEED as usize)
     );
     assert_eq!(params.seed, BuildParams::default().seed);
 
-    // G1: every arm builds what `build_partition` builds, graph and medoid; the
-    // incremental arm, which is a copy of it, also counts the same distances. Over
-    // the whole partition `build_partition` must also build the stored graph.
-    let gate_store = store_of(&stored, gate_stride);
+    // G1: every arm builds what `build_partition` builds, graph and medoid, with its
+    // insertions shared out among the walks as they are below; the incremental arm,
+    // which is a copy of it, also counts the same distances. Over the whole
+    // partition `build_partition` must also build the stored graph.
+    let (gate_store, gate_vectors) = store_of(&stored, gate_stride);
+    let gate_values = vector_values(&gate_vectors, &gate_store);
     let mut gate_seconds = Vec::new();
     for round in 0..gate_rounds {
         let counted = Comparisons::default();
@@ -867,7 +1167,16 @@ async fn main() {
         let mut copies = Vec::new();
         for arm in &arms {
             let clock = Instant::now();
-            let copied = profiled_build(&gate_store, &params, *arm, buckets, origin, false);
+            let copied = profiled_build(
+                &gate_store,
+                gate_values,
+                &params,
+                *arm,
+                &walks,
+                buckets,
+                origin,
+                false,
+            );
             let copy = clock.elapsed().as_secs_f64();
             assert_eq!(
                 copied.medoid, built.medoid,
@@ -903,19 +1212,22 @@ async fn main() {
         }));
     }
     drop(gate_store);
+    drop(gate_vectors);
 
-    let store = store_of(&stored, stride);
+    let (store, vectors) = store_of(&stored, stride);
+    let values = vector_values(&vectors, &store);
     let mut runs = Vec::new();
     let mut profiled_arms: Vec<Profiled> = Vec::new();
     let mut failed = false;
     for arm in &arms {
         println!(
-            "profiling arm {arm:?} over {} vectors (stride {stride}) from {:.1} s",
+            "profiling arm {arm:?} over {} vectors (stride {stride}), walks {}, from {:.1} s",
             store.len(),
+            walk_list(&walks),
             origin.elapsed().as_secs_f64()
         );
         std::io::stdout().flush().unwrap();
-        let profiled = profiled_build(&store, &params, *arm, buckets, origin, true);
+        let profiled = profiled_build(&store, values, &params, *arm, &walks, buckets, origin, true);
         println!(
             "setup: randomize {:.2} s, medoid {:.2} s over {} distances",
             seconds(profiled.randomize_nanos),
@@ -923,6 +1235,7 @@ async fn main() {
             profiled.medoid_distances
         );
         print_passes(&profiled);
+        print_walks(&profiled);
 
         // G2: over the whole partition every arm must build the stored graph.
         let stored_match = differing_from_stored(&stored, &profiled.graph, stride).map(|apart| {
@@ -936,6 +1249,7 @@ async fn main() {
         });
         runs.push(json!({
             "arm": arm,
+            "walks": profiled.walks.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "randomize_nanos": profiled.randomize_nanos,
             "medoid_nanos": profiled.medoid_nanos,
             "medoid_distances": profiled.medoid_distances,

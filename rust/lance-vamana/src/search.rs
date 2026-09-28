@@ -8,6 +8,7 @@
 //! runs it to answer. Both want the same thing, so it lives on its own.
 
 use std::cell::Cell;
+use std::collections::BinaryHeap;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
@@ -78,7 +79,8 @@ impl Comparisons {
     }
 }
 
-/// Reusable scratch space for [`greedy_search`].
+/// Reusable scratch space for [`greedy_search`] and
+/// [`greedy_search_with_lookahead`].
 ///
 /// The visited marks are the only allocation that scales with the partition,
 /// and a build runs one search per vertex, so they are stamped with a
@@ -289,13 +291,14 @@ struct Margin {
 
 /// `L`: the beam a walk keeps, nearest first.
 ///
-/// Shared rather than written twice because there are two walks over it and they
-/// have to be the same walk. [`greedy_search`] holds the whole partition and
-/// takes one vertex at a time; the lazy walk in `crate::lazy` fetches the edges
-/// of several at once, because a round trip it can batch is what it is paying
-/// in. Everything else - what gets in, what gets pushed out, what order
-/// the answer comes back in - has to be identical, and the way to know it is
-/// identical is for there to be one copy of it.
+/// Shared rather than written twice because there are several walks over it and
+/// they have to be the same walk. [`greedy_search`] and
+/// [`greedy_search_with_lookahead`] hold the whole partition and take one
+/// vertex at a time; the lazy walk in `crate::lazy` fetches the edges of
+/// several at once, because a round trip it can batch is what it is paying in.
+/// Everything else - what gets in, what gets pushed out, what order the answer
+/// comes back in - has to be identical, and the way to know it is identical is
+/// for there to be one copy of it.
 #[derive(Debug)]
 pub struct SearchList {
     list: Vec<Entry>,
@@ -437,21 +440,22 @@ impl SearchList {
         );
     }
 
-    /// Measure every id in `ids` and offer it, asking for the code of the one
-    /// `ahead` further on before the current one is measured.
+    /// Measure every id in `ids` and offer it, asking for the code or vector of
+    /// the one `ahead` further on before the current one is measured.
     ///
     /// Every id must be a vertex of `calculator`'s store, and must already be
-    /// marked, exactly as [`Self::offer`] requires - this asks for a code at the
-    /// id as well as measuring one, and both index the same array.
+    /// marked, exactly as [`Self::offer`] requires - this asks for a code or a
+    /// vector at the id as well as measuring one, and both index the same
+    /// array.
     ///
     /// The ask is [`DistCalculator::prefetch`], which is a hint and only a hint:
     /// it changes what the processor has already loaded by the time a distance
-    /// reads it, and it cannot change what the distance is. An eight-bit code
-    /// sits `id * d` bytes into an array holding every code of the partition,
-    /// and the ids of one hop are as unrelated to one another as the graph made
-    /// them, so no hardware prefetcher can guess the next one. What it can be
-    /// told is the whole hop at once, because a hop knows every id it will
-    /// measure before it measures any of them.
+    /// reads it, and it cannot change what the distance is. A code or a vector
+    /// sits `id` times its length into an array holding every one of the
+    /// partition, and the ids of one hop are as unrelated to one another as the
+    /// graph made them, so no hardware prefetcher can guess the next one. What
+    /// it can be told is the whole hop at once, because a hop knows every id it
+    /// will measure before it measures any of them.
     ///
     /// `ahead` of zero asks for nothing at all. That is the hint's own control -
     /// not the walk as it was, which also offered its hop one neighbour at a
@@ -541,6 +545,12 @@ pub struct SearchResult {
 /// `search_list_size` is `L`: the beam kept while walking. Larger `L` costs
 /// distance computations and buys recall, and at `L = 1` this degenerates into
 /// plain hill climbing.
+///
+/// Each neighbour is measured the moment it is marked, and nothing is asked
+/// for ahead of it. [`greedy_search_with_lookahead`] is the same walk with a
+/// look-ahead, which a build uses; this one stays as it was because a query
+/// holding a whole partition walks through it, and the look-ahead was never
+/// measured there.
 pub fn greedy_search(
     graph: &PartitionGraph,
     query: &impl DistCalculator,
@@ -549,6 +559,289 @@ pub fn greedy_search(
     scratch: &mut SearchScratch,
     comparisons: &Comparisons,
 ) -> Result<SearchResult> {
+    let mut list = start_walk(
+        graph,
+        query,
+        entry_point,
+        search_list_size,
+        scratch,
+        comparisons,
+    )?;
+    let mut visited = Vec::new();
+
+    while let Some(nearest_unexpanded) = list.next_unexpanded() {
+        visited.push(nearest_unexpanded.clone());
+
+        for neighbor in graph.neighbors(nearest_unexpanded.id)? {
+            if !scratch.mark(*neighbor) {
+                continue;
+            }
+            comparisons.record(1);
+            list.offer(*neighbor, query.distance(*neighbor));
+        }
+    }
+
+    Ok(SearchResult {
+        candidates: list.into_candidates(),
+        visited,
+    })
+}
+
+/// [`greedy_search`], asking for a neighbour's data `prefetch_ahead`
+/// neighbours before it is measured.
+///
+/// The same walk - the same list, the same vertices expanded in the same order,
+/// the same distances counted - reached another way: the neighbours of each
+/// vertex it expands that it had not reached are collected first and then
+/// measured in the order the graph lists them, through
+/// [`SearchList::offer_all`]. Collecting is what puts the ids in hand before the
+/// loads; marking a neighbour and offering it touch different state, so doing
+/// all the marks of a vertex first changes nothing but when the loads start.
+///
+/// The ask is [`DistCalculator::prefetch`], a hint that cannot change a
+/// distance. A build measures full vectors, and a vector sits wherever the
+/// graph put its id, so no hardware prefetcher can start that load by itself.
+/// `prefetch_ahead` of zero asks for nothing, which is the control for the ask
+/// but not for [`greedy_search`], which does not collect.
+pub fn greedy_search_with_lookahead(
+    graph: &PartitionGraph,
+    query: &impl DistCalculator,
+    entry_point: u32,
+    search_list_size: usize,
+    prefetch_ahead: usize,
+    scratch: &mut SearchScratch,
+    comparisons: &Comparisons,
+) -> Result<SearchResult> {
+    let mut list = start_walk(
+        graph,
+        query,
+        entry_point,
+        search_list_size,
+        scratch,
+        comparisons,
+    )?;
+    let mut visited = Vec::new();
+    // A vertex has at most `max_degree` out-edges, and no more than the
+    // partition holds.
+    let mut fresh = Vec::with_capacity((graph.max_degree() as usize).min(graph.len()));
+
+    while let Some(nearest_unexpanded) = list.next_unexpanded() {
+        visited.push(nearest_unexpanded.clone());
+
+        fresh.clear();
+        fresh.extend(
+            graph
+                .neighbors(nearest_unexpanded.id)?
+                .iter()
+                .copied()
+                .filter(|neighbor| scratch.mark(*neighbor)),
+        );
+        comparisons.record(fresh.len() as u64);
+        list.offer_all(&fresh, query, prefetch_ahead);
+    }
+
+    Ok(SearchResult {
+        candidates: list.into_candidates(),
+        visited,
+    })
+}
+
+/// A calculator whose ask names at most `lines` cache lines of a vector,
+/// stepping a line at a time from its start, where Lance's flat calculator steps
+/// through all of it.
+///
+/// A whole vector asked for ahead pays only while it is short. Two neighbours
+/// ahead, on one core of an i7-8750H over every tenth vector of each benchmark
+/// dataset, asking for all of it took a build's search to 0.735 of its time per
+/// distance on SIFT (8 lines a vector) and 0.849 on GloVe-200 (13), but to 1.099
+/// on Cohere (48) and 1.155 on GIST (60); the first eight lines took the last
+/// three to 0.681, 0.909 and 0.910. Why was not measured: asks for the next
+/// vectors holding the line fill buffers the one being measured needs is a
+/// guess.
+///
+/// `vectors` must be the buffer the wrapped calculator reads, vector `id` at
+/// `id * dimension`: the ask names addresses in it, and a wrong buffer would ask
+/// for lines no distance reads, though it could not change a distance. An id
+/// past the buffer is asked for nothing, and nothing is asked for off x86_64.
+pub struct LeadingLines<'a, C> {
+    calculator: &'a C,
+    vectors: &'a [f32],
+    dimension: usize,
+    lines: usize,
+}
+
+impl<'a, C: DistCalculator> LeadingLines<'a, C> {
+    pub fn new(calculator: &'a C, vectors: &'a [f32], dimension: usize, lines: usize) -> Self {
+        Self {
+            calculator,
+            vectors,
+            dimension,
+            lines,
+        }
+    }
+}
+
+/// Everything but the ask is the wrapped calculator's own, specialisations
+/// included.
+impl<C: DistCalculator> DistCalculator for LeadingLines<'_, C> {
+    fn distance(&self, id: u32) -> f32 {
+        self.calculator.distance(id)
+    }
+
+    fn distance_all(&self, k_hint: usize) -> Vec<f32> {
+        self.calculator.distance_all(k_hint)
+    }
+
+    fn distance_all_with_scratch(
+        &self,
+        k_hint: usize,
+        dists: &mut Vec<f32>,
+        u16_scratch: &mut Vec<u16>,
+        u8_scratch: &mut Vec<u8>,
+        u32_scratch: &mut Vec<u32>,
+    ) {
+        self.calculator.distance_all_with_scratch(
+            k_hint,
+            dists,
+            u16_scratch,
+            u8_scratch,
+            u32_scratch,
+        );
+    }
+
+    fn prefetch(&self, id: u32) {
+        let vector = (id as usize)
+            .checked_mul(self.dimension)
+            .and_then(|start| self.vectors.get(start..))
+            .and_then(|rest| rest.get(..self.dimension));
+        if let Some(vector) = vector {
+            ask_leading_lines(vector, self.lines);
+        }
+    }
+
+    fn accumulate_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_id: impl Fn(u32) -> u64,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        u16_scratch: &mut Vec<u16>,
+        u8_scratch: &mut Vec<u8>,
+        u32_scratch: &mut Vec<u32>,
+    ) {
+        self.calculator.accumulate_topk_with_scratch(
+            k,
+            lower_bound,
+            upper_bound,
+            row_id,
+            res,
+            dists,
+            u16_scratch,
+            u8_scratch,
+            u32_scratch,
+        );
+    }
+
+    fn accumulate_filtered_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_ids: impl Iterator<Item = (u32, u64)>,
+        accept_row: impl Fn(u64) -> bool,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        u16_scratch: &mut Vec<u16>,
+        u8_scratch: &mut Vec<u8>,
+        u32_scratch: &mut Vec<u32>,
+    ) {
+        self.calculator.accumulate_filtered_topk_with_scratch(
+            k,
+            lower_bound,
+            upper_bound,
+            row_ids,
+            accept_row,
+            res,
+            dists,
+            u16_scratch,
+            u8_scratch,
+            u32_scratch,
+        );
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+thread_local! {
+    /// The lines [`ask_leading_lines`] has asked for on this thread since
+    /// [`record_asks`], as addresses; `None` records nothing.
+    static ASKED: std::cell::RefCell<Option<Vec<usize>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Start recording the lines asked for on this thread, forgetting any recorded.
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn record_asks() {
+    ASKED.with(|asked| *asked.borrow_mut() = Some(Vec::new()));
+}
+
+/// The lines asked for on this thread since [`record_asks`], which stops
+/// recording.
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn recorded_asks() -> Vec<usize> {
+    ASKED.with(|asked| asked.borrow_mut().take().unwrap_or_default())
+}
+
+/// A cache line on x86_64, and the step of Lance's own ask.
+#[cfg(target_arch = "x86_64")]
+const CACHE_LINE: usize = 64;
+
+/// Ask for up to `lines` lines of `vector`, one every cache line from its start,
+/// as Lance's own ask steps through all of them - so a vector that starts part
+/// of the way into a line and ends part of the way into its last one spans a
+/// line more than the steps reach.
+#[inline]
+fn ask_leading_lines(vector: &[f32], lines: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        let end = vector.as_ptr_range().end.cast::<i8>();
+        let mut line = vector.as_ptr().cast::<i8>();
+        for _ in 0..lines {
+            if line >= end {
+                break;
+            }
+            #[cfg(test)]
+            ASKED.with(|asked| {
+                if let Some(asked) = asked.borrow_mut().as_mut() {
+                    asked.push(line as usize);
+                }
+            });
+            // SAFETY: the intrinsic is `unsafe` for its target feature, SSE,
+            // which every x86_64 processor has; and a prefetch reads nothing the
+            // program can see and never faults, whatever the address. Stepped
+            // with `wrapping_add` because the step past the last line leaves
+            // the allocation.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(line) };
+            line = line.wrapping_add(CACHE_LINE);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (vector, lines);
+}
+
+/// Check a walk's inputs and start it: the scratch begun, the entry point
+/// marked, measured and offered.
+fn start_walk(
+    graph: &PartitionGraph,
+    query: &impl DistCalculator,
+    entry_point: u32,
+    search_list_size: usize,
+    scratch: &mut SearchScratch,
+    comparisons: &Comparisons,
+) -> Result<SearchList> {
     if search_list_size == 0 {
         return Err(Error::invalid_input(
             "Vamana search list size must be greater than zero".to_string(),
@@ -573,24 +866,7 @@ pub fn greedy_search(
     comparisons.record(1);
     let mut list = SearchList::new(search_list_size, graph.len());
     list.offer(entry_point, query.distance(entry_point));
-    let mut visited = Vec::new();
-
-    while let Some(nearest_unexpanded) = list.next_unexpanded() {
-        visited.push(nearest_unexpanded.clone());
-
-        for neighbor in graph.neighbors(nearest_unexpanded.id)? {
-            if !scratch.mark(*neighbor) {
-                continue;
-            }
-            comparisons.record(1);
-            list.offer(*neighbor, query.distance(*neighbor));
-        }
-    }
-
-    Ok(SearchResult {
-        candidates: list.into_candidates(),
-        visited,
-    })
+    Ok(list)
 }
 
 #[cfg(test)]
@@ -1342,23 +1618,37 @@ mod tests {
         (candidates, visited, comparisons)
     }
 
+    /// A walk by [`greedy_search`], or by [`greedy_search_with_lookahead`] at
+    /// `ahead` when there is one.
     fn walk(
         graph: &PartitionGraph,
         table: &Table,
         entry_point: u32,
         search_list_size: usize,
+        ahead: Option<usize>,
         scratch: &mut SearchScratch,
     ) -> Walk {
         scratch.cover(graph.len());
         let comparisons = Comparisons::default();
-        let result = greedy_search(
-            graph,
-            table,
-            entry_point,
-            search_list_size,
-            scratch,
-            &comparisons,
-        )
+        let result = match ahead {
+            None => greedy_search(
+                graph,
+                table,
+                entry_point,
+                search_list_size,
+                scratch,
+                &comparisons,
+            ),
+            Some(ahead) => greedy_search_with_lookahead(
+                graph,
+                table,
+                entry_point,
+                search_list_size,
+                ahead,
+                scratch,
+                &comparisons,
+            ),
+        }
         .unwrap();
         (
             result.candidates.into_iter().map(bits).collect(),
@@ -1379,6 +1669,11 @@ mod tests {
     /// a smaller one leaves stamps of other walks in its tail, where smallest
     /// first would hand each size a fresh buffer; and there are enough walks
     /// for the generation to run out twice.
+    ///
+    /// Both walks: [`greedy_search`], and [`greedy_search_with_lookahead`] at
+    /// depths 0 to 3 and past any hop. The second collects a vertex's neighbours
+    /// before it measures them, so it is the same walk only if marking them all
+    /// first changes nothing, ties included.
     #[test]
     fn a_walk_is_the_reference_walk_where_distances_tie() {
         const DISTANCES: [f32; 5] = [-1.0, 0.0, 1.0, 1.0, 2.0];
@@ -1396,9 +1691,13 @@ mod tests {
                 partitions.push((graph, table, entry_point));
             }
         }
+        let walkers = [None, Some(0), Some(1), Some(2), Some(3), Some(usize::MAX)];
         let mut walks = (0..partitions.len())
             .flat_map(|partition| {
                 [1, 2, 4, 16, usize::MAX].map(|search_list_size| (partition, search_list_size))
+            })
+            .flat_map(|(partition, search_list_size)| {
+                walkers.map(|ahead| (partition, search_list_size, ahead))
             })
             .collect::<Vec<_>>();
         walks.shuffle(&mut rng);
@@ -1409,13 +1708,21 @@ mod tests {
         );
 
         let mut scratch = SearchScratch::new(0);
-        for (partition, search_list_size) in walks {
+        for (partition, search_list_size, ahead) in walks {
             let (graph, table, entry_point) = &partitions[partition];
             assert_eq!(
-                walk(graph, table, *entry_point, search_list_size, &mut scratch),
+                walk(
+                    graph,
+                    table,
+                    *entry_point,
+                    search_list_size,
+                    ahead,
+                    &mut scratch
+                ),
                 reference_walk(graph, table, *entry_point, search_list_size),
-                "a walk over {} vertices at L = {search_list_size} left a different list, \
-                 expanded a different sequence or measured a different number of distances",
+                "a walk over {} vertices at L = {search_list_size} with a look-ahead of \
+                 {ahead:?} left a different list, expanded a different sequence or measured a \
+                 different number of distances",
                 graph.len()
             );
         }
@@ -1444,11 +1751,11 @@ mod tests {
         let mut scratch = SearchScratch::new(0);
         let small_walks = |scratch: &mut SearchScratch, count: usize| {
             for _ in 0..count {
-                walk(&small, &small_table, 0, usize::MAX, scratch);
+                walk(&small, &small_table, 0, usize::MAX, None, scratch);
             }
         };
 
-        let first = walk(&large, &large_table, 0, usize::MAX, &mut scratch);
+        let first = walk(&large, &large_table, 0, usize::MAX, None, &mut scratch);
         assert_eq!(
             first.1.len(),
             LARGE,
@@ -1466,7 +1773,7 @@ mod tests {
             LARGE,
             "the small walks replaced the buffer, so its tail holds nothing stale"
         );
-        let wrapped = walk(&large, &large_table, 0, usize::MAX, &mut scratch);
+        let wrapped = walk(&large, &large_table, 0, usize::MAX, None, &mut scratch);
         assert_eq!(
             scratch.generation, 1,
             "the walk after the last generation did not restart the numbering"
@@ -1486,7 +1793,7 @@ mod tests {
             "the small partition did not take the second wrap"
         );
         small_walks(&mut scratch, 253);
-        let a_cycle_later = walk(&large, &large_table, 0, usize::MAX, &mut scratch);
+        let a_cycle_later = walk(&large, &large_table, 0, usize::MAX, None, &mut scratch);
         assert_eq!(
             scratch.generation,
             u8::MAX,
@@ -1498,6 +1805,158 @@ mod tests {
             "a walk a whole cycle after a wrap left a different list, expanded a different \
              sequence or measured a different number of distances"
         );
+    }
+
+    /// The hops the reference walk takes: for each vertex it expands, the
+    /// neighbours it had not reached, in the order the graph lists them.
+    fn reference_hops(
+        graph: &PartitionGraph,
+        table: &Table,
+        entry_point: u32,
+        search_list_size: usize,
+    ) -> Vec<Vec<u32>> {
+        let mut reached = HashSet::from([entry_point]);
+        let mut list = PlainList::new(search_list_size);
+        list.offer(entry_point, table.distance(entry_point));
+        let mut hops = Vec::new();
+        while let Some(node) = list.next_unexpanded() {
+            let fresh = graph
+                .neighbors(node.id)
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|neighbor| reached.insert(*neighbor))
+                .collect::<Vec<_>>();
+            for id in &fresh {
+                list.offer(*id, table.distance(*id));
+            }
+            hops.push(fresh);
+        }
+        hops
+    }
+
+    /// A look-ahead walk asks for each vector of a hop `ahead` measurements
+    /// before the one that reads it, the first `ahead` of the hop before any of
+    /// them, and never for the next hop's; the walk without one asks for
+    /// nothing.
+    ///
+    /// The asks expected are written out here from that rule over the hops the
+    /// reference walk takes, not from [`SearchList::offer_all`], so what is
+    /// pinned is the rule and not whatever the code happens to do.
+    #[test]
+    fn a_look_ahead_walk_asks_ahead_within_each_hop() {
+        const VERTICES: usize = 48;
+        const BEAM: usize = 12;
+        let mut rng = SmallRng::seed_from_u64(29);
+        let mut long_hops = 0;
+        for _ in 0..16 {
+            let graph = random_graph(VERTICES, 8, &mut rng);
+            // What the recorder measures a vertex at: its id.
+            let table = Table((0..VERTICES).map(|id| id as f32).collect());
+            let entry_point = rng.random_range(0..VERTICES as u32);
+            let hops = reference_hops(&graph, &table, entry_point, BEAM);
+            long_hops += hops.iter().filter(|hop| hop.len() > 3).count();
+
+            for ahead in [0, 1, 2, 3] {
+                let mut expected = vec![Ask::Measured(entry_point)];
+                for hop in &hops {
+                    if ahead > 0 {
+                        expected.extend(hop.iter().take(ahead).map(|id| Ask::Prefetched(*id)));
+                    }
+                    for (position, id) in hop.iter().enumerate() {
+                        if let Some(later) = hop.get(position + ahead).filter(|_| ahead > 0) {
+                            expected.push(Ask::Prefetched(*later));
+                        }
+                        expected.push(Ask::Measured(*id));
+                    }
+                }
+                let recorder = Recorder::default();
+                let mut scratch = SearchScratch::new(VERTICES);
+                greedy_search_with_lookahead(
+                    &graph,
+                    &recorder,
+                    entry_point,
+                    BEAM,
+                    ahead,
+                    &mut scratch,
+                    &Comparisons::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    recorder.asked.into_inner(),
+                    expected,
+                    "at a look-ahead of {ahead} the walk asked or measured out of the rule's order"
+                );
+            }
+
+            let recorder = Recorder::default();
+            let mut scratch = SearchScratch::new(VERTICES);
+            greedy_search(
+                &graph,
+                &recorder,
+                entry_point,
+                BEAM,
+                &mut scratch,
+                &Comparisons::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                only(&recorder.asked.into_inner(), prefetched),
+                Vec::<u32>::new(),
+                "the walk without a look-ahead asked for a vector"
+            );
+        }
+        assert!(
+            long_hops > 16,
+            "{long_hops} hops longer than the deepest look-ahead are too few to see asks stop at \
+             a hop's end"
+        );
+    }
+
+    /// [`LeadingLines`] asks for the first `lines` lines of the vector it is
+    /// asked about, a line at a time from the vector's start, never past the
+    /// vector's end and never for an id past the buffer; and it measures exactly
+    /// what it wraps.
+    ///
+    /// Two lengths: 160 bytes, three steps from any start, and 128, two steps
+    /// that end exactly where the vector does - a step there would be the first
+    /// line of the next vector.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn leading_lines_ask_for_the_first_lines_of_a_vector_only() {
+        const VECTORS: usize = 4;
+        for (dimension, steps) in [(40, 3), (32, 2)] {
+            let values = (0..VECTORS * dimension)
+                .map(|value| value as f32)
+                .collect::<Vec<_>>();
+            let table = Table((0..VECTORS).map(|id| id as f32 * 0.5).collect());
+            for lines in [0, 1, 2, 3, 4, usize::MAX] {
+                let ask = LeadingLines::new(&table, &values, dimension, lines);
+                for id in 0..VECTORS as u32 {
+                    record_asks();
+                    ask.prefetch(id);
+                    let start = values[id as usize * dimension..].as_ptr() as usize;
+                    assert_eq!(
+                        recorded_asks(),
+                        (0..lines.min(steps))
+                            .map(|line| start + line * CACHE_LINE)
+                            .collect::<Vec<_>>(),
+                        "asking for {lines} lines of vector {id} of {dimension} floats named \
+                         other lines"
+                    );
+                    assert_eq!(ask.distance(id), table.distance(id));
+                }
+                record_asks();
+                ask.prefetch(VECTORS as u32);
+                ask.prefetch(u32::MAX);
+                assert_eq!(
+                    recorded_asks(),
+                    Vec::<usize>::new(),
+                    "an id past the buffer was asked for"
+                );
+                assert_eq!(ask.distance_all(0), table.distance_all(0));
+            }
+        }
     }
 
     /// [`PlainList`] ruled by a [`StopRule`] straight from its definition:

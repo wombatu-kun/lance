@@ -281,14 +281,15 @@ pub struct SearchParams {
     /// early is free where the code was resident anyway and is a memory latency
     /// hidden where it was not.
     ///
-    /// **Only scalar codes are asked.** The ask is
-    /// `DistCalculator::prefetch`, and of the stores this crate can hold only
-    /// `ScalarQuantizationStorage` implements it; `RabitDistCalculator` inherits
-    /// the trait's empty default, so on [`crate::codes::CodeSpec::Rabit`] - the
-    /// default kind - every depth is a call that returns. A RaBitQ code is not
-    /// one run of bytes either: the binary code, the blocked extended code and
-    /// two factor arrays are four places a vertex has to be fetched from, which
-    /// is presumably why Lance never wrote one.
+    /// **Only scalar codes are asked.** The ask is `DistCalculator::prefetch`,
+    /// and of the code stores this crate can hold only
+    /// `ScalarQuantizationStorage` implements it; `RabitDistCalculator`
+    /// inherits the trait's empty default, so on
+    /// [`crate::codes::CodeSpec::Rabit`] - the default kind - every depth is a
+    /// call that returns. A RaBitQ code is not one run of bytes either: the
+    /// binary code, the blocked extended code and two factor arrays are four
+    /// places a vertex has to be fetched from, which is presumably why Lance
+    /// never wrote one.
     ///
     /// Two, which is what Lance's own HNSW asks for at search time
     /// (`hnsw/builder.rs`, `search_basic` passes `Some(2)`). Zero asks for
@@ -300,9 +301,11 @@ pub struct SearchParams {
     /// eight-bit code is two cache lines at `d = 128` against fifteen at
     /// `d = 960`.
     ///
-    /// Ignored by the walks that hold a whole partition, which measure it in
-    /// one sweep the hardware predicts on its own, and by [`WalkMode::Flat`],
-    /// which does the same.
+    /// Ignored by the walks that hold a whole partition, which go through
+    /// [`crate::search::greedy_search`] and ask for nothing: a look-ahead was
+    /// measured in a build's walk ([`crate::build::BUILD_PREFETCH_AHEAD`]) and
+    /// never in theirs. Ignored by [`WalkMode::Flat`] too, which sweeps the
+    /// partition in order.
     pub prefetch_ahead: usize,
     /// Whether a [`WalkMode::Lazy`] probe holds the whole `__neighbors` column
     /// of a partition it opens, rather than fetching a hop's rows at a time.

@@ -24,10 +24,13 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray};
+use arrow_array::cast::AsArray;
+use arrow_array::types::Float32Type;
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::{DataType, Field};
 use arrow_select::concat::concat;
 use lance_core::{Error, Result};
+use lance_index::vector::flat::storage::{FLAT_COLUMN, FlatFloatStorage};
 use lance_index::vector::graph::{OrderedFloat, OrderedNode};
 use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
@@ -35,17 +38,65 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 
-use crate::build::{Admission, BuildParams, admit, medoid, prune, validate_alpha};
+use crate::build::{
+    Admission, BUILD_PREFETCH_AHEAD, BUILD_PREFETCH_LINES, BuildParams, admit, medoid, prune,
+    validate_alpha,
+};
 use crate::partition::{Partition, PartitionGraph};
-use crate::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
+use crate::search::{
+    Comparisons, LeadingLines, SearchScratch, flat_storage, greedy_search_with_lookahead,
+};
 
 /// What one insertion runs under.
 ///
 /// `alpha` is here rather than taken from [`BuildParams`] because a build makes
 /// two passes at two values of it and changes nothing else between them.
-pub(crate) struct Linking {
+pub(crate) struct Linking<'a> {
     pub alpha: f32,
     pub search_list_size: usize,
+    /// The vectors the store's distances read, which the search asks for ahead;
+    /// `None` asks for nothing.
+    pub vectors: Option<&'a ResidentVectors>,
+}
+
+/// The vectors a store's distances read, in the one buffer they read them from.
+pub(crate) struct ResidentVectors {
+    values: Float32Array,
+    dimension: usize,
+}
+
+impl ResidentVectors {
+    /// The vectors `store` measures, when it is a flat store over `f32` - the
+    /// store every build and insertion in this crate makes, through
+    /// [`flat_storage`]; `None` for any other store, whose search then asks for
+    /// nothing.
+    ///
+    /// Checked against the store at both ends rather than taken on trust from
+    /// its batch: the search's ask names addresses in this buffer, and a copy of
+    /// the same vectors elsewhere would ask for the right data at the wrong
+    /// address. A flat store that does not read its vectors from its batch's
+    /// buffer gets `None` too, and asks for nothing.
+    pub(crate) fn of<S: VectorStore>(store: &S) -> Option<Self> {
+        let flat = store.as_any().downcast_ref::<FlatFloatStorage>()?;
+        let batch = flat.to_batches().ok()?.next()?;
+        let vectors = batch
+            .column_by_name(FLAT_COLUMN)?
+            .as_fixed_size_list_opt()?;
+        let dimension = vectors.value_length() as usize;
+        let values = vectors.values().as_primitive_opt::<Float32Type>()?.clone();
+        let last = flat.len().checked_sub(1)?;
+        if values.len() != flat.len() * dimension {
+            return None;
+        }
+        let read_in_place = [0, last].into_iter().all(|id| {
+            flat.vector(id as u32)
+                .as_primitive_opt::<Float32Type>()
+                .is_some_and(|read| {
+                    read.values().as_ptr() == values.values()[id * dimension..].as_ptr()
+                })
+        });
+        read_in_place.then_some(Self { values, dimension })
+    }
 }
 
 /// Reusable buffers for a run of insertions.
@@ -113,15 +164,32 @@ pub(crate) fn insert_point<S: VectorStore>(
 ) -> Result<()> {
     let max_degree = graph.max_degree() as usize;
     let from_point = store.dist_calculator_from_id(point);
-    let mut candidates = greedy_search(
-        graph,
-        &from_point,
-        entry_point,
-        linking.search_list_size,
-        &mut scratch.search,
-        comparisons,
-    )?
-    .visited;
+    let found = match linking.vectors {
+        Some(resident) => greedy_search_with_lookahead(
+            graph,
+            &LeadingLines::new(
+                &from_point,
+                resident.values.values(),
+                resident.dimension,
+                BUILD_PREFETCH_LINES,
+            ),
+            entry_point,
+            linking.search_list_size,
+            BUILD_PREFETCH_AHEAD,
+            &mut scratch.search,
+            comparisons,
+        ),
+        None => greedy_search_with_lookahead(
+            graph,
+            &from_point,
+            entry_point,
+            linking.search_list_size,
+            0,
+            &mut scratch.search,
+            comparisons,
+        ),
+    };
+    let mut candidates = found?.visited;
     // The paper folds the current out-edges into the candidate set inside the
     // prune; doing it here keeps the prune ignorant of the graph, which is what
     // lets the back-edge case below reuse it.
@@ -302,9 +370,11 @@ pub fn insert_into_partition(
     let store = flat_storage(graph.row_ids(), &vectors, distance_type)?;
 
     let mut scratch = InsertScratch::new(graph.len(), graph.max_degree());
+    let resident = ResidentVectors::of(&store);
     let linking = Linking {
         alpha: params.alpha,
         search_list_size: params.search_list_size,
+        vectors: resident.as_ref(),
     };
     let mut order = (first_new..graph.len() as u32).collect::<Vec<_>>();
     order.shuffle(&mut SmallRng::seed_from_u64(params.seed));
@@ -382,6 +452,7 @@ mod tests {
     use lance_linalg::kernels::normalize_fsl;
 
     use crate::build::{Pruned, build_partition};
+    use crate::search::greedy_search;
 
     const DIMENSION: usize = 32;
     const MAX_DEGREE: u32 = 16;
@@ -805,6 +876,7 @@ mod tests {
         let mut order = (0..graph.len() as u32).collect::<Vec<_>>();
         let mut rng = SmallRng::seed_from_u64(5);
         let mut changes = FlagChanges::default();
+        let resident = ResidentVectors::of(&store);
 
         for alpha in [1.0, params.alpha] {
             // The lists a pass hands on must hold at the alpha the next one uses.
@@ -818,6 +890,7 @@ mod tests {
             let linking = Linking {
                 alpha,
                 search_list_size: params.search_list_size,
+                vectors: resident.as_ref(),
             };
             order.shuffle(&mut rng);
             for &point in &order {
@@ -910,5 +983,177 @@ mod tests {
     fn the_prune_output_flag_follows_every_list_under_cosine() {
         let changes = prune_output_flag_over(DistanceType::Cosine);
         assert!(changes.prune_output_refilled > 0, "{changes:?}");
+    }
+
+    /// The flat store in a wrapper: every call is the flat store's, but it is not
+    /// a [`FlatFloatStorage`], so [`ResidentVectors::of`] finds no buffer in it.
+    #[derive(Clone)]
+    struct Opaque(FlatFloatStorage);
+
+    impl VectorStore for Opaque {
+        type DistanceCalculator<'a> = <FlatFloatStorage as VectorStore>::DistanceCalculator<'a>;
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> &arrow_schema::SchemaRef {
+            self.0.schema()
+        }
+
+        fn to_batches(&self) -> Result<impl Iterator<Item = arrow_array::RecordBatch> + Send> {
+            self.0.to_batches()
+        }
+
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn distance_type(&self) -> DistanceType {
+            self.0.distance_type()
+        }
+
+        fn row_id(&self, id: u32) -> u64 {
+            self.0.row_id(id)
+        }
+
+        fn row_ids(&self) -> impl Iterator<Item = &u64> {
+            self.0.row_ids()
+        }
+
+        fn append_batch(&self, batch: arrow_array::RecordBatch, column: &str) -> Result<Self> {
+            Ok(Self(self.0.append_batch(batch, column)?))
+        }
+
+        fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
+            self.0.dist_calculator(query, dist_q_c)
+        }
+
+        fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+            self.0.dist_calculator_from_id(id)
+        }
+    }
+
+    /// A store the look-ahead cannot read is built by the walk that asks for
+    /// nothing, and builds the same graph, over the same distances, as the flat
+    /// store it wraps.
+    #[test]
+    fn a_build_over_a_store_without_a_buffer_asks_for_nothing_and_builds_the_same() {
+        let vectors = scattered(200, 0);
+        let row_ids = (0..200).collect::<Vec<u64>>();
+        let store = flat_storage(&row_ids, &vectors, DistanceType::L2).unwrap();
+        let params = BuildParams {
+            max_degree: 8,
+            search_list_size: 16,
+            alpha: 1.2,
+            seed: 42,
+        };
+        assert!(ResidentVectors::of(&store).is_some());
+        assert!(ResidentVectors::of(&Opaque(store.clone())).is_none());
+
+        let flat_counted = Comparisons::default();
+        let flat = build_partition(&store, &params, &flat_counted).unwrap();
+        #[cfg(target_arch = "x86_64")]
+        crate::search::record_asks();
+        let opaque_counted = Comparisons::default();
+        let opaque = build_partition(&Opaque(store), &params, &opaque_counted).unwrap();
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            crate::search::recorded_asks(),
+            Vec::<usize>::new(),
+            "a build over a store without a buffer asked for lines"
+        );
+
+        assert_eq!(opaque.medoid, flat.medoid);
+        assert_eq!(opaque_counted.get(), flat_counted.get());
+        for vertex in 0..opaque.graph.len() as u32 {
+            assert_eq!(
+                opaque.graph.neighbors(vertex).unwrap(),
+                flat.graph.neighbors(vertex).unwrap(),
+                "vertex {vertex}"
+            );
+        }
+    }
+
+    /// Where the asks recorded since [`crate::search::record_asks`] landed, as
+    /// the line of its vector each one named: every ask must fall inside
+    /// `vectors`, on a line of one of its vectors.
+    #[cfg(target_arch = "x86_64")]
+    fn asked_lines(vectors: &FixedSizeListArray) -> HashSet<usize> {
+        let asked = crate::search::recorded_asks();
+        assert!(!asked.is_empty(), "the search asked for no vector at all");
+        let values = vectors.values().as_primitive::<Float32Type>().values();
+        let base = values.as_ptr() as usize;
+        let stride = vectors.value_length() as usize * size_of::<f32>();
+        asked
+            .into_iter()
+            .map(|address| {
+                let offset = address
+                    .checked_sub(base)
+                    .filter(|offset| *offset < values.len() * size_of::<f32>())
+                    .expect("an ask named an address outside the buffer the store reads");
+                let within = offset % stride;
+                assert_eq!(within % 64, 0, "an ask landed off a line of its vector");
+                within / 64
+            })
+            .collect()
+    }
+
+    /// A build's search and an insertion's ask for the leading lines of the
+    /// vectors they are about to measure, in the buffer the store measures - so
+    /// the look-ahead is wired all the way to the ask, which no graph can show:
+    /// a hint changes nothing but when the loads start.
+    ///
+    /// Vectors of sixteen lines, twice what a build asks for, so that an ask for
+    /// the whole vector would be caught.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_build_and_an_insertion_ask_for_the_leading_lines_of_their_vectors() {
+        const WIDE: usize = 256;
+        let noise = |count: usize, seed: u64| {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let values = (0..count * WIDE)
+                .map(|_| rng.random::<f32>())
+                .collect::<Vec<_>>();
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), WIDE as i32)
+                .unwrap()
+        };
+        let params = BuildParams {
+            max_degree: 4,
+            search_list_size: 8,
+            alpha: 1.2,
+            seed: 42,
+        };
+        let leading = (0..BUILD_PREFETCH_LINES).collect::<HashSet<_>>();
+
+        let vectors = noise(64, 1);
+        let row_ids = (0..64).collect::<Vec<u64>>();
+        let store = flat_storage(&row_ids, &vectors, DistanceType::L2).unwrap();
+        crate::search::record_asks();
+        let built = build_partition(&store, &params, &Comparisons::default()).unwrap();
+        assert_eq!(
+            asked_lines(&vectors),
+            leading,
+            "a build did not ask for exactly the leading lines of its vectors"
+        );
+
+        let partition = Partition::try_new(built.graph, vectors).unwrap();
+        let new_row_ids = (64..80).collect::<Vec<u64>>();
+        crate::search::record_asks();
+        let inserted = insert_into_partition(
+            &partition,
+            &new_row_ids,
+            &noise(16, 2),
+            built.medoid,
+            DistanceType::L2,
+            &params,
+            &Comparisons::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            asked_lines(inserted.partition.vectors()),
+            leading,
+            "an insertion did not ask for exactly the leading lines of its vectors"
+        );
     }
 }
