@@ -6,7 +6,9 @@
 //! A build is repeated insertion, and this is the step it repeats: search the
 //! graph as it currently stands for the point being added, prune what the search
 //! visited into the point's out-edges, and give each chosen neighbour an edge
-//! back - re-pruning it when its list was already full. [`crate::build`] calls
+//! back - re-pruning it when its list was already full, which for a list that is
+//! still exactly what a prune returned means checking the new point alone
+//! against it, bar a zero separation (`build::admit`). [`crate::build`] calls
 //! `insert_point` once per vertex twice over; this module's own
 //! [`insert_into_partition`] calls it once per new vertex against a graph that
 //! is already navigable, which is why it needs one pass rather than two.
@@ -33,7 +35,7 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 
-use crate::build::{BuildParams, medoid, robust_prune, validate_alpha};
+use crate::build::{Admission, BuildParams, admit, medoid, prune, validate_alpha};
 use crate::partition::{Partition, PartitionGraph};
 use crate::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
 
@@ -56,6 +58,16 @@ pub(crate) struct InsertScratch {
     search: SearchScratch,
     /// One vertex's out-edges, read out so that the graph can be written back.
     edges: Vec<u32>,
+    /// Whether each vertex's out-edges are still exactly what a prune returned
+    /// without its coincident fill, the one kind of list [`admit`] can take a
+    /// back-edge into. Such a list holds at the alpha it was pruned at and any
+    /// larger one, never a smaller one, so the insertions one scratch serves must
+    /// not lower alpha.
+    ///
+    /// False for the random graph a build starts from and for a graph read back
+    /// from disk, whose history is unknown; set by a prune that did not use the
+    /// fill; cleared by an unchecked append.
+    is_prune_output: Vec<bool>,
 }
 
 impl InsertScratch {
@@ -65,6 +77,7 @@ impl InsertScratch {
             // Plus one: a full list has to hold the contender before the prune
             // decides which of the `max_degree + 1` of them stays.
             edges: Vec::with_capacity(max_degree as usize + 1),
+            is_prune_output: vec![false; num_vertices],
         }
     }
 }
@@ -81,6 +94,14 @@ impl InsertScratch {
 /// and fought for through the prune when it does not: a neighbour at full degree
 /// gives up a slot only if the new point beats an occupant on the same diversity
 /// rule that filled the list in the first place.
+///
+/// A full list that is still exactly what a prune returned does not need the
+/// prune run over it again: [`admit`] reaches the same answer by checking the new
+/// point against the members alone, and leaves a zero separation to the prune. At
+/// `alpha = 1.2` such a re-prune keeps almost every member, so the list stays full
+/// and the next back-edge would pay the whole prune again - 2470-2548 distances
+/// each time in builds over every tenth vector of the four benchmark datasets,
+/// where it was 57% of GloVe's.
 pub(crate) fn insert_point<S: VectorStore>(
     graph: &mut PartitionGraph,
     store: &S,
@@ -111,7 +132,7 @@ pub(crate) fn insert_point<S: VectorStore>(
         }),
     );
 
-    let selected = robust_prune(
+    let selected = prune(
         store,
         point,
         candidates,
@@ -119,9 +140,10 @@ pub(crate) fn insert_point<S: VectorStore>(
         max_degree,
         comparisons,
     )?;
-    graph.set_neighbors(point, &selected)?;
+    graph.set_neighbors(point, &selected.neighbors)?;
+    scratch.is_prune_output[point as usize] = !selected.has_coincident_fill;
 
-    for neighbor in &selected {
+    for neighbor in &selected.neighbors {
         let neighbor = *neighbor;
         scratch.edges.clear();
         scratch.edges.extend_from_slice(graph.neighbors(neighbor)?);
@@ -131,9 +153,29 @@ pub(crate) fn insert_point<S: VectorStore>(
         if scratch.edges.len() < max_degree {
             scratch.edges.push(point);
             graph.set_neighbors(neighbor, &scratch.edges)?;
+            // Appended without the rule, so no longer a prune's output.
+            scratch.is_prune_output[neighbor as usize] = false;
             continue;
         }
         // Full: the back-edge has to earn its place against the rest.
+        if scratch.is_prune_output[neighbor as usize] {
+            match admit(
+                store,
+                neighbor,
+                &scratch.edges,
+                point,
+                linking.alpha,
+                max_degree,
+                comparisons,
+            )? {
+                Admission::Refused => continue,
+                Admission::Admitted(admitted) => {
+                    graph.set_neighbors(neighbor, &admitted)?;
+                    continue;
+                }
+                Admission::Undecided => {}
+            }
+        }
         let from_neighbor = store.dist_calculator_from_id(neighbor);
         comparisons.record(scratch.edges.len() as u64 + 1);
         let contenders = scratch
@@ -142,7 +184,7 @@ pub(crate) fn insert_point<S: VectorStore>(
             .chain(std::iter::once(&point))
             .map(|id| OrderedNode::new(*id, OrderedFloat(from_neighbor.distance(*id))))
             .collect();
-        let pruned = robust_prune(
+        let repruned = prune(
             store,
             neighbor,
             contenders,
@@ -150,7 +192,8 @@ pub(crate) fn insert_point<S: VectorStore>(
             max_degree,
             comparisons,
         )?;
-        graph.set_neighbors(neighbor, &pruned)?;
+        graph.set_neighbors(neighbor, &repruned.neighbors)?;
+        scratch.is_prune_output[neighbor as usize] = !repruned.has_coincident_fill;
     }
     Ok(())
 }
@@ -336,7 +379,9 @@ mod tests {
     use rand::Rng;
 
     use super::*;
-    use crate::build::build_partition;
+    use lance_linalg::kernels::normalize_fsl;
+
+    use crate::build::{Pruned, build_partition};
 
     const DIMENSION: usize = 32;
     const MAX_DEGREE: u32 = 16;
@@ -672,5 +717,198 @@ mod tests {
             )
             .contains("degree 17 into a partition built at degree 16")
         );
+    }
+
+    /// What a prune makes of `vertex`'s list as it stands. A list a prune returned
+    /// comes back unchanged, and with the coincident fill exactly when it had it.
+    fn reprune_of(
+        store: &impl VectorStore,
+        graph: &PartitionGraph,
+        vertex: u32,
+        alpha: f32,
+    ) -> Pruned {
+        let from_vertex = store.dist_calculator_from_id(vertex);
+        let candidates = graph
+            .neighbors(vertex)
+            .unwrap()
+            .iter()
+            .map(|id| OrderedNode::new(*id, OrderedFloat(from_vertex.distance(*id))))
+            .collect();
+        prune(
+            store,
+            vertex,
+            candidates,
+            alpha,
+            graph.max_degree() as usize,
+            &Comparisons::default(),
+        )
+        .unwrap()
+    }
+
+    /// How often each change of the flag was met, so the test can insist it met all.
+    #[derive(Debug, Default)]
+    struct FlagChanges {
+        appended_to_a_prune_output: usize,
+        full_prune_output_kept: usize,
+        full_prune_output_changed: usize,
+        other_list_repruned: usize,
+        other_list_filled: usize,
+        own_list_filled: usize,
+        flagged_own_list_filled: usize,
+        prune_output_refilled: usize,
+    }
+
+    /// The flag `admit` relies on says what each list is after every insertion of
+    /// a two-pass sweep over one scratch: set by a prune unless its coincident fill
+    /// was used, cleared by an unchecked append, kept by a newcomer admitted or
+    /// refused - and every list it is set on is one a prune returns unchanged.
+    fn prune_output_flag_over(distance_type: DistanceType) -> FlagChanges {
+        const DEGREE: u32 = 4;
+        // Groups of `DEGREE + 2` copies, enough for the fill to fill a list. Under
+        // `Cosine` a copy is a multiple of its point, normalised like the rest, and
+        // no two multiples differ by a power of two, which would normalise to the
+        // very same vector: the copies have to land ULPs apart.
+        const SCALES: [f32; DEGREE as usize + 2] = [1.0, 1.3, 1.7, 2.3, 2.9, 3.1];
+        let copies = scattered(24, 0)
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .chunks(DIMENSION)
+            .flat_map(|point| {
+                SCALES.iter().flat_map(move |scale| {
+                    let scale = match distance_type {
+                        DistanceType::Cosine => *scale,
+                        _ => 1.0,
+                    };
+                    point.iter().map(move |value| value * scale)
+                })
+            })
+            .collect::<Vec<_>>();
+        let copies =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(copies), DIMENSION as i32)
+                .unwrap();
+        let vectors = concat_vectors(&[copies, scattered(80, 100)]).unwrap();
+        let vectors = match distance_type {
+            DistanceType::Cosine => normalize_fsl(&vectors).unwrap(),
+            _ => vectors,
+        };
+        let row_ids = (0..vectors.len() as u64).collect::<Vec<_>>();
+        let store = flat_storage(&row_ids, &vectors, distance_type).unwrap();
+        let params = BuildParams {
+            max_degree: DEGREE,
+            search_list_size: 16,
+            ..params()
+        };
+        let built = build_partition(&store, &params, &Comparisons::default()).unwrap();
+        let mut graph = built.graph;
+        let mut scratch = InsertScratch::new(graph.len(), DEGREE);
+        let mut order = (0..graph.len() as u32).collect::<Vec<_>>();
+        let mut rng = SmallRng::seed_from_u64(5);
+        let mut changes = FlagChanges::default();
+
+        for alpha in [1.0, params.alpha] {
+            // The lists a pass hands on must hold at the alpha the next one uses.
+            for vertex in 0..graph.len() as u32 {
+                if scratch.is_prune_output[vertex as usize] {
+                    let repruned = reprune_of(&store, &graph, vertex, alpha);
+                    assert_eq!(repruned.neighbors, graph.neighbors(vertex).unwrap());
+                    assert!(!repruned.has_coincident_fill, "vertex {vertex}");
+                }
+            }
+            let linking = Linking {
+                alpha,
+                search_list_size: params.search_list_size,
+            };
+            order.shuffle(&mut rng);
+            for &point in &order {
+                let before = graph.clone();
+                let flags = scratch.is_prune_output.clone();
+                insert_point(
+                    &mut graph,
+                    &store,
+                    &mut scratch,
+                    &linking,
+                    point,
+                    built.medoid,
+                    &Comparisons::default(),
+                )
+                .unwrap();
+
+                let own = reprune_of(&store, &graph, point, alpha);
+                assert_eq!(
+                    own.neighbors,
+                    graph.neighbors(point).unwrap(),
+                    "vertex {point}"
+                );
+                assert_eq!(
+                    scratch.is_prune_output[point as usize], !own.has_coincident_fill,
+                    "vertex {point}'s own list"
+                );
+                if own.has_coincident_fill {
+                    changes.own_list_filled += 1;
+                    if flags[point as usize] {
+                        changes.flagged_own_list_filled += 1;
+                    }
+                }
+                let chosen = graph.neighbors(point).unwrap();
+                for vertex in (0..graph.len() as u32).filter(|vertex| *vertex != point) {
+                    let (was, is) = (
+                        before.neighbors(vertex).unwrap(),
+                        graph.neighbors(vertex).unwrap(),
+                    );
+                    let (flagged, flag) = (
+                        flags[vertex as usize],
+                        scratch.is_prune_output[vertex as usize],
+                    );
+                    let what = format!("vertex {vertex} after inserting {point} at {alpha}");
+                    if !chosen.contains(&vertex) || was.contains(&point) {
+                        assert_eq!(is, was, "{what}");
+                        assert_eq!(flag, flagged, "{what}");
+                    } else if was.len() < DEGREE as usize {
+                        assert_eq!(is, [was, &[point]].concat(), "{what}");
+                        assert!(!flag, "{what}: appended to, and still flagged");
+                        if flagged {
+                            changes.appended_to_a_prune_output += 1;
+                        }
+                    } else {
+                        let repruned = reprune_of(&store, &graph, vertex, alpha);
+                        assert_eq!(repruned.neighbors, is, "{what}");
+                        assert_eq!(flag, !repruned.has_coincident_fill, "{what}");
+                        match (flagged, repruned.has_coincident_fill) {
+                            (true, true) => changes.prune_output_refilled += 1,
+                            (true, _) if is == was => changes.full_prune_output_kept += 1,
+                            (true, _) => changes.full_prune_output_changed += 1,
+                            (false, false) => changes.other_list_repruned += 1,
+                            (false, true) => changes.other_list_filled += 1,
+                        }
+                    }
+                }
+            }
+        }
+        changes
+    }
+
+    #[test]
+    fn the_prune_output_flag_follows_every_list() {
+        let changes = prune_output_flag_over(DistanceType::L2);
+        assert!(
+            changes.appended_to_a_prune_output > 0
+                && changes.full_prune_output_kept > 0
+                && changes.full_prune_output_changed > 0
+                && changes.other_list_repruned > 0
+                && changes.other_list_filled > 0
+                && changes.own_list_filled > 0
+                && changes.flagged_own_list_filled > 0,
+            "{changes:?}"
+        );
+    }
+
+    /// Under cosine a newcomer can sit at zero separation from two members that are
+    /// not at zero from each other, so a list with the flag set can come back from
+    /// the prune filled - and the flag has to clear.
+    #[test]
+    fn the_prune_output_flag_follows_every_list_under_cosine() {
+        let changes = prune_output_flag_over(DistanceType::Cosine);
+        assert!(changes.prune_output_refilled > 0, "{changes:?}");
     }
 }

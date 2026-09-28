@@ -578,6 +578,17 @@ can drop the record.
   gives the compute pool cores, and write them one at a time in id order. That is
   a fivefold saving on twelve cores and a working set of that many partitions:
   `num_partitions` sets both. A query's own bound is separate and unchanged.
+- A back-edge into a full list that is still exactly what a prune returned is
+  settled by checking the new vertex against the list's members alone; a list
+  appended to, filled with coincident copies or not yet pruned is re-pruned
+  whole, and so is one the new vertex meets at zero separation. The graph comes
+  out the same bit for bit. At `alpha = 1.2` a re-prune keeps nearly every
+  member, so the next back-edge used to pay the whole prune again. Timed on the
+  harness prototype of this rule, `examples/build_profile.rs`, whose gate holds
+  it to the build's own distance count, on one pinned core under the
+  `performance` power profile, over every tenth vector of SIFT1M, GloVe-200,
+  Cohere and GIST1M and over all of SIFT1M (`R = 70`, `L = 100`): builds 1.05x,
+  1.90x, 1.37x, 1.41x and 1.08x faster.
 - `L2` and `Cosine` only. Cosine normalises the vectors it stores, so what the
   index holds is not bit-identical to the dataset's column. `Dot` is refused: see
   `supported_distance_type` for why.

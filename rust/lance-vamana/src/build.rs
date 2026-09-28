@@ -404,6 +404,30 @@ pub fn robust_prune<S: VectorStore>(
     max_degree: usize,
     comparisons: &Comparisons,
 ) -> Result<Vec<u32>> {
+    prune(store, point, candidates, alpha, max_degree, comparisons).map(|pruned| pruned.neighbors)
+}
+
+/// What [`prune`] chose.
+pub(crate) struct Pruned {
+    /// The out-edges in the order they were chosen: the picks nearest first, ties
+    /// broken by id, then whatever the coincident fill added.
+    pub(crate) neighbors: Vec<u32>,
+    /// Whether the coincident fill supplied part of `neighbors`.
+    ///
+    /// A filled member was occluded - at zero separation, but occluded - so a list
+    /// holding one is not the kind of list [`admit`] can take a newcomer into.
+    pub(crate) has_coincident_fill: bool,
+}
+
+/// [`robust_prune`], saying as well whether the coincident fill was used.
+pub(crate) fn prune<S: VectorStore>(
+    store: &S,
+    point: u32,
+    candidates: Vec<OrderedNode>,
+    alpha: f32,
+    max_degree: usize,
+    comparisons: &Comparisons,
+) -> Result<Pruned> {
     validate_alpha(alpha)?;
     if max_degree == 0 {
         return Err(Error::invalid_input(
@@ -512,6 +536,7 @@ pub fn robust_prune<S: VectorStore>(
     // equal recall from 0.97 up, and 7x the distances to build - 78G against 11G.
     // The extra edges buy recall per beam, which is not the same thing as recall
     // per distance, and a denser graph makes every build-time search pay for them.
+    let mut has_coincident_fill = false;
     if selected.len() < max_degree {
         coincident.sort_unstable_by(|a, b| a.dist.cmp(&b.dist).then(a.id.cmp(&b.id)));
         for candidate in coincident {
@@ -519,9 +544,123 @@ pub fn robust_prune<S: VectorStore>(
                 break;
             }
             selected.push(candidate.id);
+            has_coincident_fill = true;
         }
     }
-    Ok(selected)
+    Ok(Pruned {
+        neighbors: selected,
+        has_coincident_fill,
+    })
+}
+
+/// What [`admit`] decided about a newcomer to a full list.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Admission {
+    /// A closer member occludes the newcomer, or it is the farthest of them all:
+    /// the prune would return the list as it stands.
+    Refused,
+    /// The list the prune would return: the newcomer in its place, the members it
+    /// occludes gone, cut at `max_degree`.
+    Admitted(Vec<u32>),
+    /// A separation of zero, or a distance the prune would refuse: left to the
+    /// prune. A zero separation matters only against a farther member, where the
+    /// coincident fill could take the freed slot, but it is rare - duplicates, and
+    /// under cosine rows that were proportional before normalisation - so a closer
+    /// member's goes to the prune as well.
+    Undecided,
+}
+
+/// [`prune`] over a full list and one newcomer, when the list is itself what a
+/// prune returned.
+///
+/// `members` must be the `max_degree` out-edges of `owner` exactly as a prune
+/// without a coincident fill chose them, at `alpha` or at a smaller one: sorted by
+/// distance to `owner`, pinned at zero as the prune pins it, and then by id, no
+/// member occluded by a closer one. The prune picks nearest first and drops
+/// whatever a pick occludes, so over such a list and a newcomer every member closer
+/// than the newcomer is picked again, the newcomer survives only if none of them
+/// occludes it, and a farther member drops only if the newcomer occludes it - no
+/// member occludes another, so dropping one frees nothing. That takes the
+/// newcomer's distance to each member, about `2 * max_degree` distances counting
+/// the owner's, where the prune spends about `max_degree^2 / 2` on the whole list
+/// again. The answer is the prune's bit for bit: the same distances, pinned and
+/// compared the same way.
+///
+/// A smaller `alpha` for the list is fine because the rule only loosens as `alpha`
+/// grows: a separation that kept two members apart at `1.0` keeps them apart at
+/// `1.2`. That is what lets a build's first pass hand its lists to the second.
+pub(crate) fn admit<S: VectorStore>(
+    store: &S,
+    owner: u32,
+    members: &[u32],
+    newcomer: u32,
+    alpha: f32,
+    max_degree: usize,
+    comparisons: &Comparisons,
+) -> Result<Admission> {
+    debug_assert_eq!(members.len(), max_degree, "vertex {owner} is not full");
+    let from_owner = store.dist_calculator_from_id(owner);
+    comparisons.record(members.len() as u64 + 1);
+    let distances = members
+        .iter()
+        .map(|member| from_owner.distance(*member))
+        .collect::<Vec<_>>();
+    let newcomer_distance = from_owner.distance(newcomer);
+    // The prune refuses a non-finite distance with an error of its own.
+    if !newcomer_distance.is_finite() || distances.iter().any(|distance| !distance.is_finite()) {
+        return Ok(Admission::Undecided);
+    }
+    let key = |distance: f32, id: u32| (OrderedFloat(distance.max(0.0)), id);
+    let newcomer_key = key(newcomer_distance, newcomer);
+    debug_assert!(
+        distances
+            .windows(2)
+            .zip(members.windows(2))
+            .all(|(pair, ids)| key(pair[0], ids[0]) < key(pair[1], ids[1])),
+        "vertex {owner}: a list taken for a prune's output is not in prune order"
+    );
+
+    let place = members
+        .iter()
+        .zip(&distances)
+        .position(|(member, distance)| key(*distance, *member) > newcomer_key)
+        .unwrap_or(members.len());
+    if place >= max_degree {
+        return Ok(Admission::Refused);
+    }
+    for member in &members[..place] {
+        comparisons.record(1);
+        let separation = store
+            .dist_calculator_from_id(*member)
+            .distance(newcomer)
+            .max(0.0);
+        if alpha * separation > newcomer_key.0.0 {
+            continue;
+        }
+        return Ok(if separation == 0.0 {
+            Admission::Undecided
+        } else {
+            Admission::Refused
+        });
+    }
+
+    let mut admitted = Vec::with_capacity(max_degree);
+    admitted.extend_from_slice(&members[..place]);
+    admitted.push(newcomer);
+    let from_newcomer = store.dist_calculator_from_id(newcomer);
+    for (member, distance) in members[place..].iter().zip(&distances[place..]) {
+        if admitted.len() == max_degree {
+            break;
+        }
+        comparisons.record(1);
+        let separation = from_newcomer.distance(*member).max(0.0);
+        if alpha * separation > distance.max(0.0) {
+            admitted.push(*member);
+        } else if separation == 0.0 {
+            return Ok(Admission::Undecided);
+        }
+    }
+    Ok(Admission::Admitted(admitted))
 }
 
 #[cfg(test)]
@@ -534,7 +673,9 @@ mod tests {
 
     use super::*;
     use crate::format::MAX_DEGREE;
-    use crate::search::{SearchScratch, greedy_search};
+    use crate::insert::{concat_vectors, insert_into_partition};
+    use crate::partition::Partition;
+    use crate::search::{SearchScratch, flat_storage, greedy_search};
 
     /// Deterministic pseudo-random vectors: a fixed multiplicative congruential
     /// sequence, so the cross-check against Lance runs on the same points every
@@ -1257,6 +1398,576 @@ mod tests {
         assert!(
             error.to_string().contains("no comparison can order"),
             "{error}"
+        );
+    }
+
+    /// `groups` points `copies` times each, then `unique` more. Under `Cosine` a
+    /// copy is a multiple of its point, and everything is normalised, as a cosine
+    /// build stores it: the copies then sit at `1 - dot` a few ULPs either side of
+    /// zero rather than at zero.
+    fn storage_with_copies(
+        groups: usize,
+        copies: usize,
+        unique: usize,
+        dimension: usize,
+        distance_type: DistanceType,
+    ) -> FlatFloatStorage {
+        let values = scattered_values((groups + unique) * dimension);
+        let (grouped, rest) = values.split_at(groups * dimension);
+        let mut all = Vec::with_capacity((groups * copies + unique) * dimension);
+        for point in grouped.chunks(dimension) {
+            for copy in 0..copies {
+                let scale = match distance_type {
+                    DistanceType::Cosine => (copy + 1) as f32,
+                    _ => 1.0,
+                };
+                all.extend(point.iter().map(|value| value * scale));
+            }
+        }
+        all.extend_from_slice(rest);
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(all), dimension as i32)
+                .unwrap();
+        let vectors = match distance_type {
+            DistanceType::Cosine => normalize_fsl(&vectors).unwrap(),
+            _ => vectors,
+        };
+        FlatFloatStorage::new(vectors, distance_type)
+    }
+
+    /// Every point of `{0, 1, 2, 3}^3`. Squared distances are exact integers, so
+    /// they tie at different ids, and `alpha * separation` lands exactly on a
+    /// distance at both alphas a build uses: `5 = 5`, and `1.2 * 5` rounds to `6`.
+    fn lattice_storage() -> FlatFloatStorage {
+        let values = (0..64)
+            .flat_map(|point| [point % 4, point / 4 % 4, point / 16].map(|axis| axis as f32))
+            .collect::<Vec<_>>();
+        storage_of(values, 3)
+    }
+
+    fn prune_over(
+        storage: &FlatFloatStorage,
+        owner: u32,
+        ids: &[u32],
+        alpha: f32,
+        max_degree: usize,
+    ) -> Pruned {
+        let from_owner = storage.dist_calculator_from_id(owner);
+        let candidates = ids
+            .iter()
+            .map(|id| OrderedNode::new(*id, OrderedFloat(from_owner.distance(*id))))
+            .collect();
+        prune(
+            storage,
+            owner,
+            candidates,
+            alpha,
+            max_degree,
+            &Comparisons::default(),
+        )
+        .unwrap()
+    }
+
+    /// How often each way through `admit` was taken over a fixture, so that a test
+    /// can insist its fixture reached the ways it is there for.
+    #[derive(Debug, Default)]
+    struct AdmitPaths {
+        refused_by_a_closer_member: usize,
+        /// Farther than every member and occluded by none of them: refused only
+        /// because the list has no room past its last member.
+        refused_as_the_farthest: usize,
+        admitted_with_the_last_member_cut: usize,
+        admitted_with_a_member_dropped: usize,
+        admitted_into_a_shorter_list: usize,
+        admitted_into_the_last_slot: usize,
+        undecided: usize,
+        /// Undecided at a farther member whose distance to the owner rounded below
+        /// zero: the one case where the pin on that distance decides between
+        /// undecided and admitted.
+        undecided_at_a_member_below_zero: usize,
+        /// Admitted ahead of a member at the same distance, which has a higher id.
+        admitted_on_the_id: usize,
+        /// Refused by closer members all at exactly `alpha * separation == distance`.
+        refused_at_a_tie: usize,
+        /// A farther member dropped at exactly that equality.
+        dropped_at_a_tie: usize,
+        /// Decided while a distance to the owner had rounded below zero.
+        decided_below_zero: usize,
+    }
+
+    /// `admit` against the prune it stands in for. Each list is a prune's own output
+    /// over half the partition, taken only when full and fill-free, and every
+    /// vertex outside that half comes in as the newcomer. The prune must return the
+    /// list `admit` decided, without the fill, and `admit` must have counted what
+    /// it computed: the owner's distances, then one per member it checked.
+    fn admit_against_prune(
+        storage: &FlatFloatStorage,
+        max_degree: usize,
+        owners: impl Iterator<Item = u32>,
+    ) -> AdmitPaths {
+        let mut rng = SmallRng::seed_from_u64(7);
+        let mut paths = AdmitPaths::default();
+        for owner in owners {
+            // A list pruned at 1.0 taking a newcomer at 1.2 is a build's handover
+            // from its first pass to its second.
+            for (list_alpha, alpha) in [(1.0, 1.0), (1.0, 1.2), (1.2, 1.2)] {
+                let mut others = (0..storage.len() as u32)
+                    .filter(|id| *id != owner)
+                    .collect::<Vec<_>>();
+                others.shuffle(&mut rng);
+                let (pool, outside) = others.split_at(others.len() / 2);
+                let listed = prune_over(storage, owner, pool, list_alpha, max_degree);
+                if listed.neighbors.len() < max_degree || listed.has_coincident_fill {
+                    continue;
+                }
+                let members = listed.neighbors;
+                let from_owner = storage.dist_calculator_from_id(owner);
+                let key = |id: u32| (OrderedFloat(from_owner.distance(id).max(0.0)), id);
+                let member_keys = members.iter().map(|id| key(*id)).collect::<Vec<_>>();
+                let separation = |from: u32, to: u32| {
+                    storage.dist_calculator_from_id(from).distance(to).max(0.0)
+                };
+                let slack = |from: u32, to: u32| alpha * separation(from, to);
+
+                for &newcomer in outside {
+                    let counted = Comparisons::default();
+                    let admission = admit(
+                        storage, owner, &members, newcomer, alpha, max_degree, &counted,
+                    )
+                    .unwrap();
+                    let expected = prune_over(
+                        storage,
+                        owner,
+                        &[members.as_slice(), &[newcomer]].concat(),
+                        alpha,
+                        max_degree,
+                    );
+                    let what = format!(
+                        "owner {owner}, newcomer {newcomer}, list at {list_alpha}, newcomer at \
+                         {alpha}: {admission:?}"
+                    );
+                    let newcomer_key = key(newcomer);
+                    let distance = newcomer_key.0.0;
+                    let place = member_keys
+                        .iter()
+                        .position(|member| *member > newcomer_key)
+                        .unwrap_or(max_degree);
+
+                    let (list, checked) = match &admission {
+                        Admission::Undecided => {
+                            paths.undecided += 1;
+                            // Where `admit` stops: at the first closer member that
+                            // occludes the newcomer, or at the first farther one the
+                            // newcomer drops while the list still has room.
+                            let mut length = place + 1;
+                            let stopped = members[..place]
+                                .iter()
+                                .position(|member| slack(*member, newcomer) <= distance)
+                                .or_else(|| {
+                                    (place..max_degree).find(|at| {
+                                        let member = members[*at];
+                                        if length == max_degree {
+                                            false
+                                        } else if slack(newcomer, member) > key(member).0.0 {
+                                            length += 1;
+                                            false
+                                        } else {
+                                            separation(newcomer, member) == 0.0
+                                        }
+                                    })
+                                })
+                                .unwrap_or_else(|| panic!("{what}: nowhere to stop"));
+                            let zero = if stopped < place {
+                                separation(members[stopped], newcomer)
+                            } else {
+                                separation(newcomer, members[stopped])
+                            };
+                            assert_eq!(zero, 0.0, "{what}: undecided at member {stopped}");
+                            assert_eq!(
+                                counted.get(),
+                                (max_degree + 2 + stopped) as u64,
+                                "{what}: counted distances"
+                            );
+                            if stopped >= place && from_owner.distance(members[stopped]) < 0.0 {
+                                paths.undecided_at_a_member_below_zero += 1;
+                            }
+                            continue;
+                        }
+                        Admission::Refused if place == max_degree => {
+                            if members
+                                .iter()
+                                .all(|member| slack(*member, newcomer) > distance)
+                            {
+                                paths.refused_as_the_farthest += 1;
+                            }
+                            (members.clone(), 0)
+                        }
+                        Admission::Refused => {
+                            paths.refused_by_a_closer_member += 1;
+                            let occluders = members[..place]
+                                .iter()
+                                .filter(|member| slack(**member, newcomer) <= distance)
+                                .collect::<Vec<_>>();
+                            if occluders
+                                .iter()
+                                .all(|member| slack(**member, newcomer) == distance)
+                            {
+                                paths.refused_at_a_tie += 1;
+                            }
+                            let first = members
+                                .iter()
+                                .position(|member| Some(&member) == occluders.first())
+                                .unwrap_or_else(|| panic!("{what}: no closer member occludes"));
+                            assert!(
+                                separation(members[first], newcomer) > 0.0,
+                                "{what}: refused at a zero separation, which is the prune's to settle"
+                            );
+                            (members.clone(), first + 1)
+                        }
+                        Admission::Admitted(list) => {
+                            let examined = if list.len() < max_degree {
+                                max_degree - place
+                            } else if list.last() == Some(&newcomer) {
+                                0
+                            } else {
+                                1 + members[place..]
+                                    .iter()
+                                    .position(|member| Some(member) == list.last())
+                                    .unwrap_or_else(|| panic!("{what}: ends on a stranger"))
+                            };
+                            let cut = [
+                                &members[..place],
+                                &[newcomer],
+                                &members[place..max_degree - 1],
+                            ]
+                            .concat();
+                            if list.len() < max_degree {
+                                paths.admitted_into_a_shorter_list += 1;
+                            } else if *list == cut {
+                                paths.admitted_with_the_last_member_cut += 1;
+                            } else {
+                                paths.admitted_with_a_member_dropped += 1;
+                            }
+                            if place == max_degree - 1 {
+                                paths.admitted_into_the_last_slot += 1;
+                            }
+                            if member_keys.iter().any(|(member_distance, id)| {
+                                *member_distance == newcomer_key.0 && *id > newcomer
+                            }) {
+                                paths.admitted_on_the_id += 1;
+                            }
+                            if members[place..place + examined]
+                                .iter()
+                                .any(|member| slack(newcomer, *member) == key(*member).0.0)
+                            {
+                                paths.dropped_at_a_tie += 1;
+                            }
+                            (list.clone(), place + examined)
+                        }
+                    };
+                    assert_eq!(list, expected.neighbors, "{what}");
+                    assert!(
+                        !expected.has_coincident_fill,
+                        "{what}: the prune filled a list admit decided"
+                    );
+                    assert_eq!(
+                        counted.get(),
+                        (max_degree + 1 + checked) as u64,
+                        "{what}: counted distances"
+                    );
+                    if from_owner.distance(newcomer) < 0.0
+                        || members
+                            .iter()
+                            .any(|member| from_owner.distance(*member) < 0.0)
+                    {
+                        paths.decided_below_zero += 1;
+                    }
+                }
+            }
+        }
+        paths
+    }
+
+    #[test]
+    fn admitting_a_newcomer_agrees_with_the_prune_over_scattered_points() {
+        let storage = storage_with_copies(40, 2, 80, 8, DistanceType::L2);
+        let paths = admit_against_prune(&storage, 8, (0..storage.len() as u32).step_by(2));
+        assert!(
+            paths.refused_by_a_closer_member > 0
+                && paths.refused_as_the_farthest > 0
+                && paths.admitted_with_the_last_member_cut > 0
+                && paths.admitted_with_a_member_dropped > 0
+                && paths.admitted_into_a_shorter_list > 0
+                && paths.admitted_into_the_last_slot > 0
+                && paths.undecided > 0,
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn admitting_a_newcomer_agrees_with_the_prune_on_a_lattice() {
+        let paths = admit_against_prune(&lattice_storage(), 4, 0..64);
+        assert!(
+            paths.admitted_on_the_id > 0
+                && paths.refused_at_a_tie > 0
+                && paths.dropped_at_a_tie > 0,
+            "{paths:?}"
+        );
+    }
+
+    /// Groups of six copies, so that the owner, a member and the newcomer can all be
+    /// copies of one point: only then can a member behind the newcomer sit below
+    /// zero.
+    #[test]
+    fn admitting_a_newcomer_agrees_with_the_prune_under_cosine() {
+        let storage = storage_with_copies(25, 6, 0, 8, DistanceType::Cosine);
+        let paths = admit_against_prune(&storage, 8, (0..storage.len() as u32).step_by(2));
+        assert!(
+            paths.decided_below_zero > 0
+                && paths.undecided > 0
+                && paths.undecided_at_a_member_below_zero > 0,
+            "{paths:?}"
+        );
+    }
+
+    /// `insert::insert_point` from before a full list could take a newcomer without
+    /// a prune: every back-edge into a full list re-prunes all of it.
+    fn insert_with_full_reprunes(
+        graph: &mut PartitionGraph,
+        storage: &FlatFloatStorage,
+        scratch: &mut SearchScratch,
+        linking: &Linking,
+        point: u32,
+        entry_point: u32,
+        comparisons: &Comparisons,
+    ) {
+        let max_degree = graph.max_degree() as usize;
+        let from_point = storage.dist_calculator_from_id(point);
+        let mut candidates = greedy_search(
+            graph,
+            &from_point,
+            entry_point,
+            linking.search_list_size,
+            scratch,
+            comparisons,
+        )
+        .unwrap()
+        .visited;
+        comparisons.record(graph.neighbors(point).unwrap().len() as u64);
+        candidates.extend(graph.neighbors(point).unwrap().iter().map(|neighbor| {
+            OrderedNode::new(*neighbor, OrderedFloat(from_point.distance(*neighbor)))
+        }));
+        let selected = robust_prune(
+            storage,
+            point,
+            candidates,
+            linking.alpha,
+            max_degree,
+            comparisons,
+        )
+        .unwrap();
+        graph.set_neighbors(point, &selected).unwrap();
+
+        for neighbor in selected {
+            let mut edges = graph.neighbors(neighbor).unwrap().to_vec();
+            if edges.contains(&point) {
+                continue;
+            }
+            if edges.len() < max_degree {
+                edges.push(point);
+                graph.set_neighbors(neighbor, &edges).unwrap();
+                continue;
+            }
+            let from_neighbor = storage.dist_calculator_from_id(neighbor);
+            comparisons.record(edges.len() as u64 + 1);
+            let contenders = edges
+                .iter()
+                .chain(std::iter::once(&point))
+                .map(|id| OrderedNode::new(*id, OrderedFloat(from_neighbor.distance(*id))))
+                .collect();
+            let pruned = robust_prune(
+                storage,
+                neighbor,
+                contenders,
+                linking.alpha,
+                max_degree,
+                comparisons,
+            )
+            .unwrap();
+            graph.set_neighbors(neighbor, &pruned).unwrap();
+        }
+    }
+
+    /// `build_partition` over [`insert_with_full_reprunes`], drawing the random
+    /// start and both insertion orders from the same generator in the same order.
+    fn build_with_full_reprunes(
+        storage: &FlatFloatStorage,
+        params: &BuildParams,
+        comparisons: &Comparisons,
+    ) -> BuiltPartition {
+        let num_vertices = storage.len() as u32;
+        let mut rng = SmallRng::seed_from_u64(params.seed);
+        let row_ids = (0..num_vertices).map(|id| storage.row_id(id)).collect();
+        let mut graph = PartitionGraph::edgeless(params.max_degree, row_ids).unwrap();
+        randomize(&mut graph, &mut rng).unwrap();
+        let medoid = medoid(storage, comparisons).unwrap();
+        let mut scratch = SearchScratch::new(num_vertices as usize);
+        let mut order = (0..num_vertices).collect::<Vec<_>>();
+        for alpha in [1.0, params.alpha] {
+            let linking = Linking {
+                alpha,
+                search_list_size: params.search_list_size,
+            };
+            order.shuffle(&mut rng);
+            for point in &order {
+                insert_with_full_reprunes(
+                    &mut graph,
+                    storage,
+                    &mut scratch,
+                    &linking,
+                    *point,
+                    medoid,
+                    comparisons,
+                );
+            }
+        }
+        BuiltPartition { graph, medoid }
+    }
+
+    fn assert_same_graph(built: &PartitionGraph, reference: &PartitionGraph) {
+        assert_eq!(built.len(), reference.len());
+        for vertex in 0..built.len() as u32 {
+            assert_eq!(
+                built.neighbors(vertex).unwrap(),
+                reference.neighbors(vertex).unwrap(),
+                "vertex {vertex}"
+            );
+        }
+    }
+
+    /// Small lists fill up, which is when a back-edge has to fight for a slot.
+    fn narrow_params() -> BuildParams {
+        BuildParams {
+            max_degree: 4,
+            search_list_size: 16,
+            ..small_params()
+        }
+    }
+
+    /// The distances each build counted, after insisting they built the same
+    /// graph from the same entry point: the build's, then the reference's.
+    fn build_both_ways(storage: &FlatFloatStorage) -> (u64, u64) {
+        let params = narrow_params();
+        let counted = Comparisons::default();
+        let built = build_partition(storage, &params, &counted).unwrap();
+        let reference_counted = Comparisons::default();
+        let reference = build_with_full_reprunes(storage, &params, &reference_counted);
+        assert_eq!(built.medoid, reference.medoid);
+        assert_same_graph(&built.graph, &reference.graph);
+        (counted.get(), reference_counted.get())
+    }
+
+    #[test]
+    fn a_build_equals_one_that_re_prunes_every_full_list() {
+        let (counted, reference) = build_both_ways(&scattered_storage(256, 8));
+        assert!(
+            counted < reference,
+            "{counted} distances against {reference}: the short path never paid"
+        );
+    }
+
+    /// Groups of `max_degree + 2` copies, so the coincident fill can fill a list.
+    /// The counts need only differ, which says `admit` ran: a zero separation pays
+    /// for the check and the prune, so over copies it can cost more.
+    #[test]
+    fn a_build_over_copies_equals_one_that_re_prunes_every_full_list() {
+        let copies = narrow_params().max_degree as usize + 2;
+        let (counted, reference) =
+            build_both_ways(&storage_with_copies(32, copies, 64, 8, DistanceType::L2));
+        assert_ne!(counted, reference);
+    }
+
+    #[test]
+    fn a_cosine_build_equals_one_that_re_prunes_every_full_list() {
+        let copies = narrow_params().max_degree as usize + 2;
+        let (counted, reference) = build_both_ways(&storage_with_copies(
+            32,
+            copies,
+            64,
+            8,
+            DistanceType::Cosine,
+        ));
+        assert_ne!(counted, reference);
+    }
+
+    /// Insertion into a graph read back whole, where no list starts out known to be
+    /// a prune's output, against the same insertion re-pruning every full list.
+    #[test]
+    fn an_insertion_equals_one_that_re_prunes_every_full_list() {
+        const OLD: usize = 200;
+        const NEW: usize = 100;
+        const DIMENSION: usize = 8;
+        let params = narrow_params();
+        let values = scattered_values((OLD + NEW) * DIMENSION);
+        let (old_values, new_values) = values.split_at(OLD * DIMENSION);
+        let vectors_of = |values: &[f32]| {
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(values.to_vec()),
+                DIMENSION as i32,
+            )
+            .unwrap()
+        };
+        let (old, new) = (vectors_of(old_values), vectors_of(new_values));
+        let old_row_ids = (0..OLD as u64).collect::<Vec<_>>();
+        let new_row_ids = (OLD as u64..(OLD + NEW) as u64).collect::<Vec<_>>();
+        let storage = flat_storage(&old_row_ids, &old, DistanceType::L2).unwrap();
+        let built = build_partition(&storage, &params, &Comparisons::default()).unwrap();
+        let partition = Partition::try_new(built.graph, old).unwrap();
+
+        let counted = Comparisons::default();
+        let inserted = insert_into_partition(
+            &partition,
+            &new_row_ids,
+            &new,
+            built.medoid,
+            DistanceType::L2,
+            &params,
+            &counted,
+        )
+        .unwrap();
+
+        let reference_counted = Comparisons::default();
+        let mut graph = partition.graph().clone();
+        graph.extend(&new_row_ids).unwrap();
+        let vectors = concat_vectors(&[partition.vectors().clone(), new]).unwrap();
+        let storage = flat_storage(graph.row_ids(), &vectors, DistanceType::L2).unwrap();
+        let mut scratch = SearchScratch::new(graph.len());
+        let linking = Linking {
+            alpha: params.alpha,
+            search_list_size: params.search_list_size,
+        };
+        let mut order = (OLD as u32..(OLD + NEW) as u32).collect::<Vec<_>>();
+        order.shuffle(&mut SmallRng::seed_from_u64(params.seed));
+        for point in order {
+            insert_with_full_reprunes(
+                &mut graph,
+                &storage,
+                &mut scratch,
+                &linking,
+                point,
+                built.medoid,
+                &reference_counted,
+            );
+        }
+        let reference_medoid = medoid(&storage, &reference_counted).unwrap();
+
+        assert_eq!(inserted.medoid, reference_medoid);
+        assert_same_graph(inserted.partition.graph(), &graph);
+        assert!(
+            counted.get() < reference_counted.get(),
+            "{} distances against {}: the short path never paid",
+            counted.get(),
+            reference_counted.get()
         );
     }
 }
