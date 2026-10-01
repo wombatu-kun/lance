@@ -40,7 +40,7 @@ rand = { version = "0.9.1", features = ["small_rng"] }
 roaring = "0.11.4"
 serde = { version = "^1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1.23", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.23", features = ["macros", "rt-multi-thread", "sync"] }
 uuid = { version = "1.2", features = ["v4"] }
 
 # A re-score reads its vectors on the thread that asked whenever the page cache
@@ -69,7 +69,7 @@ required-features = ["cli"]
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1.23", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.23", features = ["macros", "rt-multi-thread", "time"] }
 
 # The `fs` feature, for the tests' `fadvise`: to put a file out of the page
 # cache.

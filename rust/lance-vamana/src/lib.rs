@@ -16,6 +16,8 @@ mod cache;
 pub mod codes;
 pub mod consolidate;
 pub mod consolidator;
+mod data_file;
+mod dataset_vectors;
 pub mod format;
 pub mod insert;
 pub mod inserter;

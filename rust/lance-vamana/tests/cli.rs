@@ -24,11 +24,12 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_file::version::LanceFileVersion;
 use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode};
 use serde_json::Value;
 use tempfile::TempDir;
 
-use common::{VECTOR_DIM, random_vectors};
+use common::{DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, random_vectors, random_vectors_of};
 
 const ROWS: usize = 600;
 const QUERIES: usize = 20;
@@ -514,6 +515,146 @@ async fn a_build_records_the_parameters_it_was_given() {
     assert_eq!(segment["search_list_size"], 40);
     assert_eq!(segment["alpha"], 1.0);
     assert_eq!(segment["codes"]["num_bits"], 5);
+}
+
+/// `--vectors dataset` builds an index that keeps none, which `info` says and a
+/// lazy walk answers from. What it refuses, it refuses with the library's own
+/// words.
+#[tokio::test]
+async fn an_index_may_leave_its_vectors_to_the_dataset() {
+    let dir = TempDir::new().unwrap();
+    let ingested = |dimension: i32| {
+        let base = dir.path().join(format!("base_{dimension}.fvecs"));
+        write_fvecs(&base, &random_vectors_of(ROWS, dimension, 7));
+        let dataset = dir.path().join(format!("data_{dimension}.lance"));
+        let dataset = dataset.to_str().unwrap().to_string();
+        run(&[
+            "ingest",
+            "--fvecs",
+            base.to_str().unwrap(),
+            "--dataset",
+            &dataset,
+        ]);
+        dataset
+    };
+    let build = |dataset: &str, extra: &[&str]| {
+        let mut args = vec![
+            "build",
+            "--dataset",
+            dataset,
+            "--index-name",
+            "idx",
+            "--partitions",
+            "2",
+            "--vectors",
+            "dataset",
+        ];
+        args.extend_from_slice(extra);
+        vamana(&args)
+    };
+
+    let wide = ingested(64);
+    let built = build(&wide, &["--code-bits", "3"]);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&built.stderr).contains("warning"),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let info: Value = serde_json::from_str(&run(&[
+        "info",
+        "--dataset",
+        &wide,
+        "--index-name",
+        "idx",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(info["first_segment"]["vector_source"], "dataset");
+    let plain = run(&["info", "--dataset", &wide, "--index-name", "idx"]);
+    assert!(plain.contains("vectors        dataset"), "{plain}");
+    let query = vec!["0.5"; 64].join(",");
+    let answered: Value = serde_json::from_str(&run(&[
+        "search",
+        "--dataset",
+        &wide,
+        "--index-name",
+        "idx",
+        "--vector",
+        &query,
+        "--mode",
+        "lazy",
+        "-k",
+        "5",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(answered["answers"][0].as_array().unwrap().len(), 5);
+    let error = refused(&[
+        "search",
+        "--dataset",
+        &wide,
+        "--index-name",
+        "idx",
+        "--vector",
+        &query,
+    ]);
+    assert!(
+        error.contains("leaves its vectors to the dataset"),
+        "{error}"
+    );
+
+    let error = String::from_utf8(build(&wide, &[]).stderr).unwrap();
+    assert!(error.contains("to the dataset without codes"), "{error}");
+    let narrow = ingested(VECTOR_DIM);
+    let error = String::from_utf8(build(&narrow, &["--code-bits", "3"]).stderr).unwrap();
+    assert!(
+        error.contains("they have 16 dimensions and at least 64 are needed"),
+        "{error}"
+    );
+}
+
+/// A build that leaves its vectors to files no offset reaches - Lance 2.0 ones
+/// here - goes ahead and says so on stderr, since this binary installs no
+/// logger for the library's own warning to reach.
+#[tokio::test]
+async fn a_build_over_files_no_offset_reaches_warns() {
+    let dir = TempDir::new().unwrap();
+    let dataset = dir.path().join("data_2_0.lance");
+    let dataset = dataset.to_str().unwrap();
+    DatasetFixture {
+        rows_per_fragment: 64,
+        dimension: 64,
+        storage_version: Some(LanceFileVersion::V2_0),
+        ..Default::default()
+    }
+    .write(dataset)
+    .await;
+    let built = vamana(&[
+        "build",
+        "--dataset",
+        dataset,
+        "--index-name",
+        "idx",
+        "--column",
+        VECTOR_COLUMN,
+        "--partitions",
+        "2",
+        "--vectors",
+        "dataset",
+        "--code-bits",
+        "3",
+    ]);
+    let warned = String::from_utf8_lossy(&built.stderr);
+    assert!(built.status.success(), "{warned}");
+    assert!(
+        warned.contains("warning: 3 fragments keep their vectors where no offset reaches"),
+        "{warned}"
+    );
 }
 
 /// The one mode no other case reaches.

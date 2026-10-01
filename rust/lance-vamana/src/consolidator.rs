@@ -42,6 +42,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::index::{DatasetIndexExt, IndexSegment};
@@ -54,12 +55,10 @@ use crate::build::BuildParams;
 use crate::builder::{INDEX_DETAILS_TYPE_URL, index_column};
 use crate::format::{FORMAT_VERSION, IndexMetadata, ROW_ID_COLUMN};
 use crate::io::{
-    SegmentWriter, check_partition_shape, open_file, partitions_in_flight, read_partition,
-    read_row_ids,
+    SegmentWriter, check_partition_shape, open_file, partitions_in_flight, read_row_ids,
 };
 use crate::merge::{Merged, merge_partition};
-use crate::partition::Partition;
-use crate::query::{Segment, VamanaIndex};
+use crate::query::{Segment, VamanaIndex, Vertices};
 use crate::search::Comparisons;
 use crate::segment::PartitionEntry;
 
@@ -113,11 +112,15 @@ pub struct ConsolidateStats {
 /// tracked the live fraction the whole way - 73.9 MiB down to 7.5 at 90%
 /// deleted, where the same index left alone stays at 73.9.
 ///
-/// It is the only maintenance call that never reads the dataset's vector column
-/// and never routes: what it needs is the delete list and the graphs it already
-/// holds. When something other than deletions is pending too - a delta segment,
-/// or fragments no segment covers - [`crate::merger::merge_index`] does this and
-/// those in one pass over the same partitions.
+/// It is the only maintenance call that never routes, and over an index that
+/// keeps its vectors it never reads the dataset's vector column either: what it
+/// needs is the delete list and the graphs it already holds. An index that
+/// leaves its vectors to the dataset reads the live ones of every partition it
+/// repairs back out of the dataset, by row address - not of one whose rows only
+/// moved, which is written out again as its file holds it. When something other than
+/// deletions is pending too - a delta segment, or fragments no segment covers -
+/// [`crate::merger::merge_index`] does this and those in one pass over the same
+/// partitions.
 ///
 /// The delete list is a snapshot taken when the index is opened, so a row
 /// deleted while this runs is simply left for the next call - it stays filtered
@@ -135,7 +138,7 @@ pub async fn consolidate_index(
     dataset: &mut Dataset,
     index_name: &str,
 ) -> Result<ConsolidateStats> {
-    let index = VamanaIndex::open(dataset, index_name).await?;
+    let index = VamanaIndex::open_for_maintenance(dataset, index_name).await?;
     let mut stats = ConsolidateStats::default();
     if index.row_filter().is_empty() {
         stats.segments_untouched = index.num_segments();
@@ -275,23 +278,22 @@ async fn repair_partition(
     if dead.len() == entry.num_rows as u64 {
         return Ok(Rewritten::Dropped);
     }
+    // Moved, and nothing in it deleted: the file as it is, but for the row
+    // addresses - read as one batch, and without the dataset's vectors for
+    // a segment that keeps none of its own.
+    if dead.is_empty() {
+        let (stored, row_ids) = index.read_readdressed(segment, entry).await?;
+        return Ok(Rewritten::Readdressed { stored, row_ids });
+    }
 
-    let reader = open_file(
-        index.scheduler(),
-        &segment.dir.clone().join(entry.file.as_str()),
-        None,
-        segment.file_sizes.get(&entry.file).copied(),
-    )
-    .await?;
-    let mut partition = read_partition(&reader, entry.num_rows).await?;
+    let mut partition = index
+        .read_partition_whole(segment, entry, Vertices::Live)
+        .await?;
     check_partition_shape(&partition, entry, metadata.max_degree, metadata.dimension)?;
     if segment.moved {
         let rows = index.row_filter().clone();
         let segment = segment.uuid;
         partition = spawn_cpu(move || rows.readdress(segment, partition)).await?;
-    }
-    if dead.is_empty() {
-        return Ok(Rewritten::Readdressed(partition));
     }
 
     // Minutes of arithmetic over a whole segment, and not one await in it, so it
@@ -328,8 +330,11 @@ enum Rewritten {
     /// Nothing in it is deleted, so its bytes cross over without being decoded.
     Copied,
     /// Nothing in it is deleted, but its rows moved, so it is written out again
-    /// with the addresses they live at now.
-    Readdressed(Partition),
+    /// as its file stores it, with the addresses they live at now.
+    Readdressed {
+        stored: RecordBatch,
+        row_ids: Vec<u64>,
+    },
     /// Every vertex of it is deleted: no file and no table row.
     /// `consolidate_partition` refuses a partition of nothing rather than
     /// returning one, so that dropping it is a decision taken here and not a
@@ -373,9 +378,9 @@ async fn rewrite_segment(
                     .await?;
                 stats.partitions_copied += 1;
             }
-            Rewritten::Readdressed(partition) => {
+            Rewritten::Readdressed { stored, row_ids } => {
                 writer
-                    .write_partition(entry.partition_id, entry.medoid, &partition)
+                    .write_readdressed(&segment.manifest, entry.partition_id, &stored, row_ids)
                     .await?;
                 stats.partitions_readdressed += 1;
             }

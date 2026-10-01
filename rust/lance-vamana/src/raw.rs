@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Where a partition's vectors sit in its file, so that re-scoring can fetch
-//! them without building a decoder for twenty rows.
+//! Where a partition's vectors sit in its file - or the dataset's, in one of its
+//! data files - so that re-scoring can fetch them without building a decoder
+//! for twenty rows.
 //!
 //! A re-score reads `budget` whole vectors out of one column and computes a
 //! distance against each. Going through `FileReader::read_stream` to do it
@@ -19,13 +20,18 @@
 //! (`FullZipScheduler::schedule_ranges_simple`), with no validity bitmap, no
 //! repetition index and no control words, because there is no repetition or
 //! definition to record. What this module does is read that one arithmetic out
-//! of the footer Lance already parsed, and then do it itself.
+//! of the footer - the one Lance already parsed, for a partition file, and one
+//! column's part of it read by [`crate::data_file`], for a data file - and then
+//! do it itself. A dataset's data
+//! file carries no hint: Lance lays a fixed-width value of 256 bytes or more
+//! out full-zip on its own ([`crate::format::MIN_DATASET_VECTOR_DIMENSION`]),
+//! and whether it did is left to the page checks alone.
 //!
 //! Every assumption in that paragraph is checked rather than trusted, and a
 //! file that fails any of them gets no layout at all - the caller falls back to
-//! the decoder, which can read anything. That is deliberate: this is an
-//! optimisation of a path that already works, so it must never be the reason a
-//! file stops being readable.
+//! the decoder, or for a data file to Lance's take, either of which can read
+//! anything. That is deliberate: this is an optimisation of a path that already
+//! works, so it must never be the reason a file stops being readable.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -33,17 +39,20 @@ use std::ops::Range;
 use arrow_array::{FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::cache::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
+use lance_encoding::decoder::PageEncoding;
 use lance_encoding::format::pb21;
 use lance_file::reader::FileReader;
 use lance_file::versions::reader_projection_from_column_names;
 
 use crate::io::SEGMENT_FILE_VERSION;
 
-/// The byte layout of one fixed-width column of a partition file.
+/// The byte layout of one fixed-width column of a partition file, or of a data
+/// file.
 ///
 /// Built once per file and shared by every query that re-scores out of it.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct VectorLayout {
     /// Bytes one value occupies, which for this column is `dimension * 4`.
     stride: u64,
@@ -61,11 +70,29 @@ pub(crate) struct VectorLayout {
 /// million rows of a 960-wide vector is some four hundred of them, each with a
 /// position of its own that only the footer knows - the buffers are aligned, so
 /// there is no arithmetic that gets from one page to the next.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct PageSpan {
     first_row: u64,
     num_rows: u64,
     position: u64,
+}
+
+/// Held in a cache when it describes one of the dataset's data files, which
+/// weighs it by this.
+impl DeepSizeOf for VectorLayout {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        self.pages.capacity() * std::mem::size_of::<PageSpan>()
+    }
+}
+
+/// One page of a column as [`VectorLayout::of_pages`] checks it, whichever
+/// footer it was read out of.
+#[derive(Debug)]
+pub(crate) struct PageView<'a> {
+    pub(crate) num_rows: u64,
+    pub(crate) layout: &'a pb21::PageLayout,
+    /// Where each of the page's buffers is in the file, and how long it is.
+    pub(crate) buffers: &'a [(u64, u64)],
 }
 
 impl VectorLayout {
@@ -108,19 +135,48 @@ impl VectorLayout {
         if item.data_type() != &DataType::Float32 {
             return None;
         }
-        let items = u64::try_from(width).ok()?;
-        let info = reader.metadata().column_infos.get(index as usize)?;
+        Self::of_column(reader, index, u64::try_from(width).ok()?)
+    }
 
-        let mut pages = Vec::with_capacity(info.page_infos.len());
+    /// The layout of physical column `index` of the file `reader` read the
+    /// footer of, whose values the caller has already established are
+    /// `FixedSizeList<Float32, items>`.
+    pub(crate) fn of_column(reader: &FileReader, index: u32, items: u64) -> Option<Self> {
+        let info = reader.metadata().column_infos.get(index as usize)?;
+        let pages = info
+            .page_infos
+            .iter()
+            .map(|page| match &page.encoding {
+                PageEncoding::Structural(layout) => Some(PageView {
+                    num_rows: page.num_rows,
+                    layout,
+                    buffers: &page.buffer_offsets_and_sizes,
+                }),
+                PageEncoding::Legacy(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Self::of_pages(pages, items, reader.num_rows())
+    }
+
+    /// The layout of a column of `rows` rows made of `pages`, whose values the
+    /// caller has already established are `FixedSizeList<Float32, items>`.
+    ///
+    /// Split from [`Self::of_column`] for the dataset's own data files, whose
+    /// pages are read out of the footer a column at a time rather than all of
+    /// them at once by a [`FileReader`]: what the pages have to look like is
+    /// the same whichever way they were read, and so is where that is checked.
+    pub(crate) fn of_pages<'a>(
+        pages: impl IntoIterator<Item = PageView<'a>>,
+        items: u64,
+        rows: u64,
+    ) -> Option<Self> {
+        let pages_in = pages.into_iter();
+        let mut pages = Vec::with_capacity(pages_in.size_hint().0);
         let mut stride: Option<u64> = None;
         let mut first_row = 0u64;
         let mut written_to = 0u64;
-        for page in info.page_infos.iter() {
-            if !page.encoding.is_structural() {
-                return None;
-            }
-            let Some(pb21::page_layout::Layout::FullZipLayout(zip)) =
-                page.encoding.as_structural().layout.as_ref()
+        for page in pages_in {
+            let Some(pb21::page_layout::Layout::FullZipLayout(zip)) = page.layout.layout.as_ref()
             else {
                 return None;
             };
@@ -172,7 +228,7 @@ impl VectorLayout {
                 return None;
             }
 
-            let [(position, size)] = page.buffer_offsets_and_sizes[..] else {
+            let [(position, size)] = page.buffers[..] else {
                 return None;
             };
             // The arithmetic, checked against the file rather than assumed: the
@@ -200,7 +256,7 @@ impl VectorLayout {
             first_row = first_row.checked_add(page.num_rows)?;
         }
 
-        if first_row != reader.num_rows() {
+        if first_row != rows {
             return None;
         }
         Some(Self {
@@ -218,6 +274,12 @@ impl VectorLayout {
     /// Values one vector holds, as the column declares it.
     pub(crate) fn items(&self) -> u64 {
         self.items
+    }
+
+    /// Pages the column spans, for a test to say its fixture spans several.
+    #[cfg(test)]
+    pub(crate) fn num_pages(&self) -> usize {
+        self.pages.len()
     }
 
     /// Where each of `rows` is, in the order given.
@@ -247,7 +309,7 @@ impl VectorLayout {
             }
             let Some(span) = self.pages.get(page).filter(|span| row >= span.first_row) else {
                 return Err(Error::internal(format!(
-                    "Vamana re-scored vertex {row}, which is not a row of a partition holding {} rows",
+                    "Vamana re-scored row {row}, which is not a row of a file holding {} rows",
                     self.pages.last().map_or(0, PageSpan::end)
                 )));
             };
@@ -416,7 +478,7 @@ mod tests {
     use lance_io::scheduler::IoStats;
     use object_store::path::Path;
 
-    use crate::format::VECTOR_COLUMN;
+    use crate::format::{VECTOR_COLUMN, VectorSource};
     use crate::io::{DirectReads, PartitionFile, read_scattered, scan_scheduler, write_partition};
     use crate::partition::{Partition, PartitionGraph, vectors_of};
 
@@ -453,9 +515,15 @@ mod tests {
     async fn opened(dir: &tempfile::TempDir, rows: usize, dimension: u32) -> PartitionFile {
         let store = Arc::new(ObjectStore::local());
         let path = Path::from_absolute_path(dir.path().join("part_00000.idx")).unwrap();
-        write_partition(&store, &path, &partition(rows, dimension), None)
-            .await
-            .unwrap();
+        write_partition(
+            &store,
+            &path,
+            &partition(rows, dimension),
+            None,
+            VectorSource::Index,
+        )
+        .await
+        .unwrap();
         PartitionFile::open(&scan_scheduler(&store), &path, None, None)
             .await
             .unwrap()
@@ -511,7 +579,7 @@ mod tests {
         partition: &Partition,
         slice: usize,
     ) {
-        let batch = partition.to_batch(None).unwrap();
+        let batch = partition.to_batch(None, VectorSource::Index).unwrap();
         let schema = lance_core::datatypes::Schema::try_from(batch.schema().as_ref()).unwrap();
         let mut writer = create_writer(
             SEGMENT_FILE_VERSION,
@@ -890,14 +958,17 @@ mod tests {
         let file = opened(&dir, 8, NARROW).await;
         let layout = VectorLayout::of(file.reader(), VECTOR_COLUMN).unwrap();
         let error = layout.ranges(&[8]).unwrap_err().to_string();
-        assert!(error.contains("not a row of a partition"), "{error}");
+        assert!(
+            error.contains("not a row of a file holding 8 rows"),
+            "{error}"
+        );
     }
 
     /// The same partition written with the encoding hints stripped, which is how
     /// Lance stores a column small enough to prefer mini-block. It is the arm
     /// that proves the checks above can fail.
     async fn write_without_hint(store: &ObjectStore, path: &Path, partition: &Partition) {
-        let hinted = partition.to_batch(None).unwrap();
+        let hinted = partition.to_batch(None, VectorSource::Index).unwrap();
         let fields = hinted
             .schema()
             .fields()
@@ -925,7 +996,7 @@ mod tests {
     /// holds no nulls, so the hole has to be real for this to be the case it is
     /// meant to be.
     async fn write_with_a_hole(store: &ObjectStore, path: &Path, partition: &Partition) {
-        let hinted = partition.to_batch(None).unwrap();
+        let hinted = partition.to_batch(None, VectorSource::Index).unwrap();
         let vectors = hinted[VECTOR_COLUMN].as_fixed_size_list();
         let width = vectors.value_length() as usize;
         let slots = vectors
@@ -990,7 +1061,7 @@ mod tests {
     /// doubles are both `PAIRED * 4` bytes a row, both flat, both full-zip.
     /// Nothing about the layout descriptors distinguishes them.
     async fn write_as_doubles(store: &ObjectStore, path: &Path, partition: &Partition) {
-        let hinted = partition.to_batch(None).unwrap();
+        let hinted = partition.to_batch(None, VectorSource::Index).unwrap();
         let slots = hinted[VECTOR_COLUMN]
             .as_fixed_size_list()
             .values()
@@ -1059,9 +1130,15 @@ mod tests {
         // The control: at this width and this type there is a layout, so what
         // the arm below proves is the type check and not the width.
         let float = Path::from_absolute_path(dir.path().join("f32.idx")).unwrap();
-        write_partition(&store, &float, &partition(8, PAIRED), None)
-            .await
-            .unwrap();
+        write_partition(
+            &store,
+            &float,
+            &partition(8, PAIRED),
+            None,
+            VectorSource::Index,
+        )
+        .await
+        .unwrap();
         let float = PartitionFile::open(&scan_scheduler(&store), &float, None, None)
             .await
             .unwrap();

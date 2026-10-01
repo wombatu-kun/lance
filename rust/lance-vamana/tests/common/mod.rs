@@ -12,17 +12,31 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt64Type};
-use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionMetrics, CompactionOptions, compact_files};
-use lance::dataset::{WriteMode, WriteParams};
-use lance_vamana::io::{open_file, read_partition, read_segment, scan_scheduler};
+use lance::dataset::transaction::{DataOverlayGroup, Operation};
+use lance::dataset::{WriteDestination, WriteMode, WriteParams};
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::versions::create_writer;
+use lance_file::writer::FileWriterOptions;
+use lance_io::utils::CachedFileSize;
+use lance_table::format::DataFile;
+use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+use lance_vamana::build::BuildParams;
+use lance_vamana::builder::{IndexParams, create_index};
+use lance_vamana::codes::CodeSpec;
+use lance_vamana::format::{IndexMetadata, VectorSource};
+use lance_vamana::io::{
+    open_file, read_partition, read_partition_batch, read_segment, scan_scheduler,
+};
 use lance_vamana::partition::{Partition, PartitionGraph};
 use lance_vamana::query::committed_segments;
 use lance_vamana::segment::SegmentManifest;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use roaring::RoaringBitmap;
 
 /// A graph whose vertices have deliberately unequal degrees.
 ///
@@ -79,6 +93,13 @@ pub struct DatasetFixture {
     /// Make every n-th vector null, to exercise the skip path.
     pub null_every: Option<usize>,
     pub seed: u64,
+    /// The width of every vector. Lance lays a column out full-zip, which is
+    /// what a re-score can read out of a data file by offset, only from 256
+    /// bytes a value on: 64 and up here, and never at the default.
+    pub dimension: i32,
+    /// The data file format the dataset is written in; `None` for Lance's
+    /// default.
+    pub storage_version: Option<LanceFileVersion>,
 }
 
 impl Default for DatasetFixture {
@@ -89,6 +110,8 @@ impl Default for DatasetFixture {
             stable_row_ids: false,
             null_every: None,
             seed: 11,
+            dimension: VECTOR_DIM,
+            storage_version: None,
         }
     }
 }
@@ -119,14 +142,14 @@ impl DatasetFixture {
         let item = Arc::new(Field::new("item", DataType::Float32, true));
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             VECTOR_COLUMN,
-            DataType::FixedSizeList(item, VECTOR_DIM),
+            DataType::FixedSizeList(item, self.dimension),
             true,
         )]));
 
         let mut rng = SmallRng::seed_from_u64(self.seed);
         let pool = (0..self.rows())
             .map(|_| {
-                (0..VECTOR_DIM)
+                (0..self.dimension)
                     .map(|_| Some(rng.random::<f32>()))
                     .collect::<Vec<_>>()
             })
@@ -138,7 +161,7 @@ impl DatasetFixture {
                     _ => Some(pool[row].clone()),
                 })
                 .collect::<Vec<_>>(),
-            VECTOR_DIM,
+            self.dimension,
         );
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
 
@@ -151,6 +174,7 @@ impl DatasetFixture {
                 max_rows_per_file: self.rows_per_fragment,
                 max_rows_per_group: self.rows_per_fragment,
                 enable_stable_row_ids: self.stable_row_ids,
+                data_storage_version: self.storage_version,
                 ..Default::default()
             }),
         )
@@ -269,11 +293,248 @@ pub async fn read_committed_segment(
     (segment.manifest, segment.partitions)
 }
 
+/// Vectors of 64 floats, 256 bytes: the narrowest Lance lays out full-zip, and
+/// so the narrowest a re-score can read out of a data file by offset - and an
+/// index may leave to the dataset.
+pub const WIDE_DIM: i32 = 64;
+
+/// A dataset an index may leave its vectors to, small enough to build twice in
+/// a test.
+pub fn wide_fixture() -> DatasetFixture {
+    DatasetFixture {
+        fragments: 3,
+        rows_per_fragment: 200,
+        dimension: WIDE_DIM,
+        ..Default::default()
+    }
+}
+
+/// What twins are built with: the codes the stand measures, which also carry
+/// no random rotation for the twins to differ by, over a narrow graph.
+pub fn twin_params(num_partitions: u32) -> IndexParams {
+    IndexParams::new(VECTOR_COLUMN, num_partitions)
+        .with_codes(CodeSpec::Scalar { num_bits: 8 })
+        .with_graph_params(BuildParams {
+            max_degree: 16,
+            search_list_size: 32,
+            ..Default::default()
+        })
+}
+
+/// The same rows written twice, under `dir`, each with `params` built over them:
+/// first an index that keeps its vectors, then one that leaves them to the
+/// dataset. Returned with their URIs, in that order.
+pub async fn twins(
+    dir: &std::path::Path,
+    fixture: &DatasetFixture,
+    index_name: &str,
+    params: &IndexParams,
+) -> Vec<(String, Dataset)> {
+    let mut twins = Vec::with_capacity(2);
+    for vector_source in [VectorSource::Index, VectorSource::Dataset] {
+        let uri = dir
+            .join(vector_source.to_string())
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mut dataset = fixture.write(&uri).await;
+        create_index(
+            &mut dataset,
+            index_name,
+            &params.clone().with_vector_source(vector_source),
+        )
+        .await
+        .unwrap();
+        twins.push((uri, dataset));
+    }
+    twins
+}
+
+/// Every committed segment of `index_name` with each partition's batch as its
+/// file holds it, which reads an index whether or not it keeps its vectors.
+pub async fn read_committed_batches(
+    dataset: &Dataset,
+    index_name: &str,
+) -> Vec<(SegmentManifest, Vec<RecordBatch>)> {
+    let indices = committed_segments(dataset, index_name).await.unwrap();
+    let store = dataset.object_store(None).await.unwrap();
+    let scheduler = scan_scheduler(&store);
+
+    let mut segments = Vec::with_capacity(indices.len());
+    for index in indices.iter() {
+        let dir = dataset.indices_dir().join(index.uuid.to_string());
+        let manifest = read_segment(&scheduler, &dir, None).await.unwrap();
+        let mut batches = Vec::with_capacity(manifest.partitions().len());
+        for entry in manifest.partitions() {
+            let reader = open_file(
+                &scheduler,
+                &dir.clone().join(entry.file.as_str()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            batches.push(read_partition_batch(&reader, entry.num_rows).await.unwrap());
+        }
+        segments.push((manifest, batches));
+    }
+    segments
+}
+
+/// Twins hold the same index: segment for segment the same routing, table,
+/// graphs and codes, and in every partition file the same columns but the
+/// vectors, which only the first keeps.
+pub async fn assert_twins_hold_the_same(with: &Dataset, without: &Dataset, index_name: &str) {
+    let with = read_committed_batches(with, index_name).await;
+    let without = read_committed_batches(without, index_name).await;
+    assert_eq!(
+        with.len(),
+        without.len(),
+        "the twins hold different segments"
+    );
+    for ((with, with_batches), (without, without_batches)) in with.iter().zip(&without) {
+        assert_eq!(with.metadata().vector_source, VectorSource::Index);
+        assert_eq!(without.metadata().vector_source, VectorSource::Dataset);
+        let relabelled = SegmentManifest::try_new(
+            IndexMetadata {
+                vector_source: VectorSource::Index,
+                ..without.metadata().clone()
+            },
+            without.ivf().clone(),
+            without.partitions().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            &relabelled, with,
+            "the routing, the table or the codes drifted"
+        );
+        assert_eq!(without_batches.len(), with_batches.len());
+        for (without, with) in without_batches.iter().zip(with_batches) {
+            let kept = (0..with.num_columns())
+                .filter(|column| {
+                    with.schema().field(*column).name() != lance_vamana::format::VECTOR_COLUMN
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kept.len(),
+                with.num_columns() - 1,
+                "no vector column to leave out"
+            );
+            assert_eq!(
+                *without,
+                with.project(&kept).unwrap(),
+                "a partition drifted"
+            );
+        }
+    }
+}
+
+/// Replace one fragment's vectors with an overlay, the way Lance's own overlay
+/// tests do: write a file holding the new values for the indexed field alone,
+/// then commit `Operation::DataOverlay` naming the offsets it covers.
+///
+/// `committed_version` is stamped by the commit, not by this caller, so an
+/// overlay is newer than every index built before it and older than every index
+/// built after it - which is the whole basis of the version gate under test.
+pub async fn commit_overlay(
+    dataset: Dataset,
+    fragment_id: u64,
+    offsets: &[u32],
+    name: &str,
+) -> Dataset {
+    let field = dataset.schema().field(VECTOR_COLUMN).unwrap();
+    let DataType::FixedSizeList(_, width) = field.data_type() else {
+        panic!("the vector column is {}", field.data_type());
+    };
+    // A constant vector, so an answer ranked on the pre-overlay values is
+    // distinguishable from one ranked on these.
+    let replacement = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        offsets
+            .iter()
+            .map(|_| Some(vec![Some(9.0f32); width as usize]))
+            .collect::<Vec<_>>(),
+        width,
+    );
+    commit_overlay_of(dataset, fragment_id, offsets, name, replacement).await
+}
+
+/// [`commit_overlay`] with `replacement` as the new values, one for each of
+/// `offsets`.
+pub async fn commit_overlay_of(
+    dataset: Dataset,
+    fragment_id: u64,
+    offsets: &[u32],
+    name: &str,
+    replacement: FixedSizeListArray,
+) -> Dataset {
+    assert_eq!(replacement.len(), offsets.len());
+    let read_version = dataset.version().version;
+    let field = dataset.schema().field(VECTOR_COLUMN).unwrap();
+    let overlay_schema = dataset.schema().project_by_ids(&[field.id], true);
+
+    let file = format!("{name}.lance");
+    let store = dataset.object_store(None).await.unwrap();
+    let mut writer = create_writer(
+        ConcreteFileVersion::V2_1,
+        store
+            .create(&dataset.data_dir().join(file.as_str()))
+            .await
+            .unwrap(),
+        overlay_schema,
+        FileWriterOptions::default(),
+    )
+    .unwrap();
+    writer.write_column(0, Arc::new(replacement)).await.unwrap();
+    let summary = writer.finish().await.unwrap();
+
+    let mut data_file = DataFile::new_unstarted(file, ConcreteFileVersion::V2_1);
+    data_file.fields = writer
+        .field_id_to_column_indices()
+        .iter()
+        .map(|(field_id, _)| *field_id as i32)
+        .collect::<Vec<_>>()
+        .into();
+    data_file.column_indices = writer
+        .field_id_to_column_indices()
+        .iter()
+        .map(|(_, column_index)| *column_index as i32)
+        .collect::<Vec<_>>()
+        .into();
+    data_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
+
+    Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id,
+                overlays: vec![DataOverlayFile {
+                    data_file,
+                    coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter(
+                        offsets.iter().copied(),
+                    ))),
+                    committed_version: 0,
+                }],
+            }],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap()
+}
+
 /// Query vectors drawn the same way as the dataset's, from a different seed.
 pub fn random_vectors(count: usize, seed: u64) -> Vec<Vec<f32>> {
+    random_vectors_of(count, VECTOR_DIM, seed)
+}
+
+pub fn random_vectors_of(count: usize, dimension: i32, seed: u64) -> Vec<Vec<f32>> {
     let mut rng = SmallRng::seed_from_u64(seed);
     (0..count)
-        .map(|_| (0..VECTOR_DIM).map(|_| rng.random::<f32>()).collect())
+        .map(|_| (0..dimension).map(|_| rng.random::<f32>()).collect())
         .collect()
 }
 

@@ -56,7 +56,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, Float32Array};
+use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
 use futures::{StreamExt, TryStreamExt, stream};
 use lance::Dataset;
 use lance::index::{DatasetIndexExt, IndexSegment};
@@ -78,12 +78,10 @@ use crate::consolidator::dead_by_partition;
 use crate::format::{FORMAT_VERSION, IndexMetadata};
 use crate::insert::concat_vectors;
 use crate::inserter::inherited_params;
-use crate::io::{
-    SegmentWriter, check_partition_shape, open_file, partitions_in_flight, read_partition,
-};
+use crate::io::{SegmentWriter, check_partition_shape, partitions_in_flight};
 use crate::merge::{Newcomers, merge_partition};
 use crate::partition::Partition;
-use crate::query::{Segment, VamanaIndex};
+use crate::query::{Segment, VamanaIndex, Vertices};
 use crate::search::{Comparisons, flat_storage};
 use crate::segment::PartitionEntry;
 
@@ -152,7 +150,7 @@ pub struct MergeStats {
 /// # Against the two calls it replaces
 ///
 /// [`crate::consolidator::consolidate_index`] is still the cheaper answer when
-/// deletions are all there is: it never reads a vector, never routes and leaves
+/// deletions are all there is: it never reads a new row, never routes and leaves
 /// the segments as they are. [`crate::inserter::insert_as_segment`] is still the
 /// cheaper answer when new rows are all there is, and it is the one that does
 /// not touch the base at all.
@@ -188,7 +186,7 @@ pub struct MergeStats {
 /// commit and go when `cleanup_old_versions` takes those versions, so an index
 /// costs both copies until then.
 pub async fn merge_index(dataset: &mut Dataset, index_name: &str) -> Result<MergeStats> {
-    let index = VamanaIndex::open(dataset, index_name).await?;
+    let index = VamanaIndex::open_for_maintenance(dataset, index_name).await?;
     let new_fragments = index.unindexed_fragments(dataset);
     let has_dead = !index.row_filter().is_empty();
     if new_fragments.is_empty() && !has_dead && index.num_segments() == 1 {
@@ -324,9 +322,13 @@ pub async fn merge_index(dataset: &mut Dataset, index_name: &str) -> Result<Merg
                     .await?;
                 stats.partitions_copied += 1;
             }
-            Folded::Readdressed { partition, medoid } => {
+            Folded::Readdressed {
+                from,
+                stored,
+                row_ids,
+            } => {
                 writer
-                    .write_partition(partition_id, medoid, &partition)
+                    .write_readdressed(&from.manifest, partition_id, &stored, row_ids)
                     .await?;
                 stats.partitions_readdressed += 1;
             }
@@ -482,8 +484,13 @@ enum Folded<'a> {
     /// without being decoded.
     Copied(&'a Segment),
     /// As [`Self::Copied`], except that a deferred compaction moved its rows,
-    /// so it is written out again at the addresses they live at now.
-    Readdressed { partition: Partition, medoid: u32 },
+    /// so it is written out again as its file stores it, at the addresses they
+    /// live at now.
+    Readdressed {
+        from: &'a Segment,
+        stored: RecordBatch,
+        row_ids: Vec<u64>,
+    },
     Written {
         partition: Partition,
         medoid: u32,
@@ -562,17 +569,27 @@ async fn fold_partition<'a>(
     if untouched && !sources[0].segment.moved {
         return Ok((folding, Folded::Copied(sources[0].segment)));
     }
+    if untouched {
+        let (stored, row_ids) = fold
+            .index
+            .read_readdressed(sources[0].segment, sources[0].entry)
+            .await?;
+        return Ok((
+            folding,
+            Folded::Readdressed {
+                from: sources[0].segment,
+                stored,
+                row_ids,
+            },
+        ));
+    }
 
     let mut read = Vec::with_capacity(sources.len());
     for source in &sources {
-        let reader = open_file(
-            fold.index.scheduler(),
-            &source.segment.dir.clone().join(source.entry.file.as_str()),
-            None,
-            source.segment.file_sizes.get(&source.entry.file).copied(),
-        )
-        .await?;
-        let mut partition = read_partition(&reader, source.entry.num_rows).await?;
+        let mut partition = fold
+            .index
+            .read_partition_whole(source.segment, source.entry, Vertices::Live)
+            .await?;
         check_partition_shape(
             &partition,
             source.entry,
@@ -585,15 +602,6 @@ async fn fold_partition<'a>(
             partition = spawn_cpu(move || rows.readdress(segment, partition)).await?;
         }
         read.push(partition);
-    }
-    if untouched && let Some(partition) = read.pop() {
-        return Ok((
-            folding,
-            Folded::Readdressed {
-                partition,
-                medoid: sources[0].entry.medoid,
-            },
-        ));
     }
 
     // The graph the others fold into: the largest of them, because linking the

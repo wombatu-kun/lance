@@ -101,10 +101,8 @@ use crate::builder::{
 };
 use crate::format::{FORMAT_VERSION, IndexMetadata};
 use crate::insert::{Inserted, insert_into_partition};
-use crate::io::{
-    SegmentWriter, check_partition_shape, open_file, partitions_in_flight, read_partition,
-};
-use crate::query::{Segment, VamanaIndex};
+use crate::io::{SegmentWriter, check_partition_shape, partitions_in_flight};
+use crate::query::{Segment, VamanaIndex, Vertices};
 use crate::search::Comparisons;
 
 /// What indexing a dataset's new rows did, and what it cost.
@@ -189,6 +187,7 @@ pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Resul
         Some(Inherited {
             router: base.manifest.ivf().clone(),
             codes: base.manifest.metadata().codes.clone(),
+            vector_source: base.manifest.metadata().vector_source,
         }),
     )
     .await?;
@@ -248,7 +247,10 @@ pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Resul
 ///
 /// Deleted rows are a different matter and are carried across untouched. Their
 /// vertices stay in the graph as routers, the new segment still declares their
-/// fragments, and the delete list still keeps them out of every answer.
+/// fragments, and the delete list still keeps them out of every answer. An index
+/// that leaves its vectors to the dataset reads theirs where they were stored:
+/// by offset, or where no offset reaches by one Lance take from the fragment
+/// as it would be without its deletion file.
 ///
 /// # Where it sits in a maintenance pipeline
 ///
@@ -281,7 +283,7 @@ pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Resul
 /// a rebuild takes the recall back. Files, read operations and index size do not
 /// move at all, which is the whole difference from [`insert_as_segment`].
 pub async fn insert_in_place(dataset: &mut Dataset, index_name: &str) -> Result<InsertStats> {
-    let index = VamanaIndex::open(dataset, index_name).await?;
+    let index = VamanaIndex::open_for_maintenance(dataset, index_name).await?;
     let new_fragments = index.unindexed_fragments(dataset);
     if new_fragments.is_empty() {
         return Ok(InsertStats::default());
@@ -461,14 +463,10 @@ async fn insert_one(growth: &Growth<'_>, partition_id: u32, members: &[u32]) -> 
             ))
         }
         (Some(entry), false) => {
-            let reader = open_file(
-                growth.index.scheduler(),
-                &growth.target.dir.clone().join(entry.file.as_str()),
-                None,
-                growth.target.file_sizes.get(&entry.file).copied(),
-            )
-            .await?;
-            let partition = read_partition(&reader, entry.num_rows).await?;
+            let partition = growth
+                .index
+                .read_partition_whole(growth.target, entry, Vertices::All)
+                .await?;
             check_partition_shape(
                 &partition,
                 entry,

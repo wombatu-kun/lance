@@ -23,26 +23,18 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
-use lance::dataset::transaction::{
-    DataOverlayGroup, Operation, UpdateMode, UpdatedFragmentOffsets,
-};
-use lance::dataset::{ProjectionRequest, WriteDestination};
+use lance::dataset::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
+use lance::dataset::{NewColumnTransform, ProjectionRequest};
 use lance::index::{DatasetIndexExt, IndexSegment};
 use lance_core::utils::address::RowAddress;
-use lance_file::version::ConcreteFileVersion;
-use lance_file::versions::create_writer;
-use lance_file::writer::FileWriterOptions;
-use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::DistanceType;
-use lance_table::format::DataFile;
-use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{
     INDEX_DETAILS_TYPE_URL, IndexParams, build_index_segment, build_segment, create_index,
     live_fragments,
 };
-use lance_vamana::codes::CodeSpec;
-use lance_vamana::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
+use lance_vamana::codes::{CodeParams, CodeSpec};
+use lance_vamana::format::{FORMAT_VERSION, IndexMetadata, RowIdMode, VectorSource};
 use lance_vamana::io::{SegmentWriter, read_segment, scan_scheduler};
 use lance_vamana::partition::Partition;
 use lance_vamana::query::{Neighbor, SearchParams, VamanaIndex, WalkMode, committed_segments};
@@ -51,8 +43,8 @@ use uuid::Uuid;
 
 mod common;
 use common::{
-    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, compact_indexed, random_vectors,
-    recall, sample_partition,
+    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, commit_overlay, compact_indexed,
+    random_vectors, recall, sample_partition,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
@@ -318,6 +310,7 @@ async fn a_partition_disagreeing_with_its_segment_is_refused() {
             &segment_dir.join(manifest.partitions()[0].file.as_str()),
             &doctor(declared),
             None,
+            VectorSource::Index,
         )
         .await
         .unwrap();
@@ -1156,87 +1149,6 @@ async fn a_rewritten_fragment_that_is_then_deleted_stops_being_a_refusal() {
     );
 }
 
-/// Replace one fragment's vectors with an overlay, the way Lance's own overlay
-/// tests do: write a file holding the new values for the indexed field alone,
-/// then commit `Operation::DataOverlay` naming the offsets it covers.
-///
-/// `committed_version` is stamped by the commit, not by this caller, so an
-/// overlay is newer than every index built before it and older than every index
-/// built after it - which is the whole basis of the version gate under test.
-async fn commit_overlay(
-    dataset: Dataset,
-    fragment_id: u64,
-    offsets: &[u32],
-    name: &str,
-) -> Dataset {
-    let read_version = dataset.version().version;
-    let field_id = dataset.schema().field(VECTOR_COLUMN).unwrap().id;
-    let overlay_schema = dataset.schema().project_by_ids(&[field_id], true);
-
-    // A constant vector, so an answer ranked on the pre-overlay values is
-    // distinguishable from one ranked on these.
-    let replacement = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-        offsets
-            .iter()
-            .map(|_| Some(vec![Some(9.0f32); VECTOR_DIM as usize]))
-            .collect::<Vec<_>>(),
-        VECTOR_DIM,
-    );
-
-    let file = format!("{name}.lance");
-    let store = dataset.object_store(None).await.unwrap();
-    let mut writer = create_writer(
-        ConcreteFileVersion::V2_1,
-        store
-            .create(&dataset.data_dir().join(file.as_str()))
-            .await
-            .unwrap(),
-        overlay_schema,
-        FileWriterOptions::default(),
-    )
-    .unwrap();
-    writer.write_column(0, Arc::new(replacement)).await.unwrap();
-    let summary = writer.finish().await.unwrap();
-
-    let mut data_file = DataFile::new_unstarted(file, ConcreteFileVersion::V2_1);
-    data_file.fields = writer
-        .field_id_to_column_indices()
-        .iter()
-        .map(|(field_id, _)| *field_id as i32)
-        .collect::<Vec<_>>()
-        .into();
-    data_file.column_indices = writer
-        .field_id_to_column_indices()
-        .iter()
-        .map(|(_, column_index)| *column_index as i32)
-        .collect::<Vec<_>>()
-        .into();
-    data_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
-
-    Dataset::commit(
-        WriteDestination::Dataset(Arc::new(dataset)),
-        Operation::DataOverlay {
-            groups: vec![DataOverlayGroup {
-                fragment_id,
-                overlays: vec![DataOverlayFile {
-                    data_file,
-                    coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter(
-                        offsets.iter().copied(),
-                    ))),
-                    committed_version: 0,
-                }],
-            }],
-        },
-        Some(read_version),
-        None,
-        None,
-        Arc::new(Default::default()),
-        false,
-    )
-    .await
-    .unwrap()
-}
-
 /// The rewrite that leaves *every* coverage record intact.
 ///
 /// `Operation::DataOverlay` touches fragments and never indices: the fragment
@@ -1281,6 +1193,160 @@ async fn an_index_whose_vectors_an_overlay_replaced_is_refused() {
         error.to_string().contains("replaced by an overlay"),
         "{error}"
     );
+}
+
+/// An overlay the build saw is part of what the index was built over, and a
+/// re-score from the dataset reads the overlaid values where they live -
+/// through Lance, since the base data file no longer holds them - rather than
+/// the replaced ones by offset. Wide vectors, so that the overlay is the one
+/// reason to go through Lance.
+#[tokio::test]
+async fn a_re_score_from_the_dataset_reads_the_overlay_the_build_saw() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = DatasetFixture {
+        dimension: 64,
+        ..small_fixture()
+    };
+    let dataset = fixture.write(uri).await;
+    let mut dataset = commit_overlay(dataset, 0, &[0, 1, 2], "seen").await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &params().with_codes(CodeSpec::Scalar { num_bits: 8 }),
+    )
+    .await
+    .unwrap();
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    // The replacement itself, so that the overlaid rows are the answer: a read
+    // of the values they replaced would put them anywhere but at distance zero.
+    let replacement = vec![9.0f32; 64];
+    let params = SearchParams::new(K)
+        .with_nprobes(PARTITIONS as usize)
+        .with_search_list_size(BEAM)
+        .with_mode(WalkMode::Lazy);
+    let partition = index.search(&replacement, &params).await.unwrap();
+    let from_dataset = index
+        .search(
+            &replacement,
+            &params.clone().with_rescore_from_dataset(true),
+        )
+        .await
+        .unwrap();
+    assert_eq!(partition.neighbors, from_dataset.neighbors);
+    assert_eq!(
+        from_dataset.neighbors[..3]
+            .iter()
+            .map(|neighbor| neighbor.distance)
+            .collect::<Vec<_>>(),
+        vec![0.0; 3],
+        "the overlaid rows were not re-scored at the overlaid values"
+    );
+    assert!(
+        index.rescore_reads().through_lance > 0,
+        "the overlaid fragment was read by offset, from the values the overlay replaced"
+    );
+}
+
+/// An index that keeps no copy of its vectors has nothing to fall back on, so a
+/// column that cannot supply them is refused on open rather than by the first
+/// query - while an index with a copy opens, since it reads the column only
+/// when a query asks it to, and that query is refused up front. Committed over
+/// a column of another type, the one way to have the index row name a field
+/// that does not hold the vectors.
+#[tokio::test]
+async fn an_index_without_vectors_does_not_open_over_a_column_that_cannot_supply_them() {
+    for vector_source in [VectorSource::Index, VectorSource::Dataset] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut dataset = DatasetFixture {
+            dimension: 64,
+            ..small_fixture()
+        }
+        .write(uri)
+        .await;
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("n".into(), "1".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let uuid = Uuid::new_v4();
+        build_segment(
+            &dataset,
+            &params()
+                .with_codes(CodeSpec::Scalar { num_bits: 8 })
+                .with_vector_source(vector_source),
+            &dataset.indices_dir().join(uuid.to_string()),
+            &live_fragments(&dataset),
+        )
+        .await
+        .unwrap();
+        let described = IndexSegment::new(
+            uuid,
+            live_fragments(&dataset),
+            [dataset.schema().field("n").unwrap().id],
+            Arc::new(prost_types::Any {
+                type_url: INDEX_DETAILS_TYPE_URL.to_string(),
+                value: Vec::new(),
+            }),
+            FORMAT_VERSION as i32,
+            dataset.manifest.version,
+            vec![],
+        );
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "n", vec![described])
+            .await
+            .unwrap();
+
+        let opened = VamanaIndex::open(&dataset, INDEX_NAME).await;
+        match vector_source {
+            VectorSource::Index => {
+                // It opens, and a query told to re-score from the column is
+                // refused before it walks anything - not by the read after the
+                // walk, which one keeping no live candidate would never reach.
+                let index = opened.unwrap();
+                let before = index.io_stats();
+                let error = index
+                    .search(
+                        &vec![0.5; 64],
+                        &SearchParams::new(K)
+                            .with_mode(WalkMode::Lazy)
+                            .with_rescore_from_dataset(true),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, lance_core::Error::InvalidInput { .. }),
+                    "{error}"
+                );
+                assert!(
+                    error.to_string().contains(
+                        "rescore_from_dataset was set, but the dataset cannot supply the vectors"
+                    ),
+                    "{error}"
+                );
+                assert_eq!(
+                    index.io_stats().bytes_read,
+                    before.bytes_read,
+                    "the query walked before it was refused"
+                );
+            }
+            VectorSource::Dataset => {
+                let error = opened.unwrap_err();
+                assert!(matches!(error, lance_core::Error::Index { .. }), "{error}");
+                assert!(
+                    error.to_string().contains(
+                        "leaves its vectors to the dataset, which cannot supply them: column 'n' is"
+                    ),
+                    "{error}"
+                );
+            }
+        }
+    }
 }
 
 /// A compaction bakes a fragment's overlays into the fragment it writes, which
@@ -1769,6 +1835,7 @@ fn declaring(fragments: Vec<u32>) -> IndexMetadata {
         row_id_mode: RowIdMode::Address,
         fragments,
         codes: None,
+        vector_source: VectorSource::Index,
     }
 }
 
@@ -1880,6 +1947,38 @@ async fn segments_that_disagree_about_their_vectors_are_refused() {
             "segments disagreeing about {what} were merged instead: {error}"
         );
     }
+
+    // Where the vectors are: wide ones, so that a segment may leave them to the
+    // dataset at all, coded alike, so that the codes do not refuse the pair
+    // first.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = DatasetFixture {
+        dimension: 64,
+        ..small_fixture()
+    }
+    .write(uri)
+    .await;
+    let coded = |fragments, vector_source| IndexMetadata {
+        dimension: 64,
+        codes: Some(CodeParams::Scalar {
+            num_bits: 8,
+            bounds: 0.0..1.0,
+        }),
+        vector_source,
+        ..declaring(fragments)
+    };
+    let keeping = hand_made_segment(&dataset, coded(vec![0], VectorSource::Index)).await;
+    let leaving = hand_made_segment(&dataset, coded(vec![1], VectorSource::Dataset)).await;
+    dataset
+        .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![keeping, leaving])
+        .await
+        .unwrap();
+    let error = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap_err();
+    assert!(
+        error.to_string().contains("disagree about the vectors"),
+        "a segment keeping its vectors and one leaving them to the dataset were merged: {error}"
+    );
 
     // And the pair the check must stay quiet about, so that it is testing the
     // fields it names rather than "the two segments are not identical".
@@ -2207,6 +2306,7 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
             row_id_mode: RowIdMode::Address,
             fragments: covered.clone(),
             codes: None,
+            vector_source: VectorSource::Index,
         },
         lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
     );
@@ -2424,6 +2524,7 @@ async fn a_partition_holding_a_non_finite_vector_is_reported_as_corrupt() {
                 row_id_mode: RowIdMode::Address,
                 fragments: covered.clone(),
                 codes: None,
+                vector_source: VectorSource::Index,
             },
             lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
         );

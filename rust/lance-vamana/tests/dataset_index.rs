@@ -24,21 +24,23 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::{ProjectionRequest, WriteParams};
 use lance::index::DatasetIndexExt;
+use lance_file::version::LanceFileVersion;
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{
     INDEX_DETAILS_TYPE_URL, IndexParams, MAX_KMEANS_SAMPLE_RATE, build_segment, create_index,
     live_fragments,
 };
-use lance_vamana::format::INDEX_FILE_NAME;
-use lance_vamana::io::{open_file, read_partition, scan_scheduler};
+use lance_vamana::codes::CodeSpec;
+use lance_vamana::format::{INDEX_FILE_NAME, IndexMetadata, VectorSource};
+use lance_vamana::io::{open_file, read_partition, read_partition_batch, scan_scheduler};
 use lance_vamana::partition::Partition;
 use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
 use lance_vamana::segment::SegmentManifest;
 use object_store::path::Path;
 
 mod common;
-use common::{DatasetFixture, VECTOR_COLUMN, live_row_ids, read_committed_segment};
+use common::{DatasetFixture, VECTOR_COLUMN, live_row_ids, read_committed_segment, twin_params};
 
 const INDEX_NAME: &str = "vamana_idx";
 const PARTITIONS: u32 = 8;
@@ -456,6 +458,184 @@ async fn the_same_seed_builds_the_same_index() {
         built[0].0.ivf().centroids,
         "a different seed trained the same router, so the seed is not reaching k-means"
     );
+}
+
+/// Leaving the vectors to the dataset changes what is written and nothing that
+/// is built: over the same rows, one seed gives the same routing, table, graphs
+/// and codes, and the one difference on disk is the column left out.
+#[tokio::test]
+async fn leaving_the_vectors_to_the_dataset_writes_everything_else_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = DatasetFixture {
+        fragments: 2,
+        rows_per_fragment: 200,
+        dimension: 64,
+        ..Default::default()
+    }
+    .write(uri)
+    .await;
+    let scheduler = scan_scheduler(&dataset.object_store(None).await.unwrap());
+    let params = IndexParams::new(VECTOR_COLUMN, 2)
+        .with_codes(CodeSpec::Scalar { num_bits: 8 })
+        .with_graph_params(BuildParams {
+            max_degree: 16,
+            search_list_size: 32,
+            ..Default::default()
+        });
+
+    let mut built = Vec::new();
+    for vector_source in [VectorSource::Index, VectorSource::Dataset] {
+        let segment_dir =
+            Path::from_absolute_path(dir.path().join(vector_source.to_string())).unwrap();
+        let (manifest, _) = build_segment(
+            &dataset,
+            &params.clone().with_vector_source(vector_source),
+            &segment_dir,
+            &live_fragments(&dataset),
+        )
+        .await
+        .unwrap();
+        let mut batches = Vec::new();
+        for entry in manifest.partitions() {
+            let reader = open_file(
+                &scheduler,
+                &segment_dir.clone().join(entry.file.as_str()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            batches.push(read_partition_batch(&reader, entry.num_rows).await.unwrap());
+        }
+        built.push((manifest, batches));
+    }
+
+    let [(with, with_batches), (without, without_batches)] = built.try_into().unwrap();
+    assert_eq!(without.metadata().vector_source, VectorSource::Dataset);
+    let relabelled = SegmentManifest::try_new(
+        IndexMetadata {
+            vector_source: VectorSource::Index,
+            ..without.metadata().clone()
+        },
+        without.ivf().clone(),
+        without.partitions().to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        relabelled, with,
+        "the routing, the table or the codes drifted"
+    );
+    assert_eq!(without_batches.len(), with_batches.len());
+    for (without, with) in without_batches.iter().zip(&with_batches) {
+        let kept = (0..with.num_columns())
+            .filter(|column| {
+                with.schema().field(*column).name() != lance_vamana::format::VECTOR_COLUMN
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept.len(),
+            with.num_columns() - 1,
+            "no vector column to leave out"
+        );
+        assert_eq!(*without, with.project(&kept).unwrap());
+    }
+}
+
+/// A segment that leaves its vectors to fragments no offset reaches - Lance 2.0
+/// files here - is built anyway, and counts them: every re-score of their rows
+/// will go through Lance. One over files an offset reaches counts none, and so
+/// does one that keeps its vectors, whatever the dataset's files are.
+#[tokio::test]
+async fn a_build_counts_the_fragments_its_re_scores_will_read_through_lance() {
+    let dir = tempfile::tempdir().unwrap();
+    for (storage_version, vector_source, through_lance) in [
+        (Some(LanceFileVersion::V2_0), VectorSource::Dataset, 3),
+        (None, VectorSource::Dataset, 0),
+        (Some(LanceFileVersion::V2_0), VectorSource::Index, 0),
+    ] {
+        let what = format!("{storage_version:?}, vectors in the {vector_source}");
+        let uri = dir
+            .path()
+            .join(format!("data_{storage_version:?}_{vector_source}"));
+        let dataset = DatasetFixture {
+            fragments: 3,
+            rows_per_fragment: 64,
+            dimension: 64,
+            storage_version,
+            ..Default::default()
+        }
+        .write(uri.to_str().unwrap())
+        .await;
+        let segment_dir = dir
+            .path()
+            .join(format!("segment_{storage_version:?}_{vector_source}"));
+        let (_, stats) = build_segment(
+            &dataset,
+            &twin_params(1).with_vector_source(vector_source),
+            &Path::from_absolute_path(&segment_dir).unwrap(),
+            &live_fragments(&dataset),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.fragments_through_lance, through_lance, "{what}");
+    }
+}
+
+/// Both rules are the builder's to apply before it reads a row: the wording is
+/// its own rather than the segment's, which is only checked once every
+/// partition is written, and no directory is left behind.
+#[tokio::test]
+async fn a_build_that_cannot_leave_its_vectors_to_the_dataset_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    for (dimension, codes, expected) in [
+        (64, None, "to the dataset without codes"),
+        (
+            63,
+            Some(CodeSpec::Scalar { num_bits: 8 }),
+            "they have 63 dimensions and at least 64 are needed",
+        ),
+    ] {
+        let uri = dir.path().join(format!("data_{dimension}"));
+        let dataset = DatasetFixture {
+            fragments: 1,
+            rows_per_fragment: 64,
+            dimension,
+            ..Default::default()
+        }
+        .write(uri.to_str().unwrap())
+        .await;
+        let mut params =
+            IndexParams::new(VECTOR_COLUMN, 1).with_vector_source(VectorSource::Dataset);
+        if let Some(codes) = codes {
+            params = params.with_codes(codes);
+        }
+        let segment_dir = dir.path().join(format!("segment_{dimension}"));
+        let error = build_segment(
+            &dataset,
+            &params,
+            &Path::from_absolute_path(&segment_dir).unwrap(),
+            &live_fragments(&dataset),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Vamana cannot leave the vectors of column 'vec'"),
+            "{error}"
+        );
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(
+            !segment_dir.exists(),
+            "the refused build wrote into {}",
+            segment_dir.display()
+        );
+    }
 }
 
 #[tokio::test]

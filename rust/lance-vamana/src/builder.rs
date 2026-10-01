@@ -39,7 +39,10 @@ use uuid::Uuid;
 
 use crate::build::{BuildParams, build_partition};
 use crate::codes::{CodeParams, CodeSpec};
-use crate::format::{FORMAT_VERSION, IndexMetadata, RowIdMode};
+use crate::dataset_vectors::DatasetVectors;
+use crate::format::{
+    FORMAT_VERSION, IndexMetadata, MIN_DATASET_VECTOR_DIMENSION, RowIdMode, VectorSource,
+};
 use crate::io::{SegmentWriter, partitions_in_flight};
 use crate::partition::Partition;
 use crate::search::{Comparisons, flat_storage};
@@ -113,6 +116,17 @@ pub struct IndexParams {
     /// `IVF_HNSW_SQ` steers by, which leaves the graph as the only difference
     /// between the two.
     pub codes: Option<CodeSpec>,
+    /// Whether the partitions keep a copy of the vectors, or the re-score reads
+    /// them from the dataset. [`VectorSource::Index`] by default.
+    ///
+    /// Leaving them to the dataset takes `4 * dimension` bytes a vertex off the
+    /// index, and is refused rather than attempted without [`Self::codes`] or
+    /// under [`MIN_DATASET_VECTOR_DIMENSION`] dimensions: see [`VectorSource`].
+    /// A segment joining an existing index keeps them where the index does,
+    /// whatever this says. An index that leaves them to the dataset is searched
+    /// with [`crate::query::WalkMode::Lazy`] or [`crate::query::WalkMode::Flat`]
+    /// only: the other two modes read partitions whole, vectors included.
+    pub vector_source: VectorSource,
 }
 
 impl IndexParams {
@@ -125,6 +139,7 @@ impl IndexParams {
             kmeans_max_iters: 50,
             kmeans_sample_rate: 256,
             codes: None,
+            vector_source: VectorSource::Index,
         }
     }
 
@@ -152,6 +167,11 @@ impl IndexParams {
         self.codes = Some(codes);
         self
     }
+
+    pub fn with_vector_source(mut self, vector_source: VectorSource) -> Self {
+        self.vector_source = vector_source;
+        self
+    }
 }
 
 /// What building a segment cost.
@@ -173,6 +193,14 @@ pub struct BuildStats {
     pub vectors: usize,
     /// Partitions that came out non-empty and were therefore written.
     pub partitions: usize,
+    /// For a segment that leaves its vectors to the dataset, the fragments it
+    /// covers whose vectors no offset reaches by the manifest alone: a data
+    /// file older than Lance 2.1, another base path, an overlay on the column,
+    /// a count of rows the manifest does not vouch for. Every re-score of their
+    /// rows goes through Lance's take, milliseconds where an offset read takes
+    /// microseconds; the build goes ahead and says so in the log. Zero for a
+    /// segment that keeps its vectors.
+    pub fragments_through_lance: usize,
 }
 
 /// Reject the metrics this crate cannot answer correctly.
@@ -301,10 +329,10 @@ pub async fn build_index_segment(
 
 /// What a segment added to an existing index takes from it rather than choosing.
 ///
-/// Both fields are things that must be one per *index* and not one per segment,
-/// and both fail silently if they are not: two routers would number the
-/// partitions differently, and two rotations would leave a partition copied
-/// between segments decoded under the wrong one.
+/// Every field is a thing that must be one per *index* and not one per segment.
+/// Two routers would number the partitions differently and two rotations would
+/// leave a partition copied between segments decoded under the wrong one, both
+/// silently; two vector sources would make an index that cannot be opened.
 pub(crate) struct Inherited {
     /// The base's centroids. See [`crate::inserter`] for why one numbering.
     pub router: IvfModel,
@@ -314,6 +342,9 @@ pub(crate) struct Inherited {
     /// for freshly minted parameters and is therefore not a thing a segment
     /// joining an index may act on.
     pub codes: Option<CodeParams>,
+    /// Where the base keeps its vectors, taken over [`IndexParams::vector_source`]
+    /// for the same reason.
+    pub vector_source: VectorSource,
 }
 
 /// [`build_index_segment`], for a segment joining an index that already exists.
@@ -392,9 +423,10 @@ pub async fn build_segment(
 /// [`build_segment`], taking the routing and the codes from an index this
 /// segment is joining rather than choosing its own.
 ///
-/// `params.num_partitions`, the two k-means knobs and `params.codes` are
-/// then unused: how many buckets there are is a property of the model, and both
-/// the model and the rotation belong to the index rather than to this segment.
+/// `params.num_partitions`, the two k-means knobs, `params.codes` and
+/// `params.vector_source` are then unused: how many buckets there are is a
+/// property of the model, and the model, the rotation and where the vectors are
+/// kept belong to the index rather than to this segment.
 pub(crate) async fn build_segment_inheriting(
     dataset: &Dataset,
     params: &IndexParams,
@@ -477,13 +509,16 @@ pub(crate) async fn build_segment_inheriting(
             params.column
         ))
     })?;
-    match field.data_type() {
+    let width = match field.data_type() {
         // Width included, because zero is a type the schema can hold and no
         // layer below is ready for it: k-means divides by the dimension and
         // `l2_distance_batch` takes a chunk size of zero, both of which end the
         // process rather than the call.
         DataType::FixedSizeList(item, width)
-            if item.data_type() == &DataType::Float32 && width > 0 => {}
+            if item.data_type() == &DataType::Float32 && width > 0 =>
+        {
+            width.unsigned_abs()
+        }
         other => {
             return Err(Error::not_supported(format!(
                 "column '{}' has type {other}; Vamana indexes FixedSizeList<Float32> of a \
@@ -491,6 +526,63 @@ pub(crate) async fn build_segment_inheriting(
                 params.column
             )));
         }
+    };
+    // Asked of the schema too, and for the same reason: a segment that leaves
+    // its vectors to the dataset has to steer by codes and read the dataset's
+    // rows by offset, and a build that could not do both would find out only
+    // when `SegmentWriter::finish` refused what it had spent minutes writing.
+    let (vector_source, has_codes) = match &inherited {
+        Some(inherited) => (inherited.vector_source, inherited.codes.is_some()),
+        None => (params.vector_source, params.codes.is_some()),
+    };
+    if vector_source == VectorSource::Dataset {
+        if !has_codes {
+            return Err(Error::invalid_input(format!(
+                "Vamana cannot leave the vectors of column '{}' to the dataset without codes: a \
+                 walk that reads no vectors steers by codes; build with IndexParams::with_codes \
+                 (--code-bits on the command line) as well",
+                params.column
+            )));
+        }
+        if width < MIN_DATASET_VECTOR_DIMENSION {
+            return Err(Error::invalid_input(format!(
+                "Vamana cannot leave the vectors of column '{}' to the dataset: they have {width} \
+                 dimensions and at least {MIN_DATASET_VECTOR_DIMENSION} are needed. Lance stores \
+                 vectors narrower than 256 bytes in a mini-block layout that the re-score cannot \
+                 read by offset; build with \
+                 IndexParams::with_vector_source(VectorSource::Index) (--vectors index on the \
+                 command line) instead",
+                params.column
+            )));
+        }
+    }
+
+    // Counted from the manifest before the rows are read, and warned about
+    // rather than refused: such a segment answers correctly, only slower, and
+    // how the dataset stores its vectors is the dataset's to change.
+    let fragments_through_lance = if vector_source == VectorSource::Dataset {
+        DatasetVectors::of(
+            dataset,
+            &[field.id],
+            width,
+            params.distance_type,
+            &fragments.iter().copied().collect(),
+        )
+        .fragments_through_lance()
+    } else {
+        0
+    };
+    if fragments_through_lance > 0 {
+        log::warn!(
+            "Vamana leaves the vectors of column '{}' to the dataset, but {fragments_through_lance} \
+             of the {} fragments it indexes keep them where no offset reaches - a data file older \
+             than Lance 2.1, another base path, an overlay, a row count the manifest does not \
+             vouch for - so every re-score of their rows goes through Lance's take, milliseconds \
+             where an offset read takes microseconds; an index that \
+             keeps its vectors does not depend on how the dataset stores them",
+            params.column,
+            fragments.len()
+        );
     }
 
     let (row_ids, vectors) = read_vectors(dataset, &params.column, fragments).await?;
@@ -507,7 +599,7 @@ pub(crate) async fn build_segment_inheriting(
     // about the rotation or the bounds it was built under. An inherited segment
     // therefore ignores what this call asked for.
     let (router, inherited_codes, spec) = match inherited {
-        Some(Inherited { router, codes }) => (Some(router), codes, None),
+        Some(Inherited { router, codes, .. }) => (Some(router), codes, None),
         None => (None, None, params.codes),
     };
 
@@ -576,6 +668,7 @@ pub(crate) async fn build_segment_inheriting(
         row_id_mode: RowIdMode::Address,
         fragments: fragments.to_vec(),
         codes,
+        vector_source,
     };
     // Off the model rather than off the request, because the two are the same
     // number only when the model was trained here. An inherited one decides how
@@ -590,8 +683,10 @@ pub(crate) async fn build_segment_inheriting(
     );
 
     let members_by_partition = group_by_partition(&assignment, num_partitions);
-    let stats =
-        write_partitions(&mut writer, members_by_partition, row_ids, vectors, params).await?;
+    let stats = BuildStats {
+        fragments_through_lance,
+        ..write_partitions(&mut writer, members_by_partition, row_ids, vectors, params).await?
+    };
     Ok((writer.finish().await?, stats))
 }
 
@@ -973,6 +1068,7 @@ mod tests {
             row_id_mode: RowIdMode::Address,
             fragments: vec![0],
             codes: None,
+            vector_source: VectorSource::Index,
         };
         let mut writer =
             SegmentWriter::new(store, path, metadata, IvfModel::new(centroids, Some(0.0)));
@@ -1083,6 +1179,7 @@ mod tests {
             row_id_mode: RowIdMode::Address,
             fragments: vec![0],
             codes: None,
+            vector_source: VectorSource::Index,
         };
         let mut writer =
             SegmentWriter::new(store, path, metadata, IvfModel::new(centroids, Some(0.0)));

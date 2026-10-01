@@ -13,7 +13,7 @@ use lance_index::vector::ivf::storage::IvfModel;
 
 use crate::format::{
     FILE_COLUMN, FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, MAX_PARTITION_ROWS, MEDOID_COLUMN,
-    NUM_ROWS_COLUMN, PARTITION_ID_COLUMN, index_schema,
+    MIN_DATASET_VECTOR_DIMENSION, NUM_ROWS_COLUMN, PARTITION_ID_COLUMN, VectorSource, index_schema,
 };
 
 /// One non-empty partition of a segment.
@@ -81,6 +81,25 @@ impl SegmentManifest {
                 "Vamana segment declares dimension 0, which no query could be measured against"
                     .to_string(),
             ));
+        }
+        // The builder refuses both before it reads a row; these are for a
+        // segment arriving any other way, through `SegmentWriter` or off disk.
+        if metadata.vector_source == VectorSource::Dataset {
+            if metadata.codes.is_none() {
+                return Err(Error::invalid_input(
+                    "Vamana segment leaves its vectors to the dataset but carries no codes, so \
+                     nothing could walk it: every walk that reads no vectors steers by codes"
+                        .to_string(),
+                ));
+            }
+            if metadata.dimension < MIN_DATASET_VECTOR_DIMENSION {
+                return Err(Error::invalid_input(format!(
+                    "Vamana segment leaves vectors of {} dimensions to the dataset, and at least \
+                     {MIN_DATASET_VECTOR_DIMENSION} are needed for a re-score to read them by \
+                     offset",
+                    metadata.dimension
+                )));
+            }
         }
 
         // Lance packs every partition into one file, so its own `IvfModel`
@@ -332,6 +351,7 @@ mod tests {
     use lance_linalg::distance::DistanceType;
 
     use super::*;
+    use crate::codes::CodeParams;
     use crate::format::{FORMAT_VERSION, RowIdMode, partition_file_name};
 
     fn metadata(dimension: u32) -> IndexMetadata {
@@ -345,6 +365,7 @@ mod tests {
             row_id_mode: RowIdMode::Address,
             fragments: vec![0],
             codes: None,
+            vector_source: VectorSource::Index,
         }
     }
 
@@ -536,6 +557,32 @@ mod tests {
             assert!(matches!(error, Error::InvalidInput { .. }));
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    /// Both sides of each rule, with a routing model of the matching width so
+    /// that a refusal can only come from the rule itself.
+    #[test]
+    fn a_segment_leaving_its_vectors_to_the_dataset_needs_codes_and_64_dimensions() {
+        let codes = Some(CodeParams::Scalar {
+            num_bits: 8,
+            bounds: 0.0..1.0,
+        });
+        let dataset = |dimension, codes| IndexMetadata {
+            vector_source: VectorSource::Dataset,
+            codes,
+            ..metadata(dimension)
+        };
+        for (metadata, expected) in [
+            (dataset(64, None), "carries no codes"),
+            (dataset(63, codes.clone()), "vectors of 63 dimensions"),
+        ] {
+            let dimension = metadata.dimension as usize;
+            let error = SegmentManifest::try_new(metadata, ivf(8, dimension), vec![entry(0, 4)])
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        SegmentManifest::try_new(dataset(64, codes), ivf(8, 64), vec![entry(0, 4)]).unwrap();
     }
 
     /// The file name is joined onto the segment directory and handed to the

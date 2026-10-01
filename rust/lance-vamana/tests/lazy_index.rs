@@ -30,10 +30,22 @@ use lance_core::cache::LanceCache;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::codes::{CodeParams, CodeSpec};
+use lance_vamana::format::VectorSource;
+use lance_vamana::inserter::insert_as_segment;
 use lance_vamana::query::{QueryResult, SearchParams, VamanaIndex, WalkMode};
 
 mod common;
-use common::{DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, random_vectors, recall};
+use arrow_array::types::Float32Type;
+use arrow_array::{FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use common::{
+    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, WIDE_DIM, brute_force, random_vectors,
+    random_vectors_of, recall, wide_fixture,
+};
+use lance::dataset::cleanup::CleanupPolicyBuilder;
+use lance::dataset::{ColumnAlteration, NewColumnTransform, WriteParams};
+use lance_file::version::LanceFileVersion;
+use lance_linalg::distance::DistanceType;
 
 const INDEX_NAME: &str = "vamana_idx";
 const PARTITIONS: u32 = 4;
@@ -62,7 +74,11 @@ const RABIT: CodeSpec = CodeSpec::Rabit {
 const SCALAR: CodeSpec = CodeSpec::Scalar { num_bits: 8 };
 
 fn params(codes: CodeSpec) -> IndexParams {
-    IndexParams::new(VECTOR_COLUMN, PARTITIONS)
+    params_on(VECTOR_COLUMN, codes)
+}
+
+fn params_on(column: &str, codes: CodeSpec) -> IndexParams {
+    IndexParams::new(column, PARTITIONS)
         .with_graph_params(BuildParams {
             max_degree: MAX_DEGREE,
             search_list_size: 64,
@@ -600,6 +616,18 @@ async fn a_lazy_walk_refuses_what_it_cannot_do() {
         )
         .await
         .unwrap();
+    // Where to re-score from, asked of the modes that have no re-score read.
+    for mode in [WalkMode::Exact, WalkMode::Coded] {
+        let error = index
+            .search(query, &search(mode).with_rescore_from_dataset(true))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("no re-score read to redirect"),
+            "{error}"
+        );
+    }
 }
 
 /// A beam wider than the partition, which is the case the mode is *not* for.
@@ -1855,5 +1883,679 @@ async fn the_coded_answer_is_the_answer_before_the_vectors_were_read() {
             .iter()
             .all(|answer| answer.rescore == Default::default()),
         "a mode that never re-scores reported a re-score cost"
+    );
+}
+
+/// Queries each re-score test asks both ways. Few, because what is compared is
+/// exact and each query is two walks.
+const BOTH_WAYS: usize = 12;
+
+/// An index with eight-bit scalar codes, the kind the stand measures.
+async fn scalar_index(
+    uri: &str,
+    fixture: &DatasetFixture,
+    distance_type: DistanceType,
+    vector_source: VectorSource,
+) -> Dataset {
+    let mut dataset = fixture.write(uri).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &params(SCALAR)
+            .with_distance_type(distance_type)
+            .with_vector_source(vector_source),
+    )
+    .await
+    .unwrap();
+    dataset
+}
+
+/// Every query answered twice by `index`, re-scoring from its partitions and
+/// from the dataset, and the two answers held to be one: the same rows at the
+/// same distances, to the last bit.
+async fn assert_either_copy_answers_the_same(
+    index: &VamanaIndex,
+    params: &SearchParams,
+    dimension: i32,
+    what: &str,
+) {
+    let from_dataset = params.clone().with_rescore_from_dataset(true);
+    for (n, query) in random_vectors_of(BOTH_WAYS, dimension, 4242)
+        .iter()
+        .enumerate()
+    {
+        let partition = index.search(query, params).await.unwrap();
+        let dataset = index.search(query, &from_dataset).await.unwrap();
+        assert_eq!(
+            partition.neighbors.len(),
+            K,
+            "{what}: query {n} came back short"
+        );
+        assert_eq!(
+            partition.neighbors, dataset.neighbors,
+            "{what}: query {n} answered differently from the dataset's copy"
+        );
+    }
+}
+
+/// The dataset's copy of a vector is the partition's copy: both modes that
+/// re-score answer the same from either, to the last bit, whether the index
+/// opens its files per read or holds them - and every row is read by offset.
+async fn a_re_score_from_the_dataset_is_the_re_score_from_the_partition(
+    distance_type: DistanceType,
+    storage_version: Option<LanceFileVersion>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = DatasetFixture {
+        storage_version,
+        ..wide_fixture()
+    };
+    let dataset = scalar_index(uri, &fixture, distance_type, VectorSource::Index).await;
+    for held in [false, true] {
+        let mut index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+        if held {
+            index = index.with_cache(LanceCache::with_capacity(BUDGET));
+        }
+        for mode in [WalkMode::Lazy, WalkMode::Flat] {
+            let what =
+                format!("{distance_type:?}, {storage_version:?}, files held {held}, {mode:?}");
+            assert_either_copy_answers_the_same(&index, &search(mode), WIDE_DIM, &what).await;
+        }
+        assert_eq!(
+            index.rescore_reads().through_lance,
+            0,
+            "{distance_type:?}, {storage_version:?}, files held {held}: a data file of \
+             {WIDE_DIM}-wide vectors was not read by offset"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_l2_re_score_from_the_dataset_is_the_re_score_from_the_partition() {
+    a_re_score_from_the_dataset_is_the_re_score_from_the_partition(DistanceType::L2, None).await;
+}
+
+/// The partition holds unit vectors and the dataset does not, so what is read
+/// has to be normalised exactly as the build normalised it.
+#[tokio::test]
+async fn a_cosine_re_score_from_the_dataset_is_the_re_score_from_the_partition() {
+    a_re_score_from_the_dataset_is_the_re_score_from_the_partition(DistanceType::Cosine, None)
+        .await;
+}
+
+/// Every file version the offset read accepts lays the column out the way it
+/// reads it, not only the default one.
+#[tokio::test]
+async fn a_re_score_from_a_2_1_data_file_is_the_re_score_from_the_partition() {
+    a_re_score_from_the_dataset_is_the_re_score_from_the_partition(
+        DistanceType::L2,
+        Some(LanceFileVersion::V2_1),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_re_score_from_a_2_3_data_file_is_the_re_score_from_the_partition() {
+    a_re_score_from_the_dataset_is_the_re_score_from_the_partition(
+        DistanceType::L2,
+        Some(LanceFileVersion::V2_3),
+    )
+    .await;
+}
+
+/// An index that keeps no vectors re-scores from the dataset what its twin with
+/// vectors re-scores from its own copy: the same rows at the same distances, to
+/// the last bit, in both modes that re-score - and whatever the query's switch
+/// says, since there is no copy to switch to.
+async fn an_index_without_vectors_answers_what_its_twin_with_vectors_answers(
+    distance_type: DistanceType,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut twins = Vec::new();
+    for vector_source in [VectorSource::Index, VectorSource::Dataset] {
+        let uri = dir.path().join(vector_source.to_string());
+        let dataset = scalar_index(
+            uri.to_str().unwrap(),
+            &wide_fixture(),
+            distance_type,
+            vector_source,
+        )
+        .await;
+        twins.push(VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap());
+    }
+    let [with, without] = twins.try_into().unwrap();
+    assert_eq!(without.metadata().vector_source, VectorSource::Dataset);
+    for mode in [WalkMode::Lazy, WalkMode::Flat] {
+        for switch in [false, true] {
+            let params = search(mode).with_rescore_from_dataset(switch);
+            for (n, query) in random_vectors_of(BOTH_WAYS, WIDE_DIM, 4242)
+                .iter()
+                .enumerate()
+            {
+                let expected = with.search(query, &search(mode)).await.unwrap();
+                let answered = without.search(query, &params).await.unwrap();
+                assert_eq!(expected.neighbors.len(), K);
+                assert_eq!(
+                    answered.neighbors, expected.neighbors,
+                    "{distance_type:?}, {mode:?}, switch {switch}: query {n}"
+                );
+            }
+        }
+    }
+    assert_eq!(without.rescore_reads().through_lance, 0);
+}
+
+#[tokio::test]
+async fn an_l2_index_without_vectors_answers_what_its_twin_with_vectors_answers() {
+    an_index_without_vectors_answers_what_its_twin_with_vectors_answers(DistanceType::L2).await;
+}
+
+#[tokio::test]
+async fn a_cosine_index_without_vectors_answers_what_its_twin_with_vectors_answers() {
+    an_index_without_vectors_answers_what_its_twin_with_vectors_answers(DistanceType::Cosine).await;
+}
+
+/// The two modes that read partitions whole read every vector along with them,
+/// and a partition of this index holds none.
+#[tokio::test]
+async fn an_index_without_vectors_refuses_the_modes_that_read_them_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = scalar_index(
+        uri,
+        &wide_fixture(),
+        DistanceType::L2,
+        VectorSource::Dataset,
+    )
+    .await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let query = random_vectors_of(1, WIDE_DIM, 7).remove(0);
+    for mode in [WalkMode::Exact, WalkMode::Coded] {
+        let error = index.search(&query, &search(mode)).await.unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{mode:?}: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("leaves its vectors to the dataset"),
+            "{mode:?}: {error}"
+        );
+    }
+}
+
+/// A segment added beside an index without vectors keeps none either, though
+/// the parameters it is built from default to keeping them: the index opens
+/// over both, which it would refuse over segments keeping their vectors in two
+/// places, and finds an appended row where it is.
+#[tokio::test]
+async fn a_segment_added_to_an_index_without_vectors_keeps_none_either() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let base = wide_fixture();
+    scalar_index(uri, &base, DistanceType::L2, VectorSource::Dataset).await;
+    let appended = DatasetFixture {
+        seed: 99,
+        ..wide_fixture()
+    };
+    let mut dataset = appended.append(uri).await;
+    let inserted = insert_as_segment(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(inserted.fragments_indexed, appended.fragments);
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(index.num_segments(), 2);
+    assert_eq!(index.metadata().vector_source, VectorSource::Dataset);
+    // The appended fixture draws its rows the way `random_vectors_of` draws
+    // queries, so the first of them is its first row.
+    let first = random_vectors_of(1, WIDE_DIM, appended.seed).remove(0);
+    let answer = index.search(&first, &search(WalkMode::Lazy)).await.unwrap();
+    assert_eq!(
+        (answer.neighbors[0].row_addr, answer.neighbors[0].distance),
+        ((base.fragments as u64) << 32, 0.0)
+    );
+}
+
+/// Vectors narrower than 256 bytes are laid out as mini-blocks, which no offset
+/// reaches, so the rows are re-scored through Lance - at least one for every
+/// answer - and still answer what the partition's copy answers. That no offset
+/// reaches them is found out once, and no file is opened again to find it out.
+#[tokio::test]
+async fn narrow_vectors_are_re_scored_through_lance() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let narrow = DatasetFixture {
+        dimension: VECTOR_DIM,
+        ..wide_fixture()
+    };
+    let dataset = scalar_index(uri, &narrow, DistanceType::L2, VectorSource::Index).await;
+    for held in [false, true] {
+        let mut index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+        if held {
+            index = index.with_cache(LanceCache::with_capacity(BUDGET));
+        }
+        assert_either_copy_answers_the_same(&index, &search(WalkMode::Lazy), VECTOR_DIM, "narrow")
+            .await;
+        let through_lance = index.rescore_reads().through_lance;
+        assert!(
+            through_lance >= (BOTH_WAYS * K) as u64,
+            "held {held}: only {through_lance} rows went through Lance for {BOTH_WAYS} queries \
+             of k = {K}"
+        );
+        // Every file was found out by the queries above, so none is opened
+        // again: a re-score whose every row goes through Lance's take reads
+        // nothing itself, whether or not the index keeps a cache.
+        let query = random_vectors_of(1, VECTOR_DIM, 7).remove(0);
+        let answered = index
+            .search(
+                &query,
+                &search(WalkMode::Lazy).with_rescore_from_dataset(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            answered.rescore.iops, 0,
+            "held {held}: a data file no offset reaches was opened again: {:?}",
+            answered.rescore
+        );
+    }
+}
+
+/// A data file Lance 2.0 wrote has another grammar, so it is read through
+/// Lance whatever its width.
+#[tokio::test]
+async fn a_lance_2_0_data_file_is_re_scored_through_lance() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let old = DatasetFixture {
+        storage_version: Some(LanceFileVersion::V2_0),
+        ..wide_fixture()
+    };
+    let dataset = scalar_index(uri, &old, DistanceType::L2, VectorSource::Index).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_either_copy_answers_the_same(&index, &search(WalkMode::Lazy), WIDE_DIM, "Lance 2.0")
+        .await;
+    assert!(
+        index.rescore_reads().through_lance > 0,
+        "a Lance 2.0 data file was read by offset"
+    );
+    // The manifest alone sends a Lance 2.0 file to Lance, so none is opened: a
+    // re-score whose every row goes through Lance's take reads nothing itself.
+    let query = random_vectors_of(1, WIDE_DIM, 7).remove(0);
+    let answered = index
+        .search(
+            &query,
+            &search(WalkMode::Lazy).with_rescore_from_dataset(true),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        answered.rescore.iops, 0,
+        "a Lance 2.0 data file was opened: {:?}",
+        answered.rescore
+    );
+}
+
+/// A column holding nulls carries validity beside its values, which moves them
+/// off the offsets a full-zip page of bare values would put them at.
+#[tokio::test]
+async fn a_column_with_nulls_is_re_scored_through_lance() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let sparse = DatasetFixture {
+        null_every: Some(7),
+        ..wide_fixture()
+    };
+    let dataset = scalar_index(uri, &sparse, DistanceType::L2, VectorSource::Index).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_either_copy_answers_the_same(&index, &search(WalkMode::Lazy), WIDE_DIM, "nulls").await;
+    assert!(
+        index.rescore_reads().through_lance > 0,
+        "a column with nulls was read by offset"
+    );
+}
+
+/// A shallow clone keeps its data files under the dataset it was cloned from,
+/// a base path this crate does not resolve, so their rows are re-scored through
+/// Lance - and the answer is the partition's.
+#[tokio::test]
+async fn a_shallow_clone_is_re_scored_through_lance() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_uri = dir.path().join("source");
+    let mut source = wide_fixture().write(source_uri.to_str().unwrap()).await;
+    let version = source.version().version;
+    let clone_uri = dir.path().join("clone");
+    let mut dataset = source
+        .shallow_clone(clone_uri.to_str().unwrap(), version, None)
+        .await
+        .unwrap();
+    assert!(
+        dataset.get_fragments().iter().all(|fragment| {
+            fragment
+                .metadata()
+                .files
+                .iter()
+                .all(|file| file.base_id.is_some())
+        }),
+        "the clone wrote data files of its own, so no base path is under test"
+    );
+    create_index(&mut dataset, INDEX_NAME, &params(SCALAR))
+        .await
+        .unwrap();
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_either_copy_answers_the_same(&index, &search(WalkMode::Lazy), WIDE_DIM, "shallow clone")
+        .await;
+    assert!(
+        index.rescore_reads().through_lance > 0,
+        "a data file under another base path was read by offset"
+    );
+}
+
+/// A dead row is dropped before anything is read for it, which is the only way
+/// past a candidate whose whole fragment has gone, since nothing is left to read
+/// - and the answer is the one the partition's copy gives, which drops the same
+/// rows afterwards.
+#[tokio::test]
+async fn a_re_score_from_the_dataset_answers_only_live_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset =
+        scalar_index(uri, &wide_fixture(), DistanceType::L2, VectorSource::Index).await;
+    dataset
+        .delete("vec IS NOT NULL AND _rowid % 3 = 0")
+        .await
+        .unwrap();
+    // Every row of fragment 0, so the fragment itself goes.
+    dataset.delete("_rowid < 200").await.unwrap();
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .all(|fragment| fragment.id() != 0),
+        "fragment 0 survived losing every row"
+    );
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_either_copy_answers_the_same(&index, &search(WalkMode::Lazy), WIDE_DIM, "deleted").await;
+    let live = common::live_row_ids(&dataset).await;
+    let from_dataset = search(WalkMode::Lazy).with_rescore_from_dataset(true);
+    for query in random_vectors_of(BOTH_WAYS, WIDE_DIM, 4243) {
+        for neighbor in index.search(&query, &from_dataset).await.unwrap().neighbors {
+            assert!(
+                live.contains(&neighbor.row_addr),
+                "row {} was deleted and came back anyway",
+                neighbor.row_addr
+            );
+        }
+    }
+}
+
+/// A deferred compaction moves rows into new fragments and the index follows
+/// the record of where they went: a re-score from the dataset reads each moved
+/// row where it landed, by offset, since the new files are full-zip too.
+#[tokio::test]
+async fn a_re_score_from_the_dataset_reads_a_moved_row_where_it_landed() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset =
+        scalar_index(uri, &wide_fixture(), DistanceType::L2, VectorSource::Index).await;
+    let metrics = common::compact_indexed(&mut dataset).await;
+    assert!(metrics.fragments_removed > 0, "nothing moved: {metrics:?}");
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_either_copy_answers_the_same(&index, &search(WalkMode::Lazy), WIDE_DIM, "moved").await;
+    assert_eq!(index.rescore_reads().through_lance, 0);
+}
+
+/// A segment indexed over appended rows re-scores from their fragments as the
+/// base segment does from its own.
+#[tokio::test]
+async fn a_re_score_from_the_dataset_answers_across_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    scalar_index(uri, &wide_fixture(), DistanceType::L2, VectorSource::Index).await;
+    wide_fixture().append(uri).await;
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    lance_vamana::insert_as_segment(&mut dataset, INDEX_NAME)
+        .await
+        .unwrap();
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert!(
+        index.num_segments() > 1,
+        "the append wrote no second segment"
+    );
+    assert_either_copy_answers_the_same(&index, &search(WalkMode::Lazy), WIDE_DIM, "two segments")
+        .await;
+}
+
+/// A dataset whose vectors are its second column: `id`, then `vec`.
+async fn write_behind_an_id(uri: &str) -> Dataset {
+    let fixture = wide_fixture();
+    let rows = fixture.rows();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        wide_field(),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+            Arc::new(wide_vectors(rows, 99)),
+        ],
+    )
+    .unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: fixture.rows_per_fragment,
+            max_rows_per_group: fixture.rows_per_fragment,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+fn wide_field() -> Field {
+    Field::new(
+        VECTOR_COLUMN,
+        DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            WIDE_DIM,
+        ),
+        true,
+    )
+}
+
+fn wide_vectors(rows: usize, seed: u64) -> FixedSizeListArray {
+    FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        random_vectors_of(rows, WIDE_DIM, seed)
+            .into_iter()
+            .map(|vector| Some(vector.into_iter().map(Some).collect::<Vec<_>>())),
+        WIDE_DIM,
+    )
+}
+
+/// The vector column is found by field id through the manifest, not by name or
+/// by position: behind another column of its own file, and again after a
+/// rename.
+#[tokio::test]
+async fn a_re_score_from_the_dataset_finds_its_column_by_field_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = write_behind_an_id(uri).await;
+    create_index(&mut dataset, INDEX_NAME, &params(SCALAR))
+        .await
+        .unwrap();
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_either_copy_answers_the_same(&index, &search(WalkMode::Lazy), WIDE_DIM, "behind an id")
+        .await;
+    assert_eq!(index.rescore_reads().through_lance, 0);
+
+    dataset
+        .alter_columns(&[
+            ColumnAlteration::new(VECTOR_COLUMN.to_string()).rename("renamed".to_string())
+        ])
+        .await
+        .unwrap();
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_either_copy_answers_the_same(&index, &search(WalkMode::Lazy), WIDE_DIM, "renamed").await;
+    assert_eq!(index.rescore_reads().through_lance, 0);
+}
+
+/// Two vector columns of one shape in one data file, an index over each, the
+/// two sharing one cache: each re-scores from its own column, although what is
+/// known about the file is known first for the other one. The neighbour column
+/// has the very shape a re-score reads, so a read that landed on it would pass
+/// every check on its pages and answer from the wrong vectors.
+#[tokio::test]
+async fn two_indices_over_two_columns_of_one_file_each_re_score_from_their_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = wide_fixture();
+    let rows = fixture.rows();
+    let other_column = "vec2";
+    let other_index = "vamana_idx2";
+    let schema = Arc::new(ArrowSchema::new(vec![
+        wide_field(),
+        Field::new(other_column, wide_field().data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(wide_vectors(rows, 97)),
+            Arc::new(wide_vectors(rows, 96)),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: fixture.rows_per_fragment,
+            max_rows_per_group: fixture.rows_per_fragment,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_index(&mut dataset, INDEX_NAME, &params(SCALAR))
+        .await
+        .unwrap();
+    create_index(&mut dataset, other_index, &params_on(other_column, SCALAR))
+        .await
+        .unwrap();
+
+    let cache = LanceCache::with_capacity(BUDGET);
+    for name in [INDEX_NAME, other_index] {
+        let index = VamanaIndex::open(&dataset, name)
+            .await
+            .unwrap()
+            .with_cache(cache.clone());
+        assert_either_copy_answers_the_same(&index, &search(WalkMode::Lazy), WIDE_DIM, name).await;
+        assert_eq!(index.rescore_reads().through_lance, 0, "{name}");
+    }
+}
+
+/// A fragment's vectors in its second data file, where adding a column puts
+/// them: the file holding the field is the one read.
+#[tokio::test]
+async fn a_re_score_from_the_dataset_finds_the_data_file_holding_its_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = wide_fixture();
+    let rows = fixture.rows();
+    let ids = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        ids.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..rows as i64))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], ids),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: fixture.rows_per_fragment,
+            max_rows_per_group: fixture.rows_per_fragment,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let vectors = Arc::new(ArrowSchema::new(vec![wide_field()]));
+    let batch =
+        RecordBatch::try_new(vectors.clone(), vec![Arc::new(wide_vectors(rows, 98))]).unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(batch)],
+                vectors,
+            ))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .all(|fragment| fragment.metadata().files.len() == 2),
+        "adding the column did not give every fragment a second data file"
+    );
+
+    create_index(&mut dataset, INDEX_NAME, &params(SCALAR))
+        .await
+        .unwrap();
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_either_copy_answers_the_same(&index, &search(WalkMode::Lazy), WIDE_DIM, "second file")
+        .await;
+    assert_eq!(index.rescore_reads().through_lance, 0);
+}
+
+/// An index is pinned to the version it was opened on, and so is the copy it
+/// re-scores from. Once a compaction and a cleanup have removed that version's
+/// data files, a re-score from the dataset fails and names the file it lost,
+/// rather than answering from rows another version put at those addresses.
+#[tokio::test]
+async fn a_re_score_from_a_cleaned_up_version_names_the_file_it_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset =
+        scalar_index(uri, &wide_fixture(), DistanceType::L2, VectorSource::Index).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let lost = dataset.get_fragments()[0].metadata().files[0].path.clone();
+
+    common::compact_indexed(&mut dataset).await;
+    let stale = (1..dataset.version().version).collect::<Vec<_>>();
+    dataset
+        .cleanup_with_policy(
+            CleanupPolicyBuilder::default()
+                .versions(stale)
+                .unwrap()
+                .delete_unverified(true)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let from_dataset = search(WalkMode::Lazy).with_rescore_from_dataset(true);
+    let mut refused = 0;
+    for query in random_vectors_of(BOTH_WAYS, WIDE_DIM, 4244) {
+        if let Err(error) = index.search(&query, &from_dataset).await {
+            assert!(error.to_string().contains(&lost), "{error}");
+            refused += 1;
+        }
+    }
+    assert_eq!(
+        refused, BOTH_WAYS,
+        "a re-score read rows of a version that is gone"
     );
 }

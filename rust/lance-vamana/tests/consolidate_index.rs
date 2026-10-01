@@ -17,20 +17,29 @@
 
 use std::collections::HashSet;
 
+use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use lance::Dataset;
 use lance::dataset::index::frag_reuse::cleanup_frag_reuse_index;
 use lance::index::DatasetIndexExt;
 use lance_core::utils::address::RowAddress;
+use lance_linalg::distance::DistanceType;
+use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
+use lance_vamana::codes::CodeSpec;
 use lance_vamana::consolidator::{ConsolidateStats, consolidate_index};
+use lance_vamana::format::{ROW_ID_COLUMN, VectorSource};
+use lance_vamana::merger::merge_index;
 use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 mod common;
 use common::{
-    DatasetFixture, VECTOR_COLUMN, brute_force, compact_indexed, live_row_ids, random_vectors,
-    read_committed_segment, recall,
+    DatasetFixture, VECTOR_COLUMN, assert_twins_hold_the_same, brute_force, compact_indexed,
+    live_row_ids, random_vectors, read_committed_batches, read_committed_segment, recall,
+    twin_params, twins, wide_fixture,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
@@ -155,6 +164,299 @@ async fn consolidating_after_a_deferred_compaction_readdresses_every_partition()
             ..Default::default()
         }
     );
+}
+
+/// The two passes that write a partition out again where only its rows moved.
+#[derive(Debug, Clone, Copy)]
+enum Pass {
+    Consolidate,
+    Merge,
+}
+
+impl Pass {
+    /// Run the pass and say how many partitions it readdressed.
+    async fn readdressed(self, dataset: &mut Dataset) -> lance_core::Result<usize> {
+        Ok(match self {
+            Self::Consolidate => {
+                consolidate_index(dataset, INDEX_NAME)
+                    .await?
+                    .partitions_readdressed
+            }
+            Self::Merge => {
+                merge_index(dataset, INDEX_NAME)
+                    .await?
+                    .partitions_readdressed
+            }
+        })
+    }
+}
+
+/// An index over `wide_fixture`, whose every row a deferred compaction then
+/// moved, and the batches its partitions were written as before the move.
+async fn moved_index(
+    uri: &str,
+    vector_source: VectorSource,
+    codes: Option<CodeSpec>,
+    distance_type: DistanceType,
+) -> (Dataset, Vec<RecordBatch>) {
+    let mut dataset = wide_fixture().write(uri).await;
+    let mut params = IndexParams::new(VECTOR_COLUMN, PARTITIONS)
+        .with_graph_params(BuildParams {
+            max_degree: 16,
+            search_list_size: 32,
+            ..Default::default()
+        })
+        .with_distance_type(distance_type)
+        .with_vector_source(vector_source);
+    if let Some(codes) = codes {
+        params = params.with_codes(codes);
+    }
+    create_index(&mut dataset, INDEX_NAME, &params)
+        .await
+        .unwrap();
+    let [(_, before)] = read_committed_batches(&dataset, INDEX_NAME)
+        .await
+        .try_into()
+        .unwrap();
+    let metrics = compact_indexed(&mut dataset).await;
+    assert!(metrics.fragments_removed > 0, "{metrics:?}");
+    (dataset, before)
+}
+
+/// A partition whose rows a deferred compaction only moved is written out again
+/// with nothing but its row addresses changed, so the pass reads nothing of the
+/// dataset's data files - not even for an index that keeps no vectors, whose
+/// every other rewrite reads them there. With the data files out of reach, the
+/// pass still readdresses every partition.
+async fn readdressing_reads_no_data_file(pass: Pass) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let (mut dataset, before) = moved_index(
+        uri,
+        VectorSource::Dataset,
+        Some(CodeSpec::Scalar { num_bits: 8 }),
+        DistanceType::L2,
+    )
+    .await;
+    let data = dir.path().join("data");
+    let away = dir.path().join("data.away");
+    std::fs::rename(&data, &away).unwrap();
+    let readdressed = pass.readdressed(&mut dataset).await;
+    std::fs::rename(&away, &data).unwrap();
+    assert_eq!(readdressed.unwrap(), before.len(), "{pass:?}");
+}
+
+#[tokio::test]
+async fn consolidating_readdresses_without_reading_a_data_file() {
+    readdressing_reads_no_data_file(Pass::Consolidate).await;
+}
+
+#[tokio::test]
+async fn merging_readdresses_without_reading_a_data_file() {
+    readdressing_reads_no_data_file(Pass::Merge).await;
+}
+
+/// A readdressed partition is the partition as it was written - its graph, its
+/// codes, and its vectors where the index keeps them, in the same schema - with
+/// each row address the one Lance's record of the move gives.
+async fn readdressing_changes_nothing_but_the_row_addresses(
+    pass: Pass,
+    vector_source: VectorSource,
+    codes: Option<CodeSpec>,
+    distance_type: DistanceType,
+) {
+    let what = format!("{pass:?}, {vector_source}, {codes:?}, {distance_type:?}");
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let (mut dataset, before) = moved_index(uri, vector_source, codes, distance_type).await;
+    let remap = dataset
+        .frag_reuse_index()
+        .await
+        .unwrap()
+        .expect("the compaction left no record of where the rows went");
+
+    assert_eq!(
+        pass.readdressed(&mut dataset).await.unwrap(),
+        before.len(),
+        "{what}"
+    );
+    let [(_, after)] = read_committed_batches(&dataset, INDEX_NAME)
+        .await
+        .try_into()
+        .unwrap();
+    assert_eq!(after.len(), before.len(), "{what}");
+    for (partition, (before, after)) in before.iter().zip(&after).enumerate() {
+        assert_eq!(
+            after.schema(),
+            before.schema(),
+            "{what}: partition {partition}"
+        );
+        let stored = before[ROW_ID_COLUMN].as_primitive::<UInt64Type>().values();
+        let moved = stored
+            .iter()
+            .map(|&row| remap.remap_row_id(row).expect("a live row went nowhere"))
+            .collect::<Vec<_>>();
+        assert_ne!(
+            moved,
+            stored.to_vec(),
+            "{what}: partition {partition} did not move"
+        );
+        assert_eq!(
+            after[ROW_ID_COLUMN]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .to_vec(),
+            moved,
+            "{what}: partition {partition}"
+        );
+        for column in 1..before.num_columns() {
+            assert_eq!(
+                after.column(column),
+                before.column(column),
+                "{what}: partition {partition}, {}",
+                before.schema().field(column).name()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn consolidating_readdresses_an_index_keeping_its_vectors_as_it_was() {
+    readdressing_changes_nothing_but_the_row_addresses(
+        Pass::Consolidate,
+        VectorSource::Index,
+        None,
+        DistanceType::L2,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn consolidating_readdresses_a_coded_index_keeping_its_vectors_as_it_was() {
+    readdressing_changes_nothing_but_the_row_addresses(
+        Pass::Consolidate,
+        VectorSource::Index,
+        Some(CodeSpec::Scalar { num_bits: 8 }),
+        DistanceType::L2,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn consolidating_readdresses_an_index_without_vectors_as_it_was() {
+    readdressing_changes_nothing_but_the_row_addresses(
+        Pass::Consolidate,
+        VectorSource::Dataset,
+        Some(CodeSpec::Scalar { num_bits: 8 }),
+        DistanceType::L2,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn merging_readdresses_a_coded_index_keeping_its_vectors_as_it_was() {
+    readdressing_changes_nothing_but_the_row_addresses(
+        Pass::Merge,
+        VectorSource::Index,
+        Some(CodeSpec::Scalar { num_bits: 8 }),
+        DistanceType::L2,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn merging_readdresses_an_index_without_vectors_as_it_was() {
+    readdressing_changes_nothing_but_the_row_addresses(
+        Pass::Merge,
+        VectorSource::Dataset,
+        Some(CodeSpec::Scalar { num_bits: 8 }),
+        DistanceType::L2,
+    )
+    .await;
+}
+
+/// RaBitQ codes are taken against the partition's centroid after a rotation,
+/// and Cosine normalises what they are taken of; neither moves with a row.
+#[tokio::test]
+async fn consolidating_readdresses_a_rabit_coded_cosine_index_without_vectors_as_it_was() {
+    readdressing_changes_nothing_but_the_row_addresses(
+        Pass::Consolidate,
+        VectorSource::Dataset,
+        Some(CodeSpec::Rabit { num_bits: 3 }),
+        DistanceType::Cosine,
+    )
+    .await;
+}
+
+/// Consolidating an index that leaves its vectors to the dataset is
+/// consolidating its twin that keeps them, round after round: the same
+/// partitions repaired and rebuilt, into the same graphs and codes. The dead get
+/// no vector - nothing measures against them - and the living are read back
+/// out of the dataset.
+#[tokio::test]
+async fn an_index_without_vectors_consolidates_as_its_twin_does() {
+    let dir = tempfile::tempdir().unwrap();
+    // One partition of every row, sparse enough at this degree for nine rows in
+    // ten taken out at once to tear it.
+    let fixture = DatasetFixture {
+        rows_per_fragment: 80,
+        ..wide_fixture()
+    };
+    let mut twins = twins(dir.path(), &fixture, INDEX_NAME, &twin_params(1)).await;
+    let mut rebuilt = 0;
+    // One row in seven, then all but one in ten of what is left: the second
+    // round is the one that tears partitions apart and has them rebuilt.
+    for predicate in ["_rowid % 7 == 0", "_rowid % 10 != 3"] {
+        let mut stats = Vec::new();
+        for (_, dataset) in &mut twins {
+            dataset.delete(predicate).await.unwrap();
+            stats.push(consolidate_index(dataset, INDEX_NAME).await.unwrap());
+        }
+        assert_eq!(stats[0], stats[1], "{predicate}");
+        assert!(
+            stats[0].partitions_consolidated + stats[0].partitions_rebuilt > 0,
+            "{predicate}: {:?}",
+            stats[0]
+        );
+        rebuilt += stats[0].partitions_rebuilt;
+        assert_twins_hold_the_same(&twins[0].1, &twins[1].1, INDEX_NAME).await;
+    }
+    assert!(
+        rebuilt > 0,
+        "no partition came apart, so no rebuild was compared"
+    );
+}
+
+/// A deferred compaction moves every row, and consolidating an index that
+/// leaves its vectors to the dataset readdresses and repairs it as it does its
+/// twin - reading, for what it repairs, the vectors where they moved to.
+#[tokio::test]
+async fn an_index_without_vectors_follows_a_deferred_compaction_as_its_twin_does() {
+    for deleted in [None, Some("_rowid % 11 == 0")] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut twins = twins(
+            dir.path(),
+            &wide_fixture(),
+            INDEX_NAME,
+            &twin_params(PARTITIONS),
+        )
+        .await;
+        let mut stats = Vec::new();
+        for (_, dataset) in &mut twins {
+            if let Some(predicate) = deleted {
+                dataset.delete(predicate).await.unwrap();
+            }
+            let metrics = compact_indexed(dataset).await;
+            assert!(metrics.fragments_removed > 0, "{metrics:?}");
+            stats.push(consolidate_index(dataset, INDEX_NAME).await.unwrap());
+        }
+        assert_eq!(stats[0], stats[1], "{deleted:?}");
+        match deleted {
+            None => assert_eq!(stats[0].partitions_readdressed, PARTITIONS as usize),
+            Some(_) => assert!(stats[0].vertices_removed > 0, "{:?}", stats[0]),
+        }
+        assert_twins_hold_the_same(&twins[0].1, &twins[1].1, INDEX_NAME).await;
+    }
 }
 
 #[tokio::test]

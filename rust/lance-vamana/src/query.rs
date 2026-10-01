@@ -40,16 +40,29 @@
 //!   what changes that, and what it keeps is the part of a partition that does
 //!   not depend on the query: the layout of its file, and for a
 //!   [`WalkMode::Lazy`] walk or a [`WalkMode::Flat`] scan the codes and row ids
-//!   they measure by, which are nine tenths of what such a query reads. What an
+//!   they measure by, which are nine tenths of what such a query reads - and,
+//!   for a re-score from the dataset, where each data file keeps them. What an
 //!   index keeps without one is scratch rather than data: the visited marks of
 //!   its lazy walks, one byte a vertex of the largest partition walked, for
-//!   as many walks as have run at once and up to one per core.
+//!   as many walks as have run at once and up to one per core - and which of
+//!   the dataset's data files no offset read can serve, learnt from a file's
+//!   footer the first time it is opened, so that it is not opened again only to
+//!   be sent to Lance's take. That is where a read goes, never what it returns:
+//!   every byte of every answer is still read every time.
+//! - **A re-score from the dataset reads the version the index was opened at.**
+//!   An index that leaves its vectors to the dataset, or a query that asks with
+//!   [`SearchParams::rescore_from_dataset`], reads them from that version's
+//!   data files. Once a compaction and `cleanup_old_versions` have removed
+//!   them, a re-score that has to open one fails, naming it, until the index is
+//!   opened again - the rule Lance's own indices live by.
 //! - **A partition is read whole unless the walk is told not to.**
 //!   [`WalkMode::Lazy`] keeps the row ids and the codes and fetches the rest as
 //!   it turns out to need it; [`WalkMode::Flat`] keeps the same and fetches even
 //!   less, because it scores every vertex instead of following edges to a few of
 //!   them. Which of the three is right is a property of the deployment rather
-//!   than of the index, and it was measured rather than assumed.
+//!   than of the index, and it was measured rather than assumed - except for an
+//!   index that leaves its vectors to the dataset, which only the last two can
+//!   walk.
 //!
 //!   Reading only what a walk touches does not pay on its own
 //!   (`examples/memory_gate.rs`): a walk expands a few dozen vertices in a
@@ -93,9 +106,11 @@
 //! one - a visible overlay, or one a deferred compaction baked into the rows it
 //! moved, which it reads the dataset version that compaction recorded to find -
 //! when the manifest records a format version this build does not read,
-//! when a segment was inherited from another dataset, or when the segments
-//! disagree about the vectors they hold or about the codes they were built with.
-//! Each refusal names what to do about it, which is always to rebuild.
+//! when a segment was inherited from another dataset, when the segments
+//! disagree about the vectors they hold or about the codes they were built with,
+//! or when an index that leaves its vectors to the dataset is opened over a
+//! column that cannot supply them. Each refusal names what to do about it, which
+//! is always to rebuild.
 //!
 //! Lance's own paths do not see a committed index: its scanner answers the column
 //! as if there were none, its listings leave it out, and its default compaction
@@ -107,9 +122,12 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
+use arrow_array::cast::AsArray;
+use arrow_array::types::Float32Type;
+use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance::Dataset;
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::{CacheStats, LanceCache};
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
@@ -130,18 +148,19 @@ use uuid::Uuid;
 use crate::builder::{live_fragments, routing_distance_type, supported_distance_type};
 use crate::cache;
 use crate::codes::{self, CODE_COLUMN};
+use crate::dataset_vectors::{DatasetVectors, FileAccess};
 use crate::format::{
     FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, NEIGHBORS_COLUMN, ROW_ID_COLUMN, RowIdMode,
-    VECTOR_COLUMN,
+    VECTOR_COLUMN, VectorSource,
 };
 use lance_io::object_store::ObjectStore;
 
 use crate::io::{
-    DirectReads, OPEN_FILES, OpenFiles, PartitionFile, check_partition_shape, read_partition_batch,
-    read_segment, scan_scheduler,
+    DirectReads, OPEN_FILES, OpenFiles, PartitionFile, check_partition_shape, open_file,
+    read_partition, read_partition_batch, read_segment, scan_scheduler,
 };
 use crate::lazy::{self, Candidate, LazyProbe};
-use crate::partition::Partition;
+use crate::partition::{Partition, graph_from_batch, row_ids_from_batch};
 use crate::search::{
     Comparisons, ScratchPool, SearchScratch, StopRule, flat_storage, greedy_search,
 };
@@ -165,13 +184,18 @@ pub struct Neighbor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WalkMode {
     /// Read the partition whole and measure against the vectors it stores.
+    ///
+    /// Refused for an index that leaves its vectors to the dataset
+    /// ([`VectorSource::Dataset`]), whose partitions store none.
     #[default]
     Exact,
     /// Read the partition whole and measure against its codes, with the
     /// candidate list re-scored exactly before it is answered from.
     ///
     /// Only for an index built with [`crate::IndexParams::with_codes`], and
-    /// refused rather than quietly downgraded for one that was not. On its own
+    /// refused rather than quietly downgraded for one that was not - and for
+    /// one that leaves its vectors to the dataset, whose partitions it would
+    /// read whole for vectors they do not store. On its own
     /// it costs a few per cent more comparisons and reads no fewer bytes: it is
     /// [`Self::Lazy`] with the reading left alone, which is the useful arm to
     /// hold a walk against when what is in question is the *steering*.
@@ -407,6 +431,27 @@ pub struct SearchParams {
     /// this one ranks and dedups the candidate list again, and only a caller
     /// asking what the re-score bought has any use for the result.
     pub report_coded: bool,
+    /// Whether the re-score reads the candidates' vectors from the dataset's
+    /// own data files instead of the partition's copy.
+    ///
+    /// The answer is the same either way, to the last bit: the vectors are the
+    /// same ones, normalised by the same function for cosine, and measured by
+    /// the same arithmetic. What changes is which file is read - and, for a
+    /// fragment whose vectors cannot be read by offset (a layout other than bare
+    /// full-zip values, an overlay, a file under another base path), how: those
+    /// rows go through Lance's take, which [`RescoreReads::through_lance`]
+    /// counts and no count of bytes includes. A deleted candidate is dropped
+    /// before the read rather than after the measure, so
+    /// [`QueryResult::comparisons`] counts only the live ones.
+    ///
+    /// An index built with [`VectorSource::Dataset`] has no copy to read, and
+    /// re-scores from the dataset whatever this says.
+    ///
+    /// Refused for [`WalkMode::Exact`] and [`WalkMode::Coded`], which have no
+    /// re-score read to move: they read every vector along with the partition.
+    /// Refused as well, before anything is read, when the dataset cannot supply
+    /// the vectors the index was built over.
+    pub rescore_from_dataset: bool,
 }
 
 impl SearchParams {
@@ -424,6 +469,7 @@ impl SearchParams {
             rescore_budget: None,
             stop_margin: None,
             report_coded: false,
+            rescore_from_dataset: false,
         }
     }
 
@@ -480,6 +526,11 @@ impl SearchParams {
 
     pub fn with_report_coded(mut self, report_coded: bool) -> Self {
         self.report_coded = report_coded;
+        self
+    }
+
+    pub fn with_rescore_from_dataset(mut self, rescore_from_dataset: bool) -> Self {
+        self.rescore_from_dataset = rescore_from_dataset;
         self
     }
 }
@@ -540,11 +591,19 @@ pub struct RescoreReads {
     /// asked for without waiting - a platform other than Linux, a kernel older
     /// than 4.14, or a filesystem or sandbox that refuses `RWF_NOWAIT`.
     pub handed_off: u64,
-    /// Trips to the blocking pool to read: one for each partition's batch that
+    /// Trips to the blocking pool to read: one for each file's batch that
     /// handed off anything, however much, so up to one per probe a query
-    /// re-scores. The trip that opens a file's descriptor - on its first
+    /// re-scores - or, re-scoring from the dataset, per fragment its candidates
+    /// sit in. The trip that opens a file's descriptor - on its first
     /// re-score, and again after the open-file cap evicts it - is not counted.
     pub trips: u64,
+    /// Rows a re-score from the dataset read through Lance's take rather than
+    /// by offset, because their fragment's vectors cannot be read that way -
+    /// see [`SearchParams::rescore_from_dataset`]. Rows, not reads, and counted
+    /// whether or not the index has a cache. Lance reads them through its own
+    /// store, so their bytes are in no count at all: not the three above, not
+    /// [`VamanaIndex::io_stats`], not [`QueryResult::rescore`].
+    pub through_lance: u64,
 }
 
 impl RescoreReads {
@@ -555,6 +614,7 @@ impl RescoreReads {
             in_place: self.in_place.saturating_sub(earlier.in_place),
             handed_off: self.handed_off.saturating_sub(earlier.handed_off),
             trips: self.trips.saturating_sub(earlier.trips),
+            through_lance: self.through_lance.saturating_sub(earlier.through_lance),
         }
     }
 }
@@ -583,7 +643,11 @@ pub struct QueryResult {
     pub search: PhaseCost,
     /// Correcting that list: the vectors of the candidates a budget was spent
     /// on, and the exact distances measured against them. Zero for the modes
-    /// that hold every vector already and never re-score.
+    /// that hold every vector already and never re-score, and short of the
+    /// rows read through Lance's take ([`RescoreReads::through_lance`]). A
+    /// re-score from the dataset by an index given no cache also counts here
+    /// where each data file keeps the column - its tail and that column's
+    /// metadata - once for every file the query reads by offset.
     pub rescore: PhaseCost,
     /// The `k` this query would have answered with had it stopped after
     /// [`Self::search`]: the candidate list ranked by its *coded* distances,
@@ -605,8 +669,17 @@ pub struct VamanaIndex {
     /// still admits an entry and reclaims it when it next runs its housekeeping,
     /// so a partition read a moment ago is served from a cache that is supposed
     /// to be holding nothing. An index nobody asked to cache has to read every
-    /// time, not almost every time. See [`Self::with_cache`].
+    /// time, not almost every time. What it does remember is which of the
+    /// dataset's data files no offset read can serve, so as not to open one
+    /// again only to be sent to Lance: where a read goes rather than anything
+    /// a read returns, and the rows themselves are read every time. See
+    /// [`Self::with_cache`].
     cache: Option<LanceCache>,
+    /// Whether the index was opened for a pass that rewrites partitions, whose
+    /// cache holds only what it learns of the dataset's data files and whose
+    /// reads of them go through the scheduler. See
+    /// [`Self::open_for_maintenance`].
+    is_maintenance: bool,
     metadata: IndexMetadata,
     segments: Vec<Segment>,
     /// Fragments this index still answers for: what its segments were built
@@ -635,6 +708,12 @@ pub struct VamanaIndex {
     /// the only place those bytes are counted, and which of those reads went to
     /// the blocking pool.
     direct: Arc<DirectReads>,
+    /// The dataset's own copy of the indexed vectors. The only copy an index of
+    /// [`VectorSource::Dataset`] has, read by every re-score and by every pass
+    /// that repairs a partition - one whose rows only moved is written from
+    /// its own file; an index keeping its own reads it only for a query that
+    /// asks with [`SearchParams::rescore_from_dataset`].
+    dataset_vectors: DatasetVectors,
 }
 
 /// The stored vertices a walk must not return.
@@ -846,6 +925,14 @@ struct Probing {
 /// bytes are read and thrown away. A caller that times a query out and retries
 /// pays for both attempts.
 const PARTITIONS_IN_FLIGHT: usize = 4;
+
+/// What an index opened for a pass that rewrites partitions may keep: the
+/// layout of one column of each of the dataset's data files it reads, some
+/// twenty-four bytes for every 8 MiB page of that column - about 11 KiB for a
+/// file of a million 960-wide vectors, so the layouts of a few thousand such
+/// files. Past that the cache drops entries, which are read again when a
+/// partition asks, at the cost of a footer read and not of an answer.
+const MAINTENANCE_CACHE_BYTES: usize = 64 << 20;
 
 /// Every committed segment named `index_name`, in manifest order.
 ///
@@ -1122,19 +1209,22 @@ impl VamanaIndex {
             let other = segment.manifest.metadata();
             // Degree and pruning slack may legitimately differ between a base
             // segment and one appended later; the identifier space, the metric,
-            // the width and the codes may not, because a query mixes their
-            // answers - and one segment coded where another is not would make
-            // the walk mode mean two different things in one query.
+            // the width, the codes and where the vectors are may not, because a
+            // query mixes their answers - and one segment coded where another is
+            // not would make the walk mode mean two different things in one
+            // query.
             if (
                 other.dimension,
                 other.distance_type,
                 other.row_id_mode,
                 &other.codes,
+                other.vector_source,
             ) != (
                 metadata.dimension,
                 metadata.distance_type,
                 metadata.row_id_mode,
                 &metadata.codes,
+                metadata.vector_source,
             ) {
                 return Err(Error::index(format!(
                     "index '{index_name}' has segments that disagree about the vectors they hold: \
@@ -1157,6 +1247,26 @@ impl VamanaIndex {
         }
         supported_distance_type(metadata.distance_type)?;
 
+        let dataset_vectors = DatasetVectors::of(
+            dataset,
+            &segments[0].fields,
+            metadata.dimension,
+            metadata.distance_type,
+            &covered,
+        );
+        // Refused here rather than by the first query, which is where an index
+        // with a copy of its own finds out: this one has nothing else to read.
+        // Ahead of the delete list, which costs a read a fragment, because the
+        // manifest alone decides it.
+        if metadata.vector_source == VectorSource::Dataset
+            && let Some(reason) = dataset_vectors.unavailable()
+        {
+            return Err(Error::index(format!(
+                "index '{index_name}' leaves its vectors to the dataset, which cannot supply \
+                 them: {reason}; rebuild the index"
+            )));
+        }
+
         let deleted = deleted_row_addresses(dataset, &covered, store.io_parallelism()).await?;
         let moved = remap
             .filter(|_| segments.iter().any(|segment| segment.moved))
@@ -1171,6 +1281,7 @@ impl VamanaIndex {
         Ok(Self {
             scheduler,
             cache: None,
+            is_maintenance: false,
             metadata,
             segments,
             covered,
@@ -1183,7 +1294,28 @@ impl VamanaIndex {
             files: OpenFiles::new(OPEN_FILES),
             store,
             direct: Arc::new(DirectReads::default()),
+            dataset_vectors,
         })
+    }
+
+    /// [`Self::open`], for a pass that rewrites partitions - consolidation, a
+    /// merge, an insertion in place - which, for an index that leaves its
+    /// vectors to the dataset, reads the vectors of a partition it repairs out
+    /// of every fragment the partition's rows are in.
+    ///
+    /// Given a cache of its own for the length of the pass, so that where a
+    /// data file keeps its vectors is read out of the file's footer once
+    /// rather than once for every partition that reads from it, and so that
+    /// the file stays open between them, for as many files as an index holds
+    /// open ([`OPEN_FILES`]). Nothing else a pass reads goes through the cache.
+    /// Its reads of those files go through the scheduler rather than off
+    /// descriptors of its own: a partition read whole is thousands of rows
+    /// scattered over each file, which the scheduler reads in parallel.
+    pub(crate) async fn open_for_maintenance(dataset: &Dataset, index_name: &str) -> Result<Self> {
+        let mut index = Self::open(dataset, index_name).await?;
+        index.cache = Some(LanceCache::with_capacity(MAINTENANCE_CACHE_BYTES));
+        index.is_maintenance = true;
+        Ok(index)
     }
 
     /// Keep what a query reads about a partition, for the queries after it.
@@ -1205,11 +1337,12 @@ impl VamanaIndex {
     /// kept, which costs a re-read rather than an error.
     ///
     /// Nothing here has to be invalidated. Every entry describes one file of one
-    /// segment, and a segment is written once: deleting rows edits no index file
-    /// at all, and adding rows or consolidating writes a *new* segment under a
-    /// new uuid, so what an old entry describes is either still exactly true or
-    /// no longer named by anything. Which of the two it is decides only when the
-    /// budget reclaims it.
+    /// segment, or one column of a data file a re-score from the dataset read,
+    /// and each is written once: deleting rows edits no index file at all, adding rows or
+    /// consolidating writes a *new* segment under a new uuid, and Lance writes a
+    /// changed column to a new data file rather than into an old one. So what an
+    /// old entry describes is either still exactly true or no longer named by
+    /// anything. Which of the two it is decides only when the budget reclaims it.
     pub fn with_cache(mut self, cache: LanceCache) -> Self {
         self.cache = Some(cache);
         self
@@ -1218,9 +1351,10 @@ impl VamanaIndex {
     /// What the cache has served and what it holds, or `None` for an index that
     /// was never given one.
     ///
-    /// Counts both kinds of entry a query looks up - a partition's codes and a
-    /// partition file's layout - so a hit ratio here is per lookup rather than
-    /// per query.
+    /// Counts every kind of entry a query looks up - a partition's codes, a
+    /// partition file's layout, and the layout of the column a re-score from
+    /// the dataset reads out of a data file - so a hit ratio here is per lookup
+    /// rather than per query.
     pub async fn cache_stats(&self) -> Option<CacheStats> {
         let cache = self.cache.as_ref()?;
         Some(cache.stats().await)
@@ -1308,14 +1442,18 @@ impl VamanaIndex {
     /// them. With the partition files in the page cache none should be handed
     /// off, so a count here then means a batch over a megabyte, a filesystem or
     /// sandbox that refuses to read without waiting, or a platform other than
-    /// Linux. Zero throughout for an index not given a cache
-    /// ([`Self::with_cache`]), one whose store is not local or reads through
-    /// io_uring, or one off Unix: each of those re-scores through its
-    /// scheduler. Take it between passes, and difference two of them with
+    /// Linux. Zero throughout, [`RescoreReads::through_lance`] apart, for an
+    /// index not given a cache ([`Self::with_cache`]), one whose store is not
+    /// local or reads through io_uring, or one off Unix: each of those
+    /// re-scores through its scheduler. Take it between passes, and difference
+    /// two of them with
     /// [`RescoreReads::since`]: the counters are read one after the other, so
     /// while queries are in flight the split can be off by a batch.
     pub fn rescore_reads(&self) -> RescoreReads {
-        self.direct.split()
+        RescoreReads {
+            through_lance: self.dataset_vectors.lance_rows(),
+            ..self.direct.split()
+        }
     }
 
     /// What opening the index established about its segments, for the one
@@ -1424,6 +1562,27 @@ impl VamanaIndex {
                 )));
             }
         }
+        // Refused rather than ignored, like a budget: the caller is asking where
+        // a re-score reads, and these modes have no read of their own to move -
+        // they take every vector along with the partition.
+        if params.rescore_from_dataset && !matches!(params.mode, WalkMode::Lazy | WalkMode::Flat) {
+            return Err(Error::invalid_input(format!(
+                "rescore_from_dataset was set for {:?}, which has no re-score read to redirect: \
+                 it reads every vector of the partitions it probes along with them",
+                params.mode
+            )));
+        }
+        // Refused before the walk rather than by the read after it, which a
+        // query whose probes keep no live candidate never reaches: that one
+        // would answer as if the switch were off.
+        if params.rescore_from_dataset
+            && let Some(reason) = self.dataset_vectors.unavailable()
+        {
+            return Err(Error::invalid_input(format!(
+                "rescore_from_dataset was set, but the dataset cannot supply the vectors this \
+                 index was built over: {reason}"
+            )));
+        }
         if let Some(stop) = params.stop_rule() {
             if params.mode != WalkMode::Lazy {
                 return Err(Error::invalid_input(format!(
@@ -1450,6 +1609,16 @@ impl VamanaIndex {
                     stop.keep, params.search_list_size
                 )));
             }
+        }
+        if self.metadata.vector_source == VectorSource::Dataset
+            && matches!(params.mode, WalkMode::Exact | WalkMode::Coded)
+        {
+            return Err(Error::invalid_input(format!(
+                "this Vamana index leaves its vectors to the dataset, so {:?} cannot search it: \
+                 that mode reads partitions whole, vectors included, and they hold none; use \
+                 WalkMode::Lazy or WalkMode::Flat",
+                params.mode
+            )));
         }
         // Refused rather than answered exactly. A caller asking for a coded
         // walk is asking about cost, and quietly giving them a walk that reads
@@ -1926,15 +2095,45 @@ impl VamanaIndex {
                 comparisons: 0,
             });
         }
-        let rescored = lazy::rescore(
-            &probing.file,
-            probing.dimension,
-            self.metadata.distance_type,
-            &probing.candidates,
-            query,
-            stats,
-        )
-        .await?;
+        let rescored = if params.rescore_from_dataset
+            || self.metadata.vector_source == VectorSource::Dataset
+        {
+            // Admitted before the read rather than only after it, as `answer`
+            // does: a dead row can sit in a fragment the dataset no longer has,
+            // where there is nothing to read, and the answer drops it either way.
+            // The survivors keep the address the segment stored, which `answer`
+            // admits again and rewrites.
+            let (candidates, rows): (Vec<Candidate>, Vec<u64>) = probing
+                .candidates
+                .iter()
+                .filter_map(|candidate| {
+                    self.rows
+                        .admit(probing.segment, candidate.row_addr)
+                        .map(|current| (*candidate, current))
+                })
+                .unzip();
+            if candidates.is_empty() {
+                return Ok(Walked {
+                    neighbors: Vec::new(),
+                    comparisons: 0,
+                });
+            }
+            let values = self
+                .dataset_vectors
+                .fetch(&rows, stats, &self.file_access())
+                .await?;
+            lazy::measure(&candidates, &values, self.metadata.distance_type, query)?
+        } else {
+            lazy::rescore(
+                &probing.file,
+                probing.dimension,
+                self.metadata.distance_type,
+                &probing.candidates,
+                query,
+                stats,
+            )
+            .await?
+        };
         let comparisons = rescored.len() as u64;
         Ok(Walked {
             neighbors: answer(rescored, &self.rows, probing.segment, params.k)?,
@@ -1972,6 +2171,169 @@ impl VamanaIndex {
             coded,
         })
     }
+
+    /// How this index opens a dataset's data file: on the terms it opens its
+    /// own partition files.
+    fn file_access(&self) -> FileAccess<'_> {
+        FileAccess {
+            scheduler: &self.scheduler,
+            cache: self.cache.as_ref(),
+            local_reads: !self.is_maintenance,
+            store: &self.store,
+            direct: &self.direct,
+        }
+    }
+
+    /// One partition of `segment` read whole, for a pass that rewrites it.
+    ///
+    /// A segment that keeps its vectors reads them off its own file. One that
+    /// leaves them to the dataset reads its graph off its file and the vectors
+    /// of `vertices` out of the dataset: a live vertex's at the address its row
+    /// answers under now, a dead one's at the address it was stored under. A
+    /// dead vertex whose vector is not wanted gets zeros, which nothing reads -
+    /// a pass that asks for [`Vertices::Live`] takes the dead out before it
+    /// measures anything.
+    pub(crate) async fn read_partition_whole(
+        &self,
+        segment: &Segment,
+        entry: &PartitionEntry,
+        vertices: Vertices,
+    ) -> Result<Partition> {
+        let path = segment.dir.clone().join(entry.file.as_str());
+        let size_bytes = segment.file_sizes.get(&entry.file).copied();
+        match segment.manifest.metadata().vector_source {
+            VectorSource::Index => {
+                let reader = open_file(&self.scheduler, &path, None, size_bytes).await?;
+                read_partition(&reader, entry.num_rows).await
+            }
+            VectorSource::Dataset => {
+                let columns = [ROW_ID_COLUMN, NEIGHBORS_COLUMN];
+                let reader = open_file(&self.scheduler, &path, Some(&columns), size_bytes).await?;
+                let graph =
+                    graph_from_batch(&read_partition_batch(&reader, entry.num_rows).await?)?;
+                let vectors = self
+                    .vectors_from_dataset(segment, graph.row_ids(), vertices)
+                    .await?;
+                Partition::try_new(graph, vectors)
+            }
+        }
+    }
+
+    /// One partition of `segment` as its file holds it, and the address each of
+    /// its vertices answers under now, for a pass that writes it out again with
+    /// nothing changed but where its rows live
+    /// ([`SegmentWriter::write_readdressed`](crate::io::SegmentWriter::write_readdressed)).
+    ///
+    /// Every column the file has is read as one batch, no graph built of it and
+    /// no code taken again, the vectors included where the segment keeps them,
+    /// since the new file keeps them too; a segment that leaves them to the
+    /// dataset reads nothing of it.
+    /// Only for a partition none of whose vertices is dead, so every one of
+    /// them answers under some address: one that answers under none is an
+    /// error rather than a vertex written back where it was stored.
+    pub(crate) async fn read_readdressed(
+        &self,
+        segment: &Segment,
+        entry: &PartitionEntry,
+    ) -> Result<(RecordBatch, Vec<u64>)> {
+        let path = segment.dir.clone().join(entry.file.as_str());
+        let size_bytes = segment.file_sizes.get(&entry.file).copied();
+        let reader = open_file(&self.scheduler, &path, None, size_bytes).await?;
+        let stored = read_partition_batch(&reader, entry.num_rows).await?;
+        let row_ids = row_ids_from_batch(&stored)?
+            .into_iter()
+            .map(|stored_at| {
+                self.rows.admit(segment.uuid, stored_at).ok_or_else(|| {
+                    Error::internal(format!(
+                        "Vamana partition {} of segment {} was to be written out again with \
+                         nothing deleted from it, and its vertex at {stored_at} answers under no \
+                         address",
+                        entry.partition_id, segment.uuid
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((stored, row_ids))
+    }
+
+    /// The vectors of one partition's vertices, in local-id order, out of the
+    /// dataset.
+    async fn vectors_from_dataset(
+        &self,
+        segment: &Segment,
+        row_ids: &[u64],
+        vertices: Vertices,
+    ) -> Result<FixedSizeListArray> {
+        let (mut live, mut live_at) = (Vec::new(), Vec::new());
+        let (mut dead, mut dead_at) = (Vec::new(), Vec::new());
+        for (local_id, &stored) in row_ids.iter().enumerate() {
+            match self.rows.admit(segment.uuid, stored) {
+                Some(current) => {
+                    live.push(local_id);
+                    live_at.push(current);
+                }
+                None => {
+                    dead.push(local_id);
+                    dead_at.push(stored);
+                }
+            }
+        }
+        let stats = IoStats::new();
+        let access = self.file_access();
+        let read = self
+            .dataset_vectors
+            .fetch(&live_at, &stats, &access)
+            .await?;
+        if dead.is_empty() {
+            return Ok(read);
+        }
+
+        let width = self.metadata.dimension as usize;
+        let mut values = vec![0.0f32; row_ids.len() * width];
+        place(&mut values, &live, &read, width)?;
+        if vertices == Vertices::All {
+            let read = self
+                .dataset_vectors
+                .fetch_deleted(&dead_at, &stats, &access)
+                .await?;
+            place(&mut values, &dead, &read, width)?;
+        }
+        Ok(FixedSizeListArray::try_new_from_values(
+            Float32Array::from(values),
+            width as i32,
+        )?)
+    }
+}
+
+/// Whose vectors a pass that rewrites a partition measures against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Vertices {
+    /// The live vertices: consolidation and merging take the dead ones out
+    /// before they measure anything.
+    Live,
+    /// Every vertex: an insertion walks through the dead ones too.
+    All,
+}
+
+/// Copy the `n`th vector of `read` into the slot of the `n`th of `local_ids`.
+fn place(
+    values: &mut [f32],
+    local_ids: &[usize],
+    read: &FixedSizeListArray,
+    width: usize,
+) -> Result<()> {
+    let read = read.values().as_primitive::<Float32Type>().values();
+    if read.len() != local_ids.len() * width {
+        return Err(Error::internal(format!(
+            "the dataset gave {} values for {} vectors of width {width}",
+            read.len(),
+            local_ids.len()
+        )));
+    }
+    for (vector, &local_id) in read.chunks_exact(width).zip(local_ids) {
+        values[local_id * width..(local_id + 1) * width].copy_from_slice(vector);
+    }
+    Ok(())
 }
 
 /// Turn one partition's re-scored candidates into its share of the answer.
@@ -1998,8 +2360,8 @@ fn answer(
         return Err(Error::corrupt_file_named(
             "partition",
             format!(
-                "Vamana row {} is at distance {} from a finite query, so the vector stored for \
-                 it is not finite",
+                "Vamana row {} is at distance {} from a finite query, so the vector it was \
+                 measured against - the partition's copy, or the dataset's - is not finite",
                 candidate.row_addr, candidate.distance,
             ),
         ));
@@ -2171,7 +2533,7 @@ fn overlay_supersedes_segment(
 }
 
 /// Whether `field` is `ancestor` itself or sits beneath it in `schema`.
-fn descends_from(schema: &Schema, field: i32, ancestor: i32) -> bool {
+pub(crate) fn descends_from(schema: &Schema, field: i32, ancestor: i32) -> bool {
     schema
         .field_ancestry_by_id(field)
         .is_some_and(|ancestry| ancestry.iter().any(|step| step.id == ancestor))
@@ -2315,7 +2677,10 @@ pub async fn deleted_row_addresses(
 mod tests {
     use super::*;
 
+    use arrow_array::RecordBatchIterator;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance::dataset::WriteParams;
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_file::version::ConcreteFileVersion;
     use lance_table::format::DataFile;
     use lance_table::format::overlay::OverlayCoverage;
@@ -2323,6 +2688,11 @@ mod tests {
         FragDigest, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
     };
 
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
+
+    use crate::builder::{IndexParams, create_index};
+    use crate::codes::CodeSpec;
     use crate::partition::PartitionGraph;
 
     fn neighbors(pairs: &[(u64, f32)]) -> Vec<Neighbor> {
@@ -2590,6 +2960,80 @@ mod tests {
         assert_eq!(
             rows.readdress(base, partition).unwrap().graph().row_ids(),
             [address(1, 1), address(10, 1), address(4, 0)]
+        );
+    }
+
+    /// A pass that rewrites partitions reads where a data file keeps its
+    /// vectors once, however many partitions read from the file: an index
+    /// opened for it has a cache of its own, which every data file's layout is
+    /// loaded into once - and is not looked up again, since the file itself
+    /// stays open for the partitions after.
+    #[tokio::test]
+    async fn a_pass_lays_out_each_data_file_once_for_all_its_partitions() {
+        const FRAGMENTS: usize = 4;
+        const ROWS: usize = 400;
+        const WIDTH: i32 = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let mut rng = SmallRng::seed_from_u64(5);
+        let values = (0..ROWS * WIDTH as usize)
+            .map(|_| rng.random::<f32>())
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "vec",
+            Arc::new(
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), WIDTH).unwrap(),
+            ) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            dir.path().to_str().unwrap(),
+            Some(WriteParams {
+                max_rows_per_file: ROWS / FRAGMENTS,
+                max_rows_per_group: ROWS / FRAGMENTS,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), FRAGMENTS);
+        create_index(
+            &mut dataset,
+            "vamana_idx",
+            &IndexParams::new("vec", 2)
+                .with_codes(CodeSpec::Scalar { num_bits: 8 })
+                .with_vector_source(VectorSource::Dataset),
+        )
+        .await
+        .unwrap();
+
+        let index = VamanaIndex::open_for_maintenance(&dataset, "vamana_idx")
+            .await
+            .unwrap();
+        let mut partitions = 0;
+        for segment in index.segments() {
+            for entry in segment.manifest.partitions() {
+                let partition = index
+                    .read_partition_whole(segment, entry, Vertices::Live)
+                    .await
+                    .unwrap();
+                assert_eq!(partition.len(), entry.num_rows as usize);
+                partitions += 1;
+            }
+        }
+        assert!(
+            partitions > 1,
+            "one partition reads each file once whatever the pass does, so this tests nothing"
+        );
+        let stats = index
+            .cache_stats()
+            .await
+            .expect("an index opened for a pass was given no cache");
+        assert_eq!(
+            (stats.hits, stats.misses, stats.num_entries),
+            (0, FRAGMENTS as u64, FRAGMENTS),
+            "{stats:?}"
         );
     }
 }

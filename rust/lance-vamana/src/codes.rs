@@ -4,8 +4,9 @@
 //! Quantised codes: what a walk steers by when it will not read a vector.
 //!
 //! A partition file may carry one [`CODE_COLUMN`] value per vertex beside its
-//! vector and its edges, and a walk given one measures its distances against
-//! that column instead of `__vector`. What the column is *for* is the disk
+//! edges and, unless the index leaves its vectors to the dataset, its vector,
+//! and a walk given one measures its distances against that column instead of
+//! `__vector`. What the column is *for* is the disk
 //! traversal: codes small enough to keep resident are what leaves a walk with
 //! only the edges of the vertices it expands to fetch. On their own they buy
 //! nothing - a partition is still read whole - and cost thirteen per cent of the

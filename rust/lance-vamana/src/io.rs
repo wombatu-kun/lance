@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use arrow_array::{FixedSizeListArray, RecordBatch};
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field};
 use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
@@ -36,10 +38,10 @@ use prost::Message;
 use crate::cache::FileKey;
 use crate::codes::encode;
 use crate::format::{
-    INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, VECTOR_COLUMN,
-    index_schema, partition_file_name,
+    INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, ROW_ID_COLUMN,
+    VECTOR_COLUMN, VectorSource, index_schema, partition_file_name, partition_schema,
 };
-use crate::partition::{Partition, row_ids_from_batch};
+use crate::partition::{Partition, graph_from_batch, row_ids_from_batch};
 use crate::query::RescoreReads;
 use crate::raw::{self, VectorLayout};
 use crate::segment::{PartitionEntry, SegmentManifest};
@@ -57,6 +59,7 @@ pub async fn write_partition(
     path: &Path,
     partition: &Partition,
     codes: Option<&FixedSizeListArray>,
+    vector_source: VectorSource,
 ) -> Result<u64> {
     // The format says an empty partition gets no row in `index.idx` and no file.
     // `SegmentWriter` enforces that; this function is public and delegated to, so
@@ -66,7 +69,58 @@ pub async fn write_partition(
             "Vamana will not write a file for an empty partition".to_string(),
         ));
     }
-    let batch = partition.to_batch(codes)?;
+    write_batch(store, path, &partition.to_batch(codes, vector_source)?).await
+}
+
+/// The column of `stored` that `field` names, as `field` declares it: a
+/// fixed-size list of that width and item type with no null at either level,
+/// under the non-nullable item field [`partition_schema`] declares.
+///
+/// Lance hands every fixed-size list back with a nullable item field, whatever
+/// it was written with, so the values are the ones written and the type is
+/// not the declared one, which `RecordBatch::try_new` would refuse.
+fn carried(stored: &RecordBatch, field: &Field, file: &str) -> Result<ArrayRef> {
+    let name = field.name();
+    let corrupt = |reason: String| {
+        Error::corrupt_file_named(file, format!("Vamana partition column {name} {reason}"))
+    };
+    let DataType::FixedSizeList(item, width) = field.data_type() else {
+        return Err(Error::internal(format!(
+            "Vamana partition column {name} is declared {}, not a fixed-size list",
+            field.data_type()
+        )));
+    };
+    let column = stored
+        .column_by_name(name)
+        .ok_or_else(|| corrupt("is missing".to_string()))?;
+    let list = column
+        .as_fixed_size_list_opt()
+        .ok_or_else(|| corrupt(format!("is {}, not a fixed-size list", column.data_type())))?;
+    if list.value_length() != *width || list.value_type() != *item.data_type() {
+        return Err(corrupt(format!(
+            "holds {} x {} a row where the segment declares {width} x {}",
+            list.value_length(),
+            list.value_type(),
+            item.data_type()
+        )));
+    }
+    let length = *width as usize;
+    let values = list
+        .values()
+        .slice(list.offset() * length, list.len() * length);
+    if list.null_count() != 0 || values.null_count() != 0 {
+        return Err(corrupt("holds nulls".to_string()));
+    }
+    Ok(Arc::new(FixedSizeListArray::try_new(
+        item.clone(),
+        *width,
+        values,
+        None,
+    )?))
+}
+
+/// Write `batch` as a partition file and return the size of the file in bytes.
+async fn write_batch(store: &ObjectStore, path: &Path, batch: &RecordBatch) -> Result<u64> {
     let schema = lance_core::datatypes::Schema::try_from(batch.schema().as_ref())?;
     let mut writer = create_writer(
         SEGMENT_FILE_VERSION,
@@ -74,7 +128,7 @@ pub async fn write_partition(
         schema,
         FileWriterOptions::default(),
     )?;
-    writer.write_batch(&batch).await?;
+    writer.write_batch(batch).await?;
     Ok(writer.finish().await?.size_bytes)
 }
 
@@ -121,7 +175,8 @@ pub struct PartitionFile {
     local: Option<LocalReads>,
 }
 
-/// A partition file open for reading without going through the scheduler.
+/// A file - a partition file, or one of the dataset's data files - open for
+/// reading without going through the scheduler.
 ///
 /// The scheduler's job on a local file is to bound how many reads are in flight
 /// and to move each one onto the blocking pool. For a re-score neither buys
@@ -154,7 +209,7 @@ pub struct PartitionFile {
 /// of the walk before it, as it had while every batch took the trip. At twelve
 /// queries in flight it fell to 0.39-0.64 of what it was.
 #[derive(Clone)]
-struct LocalReads {
+pub(crate) struct LocalReads {
     /// The scheduler's own coalescing parameters, kept so that reading by hand
     /// moves the same bytes in the same number of reads.
     block_size: u64,
@@ -170,6 +225,171 @@ struct LocalReads {
     /// would hold a descriptor for nothing, and opening one is a blocking call
     /// that has no business on a runtime worker.
     file: Arc<OnceLock<std::fs::File>>,
+}
+
+impl LocalReads {
+    /// Reads of this crate's own for the files of `store`, if it is local
+    /// storage and the platform has positional reads; `None` otherwise.
+    ///
+    /// `has_direct_local_paths` and not `is_local`, because that is the
+    /// predicate Lance's own reader dispatch turns on: a local store rooted
+    /// below `/` addresses its objects relative to that root, and
+    /// `to_local_path` would name an absolute path somewhere else entirely. The
+    /// failure would be silent rather than loud - a descriptor on another inode,
+    /// read at this file's offsets. `file+uring` is left out for the opposite
+    /// reason: a caller who configured io_uring asked for the scheduler, and
+    /// substituting synchronous reads would undo what they chose.
+    pub(crate) fn for_store(store: &ObjectStore, direct: &Arc<DirectReads>) -> Option<Self> {
+        (cfg!(unix) && store.has_direct_local_paths() && !store.prefers_lite_scheduler()).then(
+            || Self {
+                block_size: store.block_size() as u64,
+                max_iop_size: store.max_iop_size(),
+                in_place_bytes: if cfg!(target_os = "linux") {
+                    IN_PLACE_BYTES
+                } else {
+                    0
+                },
+                direct: direct.clone(),
+                file: Arc::new(OnceLock::new()),
+            },
+        )
+    }
+
+    /// The descriptor of the file at `path` a re-score reads through, opened
+    /// the first time one asks.
+    ///
+    /// `None` when opening it failed, which means the scheduler reads the same
+    /// bytes instead. The open runs off the worker: it is a blocking syscall,
+    /// and Lance's own local reader takes the same care with the same call.
+    async fn descriptor(&self, path: &Path) -> Option<&std::fs::File> {
+        if self.file.get().is_none() {
+            let path = to_local_path(path);
+            if let Ok(Ok(opened)) =
+                tokio::task::spawn_blocking(move || std::fs::File::open(path)).await
+            {
+                // The loser of a race drops its descriptor here rather than
+                // publishing a second one.
+                let _ = self.file.set(opened);
+            }
+        }
+        self.file.get()
+    }
+}
+
+/// One file as a read by offset sees it, whichever kind it is: where it is, the
+/// scheduler it is open through, and reads of this crate's own when it has
+/// them.
+pub(crate) struct OffsetFile<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) file: &'a FileScheduler,
+    pub(crate) local: Option<&'a LocalReads>,
+}
+
+impl OffsetFile<'_> {
+    /// The vectors of `rows` out of this file, laid out as `layout` says,
+    /// fetched by byte offset instead of decoded.
+    ///
+    /// The bytes are coalesced and counted exactly as the scheduler's would be,
+    /// whoever reads them: the scheduler, unless the file has reads of its own
+    /// and could open its descriptor, and that descriptor when it could - see
+    /// [`LocalReads`] for which thread does that, and `in_place` for what is
+    /// tried on the calling thread first. What is skipped is the decoder.
+    /// `rows` must ascend, which the scheduler requires and a candidate list
+    /// already satisfies.
+    pub(crate) async fn read_vectors(
+        &self,
+        layout: &VectorLayout,
+        rows: &[u32],
+        dimension: u32,
+        stats: &IoStats,
+        in_place: impl Fn(&std::fs::File, &mut [u8], u64) -> bool,
+    ) -> Result<FixedSizeListArray> {
+        let wanted = layout.ranges(rows)?;
+        let local = match self.local {
+            Some(local) => local.descriptor(self.path).await.map(|file| (local, file)),
+            None => None,
+        };
+        let Some((local, file)) = local else {
+            let chunks = self
+                .file
+                .with_io_stats(stats.recorder())
+                .submit_request(wanted, 0)
+                .await?;
+            return raw::vectors(chunks.iter().map(|chunk| chunk.as_ref()), dimension);
+        };
+
+        let reads = raw::coalesced(&wanted, local.block_size, local.max_iop_size);
+        let planned = reads.iter().map(|read| read.end - read.start).sum::<u64>();
+
+        // Every read the page cache serves is done here and now; the rest are
+        // handed off below, and so is the whole of a batch over the limit.
+        let mut blocks = vec![Vec::new(); reads.len()];
+        let pending = if planned > local.in_place_bytes {
+            (0..reads.len()).collect::<Vec<_>>()
+        } else {
+            let mut pending = Vec::new();
+            for (index, (read, block)) in reads.iter().zip(&mut blocks).enumerate() {
+                block.resize((read.end - read.start) as usize, 0);
+                if !in_place(file, block, read.start) {
+                    pending.push(index);
+                }
+            }
+            pending
+        };
+
+        // One trip for all of them. Each is a blocking syscall, and there can be
+        // one per candidate, which without a re-score budget is the whole search
+        // list - leaving that on a runtime worker would hold it through every one
+        // of them with nowhere to yield.
+        let handed = pending
+            .iter()
+            .map(|&index| reads[index].clone())
+            .collect::<Vec<_>>();
+        if !handed.is_empty() {
+            let descriptor = local.file.clone();
+            let batch = handed.clone();
+            let fetched = tokio::task::spawn_blocking(move || {
+                let Some(file) = descriptor.get() else {
+                    return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+                };
+                batch
+                    .iter()
+                    .map(|read| {
+                        let mut block = vec![0u8; (read.end - read.start) as usize];
+                        read_at(file, &mut block, read.start).map(|()| block)
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()
+            })
+            .await
+            .map_err(|source| Error::io(format!("Vamana re-score read was cancelled: {source}")))?
+            .map_err(|source| {
+                Error::io(format!(
+                    "Vamana could not read {reads:?} of {}: {source}",
+                    self.path
+                ))
+            })?;
+            for (&index, block) in pending.iter().zip(fetched) {
+                blocks[index] = block;
+            }
+        }
+
+        // Counted here because nothing else counts them at all: these bytes never
+        // reach the scheduler, so the query's own sink and the index's running
+        // total both have to be told by hand, and told the same reads whichever
+        // thread made them. After the reads and not before, so that a read that
+        // failed is not charged to an index for the rest of its life - the
+        // scheduler charges first and would have, but a number that survives its
+        // own failure is worse than one that matches it. The trip is counted
+        // only when there was one: an empty request still counts as a request.
+        stats.record_request(&reads);
+        local.direct.totals.record_request(&reads);
+        if !handed.is_empty() {
+            local.direct.handed_off.record_request(&handed);
+        }
+
+        let slices = raw::slices(&wanted, &reads, &blocks)?;
+        raw::vectors(slices.iter().map(|slice| slice.as_ref()), dimension)
+    }
 }
 
 /// What an index read off its own descriptors rather than through its
@@ -198,9 +418,9 @@ impl Default for DirectReads {
 impl DirectReads {
     /// The reads counted here, split by the thread that made them.
     ///
-    /// The two counters are read one after the other, so while a re-score is in
-    /// flight the split can be off by that re-score's batch; between passes it
-    /// is exact.
+    /// The two counters are read one after the other, so while re-scores are
+    /// in flight the split can be off by their batches; between passes it is
+    /// exact.
     pub(crate) fn split(&self) -> RescoreReads {
         let totals = self.totals.snapshot();
         let handed_off = self.handed_off.snapshot();
@@ -208,15 +428,18 @@ impl DirectReads {
             in_place: totals.iops.saturating_sub(handed_off.iops),
             handed_off: handed_off.iops,
             trips: handed_off.requests,
+            // Not a read off a descriptor; the index adds it from where it
+            // counts it.
+            through_lance: 0,
         }
     }
 }
 
-/// The most one partition's share of a re-score reads on the thread that asked
-/// for it.
+/// The most one file's share of a re-score reads on the thread that asked for
+/// it: a partition's batch, or, re-scoring from the dataset, one data file's.
 ///
-/// A query re-scoring several partitions is held to it once for each, one after
-/// another on the worker polling them. A batch the page cache holds costs a copy
+/// A query re-scoring several partitions is held to it once for each file, one
+/// after another on the worker polling them. A batch the page cache holds costs a copy
 /// a byte whichever thread copies it, so the only question is which. For a
 /// re-score with a budget of twenty - at most twenty vectors in one partition's
 /// batch, 10 to 77 kB from `d = 128` to `d = 960` - it is the thread that asked:
@@ -255,7 +478,7 @@ fn read_at(_file: &std::fs::File, _buf: &mut [u8], _offset: u64) -> std::io::Res
 /// into a buffer of its own: anything already copied into `buf` is thrown away
 /// with it, so a partial copy never has to be trusted.
 #[cfg(target_os = "linux")]
-fn read_now(file: &std::fs::File, buf: &mut [u8], offset: u64) -> bool {
+pub(crate) fn read_now(file: &std::fs::File, buf: &mut [u8], offset: u64) -> bool {
     let wanted = buf.len();
     let outcome = rustix::io::preadv2(
         file,
@@ -267,7 +490,7 @@ fn read_now(file: &std::fs::File, buf: &mut [u8], offset: u64) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_now(_file: &std::fs::File, _buf: &mut [u8], _offset: u64) -> bool {
+pub(crate) fn read_now(_file: &std::fs::File, _buf: &mut [u8], _offset: u64) -> bool {
     false
 }
 
@@ -463,7 +686,8 @@ impl PartitionFile {
     }
 
     /// Open this file a second time for reading directly, if `store` is local
-    /// storage and the platform has positional reads.
+    /// storage and the platform has positional reads - see
+    /// [`LocalReads::for_store`].
     ///
     /// A builder step rather than part of opening, because only a query wants
     /// it: a build or a maintenance pass reads whole columns once, where the
@@ -474,55 +698,13 @@ impl PartitionFile {
     /// `direct` is where the caller counts everything this file reads without
     /// its scheduler, and which of it went to the blocking pool; the caller has
     /// to add the first to whatever the scheduler reports.
-    ///
-    /// `has_direct_local_paths` and not `is_local`, because that is the
-    /// predicate Lance's own reader dispatch turns on: a local store rooted
-    /// below `/` addresses its objects relative to that root, and
-    /// `to_local_path` would name an absolute path somewhere else entirely. The
-    /// failure would be silent rather than loud - a descriptor on another inode,
-    /// read at this file's offsets. `file+uring` is left out for the opposite
-    /// reason: a caller who configured io_uring asked for the scheduler, and
-    /// substituting synchronous reads would undo what they chose.
     pub(crate) fn with_local_reads(
         mut self,
         store: &ObjectStore,
         direct: &Arc<DirectReads>,
     ) -> Self {
-        if cfg!(unix) && store.has_direct_local_paths() && !store.prefers_lite_scheduler() {
-            self.local = Some(LocalReads {
-                block_size: store.block_size() as u64,
-                max_iop_size: store.max_iop_size(),
-                in_place_bytes: if cfg!(target_os = "linux") {
-                    IN_PLACE_BYTES
-                } else {
-                    0
-                },
-                direct: direct.clone(),
-                file: Arc::new(OnceLock::new()),
-            });
-        }
+        self.local = LocalReads::for_store(store, direct);
         self
-    }
-
-    /// The descriptor a re-score reads through, opened the first time one asks.
-    ///
-    /// `None` when this file has none to open or opening it failed, both of
-    /// which mean the scheduler reads the same bytes instead. The open runs off
-    /// the worker: it is a blocking syscall, and Lance's own local reader takes
-    /// the same care with the same call.
-    async fn local_reads(&self) -> Option<(&LocalReads, &std::fs::File)> {
-        let local = self.local.as_ref()?;
-        if local.file.get().is_none() {
-            let path = to_local_path(&self.path);
-            if let Ok(Ok(opened)) =
-                tokio::task::spawn_blocking(move || std::fs::File::open(path)).await
-            {
-                // The loser of a race drops its descriptor here rather than
-                // publishing a second one.
-                let _ = local.file.set(opened);
-            }
-        }
-        Some((local, local.file.get()?))
     }
 
     /// Whether this file will read its vectors off the disk itself. Says
@@ -539,14 +721,7 @@ impl PartitionFile {
     /// is not the width the segment declares - both mean the caller has to read
     /// the ordinary way, and the second of them is left to the decoder on
     /// purpose, so that a mismatched width is reported by the check that has
-    /// always reported it.
-    ///
-    /// The bytes are coalesced and counted exactly as the scheduler's would be,
-    /// whoever reads them: the scheduler, unless this file was bound by
-    /// [`Self::with_local_reads`] and could open its descriptor, and that
-    /// descriptor when it was - see [`LocalReads`] for which thread does that.
-    /// What is skipped is the decoder. `rows` must ascend, which the scheduler
-    /// requires and a candidate list already satisfies.
+    /// always reported it. See [`OffsetFile::read_vectors`] for the rest.
     pub(crate) async fn read_vectors(
         &self,
         rows: &[u32],
@@ -580,87 +755,14 @@ impl PartitionFile {
         if layout.items() != u64::from(dimension) || layout.stride() != u64::from(dimension) * 4 {
             return Ok(None);
         }
-        let wanted = layout.ranges(rows)?;
-        let Some((local, file)) = self.local_reads().await else {
-            let chunks = self
-                .file
-                .with_io_stats(stats.recorder())
-                .submit_request(wanted, 0)
-                .await?;
-            return raw::vectors(chunks.iter().map(|chunk| chunk.as_ref()), dimension).map(Some);
-        };
-
-        let reads = raw::coalesced(&wanted, local.block_size, local.max_iop_size);
-        let planned = reads.iter().map(|read| read.end - read.start).sum::<u64>();
-
-        // Every read the page cache serves is done here and now; the rest are
-        // handed off below, and so is the whole of a batch over the limit.
-        let mut blocks = vec![Vec::new(); reads.len()];
-        let pending = if planned > local.in_place_bytes {
-            (0..reads.len()).collect::<Vec<_>>()
-        } else {
-            let mut pending = Vec::new();
-            for (index, (read, block)) in reads.iter().zip(&mut blocks).enumerate() {
-                block.resize((read.end - read.start) as usize, 0);
-                if !in_place(file, block, read.start) {
-                    pending.push(index);
-                }
-            }
-            pending
-        };
-
-        // One trip for all of them. Each is a blocking syscall, and there can be
-        // one per candidate, which without a re-score budget is the whole search
-        // list - leaving that on a runtime worker would hold it through every one
-        // of them with nowhere to yield.
-        let handed = pending
-            .iter()
-            .map(|&index| reads[index].clone())
-            .collect::<Vec<_>>();
-        if !handed.is_empty() {
-            let descriptor = local.file.clone();
-            let batch = handed.clone();
-            let fetched = tokio::task::spawn_blocking(move || {
-                let Some(file) = descriptor.get() else {
-                    return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
-                };
-                batch
-                    .iter()
-                    .map(|read| {
-                        let mut block = vec![0u8; (read.end - read.start) as usize];
-                        read_at(file, &mut block, read.start).map(|()| block)
-                    })
-                    .collect::<std::io::Result<Vec<_>>>()
-            })
-            .await
-            .map_err(|source| Error::io(format!("Vamana re-score read was cancelled: {source}")))?
-            .map_err(|source| {
-                Error::io(format!(
-                    "Vamana could not read {reads:?} of {}: {source}",
-                    self.path
-                ))
-            })?;
-            for (&index, block) in pending.iter().zip(fetched) {
-                blocks[index] = block;
-            }
+        OffsetFile {
+            path: &self.path,
+            file: &self.file,
+            local: self.local.as_ref(),
         }
-
-        // Counted here because nothing else counts them at all: these bytes never
-        // reach the scheduler, so the query's own sink and the index's running
-        // total both have to be told by hand, and told the same reads whichever
-        // thread made them. After the reads and not before, so that a read that
-        // failed is not charged to an index for the rest of its life - the
-        // scheduler charges first and would have, but a number that survives its
-        // own failure is worse than one that matches it. The trip is counted
-        // only when there was one: an empty request still counts as a request.
-        stats.record_request(&reads);
-        local.direct.totals.record_request(&reads);
-        if !handed.is_empty() {
-            local.direct.handed_off.record_request(&handed);
-        }
-
-        let slices = raw::slices(&wanted, &reads, &blocks)?;
-        raw::vectors(slices.iter().map(|slice| slice.as_ref()), dimension).map(Some)
+        .read_vectors(layout, rows, dimension, stats, in_place)
+        .await
+        .map(Some)
     }
 
     /// The reader over every column.
@@ -669,7 +771,9 @@ impl PartitionFile {
     }
 }
 
-/// How many partition files an index keeps open at once.
+/// How many partition files an index keeps open at once - and, in a pool of
+/// their own, how many of the dataset's data files a re-score from the dataset
+/// keeps open, so an index can hold twice this many entries.
 ///
 /// A descriptor is a real resource and an index can hold thousands of
 /// partitions, so this is a cap and not a count. What it caps is entries, and an
@@ -689,8 +793,9 @@ impl PartitionFile {
 /// time wants more, and a caller cannot say so yet.
 pub const OPEN_FILES: usize = 64;
 
-/// The partition files an index has open, shared by every query that probes
-/// them.
+/// The files an index has open - its partition files in one pool, the data
+/// files a re-score from the dataset reads in another - shared by every query
+/// that reads them.
 ///
 /// Opening one is not a read and so is not bounded by anything a read is bounded
 /// by: `ScanScheduler::open_file` on local storage is
@@ -699,39 +804,49 @@ pub const OPEN_FILES: usize = 64;
 /// that comes with it has been shared through the cache since the cache existed;
 /// the descriptor never was.
 ///
-/// It also pins what the handle holds, which is more than a descriptor: the
-/// footer the reader was built from is an `Arc<CachedFileMetadata>` shared with
-/// the cache, so the cache can evict its entry and reclaim nothing. A few
-/// kilobytes a file at the partition sizes this crate is written for, tens of
-/// megabytes for sixty-four files of a million 960-wide rows.
+/// It also pins what the handle holds, which is more than a descriptor. For a
+/// partition file, the footer the reader was built from is an
+/// `Arc<CachedFileMetadata>` shared with the cache, so the cache can evict its
+/// entry and reclaim nothing: a few kilobytes a file at the partition sizes
+/// this crate is written for. A data file's handle holds the layout of its one
+/// column and nothing of its footer - [`crate::data_file`] reads no more of it.
 ///
 /// A handle is stored with the sink of whichever query opened it still bound on,
 /// and that sink is never used again: every handout rebinds
 /// ([`PartitionFile::with_io_stats`] replaces the recorder rather than adding
-/// one), and the raw handle never leaves this type. Storing it that way rather
-/// than sink-free keeps the accounting exactly where it was - the query that
-/// opens a file pays for its footer, the queries that share it pay for nothing -
-/// so a query's two phases still add up to what the scheduler counted for it
-/// even when a handle is evicted and opened again mid-run.
-pub(crate) struct OpenFiles {
+/// one), and the raw handle leaves this type only through [`OpenFiles::held`]
+/// and [`OpenFiles::hold`], for reads that bind a sink of their own. Storing it
+/// that way rather than sink-free keeps the accounting exactly where it was -
+/// the query that opens a file pays for its footer, the queries that share it
+/// pay for nothing - so a query's two phases still add up to what the scheduler
+/// counted for it even when a handle is evicted and opened again mid-run.
+pub(crate) struct OpenFiles<F = PartitionFile> {
     cap: usize,
-    inner: Mutex<Opened>,
+    inner: Mutex<Opened<F>>,
 }
 
-#[derive(Default)]
-struct Opened {
-    files: HashMap<Path, Handle>,
+struct Opened<F> {
+    files: HashMap<Path, Handle<F>>,
     /// Stamped onto a handle whenever it is looked up, so the smallest stamp is
     /// the least recently used.
     tick: u64,
 }
 
-struct Handle {
-    file: Arc<PartitionFile>,
+impl<F> Default for Opened<F> {
+    fn default() -> Self {
+        Self {
+            files: HashMap::new(),
+            tick: 0,
+        }
+    }
+}
+
+struct Handle<F> {
+    file: Arc<F>,
     used: u64,
 }
 
-impl std::fmt::Debug for OpenFiles {
+impl<F> std::fmt::Debug for OpenFiles<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let held = self.inner.lock().map(|open| open.files.len()).ok();
         f.debug_struct("OpenFiles")
@@ -741,7 +856,7 @@ impl std::fmt::Debug for OpenFiles {
     }
 }
 
-impl OpenFiles {
+impl<F> OpenFiles<F> {
     pub(crate) fn new(cap: usize) -> Self {
         Self {
             cap,
@@ -749,25 +864,30 @@ impl OpenFiles {
         }
     }
 
-    /// The open file for `path` with `stats` bound onto it, if this index still
-    /// holds one.
-    pub(crate) fn get(&self, path: &Path, stats: &IoStats) -> Option<PartitionFile> {
+    /// The open file for `path` as it is held - bound to the counters of the
+    /// query that opened it - if this index still holds one.
+    ///
+    /// Only for reads that bind counters of their own, which
+    /// [`OffsetFile::read_vectors`] does - and a data file is asked for nothing
+    /// else. [`OpenFiles::get`]'s rebinding clones a reader and a scheduler on
+    /// every call, and such a read never looks at what they were bound to.
+    pub(crate) fn held(&self, path: &Path) -> Option<Arc<F>> {
         let mut open = self.inner.lock().ok()?;
         open.tick += 1;
         let tick = open.tick;
         let handle = open.files.get_mut(path)?;
         handle.used = tick;
-        Some(handle.file.with_io_stats(stats))
+        Some(handle.file.clone())
     }
 
-    /// Hold `file` for the queries after this one, and return the handle they
-    /// will all share, with `stats` bound onto it.
+    /// [`OpenFiles::put`] without the rebinding, for the reads [`Self::held`]
+    /// is for.
     ///
     /// Keeps what is already held under `path` when there is one rather than
     /// replacing it: two queries that miss on the same partition at the same
     /// moment both open the file, and the loser's handle is dropped here so that
     /// both of them read through one descriptor rather than two.
-    pub(crate) fn put(&self, path: &Path, file: PartitionFile, stats: &IoStats) -> PartitionFile {
+    pub(crate) fn hold(&self, path: &Path, file: F) -> Arc<F> {
         // Both of these hold descriptors, and both are dropped after the guard
         // goes out of scope: closing a file on a slow mount inside the lock
         // would stall every other query's lookup behind it.
@@ -775,20 +895,19 @@ impl OpenFiles {
         let mut evicted = Vec::new();
         let shared = {
             let Ok(mut open) = self.inner.lock() else {
-                return file;
+                return Arc::new(file);
             };
             open.tick += 1;
             let tick = open.tick;
             match open.files.get_mut(path) {
                 Some(handle) => {
                     handle.used = tick;
-                    let shared = handle.file.with_io_stats(stats);
                     loser = Some(file);
-                    shared
+                    handle.file.clone()
                 }
                 None => {
                     let held = Arc::new(file);
-                    let shared = held.with_io_stats(stats);
+                    let shared = held.clone();
                     open.files.insert(
                         path.clone(),
                         Handle {
@@ -816,6 +935,20 @@ impl OpenFiles {
         drop(loser);
         drop(evicted);
         shared
+    }
+}
+
+impl OpenFiles {
+    /// The open file for `path` with `stats` bound onto it, if this index still
+    /// holds one.
+    pub(crate) fn get(&self, path: &Path, stats: &IoStats) -> Option<PartitionFile> {
+        self.held(path).map(|file| file.with_io_stats(stats))
+    }
+
+    /// Hold `file` for the queries after this one, and return the handle they
+    /// will all share, with `stats` bound onto it.
+    pub(crate) fn put(&self, path: &Path, file: PartitionFile, stats: &IoStats) -> PartitionFile {
+        self.hold(path, file).with_io_stats(stats)
     }
 }
 
@@ -974,7 +1107,11 @@ pub async fn read_partition_batch(reader: &FileReader, expected_rows: u32) -> Re
     read_rows(reader, 0..expected_rows as usize).await
 }
 
-/// Read a whole partition back into memory.
+/// Read a whole partition back into memory, vectors and all.
+///
+/// For a segment that keeps its vectors. A partition of one that leaves them to
+/// the dataset has no [`VECTOR_COLUMN`] to read, which this reports as a missing
+/// column: the vectors of such a partition are the dataset's to give.
 pub async fn read_partition(reader: &FileReader, expected_rows: u32) -> Result<Partition> {
     Partition::try_from_batch(&read_partition_batch(reader, expected_rows).await?)
 }
@@ -1138,7 +1275,14 @@ impl SegmentWriter {
 
         let file = partition_file_name(partition_id);
         let path = self.dir.clone().join(file.as_str());
-        let size = write_partition(&self.store, &path, partition, codes.as_ref()).await?;
+        let size = write_partition(
+            &self.store,
+            &path,
+            partition,
+            codes.as_ref(),
+            self.metadata.vector_source,
+        )
+        .await?;
         self.partitions.push(PartitionEntry {
             partition_id,
             medoid,
@@ -1173,45 +1317,7 @@ impl SegmentWriter {
         from: &SegmentManifest,
         partition_id: u32,
     ) -> Result<()> {
-        let entry = from.partition(partition_id).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Vamana was asked to copy partition {partition_id}, which the source segment does \
-                 not list"
-            ))
-        })?;
-        for (what, source, mine) in [
-            (
-                "max_degree",
-                from.metadata().max_degree,
-                self.metadata.max_degree,
-            ),
-            (
-                "dimension",
-                from.metadata().dimension,
-                self.metadata.dimension,
-            ),
-        ] {
-            if source != mine {
-                return Err(Error::invalid_input(format!(
-                    "Vamana cannot copy partition {partition_id} from a segment declaring {what} \
-                     {source} into one declaring {mine}"
-                )));
-            }
-        }
-        // Codes are bytes quantised under one rotation, and nothing downstream
-        // reads a rotation back off a partition file: copied into a segment
-        // declaring another one, they would be decoded into distances that are
-        // meaningless rather than approximate. Equality of the whole parameters
-        // is the check because the rotation is inside them, and it is what makes
-        // "one rotation per index" enforced rather than merely inherited.
-        if from.metadata().codes != self.metadata.codes {
-            return Err(Error::invalid_input(format!(
-                "Vamana cannot copy partition {partition_id} between segments whose codes \
-                 disagree; the rotation a code was built under is not recoverable from it"
-            )));
-        }
-        self.check_entry(partition_id, entry.medoid, entry.num_rows)?;
-
+        let entry = self.carried_entry(from, partition_id)?;
         let file = partition_file_name(partition_id);
         let from_path = from_dir.clone().join(entry.file.as_str());
         let to_path = self.dir.clone().join(file.as_str());
@@ -1233,6 +1339,163 @@ impl SegmentWriter {
             file,
         });
         Ok(())
+    }
+
+    /// Write partition `partition_id` of `from` into this segment as `stored`,
+    /// the batch its file holds, with every vertex at `row_ids` instead of the
+    /// address it was stored under.
+    ///
+    /// For a partition whose rows a deferred compaction moved and nothing else
+    /// touched: the graph, the codes and any vectors it keeps are what they
+    /// were, so they are carried over as read rather than built into a graph
+    /// and coded
+    /// again - a code is a function of a vector and the partition's centroid,
+    /// and neither moved with the row. That is also what spares a segment
+    /// without vectors from reading every one of them out of the dataset.
+    ///
+    /// Checked as [`Self::copy_partition`] checks, and then for what a copy
+    /// never has to: that `stored` is the shape both segments declare, and
+    /// that the centroid its codes were taken against is this segment's.
+    pub(crate) async fn write_readdressed(
+        &mut self,
+        from: &SegmentManifest,
+        partition_id: u32,
+        stored: &RecordBatch,
+        row_ids: Vec<u64>,
+    ) -> Result<u64> {
+        let entry = self.carried_entry(from, partition_id)?;
+        let file = entry.file.as_str();
+        if stored.num_rows() != entry.num_rows as usize {
+            return Err(Error::corrupt_file_named(
+                file,
+                format!(
+                    "Vamana partition {partition_id} lists {} vertices and its file holds {}",
+                    entry.num_rows,
+                    stored.num_rows()
+                ),
+            ));
+        }
+        if row_ids.len() != stored.num_rows() {
+            return Err(Error::internal(format!(
+                "Vamana was given {} addresses for the {} vertices of partition {partition_id}",
+                row_ids.len(),
+                stored.num_rows()
+            )));
+        }
+        // `IvfModel::centroid` indexes without a check, so a partition past the
+        // end of either model is asked about first.
+        let centroid = |ivf: &IvfModel| {
+            ((partition_id as usize) < ivf.num_partitions())
+                .then(|| ivf.centroid(partition_id as usize))
+                .flatten()
+        };
+        if centroid(from.ivf()) != centroid(&self.ivf) {
+            return Err(Error::invalid_input(format!(
+                "Vamana cannot carry partition {partition_id} between segments that do not route \
+                 it by one centroid; its rows were filed, and any codes taken, against another"
+            )));
+        }
+        // The edges as the graph they are, which a copy of the bytes would
+        // never look at and reading the partition to rewrite it always did.
+        graph_from_batch(stored)?;
+
+        let stride = self
+            .metadata
+            .codes
+            .as_ref()
+            .map(|codes| codes.stride(self.metadata.dimension))
+            .transpose()?;
+        let schema = Arc::new(partition_schema(
+            self.metadata.max_degree,
+            self.metadata.dimension,
+            stride,
+            self.metadata.vector_source,
+        )?);
+        let row_ids: ArrayRef = Arc::new(UInt64Array::from(row_ids));
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == ROW_ID_COLUMN {
+                    Ok(row_ids.clone())
+                } else {
+                    carried(stored, field, file)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let batch = RecordBatch::try_new(schema, columns)?;
+
+        let written = partition_file_name(partition_id);
+        let size = write_batch(
+            &self.store,
+            &self.dir.clone().join(written.as_str()),
+            &batch,
+        )
+        .await?;
+        self.partitions.push(PartitionEntry {
+            partition_id,
+            medoid: entry.medoid,
+            num_rows: entry.num_rows,
+            file: written,
+        });
+        Ok(size)
+    }
+
+    /// The entry of partition `partition_id` in `from`, if its bytes can be
+    /// carried into this segment as they are, graph, vectors and codes alike.
+    fn carried_entry<'a>(
+        &self,
+        from: &'a SegmentManifest,
+        partition_id: u32,
+    ) -> Result<&'a PartitionEntry> {
+        let entry = from.partition(partition_id).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Vamana was asked to carry partition {partition_id} over from a segment that does \
+                 not list it"
+            ))
+        })?;
+        for (what, source, mine) in [
+            (
+                "max_degree",
+                from.metadata().max_degree,
+                self.metadata.max_degree,
+            ),
+            (
+                "dimension",
+                from.metadata().dimension,
+                self.metadata.dimension,
+            ),
+        ] {
+            if source != mine {
+                return Err(Error::invalid_input(format!(
+                    "Vamana cannot carry partition {partition_id} from a segment declaring {what} \
+                     {source} into one declaring {mine}"
+                )));
+            }
+        }
+        // Codes are bytes quantised under one rotation, and nothing downstream
+        // reads a rotation back off a partition file: copied into a segment
+        // declaring another one, they would be decoded into distances that are
+        // meaningless rather than approximate. Equality of the whole parameters
+        // is the check because the rotation is inside them, and it is what makes
+        // "one rotation per index" enforced rather than merely inherited.
+        if from.metadata().codes != self.metadata.codes {
+            return Err(Error::invalid_input(format!(
+                "Vamana cannot carry partition {partition_id} between segments whose codes \
+                 disagree; the rotation a code was built under is not recoverable from it"
+            )));
+        }
+        if from.metadata().vector_source != self.metadata.vector_source {
+            return Err(Error::invalid_input(format!(
+                "Vamana cannot carry partition {partition_id} from a segment whose vectors are in \
+                 the {} into one whose vectors are in the {}; the file either holds them or does \
+                 not",
+                from.metadata().vector_source,
+                self.metadata.vector_source
+            )));
+        }
+        self.check_entry(partition_id, entry.medoid, entry.num_rows)?;
+        Ok(entry)
     }
 
     /// What both ways into the table have to agree on before a row is added.
@@ -1419,6 +1682,7 @@ mod tests {
     use arrow_array::{Array, Float32Array};
     use arrow_schema::{DataType, Field};
     use futures::FutureExt;
+    use lance_arrow::FixedSizeListArrayExt;
 
     use crate::partition::PartitionGraph;
 
@@ -1445,9 +1709,15 @@ mod tests {
     async fn written(dir: &tempfile::TempDir, name: &str) -> (Arc<ScanScheduler>, Path) {
         let store = Arc::new(ObjectStore::local());
         let path = Path::from_absolute_path(dir.path().join(name)).unwrap();
-        write_partition(&store, &path, &sample_partition(), None)
-            .await
-            .unwrap();
+        write_partition(
+            &store,
+            &path,
+            &sample_partition(),
+            None,
+            VectorSource::Index,
+        )
+        .await
+        .unwrap();
         (scan_scheduler(&store), path)
     }
 
@@ -1730,7 +2000,8 @@ mod tests {
             RescoreReads {
                 in_place: 3,
                 handed_off: 2,
-                trips: 1
+                trips: 1,
+                through_lance: 0,
             }
         );
     }
@@ -1788,7 +2059,8 @@ mod tests {
             RescoreReads {
                 in_place: 10,
                 handed_off: 0,
-                trips: 0
+                trips: 0,
+                through_lance: 0,
             }
         );
     }
@@ -1830,7 +2102,8 @@ mod tests {
             RescoreReads {
                 in_place: 0,
                 handed_off: 5,
-                trips: 1
+                trips: 1,
+                through_lance: 0,
             }
         );
 
@@ -1851,7 +2124,8 @@ mod tests {
             RescoreReads {
                 in_place: 5,
                 handed_off: 5,
-                trips: 1
+                trips: 1,
+                through_lance: 0,
             },
             "a batch exactly at the limit was handed off"
         );
@@ -1944,7 +2218,8 @@ mod tests {
             RescoreReads {
                 in_place: totals.iops,
                 handed_off: 0,
-                trips: 0
+                trips: 0,
+                through_lance: 0,
             },
             "a warm file was handed off"
         );
@@ -1990,7 +2265,8 @@ mod tests {
             RescoreReads {
                 in_place: 0,
                 handed_off: totals.iops,
-                trips: 1
+                trips: 1,
+                through_lance: 0,
             },
             "a file out of the page cache was read in place"
         );
@@ -2034,5 +2310,218 @@ mod tests {
                 "{who} was charged {counted:?} for a read that failed"
             );
         }
+    }
+
+    fn readdressed_metadata() -> IndexMetadata {
+        IndexMetadata {
+            format_version: crate::format::FORMAT_VERSION,
+            max_degree: 2,
+            search_list_size: 10,
+            alpha: 1.2,
+            dimension: DIMENSION as u32,
+            distance_type: lance_linalg::distance::DistanceType::L2,
+            row_id_mode: crate::format::RowIdMode::Address,
+            fragments: vec![0],
+            codes: None,
+            vector_source: VectorSource::Index,
+        }
+    }
+
+    /// A routing model of two partitions, the first centroid at `first`.
+    fn readdressed_ivf(first: f32) -> IvfModel {
+        IvfModel::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![first, first, first, 9.0, 9.0, 9.0]),
+                DIMENSION,
+            )
+            .unwrap(),
+            None,
+        )
+    }
+
+    /// A segment holding `sample_partition` as partitions 0 and 1, and the batch
+    /// the first one's file holds.
+    async fn stored_segment(dir: &tempfile::TempDir) -> (SegmentManifest, RecordBatch) {
+        let store = Arc::new(ObjectStore::local());
+        let path = Path::from_absolute_path(dir.path().join("from")).unwrap();
+        let mut writer = SegmentWriter::new(
+            store.clone(),
+            path.clone(),
+            readdressed_metadata(),
+            readdressed_ivf(0.0),
+        );
+        for partition_id in [0, 1] {
+            writer
+                .write_partition(partition_id, 1, &sample_partition())
+                .await
+                .unwrap();
+        }
+        let manifest = writer.finish().await.unwrap();
+        let file = path.join(manifest.partitions()[0].file.as_str());
+        let reader = open_file(&scan_scheduler(&store), &file, None, None)
+            .await
+            .unwrap();
+        let stored = read_partition_batch(&reader, 3).await.unwrap();
+        (manifest, stored)
+    }
+
+    fn readdressing_writer(dir: &tempfile::TempDir, ivf: IvfModel) -> SegmentWriter {
+        SegmentWriter::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_absolute_path(dir.path().join("to")).unwrap(),
+            readdressed_metadata(),
+            ivf,
+        )
+    }
+
+    /// A readdressed partition is the stored one, column for column and in the
+    /// same schema, at the addresses it was given, under the entry it had.
+    #[tokio::test]
+    async fn a_readdressed_partition_is_the_stored_one_at_its_new_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, stored) = stored_segment(&dir).await;
+        let mut writer = readdressing_writer(&dir, readdressed_ivf(0.0));
+        writer
+            .write_readdressed(&from, 0, &stored, vec![7, 8, 9])
+            .await
+            .unwrap();
+        let manifest = writer.finish().await.unwrap();
+        assert_eq!(manifest.partitions(), &from.partitions()[..1]);
+
+        let store = Arc::new(ObjectStore::local());
+        let file = Path::from_absolute_path(dir.path().join("to"))
+            .unwrap()
+            .join(manifest.partitions()[0].file.as_str());
+        let reader = open_file(&scan_scheduler(&store), &file, None, None)
+            .await
+            .unwrap();
+        let written = read_partition_batch(&reader, 3).await.unwrap();
+        assert_eq!(written.schema(), stored.schema());
+        assert_eq!(row_ids_from_batch(&written).unwrap(), vec![7, 8, 9]);
+        for column in 1..stored.num_columns() {
+            assert_eq!(
+                written.column(column),
+                stored.column(column),
+                "column {column}"
+            );
+        }
+    }
+
+    /// What reading gave no one the chance to refuse is refused on the way out:
+    /// a count of addresses that is not the count of vertices, a centroid other
+    /// than the one the codes were taken against, and a column missing, of
+    /// another width than declared, or holding a null.
+    #[tokio::test]
+    async fn readdressing_refuses_what_it_cannot_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, stored) = stored_segment(&dir).await;
+        let refusal = |stored: RecordBatch, row_ids: Vec<u64>, ivf: IvfModel| {
+            let mut writer = readdressing_writer(&dir, ivf);
+            let from = &from;
+            async move {
+                writer
+                    .write_readdressed(from, 0, &stored, row_ids)
+                    .await
+                    .unwrap_err()
+            }
+        };
+        let replaced = |name: &str, column: ArrayRef| {
+            RecordBatch::try_from_iter(stored.schema().fields().iter().enumerate().map(
+                |(at, field)| {
+                    let kept = stored.column(at).clone();
+                    (
+                        field.name().clone(),
+                        if field.name() == name {
+                            column.clone()
+                        } else {
+                            kept
+                        },
+                    )
+                },
+            ))
+            .unwrap()
+        };
+
+        let error = refusal(stored.clone(), vec![7, 8], readdressed_ivf(0.0)).await;
+        assert!(matches!(error, Error::Internal { .. }), "{error}");
+        assert!(error.to_string().contains("2 addresses"), "{error}");
+
+        let error = refusal(stored.clone(), vec![7, 8, 9], readdressed_ivf(1.0)).await;
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("one centroid"), "{error}");
+
+        let without = stored.project(&[0, 1]).unwrap();
+        let error = refusal(without, vec![7, 8, 9], readdressed_ivf(0.0)).await;
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(error.to_string().contains("__vector is missing"), "{error}");
+
+        let narrower = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 6]), 2)
+                .unwrap(),
+        );
+        let error = refusal(
+            replaced(VECTOR_COLUMN, narrower),
+            vec![7, 8, 9],
+            readdressed_ivf(0.0),
+        )
+        .await;
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(error.to_string().contains("holds 2 x Float32"), "{error}");
+
+        let holed = Arc::new(FixedSizeListArray::from_iter_primitive::<
+            arrow_array::types::UInt32Type,
+            _,
+            _,
+        >(
+            vec![
+                Some(vec![Some(1), Some(2)]),
+                None,
+                Some(vec![Some(0), Some(1)]),
+            ],
+            2,
+        ));
+        let error = refusal(
+            replaced(crate::format::NEIGHBORS_COLUMN, holed),
+            vec![7, 8, 9],
+            readdressed_ivf(0.0),
+        )
+        .await;
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(error.to_string().contains("holds nulls"), "{error}");
+
+        let astray = Arc::new(FixedSizeListArray::from_iter_primitive::<
+            arrow_array::types::UInt32Type,
+            _,
+            _,
+        >(
+            vec![
+                Some(vec![Some(5), Some(crate::format::NO_NEIGHBOR)]),
+                Some(vec![Some(2), Some(crate::format::NO_NEIGHBOR)]),
+                Some(vec![Some(0), Some(crate::format::NO_NEIGHBOR)]),
+            ],
+            2,
+        ));
+        let error = refusal(
+            replaced(crate::format::NEIGHBORS_COLUMN, astray),
+            vec![7, 8, 9],
+            readdressed_ivf(0.0),
+        )
+        .await;
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(error.to_string().contains("local id 5"), "{error}");
+
+        // A partition this segment's router has no centroid for, which asking
+        // the router about would have panicked on rather than refused.
+        let one_centroid = IvfModel::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 3]), DIMENSION)
+                .unwrap(),
+            None,
+        );
+        let error = readdressing_writer(&dir, one_centroid)
+            .write_readdressed(&from, 1, &stored, vec![7, 8, 9])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("one centroid"), "{error}");
     }
 }

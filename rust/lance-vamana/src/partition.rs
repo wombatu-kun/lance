@@ -13,7 +13,7 @@ use lance_core::{Error, Result};
 
 use crate::format::{
     MAX_DEGREE, MAX_PARTITION_ROWS, NEIGHBORS_COLUMN, NO_NEIGHBOR, ROW_ID_COLUMN, VECTOR_COLUMN,
-    partition_schema,
+    VectorSource, partition_schema,
 };
 
 /// The out-edges of one IVF partition, plus the row id of each vertex.
@@ -264,12 +264,15 @@ fn check_adjacency(
     Ok(())
 }
 
-/// One partition exactly as it is stored: the graph plus the vectors it walks.
+/// One partition's graph plus the vector of every vertex: what a build and every
+/// maintenance pass work on.
 ///
-/// The vectors live beside the edges rather than in the dataset because a graph
-/// walk needs a distance for every candidate it considers - fetching them from
-/// the dataset would be one `take` per hop. Co-locating them also makes the
-/// index self-contained: a query reads its own segment and nothing else.
+/// The vectors are here whether or not the segment stores them ([`VectorSource`]),
+/// because every pass that produces a partition measures distances between its
+/// vertices, and the writer takes the codes from them. A partition read back for
+/// a pass that takes its deleted vertices out before it measures anything may
+/// hold zeros for those, when the segment leaves its vectors to the dataset:
+/// see `VamanaIndex::read_partition_whole`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Partition {
     graph: PartitionGraph,
@@ -357,13 +360,18 @@ impl Partition {
         (self.graph, self.vectors)
     }
 
-    /// The batch this partition is written as.
+    /// The batch this partition is written as, with the vectors only for
+    /// [`VectorSource::Index`].
     ///
     /// `codes` is passed in rather than held on the partition because a code is
     /// a projection of a vector taken at write time: every maintenance pass
     /// moves vertices between local ids, and none of them has to move a code
     /// with one when there is no code to move. See [`crate::codes`].
-    pub fn to_batch(&self, codes: Option<&FixedSizeListArray>) -> Result<RecordBatch> {
+    pub fn to_batch(
+        &self,
+        codes: Option<&FixedSizeListArray>,
+        vector_source: VectorSource,
+    ) -> Result<RecordBatch> {
         let stride = codes
             .map(|codes| {
                 u32::try_from(codes.value_length()).map_err(|_| {
@@ -387,6 +395,7 @@ impl Partition {
             self.graph.max_degree,
             self.dimension(),
             stride,
+            vector_source,
         )?);
         // Built to the shape `partition_schema` gives `__neighbors` rather than
         // read back out of it: the values are a `u32` array either way, so
@@ -401,8 +410,10 @@ impl Partition {
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(UInt64Array::from(self.graph.row_ids.clone())),
             Arc::new(neighbors),
-            Arc::new(self.vectors.clone()),
         ];
+        if vector_source == VectorSource::Index {
+            columns.push(Arc::new(self.vectors.clone()));
+        }
         if let Some(codes) = codes {
             columns.push(Arc::new(codes.clone()));
         }
@@ -459,7 +470,7 @@ pub(crate) fn row_ids_from_batch(batch: &RecordBatch) -> Result<Vec<u64>> {
         .to_vec())
 }
 
-fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
+pub(crate) fn graph_from_batch(batch: &RecordBatch) -> Result<PartitionGraph> {
     let row_ids = row_ids_from_batch(batch)?;
 
     let neighbors = fixed_size_list(batch, NEIGHBORS_COLUMN)?;
@@ -818,7 +829,9 @@ mod tests {
     #[test]
     fn batch_round_trip_preserves_the_partition() {
         let partition = sample_partition(4);
-        let restored = Partition::try_from_batch(&partition.to_batch(None).unwrap()).unwrap();
+        let restored =
+            Partition::try_from_batch(&partition.to_batch(None, VectorSource::Index).unwrap())
+                .unwrap();
         assert_eq!(restored, partition);
     }
 
@@ -846,7 +859,7 @@ mod tests {
 
     /// Rebuild a partition's batch with one adjacency slot overwritten.
     fn with_slot(partition: &Partition, slot: usize, value: u32) -> RecordBatch {
-        let batch = partition.to_batch(None).unwrap();
+        let batch = partition.to_batch(None, VectorSource::Index).unwrap();
         let neighbors = batch[NEIGHBORS_COLUMN].as_fixed_size_list();
         let mut values = neighbors
             .values()
@@ -920,7 +933,7 @@ mod tests {
     #[test]
     fn a_null_row_id_read_back_is_rejected() {
         let partition = sample_partition(4);
-        let batch = partition.to_batch(None).unwrap();
+        let batch = partition.to_batch(None, VectorSource::Index).unwrap();
         let mut row_ids = batch[ROW_ID_COLUMN]
             .as_primitive::<UInt64Type>()
             .values()
@@ -964,7 +977,7 @@ mod tests {
     #[test]
     fn a_null_neighbour_read_back_is_rejected() {
         let partition = sample_partition(4);
-        let batch = partition.to_batch(None).unwrap();
+        let batch = partition.to_batch(None, VectorSource::Index).unwrap();
         let width = partition.graph().max_degree() as i32;
 
         for (what, list_nulls, slot_nulls) in
@@ -1047,7 +1060,7 @@ mod tests {
     #[test]
     fn a_column_disagreeing_with_the_segment_is_rejected() {
         let partition = sample_partition(4);
-        let batch = partition.to_batch(None).unwrap();
+        let batch = partition.to_batch(None, VectorSource::Index).unwrap();
 
         assert_eq!(
             neighbor_slots(&batch, 4).unwrap().len(),
@@ -1120,10 +1133,10 @@ mod tests {
     #[test]
     fn the_batch_schema_is_the_partition_schema() {
         let partition = sample_partition(4);
-        let batch = partition.to_batch(None).unwrap();
+        let batch = partition.to_batch(None, VectorSource::Index).unwrap();
         assert_eq!(
             batch.schema().as_ref(),
-            &partition_schema(4, DIMENSION as u32, None).unwrap()
+            &partition_schema(4, DIMENSION as u32, None, VectorSource::Index).unwrap()
         );
     }
 

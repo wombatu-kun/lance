@@ -41,14 +41,15 @@ pub const ROW_ID_COLUMN: &str = "__row_id";
 /// Out-edges of each vertex as partition-local ids, padded with [`NO_NEIGHBOR`].
 pub const NEIGHBORS_COLUMN: &str = "__neighbors";
 
-/// The vector of each vertex, in the same order as [`NEIGHBORS_COLUMN`].
+/// The vector of each vertex, in the same order as [`NEIGHBORS_COLUMN`], in a
+/// segment that keeps a copy of them: [`VectorSource::Index`].
 ///
-/// A graph walk needs a distance for every candidate it considers, so the
-/// vectors have to be reachable at query time. Keeping them in the partition
-/// makes the index self-contained - a query reads its own segment and never the
-/// dataset's data files - and it is the layout the disk-resident traversal
-/// wants: one vertex is one stride of this column plus one stride of
-/// [`NEIGHBORS_COLUMN`], with nothing else read.
+/// One vertex is one stride of this column, so the re-score that ends a coded
+/// walk reads a candidate's vector in one ranged read, and a segment holding it
+/// is self-contained: a query reads its own files and never the dataset's,
+/// unless it asks to with [`crate::query::SearchParams::rescore_from_dataset`].
+/// A segment of [`VectorSource::Dataset`] has no such column and reads the same
+/// vectors out of the dataset's data files.
 pub const VECTOR_COLUMN: &str = "__vector";
 
 /// Padding slot in [`NEIGHBORS_COLUMN`].
@@ -93,7 +94,19 @@ pub const MAX_DEGREE: u32 = 1024;
 /// manifest's `index_version` and the segment's own [`IndexMetadata`] - and
 /// checked against both on open. Two *different* numbers is what this replaced,
 /// and the one recorded in the manifest was checked nowhere at all.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
+
+/// Narrowest vectors a segment may leave to the dataset.
+///
+/// The re-score reads a row of the dataset's vector column by offset, which
+/// only a full-zip column allows: there row `r` sits at `base + r * stride`. A
+/// partition file asks Lance for full-zip explicitly ([`partition_schema`]); a
+/// dataset's column does not, and Lance then lays out any value narrower than
+/// 256 bytes as mini-block (`is_narrow` in `lance-encoding`'s
+/// `encodings/logical/primitive.rs`, over a constant it does not export), which
+/// packs rows into chunks no offset reaches. At four bytes a dimension, 256
+/// bytes is 64 dimensions.
+pub const MIN_DATASET_VECTOR_DIMENSION: u32 = 64;
 
 /// Schema metadata key under which [`IndexMetadata`] is stored as JSON.
 pub const INDEX_METADATA_KEY: &str = "lance-vamana:index";
@@ -119,6 +132,40 @@ pub enum RowIdMode {
     Address,
     /// A logical id with no relation to fragment layout.
     Stable,
+}
+
+/// Where a segment keeps the full vectors its re-score measures against.
+///
+/// A walk over codes reads a vector only for the few candidates it ends with,
+/// so the copy in [`VECTOR_COLUMN`] is a choice rather than a necessity: without
+/// it a segment is `4 * dimension` bytes a vertex smaller, and the re-score reads
+/// the same vectors out of the dataset's data files by row address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorSource {
+    /// The partitions hold a copy of every vector, and every walk mode can
+    /// search the segment without reading the dataset.
+    Index,
+    /// The partitions hold no vectors, so only the walks that steer by codes and
+    /// read the vectors of the candidates they end with -
+    /// [`crate::query::WalkMode::Lazy`] and [`crate::query::WalkMode::Flat`] -
+    /// can search the segment; `Exact`, the default, and `Coded` read partitions
+    /// whole, vectors included, and are refused. The segment must have codes,
+    /// and the dataset's vectors must be at least [`MIN_DATASET_VECTOR_DIMENSION`]
+    /// wide. A query needs the data files of the dataset version the index was
+    /// opened at, so once a compaction and a cleanup have removed them a
+    /// re-score that has to open one fails until the index is opened again -
+    /// the rule Lance's own indices live by.
+    Dataset,
+}
+
+impl std::fmt::Display for VectorSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Index => "index",
+            Self::Dataset => "dataset",
+        })
+    }
 }
 
 /// Segment-wide parameters, stored in the schema metadata of `index.idx`.
@@ -165,6 +212,12 @@ pub struct IndexMetadata {
     /// Inherited wholesale by every maintenance pass, which is what makes the
     /// rotation inside it one per index rather than one per segment.
     pub codes: Option<CodeParams>,
+    /// Whether the partitions hold the vectors or leave them to the dataset.
+    ///
+    /// Inherited by every maintenance pass like [`Self::codes`], and for the
+    /// same reason: a partition file copied between two segments either holds
+    /// [`VECTOR_COLUMN`] or does not.
+    pub vector_source: VectorSource,
 }
 
 /// `DistanceType` carries no serde impls, and its `Display` / `TryFrom<&str>`
@@ -195,26 +248,38 @@ impl IndexMetadata {
         })
     }
 
+    /// The metadata in `json`, refused unless it is of [`FORMAT_VERSION`].
+    ///
+    /// The version is read on its own first: a field a later format made
+    /// required is missing from every earlier one, and what a reader of an
+    /// earlier index has to be told is its format, not that its file is corrupt.
     pub fn from_json(json: &str) -> Result<Self> {
-        let metadata: Self = serde_json::from_str(json).map_err(|e| {
+        let corrupt = |error: serde_json::Error| {
             Error::corrupt_file_named(
                 INDEX_METADATA_KEY,
-                format!("failed to parse Vamana index metadata: {e}"),
+                format!("failed to parse Vamana index metadata: {error}"),
             )
-        })?;
-        if metadata.format_version != FORMAT_VERSION {
+        };
+        let Versioned { format_version } = serde_json::from_str(json).map_err(corrupt)?;
+        if format_version != FORMAT_VERSION {
             return Err(Error::not_supported(format!(
-                "Vamana index format version {} is not supported by this build (expected {})",
-                metadata.format_version, FORMAT_VERSION
+                "Vamana index format version {format_version} is not supported by this build \
+                 (expected {FORMAT_VERSION})"
             )));
         }
-        Ok(metadata)
+        serde_json::from_str(json).map_err(corrupt)
     }
+}
+
+/// The one field of [`IndexMetadata`] every format version shares.
+#[derive(Deserialize)]
+struct Versioned {
+    format_version: u32,
 }
 
 /// Arrow schema of one partition file.
 ///
-/// Both fixed-size-list columns are laid out so that vertex `local_id` sits at
+/// The fixed-size-list columns are laid out so that vertex `local_id` sits at
 /// `base + local_id * stride` with no read amplification: `max_degree * 4` bytes
 /// for `__neighbors`, `dimension * 4` for `__vector`. Two details make that hold
 /// and neither is the default:
@@ -239,18 +304,27 @@ impl IndexMetadata {
 ///
 /// `code_stride` is `None` for a segment built without codes, which is the
 /// default and what a dimension RaBitQ cannot quantise leaves behind. The code
-/// column goes last so that a reader projecting the other three by name is
-/// unaffected by its presence.
+/// column goes last so that a reader projecting the others by name is
+/// unaffected by its presence. `__vector` is there only for
+/// [`VectorSource::Index`].
 pub fn partition_schema(
     max_degree: u32,
     dimension: u32,
     code_stride: Option<u32>,
+    vector_source: VectorSource,
 ) -> Result<Schema> {
     let mut fields = vec![
         Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
         addressable_list(NEIGHBORS_COLUMN, DataType::UInt32, max_degree, "max_degree")?,
-        addressable_list(VECTOR_COLUMN, DataType::Float32, dimension, "dimension")?,
     ];
+    if vector_source == VectorSource::Index {
+        fields.push(addressable_list(
+            VECTOR_COLUMN,
+            DataType::Float32,
+            dimension,
+            "dimension",
+        )?);
+    }
     if let Some(stride) = code_stride {
         fields.push(addressable_list(
             CODE_COLUMN,
@@ -311,19 +385,47 @@ mod tests {
 
     #[test]
     fn metadata_round_trips_through_json() {
-        let metadata = IndexMetadata {
-            format_version: FORMAT_VERSION,
-            max_degree: 64,
-            search_list_size: 100,
-            alpha: 1.2,
-            dimension: 128,
-            distance_type: DistanceType::Cosine,
-            row_id_mode: RowIdMode::Address,
-            fragments: vec![0, 3, 7],
-            codes: None,
-        };
-        let parsed = IndexMetadata::from_json(&metadata.to_json().unwrap()).unwrap();
-        assert_eq!(parsed, metadata);
+        for (vector_source, spelling) in [
+            (VectorSource::Index, "\"vector_source\":\"index\""),
+            (VectorSource::Dataset, "\"vector_source\":\"dataset\""),
+        ] {
+            let metadata = IndexMetadata {
+                format_version: FORMAT_VERSION,
+                max_degree: 64,
+                search_list_size: 100,
+                alpha: 1.2,
+                dimension: 128,
+                distance_type: DistanceType::Cosine,
+                row_id_mode: RowIdMode::Address,
+                fragments: vec![0, 3, 7],
+                codes: None,
+                vector_source,
+            };
+            let json = metadata.to_json().unwrap();
+            assert!(json.contains(spelling), "{json}");
+            assert_eq!(IndexMetadata::from_json(&json).unwrap(), metadata);
+        }
+    }
+
+    /// A segment that does not say where its vectors are is not read as one
+    /// that holds them: guessing wrong either way sends the re-score to a
+    /// column that is not there.
+    #[test]
+    fn metadata_without_a_vector_source_is_rejected() {
+        let json = serde_json::json!({
+            "format_version": FORMAT_VERSION,
+            "max_degree": 64,
+            "search_list_size": 100,
+            "alpha": 1.2,
+            "dimension": 128,
+            "distance_type": "l2",
+            "row_id_mode": "address",
+            "fragments": [0],
+        })
+        .to_string();
+        let error = IndexMetadata::from_json(&json).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(error.to_string().contains("vector_source"), "{error}");
     }
 
     #[test]
@@ -341,6 +443,7 @@ mod tests {
             row_id_mode: RowIdMode::Stable,
             fragments: vec![0],
             codes: None,
+            vector_source: VectorSource::Index,
         };
         let json = metadata.to_json().unwrap();
         assert!(json.contains("\"stable\""), "{json}");
@@ -364,6 +467,7 @@ mod tests {
             row_id_mode: RowIdMode::Address,
             fragments: vec![0],
             codes: None,
+            vector_source: VectorSource::Index,
         };
         let json = metadata.to_json().unwrap();
         assert!(json.contains("\"alpha\":null"), "{json}");
@@ -382,15 +486,20 @@ mod tests {
             "distance_type": "manhattan",
             "row_id_mode": "address",
             "fragments": [0],
+            "vector_source": "index",
         })
         .to_string();
         let error = IndexMetadata::from_json(&json).unwrap_err();
         assert!(error.to_string().contains("manhattan"), "{error}");
     }
 
+    /// Another format is refused for its version, including an earlier one
+    /// missing a field this one requires: format 5 wrote no `vector_source`, and
+    /// its reader is told which format it has rather than that its file is
+    /// corrupt.
     #[test]
-    fn metadata_rejects_a_future_format_version() {
-        let json = serde_json::json!({
+    fn metadata_rejects_another_format_version() {
+        let future = serde_json::json!({
             "format_version": FORMAT_VERSION + 1,
             "max_degree": 64,
             "search_list_size": 100,
@@ -399,19 +508,29 @@ mod tests {
             "distance_type": "l2",
             "row_id_mode": "address",
             "fragments": [0],
-        })
-        .to_string();
-        let error = IndexMetadata::from_json(&json).unwrap_err();
-        assert!(
-            matches!(error, Error::NotSupported { .. }),
-            "unexpected error: {error}"
-        );
-        assert!(error.to_string().contains("format version"));
+            "vector_source": "index",
+        });
+        let mut earlier = future.clone();
+        earlier["format_version"] = serde_json::json!(FORMAT_VERSION - 1);
+        earlier.as_object_mut().unwrap().remove("vector_source");
+        for (version, json) in [(FORMAT_VERSION + 1, future), (FORMAT_VERSION - 1, earlier)] {
+            let error = IndexMetadata::from_json(&json.to_string()).unwrap_err();
+            assert!(
+                matches!(error, Error::NotSupported { .. }),
+                "unexpected error: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("format version {version} is not supported")),
+                "{error}"
+            );
+        }
     }
 
     #[test]
     fn partition_schema_requests_fullzip_and_stays_non_nullable() {
-        let schema = partition_schema(32, 24, None).unwrap();
+        let schema = partition_schema(32, 24, None, VectorSource::Index).unwrap();
         // Both widths are under the 256-byte threshold at which Lance would pick
         // full-zip unprompted, so both columns depend on the explicit hint.
         for (column, expected_width, expected_item) in [
@@ -440,15 +559,26 @@ mod tests {
     }
 
     #[test]
+    fn partition_schema_leaves_the_vectors_to_the_dataset() {
+        let schema = partition_schema(32, 64, Some(64), VectorSource::Dataset).unwrap();
+        let names = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [ROW_ID_COLUMN, NEIGHBORS_COLUMN, CODE_COLUMN]);
+    }
+
+    #[test]
     fn partition_schema_rejects_a_zero_degree() {
-        let error = partition_schema(0, 8, None).unwrap_err();
+        let error = partition_schema(0, 8, None, VectorSource::Index).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("max_degree"), "{error}");
     }
 
     #[test]
     fn partition_schema_rejects_a_zero_dimension() {
-        let error = partition_schema(32, 0, None).unwrap_err();
+        let error = partition_schema(32, 0, None, VectorSource::Index).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("dimension"), "{error}");
     }

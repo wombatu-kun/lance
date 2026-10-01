@@ -23,6 +23,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
+use lance_file::version::LanceFileVersion;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
 use lance_vamana::inserter::insert_as_segment;
@@ -33,8 +34,9 @@ use uuid::Uuid;
 
 mod common;
 use common::{
-    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, compact_indexed, live_row_ids,
-    random_vectors, read_committed_segments, recall,
+    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, assert_twins_hold_the_same, brute_force,
+    compact_indexed, live_row_ids, random_vectors, read_committed_segments, recall, twin_params,
+    twins, wide_fixture,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
@@ -304,6 +306,118 @@ async fn merging_takes_out_the_deleted_and_puts_in_the_new_in_one_call() {
         MergeStats::default(),
         "the merged segment left work behind, so a maintenance loop would repeat it"
     );
+}
+
+/// Merging an index that leaves its vectors to the dataset is merging its twin
+/// that keeps them: a delta folded, deleted rows taken out and new rows put in,
+/// in one call, into the same graphs and codes.
+#[tokio::test]
+async fn an_index_without_vectors_merges_as_its_twin_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut twins = twins(
+        dir.path(),
+        &wide_fixture(),
+        INDEX_NAME,
+        &twin_params(PARTITIONS),
+    )
+    .await;
+    let mut stats = Vec::new();
+    for (uri, dataset) in &mut twins {
+        *dataset = DatasetFixture {
+            seed: 98,
+            ..wide_fixture()
+        }
+        .append(uri)
+        .await;
+        insert_as_segment(dataset, INDEX_NAME).await.unwrap();
+        dataset.delete("_rowid % 5 == 0").await.unwrap();
+        *dataset = DatasetFixture {
+            seed: 99,
+            ..wide_fixture()
+        }
+        .append(uri)
+        .await;
+        stats.push(merge_index(dataset, INDEX_NAME).await.unwrap());
+    }
+    assert_eq!(stats[0], stats[1]);
+    assert!(
+        stats[0].segments_folded == 2
+            && stats[0].vertices_folded > 0
+            && stats[0].vertices_removed > 0
+            && stats[0].vectors_inserted > 0,
+        "{:?}",
+        stats[0]
+    );
+    assert_twins_hold_the_same(&twins[0].1, &twins[1].1, INDEX_NAME).await;
+}
+
+/// Over Lance 2.0 data files, which no offset reaches, the live rows a merge
+/// measures are read through Lance's take, and the merge folds as its twin's
+/// does.
+#[tokio::test]
+async fn an_index_without_vectors_merges_over_lance_2_0_files_as_its_twin_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let written_as_2_0 = |seed| DatasetFixture {
+        seed,
+        storage_version: Some(LanceFileVersion::V2_0),
+        ..wide_fixture()
+    };
+    let mut twins = twins(
+        dir.path(),
+        &written_as_2_0(wide_fixture().seed),
+        INDEX_NAME,
+        &twin_params(PARTITIONS),
+    )
+    .await;
+    let mut stats = Vec::new();
+    for (uri, dataset) in &mut twins {
+        dataset.delete("_rowid % 5 == 0").await.unwrap();
+        *dataset = written_as_2_0(99).append(uri).await;
+        stats.push(merge_index(dataset, INDEX_NAME).await.unwrap());
+    }
+    assert_eq!(stats[0], stats[1]);
+    assert!(
+        stats[0].vertices_removed > 0 && stats[0].vectors_inserted > 0,
+        "{:?}",
+        stats[0]
+    );
+    assert_twins_hold_the_same(&twins[0].1, &twins[1].1, INDEX_NAME).await;
+}
+
+/// After a deferred compaction the deleted rows' vertices keep the addresses
+/// they were stored under, in fragments the compaction took away. A merge of an
+/// index that leaves its vectors to the dataset reads only the live vertices,
+/// where their rows moved to, and folds as its twin does.
+#[tokio::test]
+async fn an_index_without_vectors_merges_after_a_deferred_compaction_as_its_twin_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut twins = twins(
+        dir.path(),
+        &wide_fixture(),
+        INDEX_NAME,
+        &twin_params(PARTITIONS),
+    )
+    .await;
+    let mut stats = Vec::new();
+    for (uri, dataset) in &mut twins {
+        dataset.delete("_rowid % 11 == 0").await.unwrap();
+        let metrics = compact_indexed(dataset).await;
+        assert!(metrics.fragments_removed > 0, "{metrics:?}");
+        *dataset = DatasetFixture {
+            seed: 99,
+            ..wide_fixture()
+        }
+        .append(uri)
+        .await;
+        stats.push(merge_index(dataset, INDEX_NAME).await.unwrap());
+    }
+    assert_eq!(stats[0], stats[1]);
+    assert!(
+        stats[0].vertices_removed > 0 && stats[0].vectors_inserted > 0,
+        "{:?}",
+        stats[0]
+    );
+    assert_twins_hold_the_same(&twins[0].1, &twins[1].1, INDEX_NAME).await;
 }
 
 /// A deferred compaction moves every row the index stores, and the index follows

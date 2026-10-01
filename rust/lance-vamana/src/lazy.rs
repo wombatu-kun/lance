@@ -72,7 +72,7 @@
 
 use std::collections::BinaryHeap;
 
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, FixedSizeListArray};
 use lance_core::{Error, Result};
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::storage::{DistCalculator, VectorStore};
@@ -403,10 +403,6 @@ pub(crate) async fn rescore(
         .iter()
         .map(|candidate| candidate.id)
         .collect::<Vec<_>>();
-    let row_addrs = candidates
-        .iter()
-        .map(|candidate| candidate.row_addr)
-        .collect::<Vec<_>>();
     let values = match file.read_vectors(&ids, dimension, stats).await? {
         Some(values) => values,
         None => {
@@ -415,7 +411,26 @@ pub(crate) async fn rescore(
             vectors_of(&batch, dimension)?
         }
     };
-    let store = flat_storage(&row_addrs, &values, distance_type)?;
+    measure(candidates, &values, distance_type, query)
+}
+
+/// Measure the query exactly against `values`, the vectors of `candidates` in
+/// the same order, and rank the candidates by it.
+///
+/// Split from [`rescore`] so that the vectors can come from the dataset's own
+/// data files instead of the partition's, and still be measured by the one
+/// piece of arithmetic both answers are compared on.
+pub(crate) fn measure(
+    candidates: &[Candidate],
+    values: &FixedSizeListArray,
+    distance_type: DistanceType,
+    query: ArrayRef,
+) -> Result<Vec<Neighbor>> {
+    let row_addrs = candidates
+        .iter()
+        .map(|candidate| candidate.row_addr)
+        .collect::<Vec<_>>();
+    let store = flat_storage(&row_addrs, values, distance_type)?;
     let exact = store.dist_calculator(query, 0.0);
 
     // Positions in what came back, not local ids: the batch holds only the

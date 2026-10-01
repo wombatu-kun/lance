@@ -25,7 +25,9 @@ use lance_file::versions::create_writer;
 use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_vamana::codes::{CODE_COLUMN, CodeParams};
-use lance_vamana::format::{NEIGHBORS_COLUMN, ROW_ID_COLUMN, VECTOR_COLUMN, partition_schema};
+use lance_vamana::format::{
+    NEIGHBORS_COLUMN, ROW_ID_COLUMN, VECTOR_COLUMN, VectorSource, partition_schema,
+};
 use lance_vamana::io::{
     SEGMENT_FILE_VERSION, open_file, read_partition, read_rows, read_scattered, scan_scheduler,
 };
@@ -78,7 +80,7 @@ fn local_store_and_path(dir: &tempfile::TempDir, name: &str) -> (Arc<ObjectStore
 /// measurements below can fail. It writes literally the same arrays, stripped of
 /// the encoding hints, so nothing but the hint differs between the two arms.
 async fn write_without_encoding_hint(store: &ObjectStore, path: &Path, partition: &Partition) {
-    let hinted = partition.to_batch(None).unwrap();
+    let hinted = partition.to_batch(None, VectorSource::Index).unwrap();
     let fields = hinted
         .schema()
         .fields()
@@ -158,7 +160,7 @@ async fn vertex_cost_at(
 /// The same partition written through a nullable schema, optionally with one
 /// vertex's neighbour list actually set to null.
 async fn write_nullable(store: &ObjectStore, path: &Path, partition: &Partition, hole: bool) {
-    let hinted = partition.to_batch(None).unwrap();
+    let hinted = partition.to_batch(None, VectorSource::Index).unwrap();
     let neighbors = hinted[NEIGHBORS_COLUMN].as_fixed_size_list();
     let width = neighbors.value_length() as usize;
     let slots = neighbors
@@ -224,7 +226,7 @@ async fn write_nullable(store: &ObjectStore, path: &Path, partition: &Partition,
 async fn addressable_and_chunked(dir: &tempfile::TempDir) -> (Arc<ObjectStore>, Path, Path) {
     let partition = sample_partition(MAX_DEGREE, VERTICES, DIMENSION);
     let (store, addressable) = local_store_and_path(dir, "fullzip.idx");
-    lance_vamana::io::write_partition(&store, &addressable, &partition, None)
+    lance_vamana::io::write_partition(&store, &addressable, &partition, None, VectorSource::Index)
         .await
         .unwrap();
     let (_, chunked) = local_store_and_path(dir, "miniblock.idx");
@@ -238,9 +240,10 @@ async fn partition_round_trips_through_a_file() {
     let (store, path) = local_store_and_path(&dir, "part_00000.idx");
     let partition = sample_partition(64, 512, DIMENSION);
 
-    let size = lance_vamana::io::write_partition(&store, &path, &partition, None)
-        .await
-        .unwrap();
+    let size =
+        lance_vamana::io::write_partition(&store, &path, &partition, None, VectorSource::Index)
+            .await
+            .unwrap();
     assert!(size > 0);
 
     let reader = open_file(&scan_scheduler(&store), &path, None, None)
@@ -284,7 +287,7 @@ async fn a_scattered_read_returns_the_rows_asked_for_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let (store, path) = local_store_and_path(&dir, "part_00000.idx");
     let partition = sample_partition(MAX_DEGREE, VERTICES, DIMENSION);
-    lance_vamana::io::write_partition(&store, &path, &partition, None)
+    lance_vamana::io::write_partition(&store, &path, &partition, None, VectorSource::Index)
         .await
         .unwrap();
     let reader = open_file(&scan_scheduler(&store), &path, Some(&[ROW_ID_COLUMN]), None)
@@ -325,9 +328,10 @@ async fn a_declared_file_size_is_the_one_used() {
     let dir = tempfile::tempdir().unwrap();
     let (store, path) = local_store_and_path(&dir, "part_00000.idx");
     let partition = sample_partition(64, 128, DIMENSION);
-    let size = lance_vamana::io::write_partition(&store, &path, &partition, None)
-        .await
-        .unwrap();
+    let size =
+        lance_vamana::io::write_partition(&store, &path, &partition, None, VectorSource::Index)
+            .await
+            .unwrap();
 
     let scheduler = scan_scheduler(&store);
     let reader = open_file(&scheduler, &path, None, Some(size))
@@ -350,7 +354,7 @@ async fn partition_file_opens_with_the_stock_reader() {
     let dir = tempfile::tempdir().unwrap();
     let (store, path) = local_store_and_path(&dir, "part_00000.idx");
     let partition = sample_partition(64, 128, DIMENSION);
-    lance_vamana::io::write_partition(&store, &path, &partition, None)
+    lance_vamana::io::write_partition(&store, &path, &partition, None, VectorSource::Index)
         .await
         .unwrap();
 
@@ -492,6 +496,7 @@ async fn the_hint_is_harmless_above_the_heuristic_threshold() {
         &path,
         &sample_partition(WIDE_DEGREE, VERTICES, WIDE_DIMENSION),
         None,
+        VectorSource::Index,
     )
     .await
     .unwrap();
@@ -542,7 +547,7 @@ async fn vertices_are_addressed_independently_across_partitions() {
             vectors,
         )
         .unwrap();
-        lance_vamana::io::write_partition(&store, &path, &partition, None)
+        lance_vamana::io::write_partition(&store, &path, &partition, None, VectorSource::Index)
             .await
             .unwrap();
         written.insert(partition_id, (path, partition));
@@ -592,6 +597,7 @@ async fn the_stride_holds_past_a_page_boundary() {
         &path,
         &sample_partition(MAX_DEGREE, MANY, DIMENSION),
         None,
+        VectorSource::Index,
     )
     .await
     .unwrap();
@@ -677,7 +683,7 @@ async fn a_code_column_gets_its_own_stride_and_disturbs_no_other() {
         None,
     )
     .unwrap();
-    lance_vamana::io::write_partition(&store, &path, &partition, Some(&codes))
+    lance_vamana::io::write_partition(&store, &path, &partition, Some(&codes), VectorSource::Index)
         .await
         .unwrap();
 
@@ -698,7 +704,7 @@ async fn a_code_column_gets_its_own_stride_and_disturbs_no_other() {
 /// Guard against the schema drifting away from what the layout needs.
 #[tokio::test]
 async fn the_written_schema_keeps_the_encoding_hint() {
-    let schema = partition_schema(64, 96, None).unwrap();
+    let schema = partition_schema(64, 96, None, VectorSource::Index).unwrap();
     let hinted = schema
         .fields()
         .iter()

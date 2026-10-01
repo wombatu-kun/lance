@@ -33,6 +33,7 @@ use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::codes::CodeSpec;
 use lance_vamana::consolidator::consolidate_index;
+use lance_vamana::format::VectorSource;
 use lance_vamana::inserter::{insert_as_segment, insert_in_place};
 use lance_vamana::merger::merge_index;
 use lance_vamana::query::{QueryResult, SearchParams, VamanaIndex, WalkMode};
@@ -124,6 +125,12 @@ struct BuildArgs {
     /// are a library option only; nothing but a measurement wants them.
     #[arg(long, value_name = "BITS")]
     code_bits: Option<u8>,
+    /// Where the full vectors a re-score measures against are read from: a
+    /// copy in the index, or the dataset's own data files. `dataset` makes the
+    /// index smaller, needs `--code-bits` and at least 64 dimensions, and is
+    /// searched with `--mode lazy` or `--mode flat` only.
+    #[arg(long, value_enum, default_value_t = VectorsArg::Index)]
+    vectors: VectorsArg,
     /// `R`: the fixed width of every vertex's neighbour list.
     #[arg(short = 'R', long, default_value_t = BuildParams::default().max_degree, value_name = "N")]
     max_degree: u32,
@@ -168,6 +175,10 @@ struct SearchArgs {
     /// `--stop-margin` it is a cap instead.
     #[arg(short = 'L', long, value_name = "N")]
     search_list_size: Option<usize>,
+    /// How a walk reads a partition. `exact` and `coded` read it whole,
+    /// vectors included, and are refused for an index built with
+    /// `--vectors dataset`; `lazy` and `flat` steer by codes and read only the
+    /// vectors they re-score.
     #[arg(long, value_enum, default_value_t = ModeArg::Exact)]
     mode: ModeArg,
     /// `W`: vertices one hop of a lazy walk expands at a time.
@@ -241,6 +252,22 @@ impl From<MetricArg> for DistanceType {
         match metric {
             MetricArg::L2 => Self::L2,
             MetricArg::Cosine => Self::Cosine,
+        }
+    }
+}
+
+/// Mirrors [`VectorSource`], for the reason [`ModeArg`] mirrors [`WalkMode`].
+#[derive(Clone, Copy, ValueEnum)]
+enum VectorsArg {
+    Index,
+    Dataset,
+}
+
+impl From<VectorsArg> for VectorSource {
+    fn from(vectors: VectorsArg) -> Self {
+        match vectors {
+            VectorsArg::Index => Self::Index,
+            VectorsArg::Dataset => Self::Dataset,
         }
     }
 }
@@ -363,6 +390,7 @@ async fn build(args: BuildArgs) -> Result<()> {
         .with_distance_type(args.metric.into())
         .with_kmeans_max_iters(args.kmeans_iters)
         .with_kmeans_sample_rate(args.kmeans_sample_rate)
+        .with_vector_source(args.vectors.into())
         .with_graph_params(BuildParams {
             max_degree: args.max_degree,
             search_list_size: args.search_list_size,
@@ -382,6 +410,17 @@ async fn build(args: BuildArgs) -> Result<()> {
         started.elapsed().as_secs_f64(),
         stats.comparisons
     );
+    // The library says this through `log`, which this binary installs nothing
+    // to print.
+    if stats.fragments_through_lance > 0 {
+        eprintln!(
+            "warning: {} fragments keep their vectors where no offset reaches (a data file older \
+             than Lance 2.1, another base path, an overlay, a row count the manifest does not \
+             vouch for), so every re-score of their rows goes through Lance's take; \
+             `--vectors index` does not depend on how the dataset stores them",
+            stats.fragments_through_lance
+        );
+    }
     Ok(())
 }
 
@@ -613,6 +652,7 @@ async fn info(args: InfoArgs) -> Result<()> {
         Some(codes) => println!("  codes          {}", codes.spec()),
         None => println!("  codes          none"),
     }
+    println!("  vectors        {}", metadata.vector_source);
     println!("  format version {}", metadata.format_version);
     Ok(())
 }

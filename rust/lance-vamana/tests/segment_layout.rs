@@ -25,7 +25,7 @@ use lance_vamana::PartitionEntry;
 use lance_vamana::codes::CodeParams;
 use lance_vamana::format::{
     FORMAT_VERSION, INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata,
-    ROW_ID_COLUMN, RowIdMode, partition_file_name,
+    ROW_ID_COLUMN, RowIdMode, VectorSource, partition_file_name,
 };
 use lance_vamana::io::{
     SEGMENT_FILE_VERSION, SegmentWriter, open_file, read_partition, read_row_ids, read_segment,
@@ -56,6 +56,7 @@ fn index_metadata() -> IndexMetadata {
         row_id_mode: RowIdMode::Address,
         fragments: vec![0],
         codes: None,
+        vector_source: VectorSource::Index,
     }
 }
 
@@ -385,9 +386,15 @@ async fn a_copy_follows_the_source_table_and_writes_the_canonical_name() {
     let source = tempfile::tempdir().unwrap();
     let (store, source_path) = segment_dir(&source);
     let partition = sample_partition(MAX_DEGREE, 12, DIMENSION);
-    write_partition(&store, &source_path.clone().join(RENAMED), &partition, None)
-        .await
-        .unwrap();
+    write_partition(
+        &store,
+        &source_path.clone().join(RENAMED),
+        &partition,
+        None,
+        VectorSource::Index,
+    )
+    .await
+    .unwrap();
     let source_manifest = lance_vamana::SegmentManifest::try_new(
         index_metadata(),
         ivf_model(),
@@ -591,6 +598,61 @@ async fn copying_between_segments_whose_codes_disagree_is_refused() {
         assert!(
             error.to_string().contains("codes disagree"),
             "{what}: {error}"
+        );
+    }
+}
+
+/// A partition file either holds the vectors or leaves them to the dataset, and
+/// the segment it is copied into declares which; nothing reads the file's
+/// schema back against that, so a copy across the two would leave a re-score
+/// reading a column that is not there, or a copy nobody reads.
+#[tokio::test]
+async fn copying_between_segments_that_keep_their_vectors_apart_is_refused() {
+    const WIDE: u32 = 64;
+    let metadata = |vector_source| IndexMetadata {
+        dimension: WIDE,
+        codes: Some(CodeParams::Scalar {
+            num_bits: 8,
+            bounds: 0.0..1.0,
+        }),
+        vector_source,
+        ..index_metadata()
+    };
+    let ivf = || {
+        let values = Float32Array::from(vec![0.5; PARTITIONS * WIDE as usize]);
+        IvfModel::new(
+            FixedSizeListArray::try_new_from_values(values, WIDE as i32).unwrap(),
+            None,
+        )
+    };
+    for (mine, theirs) in [
+        (VectorSource::Index, VectorSource::Dataset),
+        (VectorSource::Dataset, VectorSource::Index),
+    ] {
+        let source = lance_vamana::SegmentManifest::try_new(
+            metadata(theirs),
+            ivf(),
+            vec![PartitionEntry {
+                partition_id: 0,
+                medoid: 0,
+                num_rows: 4,
+                file: partition_file_name(0),
+            }],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (store, path) = segment_dir(&dir);
+        let mut writer = SegmentWriter::new(store, path.clone(), metadata(mine), ivf());
+        let error = writer.copy_partition(&path, &source, 0).await.unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{mine}: {error}"
+        );
+        assert!(
+            error.to_string().contains(&format!(
+                "vectors are in the {theirs} into one whose vectors are in the {mine}"
+            )),
+            "{error}"
         );
     }
 }
@@ -951,6 +1013,7 @@ async fn the_free_writer_refuses_an_empty_partition() {
         &path.clone().join("part_00000.idx"),
         &sample_partition(MAX_DEGREE, 0, DIMENSION),
         None,
+        VectorSource::Index,
     )
     .await
     .unwrap_err();

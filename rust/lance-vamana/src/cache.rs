@@ -9,7 +9,11 @@
 //! written once and never edited - every maintenance pass writes a new segment
 //! under a new uuid and commits it in place of the old one - so a partition file
 //! is immutable for as long as anything can name it, and both of those reads are
-//! the same read on every query that probes it.
+//! the same read on every query that probes it. A re-score from the dataset
+//! adds a third of the same kind: where a data file it reads vectors out of
+//! keeps them, which Lance never rewrites under its name either - the layout of
+//! that one column, read and kept apart from the rest of the file's footer
+//! ([`crate::data_file::DataLayoutKey`]).
 //!
 //! Which makes the cache the last multiplier of the lazy read, and the largest
 //! one left. Of the 18.2 MB a query reads at 65536 rows a partition,
@@ -21,8 +25,11 @@
 //! than the result.
 //!
 //! An index that was given no cache goes down neither path: it reads, and it
-//! does not build a key to decide to. That is not the same thing as a cache of
-//! capacity zero, which is what it looks like from the outside -
+//! does not build a key to decide to. All it keeps is which of the dataset's
+//! data files no offset read can serve, so as not to open one again only to be
+//! sent to Lance - where a read goes, not anything a read returns. That is not
+//! the same thing as a cache of capacity zero, which is what it looks like from
+//! the outside -
 //! [`LanceCache::no_cache`] admits an entry and reclaims it when it next runs
 //! its housekeeping, so a partition read a moment ago is served out of a cache
 //! holding nothing at all. Rare, invisible, and enough to make a measurement of
@@ -145,9 +152,10 @@ impl CacheKey for ResidentKey {
 
 /// One partition file's layout, keyed by its path.
 ///
-/// The path and not the segment uuid: a segment holds a file per partition, and
-/// the path is what Lance's own file-metadata cache is keyed by, so the two
-/// agree about what identifies a file.
+/// The path and not the segment uuid: a segment holds a file per partition,
+/// and the path is what Lance's own file-metadata cache is keyed by, so the two
+/// agree about what identifies a file. A data file's layout is kept under a key
+/// of its own, which names the column as well.
 #[derive(Debug)]
 pub(crate) struct FileKey<'a> {
     pub(crate) path: &'a Path,

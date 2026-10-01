@@ -180,19 +180,26 @@ two are meant to say the same thing.
   those same partitions again. `VamanaIndex::with_cache(LanceCache)` changes
   that, and holds the part of a partition that does not depend on the query: the
   open file itself, the layout that came with it, and for a lazy walk the codes
-  and row ids it steers by. The open files are capped at 64 entries and sit
-  outside the cache's byte budget; over the cap the least recently used one is
-  dropped and the next query that wants it opens it again. The cap is on entries
-  rather than on descriptors: an entry costs two once a re-score has read through
-  it on local storage, a query holds a handle per probe whatever the cap says,
-  and each held entry also pins the footer its reader was built from, which the
-  cache can then evict without reclaiming anything.
+  and row ids it steers by - and, for a re-score from the dataset, where each
+  data file keeps the vectors, read out of the footer of that one column. The
+  open files are capped at 64 entries a pool, one pool for the partition files
+  and one for the data files, and sit outside the cache's byte budget; over the
+  cap the least recently used one is dropped and the next query that wants it
+  opens it again. The cap is on entries rather than on descriptors: an entry
+  costs two once a re-score has read through it on local storage, a query holds
+  a handle per probe whatever the cap says, and each held entry also pins the
+  footer its reader was built from, which the cache can then evict without
+  reclaiming anything.
   Nothing needs invalidating, because nothing an entry describes can change -
   deleting rows edits no index file, and adding rows or consolidating writes a
   *new* segment under a new uuid. What an index keeps without a cache is
   scratch rather than data: the visited marks of its lazy walks, one byte a
   vertex of the largest partition walked, for as many walks as have run at once
-  and up to one per core - 12 MB at twelve cores and a million-row partition.
+  and up to one per core - 12 MB at twelve cores and a million-row partition -
+  and which of the dataset's data files no offset read can serve, learnt from a
+  file's footer the first time it is opened, so that it is not opened again
+  only to be sent to Lance's take. That is where a read goes, never what it
+  returns: every byte of every answer is still read every time.
 
   The budget is the caller's to set and is in bytes of *resident* form, which is
   more than the codes weigh on disk: they are stored one contiguous stride a
@@ -203,6 +210,12 @@ two are meant to say the same thing.
   cache of capacity zero is not the same thing as none: it admits an entry and
   reclaims it later, so it serves the occasional hit out of what is meant to be
   nothing.
+- **A re-score from the dataset reads the version the index was opened at.**
+  An index that leaves its vectors to the dataset, or a query that asks with
+  `SearchParams::rescore_from_dataset`, reads them from that version's data
+  files. Once a compaction and `cleanup_old_versions` have removed them, a
+  re-score that has to open one fails, naming it, until the index is opened
+  again - the rule Lance's own indices live by.
 - **A partition is read whole unless the walk is told otherwise.** Reading only
   the vertices a walk touches was measured instead of assumed
   (`examples/memory_gate.rs`): on its own it halves the pages moved at best and
@@ -223,14 +236,17 @@ two are meant to say the same thing.
   and so the walk expands more for it - three times more at one bit. At equal
   work a wider beam on plain codes reaches higher recall.
 
-  Both halves are here. `IndexParams::with_code_bits(3)` builds a partition file
-  with a `__code` column beside its vectors and its edges;
+  Both halves are here. `IndexParams::with_codes` with three-bit RaBitQ codes
+  builds a partition file with a `__code` column beside its edges and, unless
+  the index leaves them to the dataset, its vectors;
   `SearchParams::with_mode(WalkMode::Coded)` walks by it and re-scores the whole
   candidate list exactly, still reading the partition whole; and
   `WalkMode::Lazy` keeps the row ids and the codes and fetches the rest as it
   goes - the out-edges of a vertex when it expands one,
   `SearchParams::with_beam_width` vertices to a request, then the vectors of the
-  candidate list in one more.
+  candidate list in one more. An index that leaves its vectors to the dataset
+  has no partition to read whole, so only `WalkMode::Lazy` and `WalkMode::Flat`
+  search it, and `Exact`, the default, and `Coded` are refused.
 
   A hop of a lazy walk collects every neighbour it has not already seen before it
   measures any of them, and asks the processor for the code of the one
@@ -422,6 +438,10 @@ two are meant to say the same thing.
   directly. The bytes and the reads are identical to the decoder's - the ranges
   are the ones its own full-zip scheduler would have built - and what is skipped
   is a projected reader, a decode engine and a task per batch for twenty rows.
+  A re-score from the dataset reads the vector column of a data file the same
+  way, by the same arithmetic read out of that column's footer, wherever the
+  file is laid out to allow it - see
+  [An index without vectors](#an-index-without-vectors) for where it is not.
   For an index with a cache, on local storage, it goes one step further and
   reads those ranges off a descriptor the index already holds, coalescing them
   the way the scheduler would so that the byte, read and request counts stay the
@@ -429,19 +449,21 @@ two are meant to say the same thing.
   holds it and the filesystem accepts the flag - asked with `RWF_NOWAIT`, so
   that a read the kernel would have to wait for is refused rather than waited
   on - and sends only the refused ones to the blocking pool, in one trip per
-  partition. The trip is what a warm re-score is spared: it costs two wakeups -
-  a pool thread, then a runtime worker to carry the query on - where reading in
-  place costs none. With resident edges the search before it reads nothing
-  through the scheduler, so the pool thread has slept through the whole walk;
+  partition, or per fragment for a re-score from the dataset. The trip is what
+  a warm re-score is spared: it costs two wakeups - a pool thread, then a
+  runtime worker to carry the query on - where reading in place costs none.
+  With resident edges the search before it reads nothing through the
+  scheduler, so the pool thread has slept through the whole walk;
   measured that way with a budget of twenty, one query in flight, the re-score
   fell from 83-130 us to 30-45 us from `d = 128` to `d = 960`, and at twelve in
   flight to 0.39-0.64 of what it was. A walk that fetches its edges keeps the
   pool busy on every hop, and there reading in place was not measured. A
   batch over a megabyte goes to the pool whole, and so does every batch on a
-  Unix other than Linux; off Unix the scheduler reads them. A file that fails
-  any of the layout's checks is decoded as before; one on a store that is not
-  local or configured for io_uring, or any file of an index given no cache, has
-  its ranges read through the scheduler. At equal recall, with the budget set to
+  Unix other than Linux; off Unix the scheduler reads them. A partition file
+  that fails any of the layout's checks is decoded as before, and a data file
+  that does goes through Lance's take; one on a store that is not local or
+  configured for io_uring, or any file of an index given no cache, has its
+  ranges read through the scheduler. At equal recall, with the budget set to
   `L`, and timed while the decoder still did the reading:
 
   | | 8192 rows, 7 probes | 65536 rows, 4 probes |
@@ -479,8 +501,10 @@ An index is **refused** at open, rather than answering from what is left, when:
 - the manifest records a format version this build does not read;
 - a segment was inherited from another dataset by a shallow clone, so its files
   live under a base path this crate cannot resolve;
-- its segments disagree about the dimension, the metric, the identifier space or
-  the codes, because a query merges their answers.
+- its segments disagree about the dimension, the metric, the identifier space,
+  the codes or where the vectors are, because a query merges their answers;
+- it leaves its vectors to the dataset and the column it was built over is
+  gone, or is no longer a list of as many `f32` as the index has dimensions.
 
 In every case the answer is to rebuild the index.
 
@@ -498,7 +522,11 @@ else would be a second copy of one number for the two to disagree about.
 - `insert_in_place` puts those same rows into the base's own graphs instead:
   routed by the base's centroids, each partition that drew any of them read,
   grown and rewritten, and the rest copied across undecoded. One segment stays
-  one segment.
+  one segment. In an index that leaves its vectors to the dataset, a partition
+  it grows reads its vectors there - its deleted vertices' too, which the walk
+  that places a new row still passes through and Lance's take no longer
+  returns: their bytes are still in the data file, and where no offset reaches
+  them, a take from the fragment as it would be without its deletion file does.
 - `consolidate_index` takes the dataset's deleted rows out of the graphs that
   still hold them. On SIFT 100k it returns the deleted share in bytes to within
   half a percentage point and returns almost nothing in recall: a tombstone is
@@ -512,9 +540,9 @@ else would be a second copy of one number for the two to disagree about.
 **Which one to call.** Delta segments to be rid of: `merge_index`, because
 nothing else removes them. Only new rows: `insert_as_segment` to make them
 searchable now, `insert_in_place` to keep the read cost flat. Only deletions:
-`consolidate_index`, which is cheaper than merging because it never reads the
-dataset's vector column and never routes. Anything else, or more than one of them
-at once: `merge_index`.
+`consolidate_index`, which is cheaper than merging because it never routes and,
+unless the index leaves its vectors to the dataset, never reads the dataset's
+vector column. Anything else, or more than one of them at once: `merge_index`.
 
 Which insert to use is a question about read operations, not about recall.
 Measured on SIFT 100k over indices covering the same rows and differing only in
@@ -565,15 +593,17 @@ Compaction needs none of them to keep answering. Lance's default compaction
 does not touch fragments a Vamana index covers; one asked to with
 `defer_index_remap` records where every row went, and the index follows the
 record. What `consolidate_index` or `merge_index` adds afterwards is writing the
-new addresses into the index - every partition is written out again, and no
-vertex is taken out of a graph or linked back into one for it - so that Lance
-can drop the record.
+new addresses into the index - a partition whose rows only moved is written out
+again from the batch its file holds, with no vertex taken out of a graph or
+linked back into one and no code taken again, and an index without vectors
+reads nothing from the dataset for it - so that Lance can drop the record.
 
 ## Building
 
 - The whole vector column is held in memory for the duration of a build - twice
-  over, briefly, while the batches are concatenated. A build is a builder-side
-  cost; a query reads one partition at a time.
+  over, briefly, while the batches are concatenated - whether or not the index
+  keeps a copy. A build is a builder-side cost; a query holds no more than the
+  few partitions it has in flight and the vectors of its candidates.
 - Building and every maintenance call work on as many partitions at once as Lance
   gives the compute pool cores, and write them one at a time in id order. That is
   a fivefold saving on twelve cores and a working set of that many partitions:
@@ -603,17 +633,106 @@ can drop the record.
   other, over every tenth vector of GloVe-200 and GIST1M, came out 1.28x and
   1.09x faster.
 - `L2` and `Cosine` only. Cosine normalises the vectors it stores, so what the
-  index holds is not bit-identical to the dataset's column. `Dot` is refused: see
-  `supported_distance_type` for why.
+  index holds is not bit-identical to the dataset's column; an index that leaves
+  them to the dataset normalises each one it reads by the same function, and
+  re-scores to the same bits. `Dot` is refused: see `supported_distance_type`
+  for why.
 - Address-style row ids only. A dataset created with `enable_stable_row_ids` is
   refused at build and at open.
-- `with_code_bits` mints one RaBitQ rotation for the whole index and every later
-  segment inherits it, because a partition copied between two segments carries
-  its codes unchanged and a code says nothing about the rotation it was built
-  under. A copy between segments that disagree is refused.
-- A build is reproducible from `BuildParams::seed`, with one hole outside this
-  crate's control: Lance re-seeds from the OS when a k-means iteration leaves a
-  cluster empty.
+- `with_codes` mints what the codes are taken under - a RaBitQ rotation, or the
+  scalar bounds - once for the whole index, and every later segment inherits
+  it, because a partition copied between two segments carries its codes
+  unchanged and a code says nothing about what it was taken under. A copy
+  between segments that disagree is refused.
+- A build is reproducible from `BuildParams::seed`, except for two things: Lance
+  re-seeds from the OS when a k-means iteration leaves a cluster empty, which is
+  outside this crate's control, and RaBitQ's rotation is drawn fresh every build
+  from a generator the seed does not reach, so two RaBitQ builds differ in their
+  codes. Scalar codes come out the same.
+
+## An index without vectors
+
+`IndexParams::with_vector_source(VectorSource::Dataset)` - `vamana build
+--vectors dataset` - builds the same index without its copy of the vectors.
+The build runs as it does for `VectorSource::Index`, the default: from one seed
+the routing, the partition table, the graphs and scalar codes come out the
+same, and RaBitQ codes as differently as any two RaBitQ builds do (see
+[Building](#building)). The partition files leave out `__vector`, and a
+re-score reads each candidate's vector out of the dataset's own data files
+instead, at the dataset version the index was opened at, by the same offset
+arithmetic it reads a partition file with. The vectors read are the same ones,
+so the answers are the same to the last bit: twins built from one seed with
+scalar codes answer alike, and so does one index re-scored from its copy and
+from the dataset. On SIFT1M at one partition, `R = 70` and eight-bit scalar
+codes, the partition file is 410.4 MB against 922.4 MB. `vamana info` prints
+which kind an index is on its `vectors` line. The choice is recorded in the
+index, which is why the format is at version 6: an index written before it is
+refused at open and has to be rebuilt.
+
+What it asks for in return:
+
+- Codes, and vectors at least 64 dimensions wide
+  (`format::MIN_DATASET_VECTOR_DIMENSION`). The walk has to steer by something
+  resident, and the re-score reads a row by offset, which only a full-zip column
+  allows; Lance writes any value narrower than 256 bytes as mini-block, and at
+  four bytes a dimension that is 64. A build that cannot meet either is refused
+  before it reads a row. A copy in the index has no such floor, because a
+  partition file asks Lance for full-zip explicitly.
+- `WalkMode::Lazy` or `WalkMode::Flat`, chosen by the query: `Exact`, the
+  default, and `Coded` read a partition whole and are refused.
+- Data files an offset can reach. A fragment none can - a file older than Lance
+  2.1, a column that is compressed or holds nulls, an overlay the column already
+  had when the index was built, a file under another base path, a row count the
+  manifest does not vouch for - is not refused: its rows go through Lance's
+  take, milliseconds where the offset read takes microseconds. A build counts
+  the fragments the manifest alone sends there in
+  `BuildStats::fragments_through_lance` and warns, which the command line
+  prints; the index counts their rows in `RescoreReads::through_lance`
+  (`VamanaIndex::rescore_reads`), and their bytes are in no count of this
+  crate's, the command line's `search` report included.
+- The data files of the version the index was opened at, while it is open -
+  see [What the query path does not do](#what-the-query-path-does-not-do).
+
+Maintenance works on it as on any other index, reading the vectors it needs out
+of the dataset as a query does. Five things keep those reads cheap:
+
+- A data file's layout comes out of the footer of its vector column alone, not
+  out of every column's, which on a wide table is most of the footer. An index
+  with a cache keeps the layout, and every index remembers which files no offset
+  read can serve, so as not to open one again only to be sent to Lance.
+- The fragments a re-score's candidates sit in are read at once rather than in
+  turn, as many at a time as the store's I/O parallelism, and put back in the
+  order asked for. The bound is per read and shared by nothing: a search its
+  caller stops polling holds up no other.
+- Consolidation, a merge and an insertion in place open the index with a cache
+  of their own for the length of the pass, so a data file's layout is read once
+  rather than once for every partition that reads from it.
+- A partition whose rows a deferred compaction only moved is written out with
+  its new addresses from the batch its file holds, and nothing is read from the
+  dataset for it.
+- The deleted vertices an insertion in place walks through are read by offset,
+  or by one take per fragment from the fragment as it would be without its
+  deletion file, rather than a read per run of consecutive rows.
+
+The re-score of an index that keeps its vectors can be pointed at the dataset
+too, per query, with `SearchParams::rescore_from_dataset`, which is how the two
+reads were measured against each other on one index: the stand
+(`examples/ivf_rq_ab.rs`) switched between them in one binary on SIFT1M,
+GloVe-200, Cohere and GIST1M at one partition and their recall bars (0.99,
+0.85, 0.98, 0.95), with a re-score budget of 20, eight-bit scalar codes and
+resident edges, under the `performance` power profile. With one query in flight
+the dataset's read took 30.5, 36.5, 42.5 and 46.5 us against the copy's 28.5,
+32.5, 42.0 and 44.0 - GloVe's vectors sit in two data files, and its re-score
+made 1.9 requests a query to the copy's 1.0 - and the whole query moved with
+the search before it, which is the same code on both arms. With twelve in
+flight SIFT and GloVe paid nothing a query. GIST's search phase took 1.06 times
+as long in both pairs measured, and its time a query with it; Cohere's search
+phase took 1.09 in one pair and 1.01 in the other, and its time a query 1.04
+overall. GIST's reads were the same on both arms in count, bytes and place, so
+that is the same work costing more cycles at saturation, somewhere in the
+memory hierarchy; the mechanism was not established. All of it was timed before
+the reads above were reworked, which repeat its work to the digit and were not
+timed again.
 
 ## Testing
 

@@ -26,9 +26,11 @@ use lance::dataset::index::frag_reuse::cleanup_frag_reuse_index;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
+use lance_file::version::LanceFileVersion;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, build_index_segment, create_index, live_fragments};
 use lance_vamana::consolidator::consolidate_index;
+use lance_vamana::format::VectorSource;
 use lance_vamana::inserter::{InsertStats, insert_as_segment, insert_in_place};
 use lance_vamana::merger::merge_index;
 use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
@@ -37,8 +39,9 @@ use uuid::Uuid;
 
 mod common;
 use common::{
-    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, live_row_ids, random_vectors,
-    read_committed_segments, recall,
+    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, WIDE_DIM, assert_twins_hold_the_same, brute_force,
+    commit_overlay_of, live_row_ids, random_vectors, random_vectors_of, read_committed_segments,
+    recall, twin_params, twins, wide_fixture,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
@@ -780,6 +783,115 @@ async fn deleting_and_inserting_compose() {
     assert_eq!(consolidated.segments_rewritten, 1, "{consolidated:?}");
     let (rows, slots) = stored_row_ids(&dataset).await;
     assert_eq!((slots, rows.len()), (live.len(), live.len()));
+}
+
+/// Inserting in place into an index that leaves its vectors to the dataset is
+/// inserting into its twin that keeps them. The insertion walks through the
+/// deleted vertices too, so their vectors are read back as well - by offset, the
+/// bytes of a deleted row staying in its data file.
+#[tokio::test]
+async fn an_index_without_vectors_grows_in_place_as_its_twin_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut twins = twins(
+        dir.path(),
+        &wide_fixture(),
+        INDEX_NAME,
+        &twin_params(PARTITIONS),
+    )
+    .await;
+    let mut stats = Vec::new();
+    for (uri, dataset) in &mut twins {
+        dataset.delete("_rowid % 5 == 0").await.unwrap();
+        *dataset = DatasetFixture {
+            seed: 99,
+            ..wide_fixture()
+        }
+        .append(uri)
+        .await;
+        stats.push(insert_in_place(dataset, INDEX_NAME).await.unwrap());
+    }
+    assert_eq!(stats[0], stats[1]);
+    assert!(stats[0].partitions_grown > 0, "{:?}", stats[0]);
+    assert_twins_hold_the_same(&twins[0].1, &twins[1].1, INDEX_NAME).await;
+}
+
+/// Where the dataset gives vectors only through Lance - a Lance 2.0 data file
+/// here - the deleted rows an insertion walks through are read by one Lance
+/// take from the fragment without its deletion file, and the index grows in
+/// place as its twin keeping the vectors does.
+#[tokio::test]
+async fn an_index_without_vectors_grows_over_lance_2_0_files_as_its_twin_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let written_as_2_0 = |seed| DatasetFixture {
+        seed,
+        storage_version: Some(LanceFileVersion::V2_0),
+        ..wide_fixture()
+    };
+    let mut twins = twins(
+        dir.path(),
+        &written_as_2_0(wide_fixture().seed),
+        INDEX_NAME,
+        &twin_params(PARTITIONS),
+    )
+    .await;
+    let mut stats = Vec::new();
+    for (uri, dataset) in &mut twins {
+        dataset.delete("_rowid % 5 == 0").await.unwrap();
+        *dataset = written_as_2_0(99).append(uri).await;
+        stats.push(insert_in_place(dataset, INDEX_NAME).await.unwrap());
+    }
+    assert_eq!(stats[0], stats[1]);
+    assert!(stats[0].partitions_grown > 0, "{:?}", stats[0]);
+    assert_twins_hold_the_same(&twins[0].1, &twins[1].1, INDEX_NAME).await;
+}
+
+/// An overlay the build saw keeps a fragment's vectors in a file of its own,
+/// so no offset reaches them, and the deleted rows an insertion walks through
+/// there are read through Lance with the overlay applied - what the build read,
+/// and what the twin keeping its vectors holds. Some of the rows deleted are
+/// overlaid ones, whose base values the overlay replaced. The new values are
+/// drawn as the others are, so that the overlaid rows lie where the insertion
+/// walks: values far from every other row would be passed by whatever they
+/// were.
+#[tokio::test]
+async fn an_index_without_vectors_grows_over_an_overlay_as_its_twin_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let overlaid = (0..60).collect::<Vec<u32>>();
+    let replacement = || {
+        FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            random_vectors_of(overlaid.len(), WIDE_DIM, 77)
+                .into_iter()
+                .map(|vector| Some(vector.into_iter().map(Some).collect::<Vec<_>>())),
+            WIDE_DIM,
+        )
+    };
+    let mut twins = Vec::new();
+    let mut stats = Vec::new();
+    for vector_source in [VectorSource::Index, VectorSource::Dataset] {
+        let uri = dir.path().join(vector_source.to_string());
+        let uri = uri.to_str().unwrap();
+        let dataset = wide_fixture().write(uri).await;
+        let mut dataset = commit_overlay_of(dataset, 1, &overlaid, "seen", replacement()).await;
+        create_index(
+            &mut dataset,
+            INDEX_NAME,
+            &twin_params(PARTITIONS).with_vector_source(vector_source),
+        )
+        .await
+        .unwrap();
+        dataset.delete("_rowid % 5 == 0").await.unwrap();
+        let mut dataset = DatasetFixture {
+            seed: 99,
+            ..wide_fixture()
+        }
+        .append(uri)
+        .await;
+        stats.push(insert_in_place(&mut dataset, INDEX_NAME).await.unwrap());
+        twins.push(dataset);
+    }
+    assert_eq!(stats[0], stats[1]);
+    assert!(stats[0].partitions_grown > 0, "{:?}", stats[0]);
+    assert_twins_hold_the_same(&twins[0], &twins[1], INDEX_NAME).await;
 }
 
 /// Rewriting a segment whose fragments are gone would store their vertices under

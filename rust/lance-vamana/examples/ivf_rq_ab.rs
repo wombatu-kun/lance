@@ -30,6 +30,19 @@
 //! `PREFETCH_AHEAD` reaches an instruction only under `CODE_KIND=sq`: RaBitQ's
 //! calculator has no `prefetch`.
 //!
+//! `RESCORE_FROM` (`index` or `dataset`, default `index`) says where the
+//! crate's arms read the vectors they re-score: the partitions' own copy, or
+//! the dataset's data files (`SearchParams::rescore_from_dataset`). The answers
+//! are the same either way, so one binary carries both arms of the comparison.
+//! Every re-score line also says how many rows went through Lance's take
+//! because a data file could not be read by offset, which is zero unless the
+//! crate's arms read the dataset.
+//!
+//! `VECTOR_SOURCE` (`index` or `dataset`, default `index`) says where the index
+//! this example builds keeps its vectors (`IndexParams::vector_source`). An
+//! index that leaves them to the dataset lives in a directory of its own,
+//! suffixed `-nv`, and re-scores from the dataset whatever `RESCORE_FROM` says.
+//!
 //! `STOP_MARGINS` (unset: none) adds a second curve for every budget of
 //! `BUDGETS`: the walk stopped by a margin (`SearchParams::stop_margin`) rather
 //! than by its list, one point per margin, each with its list capped at
@@ -201,6 +214,7 @@ use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::codes::CodeSpec;
+use lance_vamana::format::VectorSource;
 use lance_vamana::query::{Neighbor, RescoreReads, SearchParams, VamanaIndex, WalkMode};
 
 #[path = "common/mod.rs"]
@@ -486,6 +500,11 @@ struct Fixture<'a> {
     /// leaving it unset on `IVF_HNSW_*` would measure Lance's default, not the
     /// point being compared.
     ef: Option<usize>,
+    /// Whether the crate's arms re-score from the dataset's data files rather
+    /// than from the partitions; an index built with `VECTOR_SOURCE=dataset`
+    /// does so whatever this says. Lance's arms have no such choice and ignore
+    /// it.
+    rescore_from_dataset: bool,
 }
 
 /// Runs `query(i)` for every `i` in `0..count` from `concurrency` clients and
@@ -555,6 +574,7 @@ async fn measure_vamana(
         // This arm carries its own queue as `list_size`; `ef` is the same knob
         // spelled the way Lance spells it, and only its arms read it.
         ef: _,
+        rescore_from_dataset,
     } = *fixture;
     let params = SearchParams::new(K)
         .with_nprobes(nprobes)
@@ -564,7 +584,8 @@ async fn measure_vamana(
         .with_prefetch_ahead(prefetch_ahead)
         .with_resident_edges(resident_edges)
         .with_report_coded(true)
-        .with_rescore_budget(point.budget);
+        .with_rescore_budget(point.budget)
+        .with_rescore_from_dataset(rescore_from_dataset);
     let params = match point.stop_margin {
         Some(margin) => params.with_stop_margin(margin),
         None => params,
@@ -1209,6 +1230,16 @@ async fn main() {
     let warmup = env_usize("WARMUP", num_queries).min(num_queries);
     let concurrency = env_usize("CONCURRENCY", 1).max(1);
     let resident_edges = env_usize("RESIDENT_EDGES", 0) != 0;
+    let rescore_from_dataset = match std::env::var("RESCORE_FROM").as_deref() {
+        Err(_) | Ok("index") => false,
+        Ok("dataset") => true,
+        Ok(other) => panic!("RESCORE_FROM is `index` or `dataset`, not `{other}`"),
+    };
+    let vector_source = match std::env::var("VECTOR_SOURCE").as_deref() {
+        Err(_) | Ok("index") => VectorSource::Index,
+        Ok("dataset") => VectorSource::Dataset,
+        Ok(other) => panic!("VECTOR_SOURCE is `index` or `dataset`, not `{other}`"),
+    };
     // A pass charges its later rows more than its earlier ones - one and the
     // same reference point cost 1812 us after two vamana rows and 2028 after
     // thirty-two - so `both` reads the reference at each end and brackets the
@@ -1239,12 +1270,17 @@ async fn main() {
         "{prefix} {rows} x {dim}, R = {degree}, walk on {vamana_codes}, IVF_RQ on {code_bits} \
          bits, {num_queries} queries, \
          k = {K}, cache {} MB, {concurrency} in flight, walk edges {}, reference \
-         measured {reference_position}",
+         measured {reference_position}, vectors in {vector_source}, re-score from {}",
         cache_bytes >> 20,
         if resident_edges {
             "resident"
         } else {
             "fetched"
+        },
+        if rescore_from_dataset || vector_source == VectorSource::Dataset {
+            "dataset"
+        } else {
+            "index"
         }
     );
     println!(
@@ -1290,8 +1326,13 @@ async fn main() {
         CodeSpec::Rabit { num_bits } => format!("c{num_bits}"),
         CodeSpec::Scalar { num_bits } => format!("sq{num_bits}"),
     };
-    let vamana_uri =
-        format!("{home}/{prefix}-{rows}-p{vamana_partitions}-r{degree}-{code_suffix}.lance");
+    let vector_suffix = match vector_source {
+        VectorSource::Index => "",
+        VectorSource::Dataset => "-nv",
+    };
+    let vamana_uri = format!(
+        "{home}/{prefix}-{rows}-p{vamana_partitions}-r{degree}-{code_suffix}{vector_suffix}.lance"
+    );
     let rq_uri = format!("{home}/{prefix}-{rows}-p{rq_partitions}-rq{code_bits}.lance");
     let sq_uri = format!(
         "{home}/{prefix}-{rows}-p{rq_partitions}-ivfsq{}.lance",
@@ -1311,6 +1352,7 @@ async fn main() {
             metadata.codes.as_ref().map(|codes| codes.spec()),
             Some(vamana_codes)
         );
+        assert_eq!(metadata.vector_source, vector_source);
         println!("reusing the vamana index at {vamana_uri}");
         dataset
     } else {
@@ -1322,6 +1364,7 @@ async fn main() {
             &IndexParams::new(VECTOR_FIELD, vamana_partitions)
                 .with_distance_type(DISTANCE_TYPE)
                 .with_codes(vamana_codes)
+                .with_vector_source(vector_source)
                 .with_graph_params(BuildParams {
                     max_degree: degree,
                     ..Default::default()
@@ -1425,6 +1468,7 @@ async fn main() {
         concurrency,
         resident_edges,
         ef: None,
+        rescore_from_dataset,
     };
     let rq_fixture = Fixture {
         positions: &rq_positions,
@@ -1564,8 +1608,9 @@ async fn main() {
                 // The re-score line first: parsers written before the work line
                 // read it as the line under the row.
                 println!(
-                    "# re-score reads of the row above: {} in place, {} handed off in {} trips",
-                    reads.in_place, reads.handed_off, reads.trips
+                    "# re-score reads of the row above: {} in place, {} handed off in {} trips, {} \
+                     rows through Lance",
+                    reads.in_place, reads.handed_off, reads.trips, reads.through_lance
                 );
                 println!(
                     "# work of the row above: distances a query mean {:.3}, p50 {}, p99 {}, max \
