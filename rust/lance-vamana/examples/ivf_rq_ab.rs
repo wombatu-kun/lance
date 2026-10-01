@@ -10,7 +10,8 @@
 //! ```
 //!
 //! Environment: `SIFT_DIR` (required), `VECTORS` (default 100000, `0` for all),
-//! `QUERIES` (default 200), `ROWS_PER_PARTITION` (default 8192), `NPROBES`
+//! `QUERIES` (default 200), `K` (default 10, the `k` every query asks for and
+//! recall is taken at), `ROWS_PER_PARTITION` (default 8192), `NPROBES`
 //! (default 7), `VAMANA_ROWS_PER_PARTITION`, `RQ_ROWS_PER_PARTITION`,
 //! `VAMANA_NPROBES`, `RQ_NPROBES` (each defaults to the shared value above),
 //! `DEGREE` (default 64), `CODE_BITS` (default 3), `CODE_KIND` (`rq` or `sq`,
@@ -227,7 +228,6 @@ const VAMANA_INDEX: &str = "vamana_idx";
 const RQ_INDEX: &str = "rq_idx";
 const SQ_INDEX: &str = "sq_idx";
 const DISTANCE_TYPE: DistanceType = DistanceType::L2;
-const K: usize = 10;
 
 /// Prints Lance's RaBitQ prune tallies and nothing else. Deliberately not a
 /// general logger: everything else Lance logs during a pass would land in the
@@ -461,19 +461,32 @@ async fn positions_by_address(dataset: &Dataset) -> HashMap<u64, u64> {
         .collect()
 }
 
-/// Exact nearest `K` positions of one query, by brute force over every row.
-fn exact_top(store: &FlatFloatStorage, query: ArrayRef) -> Vec<u64> {
+/// Exact nearest `k` positions of one query, by brute force over every row, in
+/// ascending order so that [`recall_of`] can search them.
+fn exact_top(store: &FlatFloatStorage, query: ArrayRef, k: usize) -> Vec<u64> {
     let calculator = store.dist_calculator(query, 0.0);
     let mut scored = (0..store.len() as u32)
         .map(|id| (calculator.distance(id), id))
         .collect::<Vec<_>>();
-    scored.select_nth_unstable_by(K, |left, right| left.0.total_cmp(&right.0));
-    scored.truncate(K);
-    scored.into_iter().map(|(_, id)| id as u64).collect()
+    scored.select_nth_unstable_by(k, |left, right| left.0.total_cmp(&right.0));
+    scored.truncate(k);
+    let mut nearest = scored
+        .into_iter()
+        .map(|(_, id)| id as u64)
+        .collect::<Vec<_>>();
+    nearest.sort_unstable();
+    nearest
 }
 
+/// `exact` is searched rather than scanned: a scan per neighbour found is `k^2`
+/// comparisons a query, a hundred million at a `k` of ten thousand.
 fn recall_of(found: &[u64], exact: &[u64]) -> f64 {
-    found.iter().filter(|id| exact.contains(id)).count() as f64 / K as f64
+    debug_assert!(exact.is_sorted(), "exact_top returns its positions sorted");
+    found
+        .iter()
+        .filter(|id| exact.binary_search(id).is_ok())
+        .count() as f64
+        / exact.len() as f64
 }
 
 /// One index and everything an arm is measured against, so an arm's own
@@ -481,6 +494,9 @@ fn recall_of(found: &[u64], exact: &[u64]) -> f64 {
 struct Fixture<'a> {
     queries: &'a [Vec<f32>],
     truth: &'a [Vec<u64>],
+    /// How many neighbours every arm asks for, and how many of each query's
+    /// exact nearest `truth` holds.
+    k: usize,
     /// Base-vector positions keyed by row address, of the dataset this fixture
     /// names - the two datasets are written alike but are not the same index.
     positions: &'a Arc<HashMap<u64, u64>>,
@@ -565,6 +581,7 @@ async fn measure_vamana(
     let Fixture {
         queries,
         truth,
+        k,
         positions,
         nprobes,
         cache_bytes,
@@ -576,7 +593,7 @@ async fn measure_vamana(
         ef: _,
         rescore_from_dataset,
     } = *fixture;
-    let params = SearchParams::new(K)
+    let params = SearchParams::new(k)
         .with_nprobes(nprobes)
         .with_search_list_size(point.list_size)
         .with_mode(mode)
@@ -597,7 +614,6 @@ async fn measure_vamana(
             .with_cache(LanceCache::with_capacity(cache_bytes)),
     );
     let queries: Arc<[Vec<f32>]> = Arc::from(queries);
-    let truth: Arc<[Vec<u64>]> = Arc::from(truth);
     // At the pass's own concurrency: the index keeps a visited-mark scratch for
     // every walk that has run at once, so a warmup one query at a time would
     // leave it only as many as one query runs, and the pass would allocate the
@@ -618,48 +634,60 @@ async fn measure_vamana(
     let cache_before = index.cache_stats().await;
     let cpu_before = cpu_micros();
     let started = Instant::now();
-    let reports = run_clients(queries.len(), concurrency, {
-        let (index, params, positions) = (index.clone(), params.clone(), Arc::clone(positions));
-        let (queries, truth) = (Arc::clone(&queries), Arc::clone(&truth));
+    let mut answers = run_clients(queries.len(), concurrency, {
+        let (index, params, queries) = (index.clone(), params.clone(), Arc::clone(&queries));
         move |at| {
-            let (index, params, positions) =
-                (index.clone(), params.clone(), Arc::clone(&positions));
-            let (queries, truth) = (Arc::clone(&queries), Arc::clone(&truth));
+            let (index, params, queries) = (index.clone(), params.clone(), Arc::clone(&queries));
             async move {
                 let call = Instant::now();
                 let result = index.search(&queries[at], &params).await.unwrap();
-                let latency = call.elapsed().as_micros() as f64;
-                let addresses = |neighbors: &[Neighbor]| {
-                    neighbors
-                        .iter()
-                        .map(|neighbor| positions[&neighbor.row_addr])
-                        .collect::<Vec<_>>()
-                };
-                // Checked rather than trusted: a coded answer that came back
-                // empty would be reported as a recall of zero, which reads as a
-                // finding rather than as a switch nobody turned on.
-                assert_eq!(
-                    result.coded_neighbors.len(),
-                    K,
-                    "the index answered {} coded neighbours rather than k = {K}",
-                    result.coded_neighbors.len()
-                );
-                Reported {
-                    recall: recall_of(&addresses(&result.neighbors), &truth[at]),
-                    coded_recall: recall_of(&addresses(&result.coded_neighbors), &truth[at]),
-                    latency_micros: latency,
-                    search_micros: result.search.elapsed.as_micros() as f64,
-                    rescore_micros: result.rescore.elapsed.as_micros() as f64,
-                    search_bytes: result.search.bytes_read as f64,
-                    rescore_bytes: result.rescore.bytes_read as f64,
-                    comparisons: result.comparisons,
-                }
+                (at, call.elapsed().as_micros() as f64, result)
             }
         }
     })
     .await;
     let micros = started.elapsed().as_micros() as f64;
     let cpu = cpu_micros() - cpu_before;
+
+    // Scored only now, with both clocks stopped: mapping `2k` addresses a query
+    // to positions and looking each up in the truth is the stand's work, not the
+    // index's, and at a large `k` it would be a share of `us` and `cpu us` - and
+    // of the cores the other queries in flight were running on. In query order,
+    // because a sum of fractions depends on the order it is taken in, and a mean
+    // recall that falls exactly between two printed digits, as one over a
+    // hundred neighbours can, would otherwise round by which client finished
+    // first.
+    answers.sort_unstable_by_key(|(at, _, _)| *at);
+    let addresses = |neighbors: &[Neighbor]| {
+        neighbors
+            .iter()
+            .map(|neighbor| positions[&neighbor.row_addr])
+            .collect::<Vec<_>>()
+    };
+    let reports = answers
+        .iter()
+        .map(|(at, latency, result)| {
+            // Checked rather than trusted: a coded answer that came back empty
+            // would be reported as a recall of zero, which reads as a finding
+            // rather than as a switch nobody turned on.
+            assert_eq!(
+                result.coded_neighbors.len(),
+                k,
+                "the index answered {} coded neighbours rather than k = {k}",
+                result.coded_neighbors.len()
+            );
+            Reported {
+                recall: recall_of(&addresses(&result.neighbors), &truth[*at]),
+                coded_recall: recall_of(&addresses(&result.coded_neighbors), &truth[*at]),
+                latency_micros: *latency,
+                search_micros: result.search.elapsed.as_micros() as f64,
+                rescore_micros: result.rescore.elapsed.as_micros() as f64,
+                search_bytes: result.search.bytes_read as f64,
+                rescore_bytes: result.rescore.bytes_read as f64,
+                comparisons: result.comparisons,
+            }
+        })
+        .collect::<Vec<_>>();
     let totals = reports.iter().fold(Reported::default(), Reported::plus);
     let each = reports
         .iter()
@@ -797,6 +825,7 @@ struct Counts {
 fn rq_scanner(
     dataset: &Dataset,
     query: &[f32],
+    k: usize,
     nprobes: usize,
     ef: Option<usize>,
     refine: Option<u32>,
@@ -805,7 +834,7 @@ fn rq_scanner(
     let key = Float32Array::from(query.to_vec());
     let mut scanner = dataset.scan();
     scanner.empty_project().unwrap();
-    scanner.nearest(VECTOR_FIELD, &key, K).unwrap();
+    scanner.nearest(VECTOR_FIELD, &key, k).unwrap();
     scanner.nprobes(nprobes);
     if let Some(ef) = ef {
         scanner.ef(ef);
@@ -824,12 +853,13 @@ fn rq_scanner(
 async fn rq_neighbors(
     dataset: &Dataset,
     query: &[f32],
+    k: usize,
     nprobes: usize,
     ef: Option<usize>,
     refine: Option<u32>,
     callback: Option<ExecutionStatsCallback>,
 ) -> Vec<u64> {
-    let batch = rq_scanner(dataset, query, nprobes, ef, refine, callback)
+    let batch = rq_scanner(dataset, query, k, nprobes, ef, refine, callback)
         .try_into_batch()
         .await
         .unwrap();
@@ -841,6 +871,7 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
     let Fixture {
         queries,
         truth,
+        k,
         positions,
         nprobes,
         ef,
@@ -855,7 +886,7 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
         .await
         .unwrap();
     for query in queries.iter().take(warmup) {
-        rq_neighbors(&dataset, query, nprobes, ef, refine, None).await;
+        rq_neighbors(&dataset, query, k, nprobes, ef, refine, None).await;
     }
 
     let counts = Arc::new(Mutex::new(Counts::default()));
@@ -870,37 +901,44 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
     });
 
     let queries: Arc<[Vec<f32>]> = Arc::from(queries);
-    let truth: Arc<[Vec<u64>]> = Arc::from(truth);
     let cpu_before = cpu_micros();
     let started = Instant::now();
-    let answers = run_clients(queries.len(), concurrency, {
-        let (dataset, positions) = (dataset.clone(), Arc::clone(positions));
-        let (queries, truth) = (Arc::clone(&queries), Arc::clone(&truth));
+    let mut answers = run_clients(queries.len(), concurrency, {
+        let (dataset, queries) = (dataset.clone(), Arc::clone(&queries));
         move |at| {
-            let (dataset, positions) = (dataset.clone(), Arc::clone(&positions));
-            let (queries, truth, callback) =
-                (Arc::clone(&queries), Arc::clone(&truth), callback.clone());
+            let (dataset, queries, callback) =
+                (dataset.clone(), Arc::clone(&queries), callback.clone());
             async move {
                 let call = Instant::now();
-                let addresses =
-                    rq_neighbors(&dataset, &queries[at], nprobes, ef, refine, Some(callback)).await;
-                let latency = call.elapsed().as_micros() as f64;
-                let found = addresses
-                    .iter()
-                    .map(|address| positions[address])
-                    .collect::<Vec<_>>();
-                (recall_of(&found, &truth[at]), latency)
+                let addresses = rq_neighbors(
+                    &dataset,
+                    &queries[at],
+                    k,
+                    nprobes,
+                    ef,
+                    refine,
+                    Some(callback),
+                )
+                .await;
+                (at, call.elapsed().as_micros() as f64, addresses)
             }
         }
     })
     .await;
     let micros = started.elapsed().as_micros() as f64;
     let cpu = cpu_micros() - cpu_before;
-    let (recall, latency) = answers
-        .iter()
-        .fold((0.0, 0.0), |(recall, latency), (hits, took)| {
-            (recall + hits, latency + took)
-        });
+    // Scored after the clocks and in query order, as `measure_vamana` scores.
+    answers.sort_unstable_by_key(|(at, _, _)| *at);
+    let (recall, latency) =
+        answers
+            .iter()
+            .fold((0.0, 0.0), |(recall, latency), (at, took, addresses)| {
+                let found = addresses
+                    .iter()
+                    .map(|address| positions[address])
+                    .collect::<Vec<_>>();
+                (recall + recall_of(&found, &truth[*at]), latency + took)
+            });
 
     let counts = counts.lock().unwrap();
     let lookups = counts.hits + counts.misses;
@@ -943,6 +981,7 @@ async fn measure_rq(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> Co
 async fn measure_rq_plan(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) -> (f64, f64) {
     let Fixture {
         queries,
+        k,
         nprobes,
         ef,
         cache_bytes,
@@ -956,7 +995,7 @@ async fn measure_rq_plan(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) 
         .await
         .unwrap();
     for query in queries.iter().take(warmup) {
-        rq_scanner(&dataset, query, nprobes, ef, refine, None)
+        rq_scanner(&dataset, query, k, nprobes, ef, refine, None)
             .create_plan()
             .await
             .unwrap();
@@ -970,7 +1009,7 @@ async fn measure_rq_plan(uri: &str, fixture: &Fixture<'_>, refine: Option<u32>) 
         move |at| {
             let (dataset, queries) = (dataset.clone(), Arc::clone(&queries));
             async move {
-                rq_scanner(&dataset, &queries[at], nprobes, ef, refine, None)
+                rq_scanner(&dataset, &queries[at], k, nprobes, ef, refine, None)
                     .create_plan()
                     .await
                     .unwrap();
@@ -1019,11 +1058,11 @@ async fn reference_sweep(
         "the unrefined reference answered nothing, so the split would report a recall of zero \
          before the re-score as though that were a measurement"
     );
-    report(&format!("{label} coded"), &K.to_string(), &bare);
+    report(&format!("{label} coded"), &fixture.k.to_string(), &bare);
 
     let mut points = Vec::with_capacity(widths.len());
     for width in widths {
-        let mut cost = measure_rq(uri, fixture, Some((width / K) as u32)).await;
+        let mut cost = measure_rq(uri, fixture, Some((width / fixture.k) as u32)).await;
         cost.coded_recall = bare.recall;
         // Latency against latency, never pass time: at twelve queries in flight
         // the pass figure is about a twelfth of the latency, and a split taken
@@ -1118,6 +1157,11 @@ async fn main() {
         requested.min(total)
     };
     let num_queries = env_usize("QUERIES", 200).min(total_queries);
+    let k = env_usize("K", 10);
+    assert!(
+        (1..rows).contains(&k),
+        "K must be at least 1 and below the {rows} rows the ground truth ranks, not {k}"
+    );
     let rows_per_partition = env_usize("ROWS_PER_PARTITION", 8192);
     let nprobes = env_usize("NPROBES", 7);
     let vamana_rows_per_partition = env_usize("VAMANA_ROWS_PER_PARTITION", rows_per_partition);
@@ -1152,8 +1196,8 @@ async fn main() {
     let hnsw_nprobes = env_usize("HNSW_NPROBES", 1);
     let widths = env_list("WIDTHS", "10,20,30,40,60,80,120,160");
     assert!(
-        widths.iter().all(|width| width % K == 0),
-        "every width must be a multiple of k = {K}: Lance spends `k * refine_factor` where this \
+        widths.iter().all(|width| width % k == 0),
+        "every width must be a multiple of k = {k}: Lance spends `k * refine_factor` where this \
          crate spends `L`, and a width it cannot express would compare two different lists"
     );
     let list_scales = env_list("LIST_SCALES", "1");
@@ -1209,8 +1253,8 @@ async fn main() {
          margin every row would have run at"
     );
     assert!(
-        budgets.iter().all(|budget| *budget >= K),
-        "every budget must be at least k = {K}: a query that re-scores fewer vectors than it \
+        budgets.iter().all(|budget| *budget >= k),
+        "every budget must be at least k = {k}: a query that re-scores fewer vectors than it \
          returns could never return k neighbours, and the crate refuses it"
     );
     assert!(
@@ -1269,7 +1313,7 @@ async fn main() {
     println!(
         "{prefix} {rows} x {dim}, R = {degree}, walk on {vamana_codes}, IVF_RQ on {code_bits} \
          bits, {num_queries} queries, \
-         k = {K}, cache {} MB, {concurrency} in flight, walk edges {}, reference \
+         k = {k}, cache {} MB, {concurrency} in flight, walk edges {}, reference \
          measured {reference_position}, vectors in {vector_source}, re-score from {}",
         cache_bytes >> 20,
         if resident_edges {
@@ -1301,6 +1345,7 @@ async fn main() {
             exact_top(
                 &store,
                 Arc::new(Float32Array::from(query.clone())) as ArrayRef,
+                k,
             )
         })
         .collect::<Vec<_>>();
@@ -1461,6 +1506,7 @@ async fn main() {
     let vamana_fixture = Fixture {
         queries: &queries,
         truth: &truth,
+        k,
         positions: &vamana_positions,
         nprobes: vamana_nprobes,
         cache_bytes,
