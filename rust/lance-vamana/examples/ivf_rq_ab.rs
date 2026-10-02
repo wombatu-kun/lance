@@ -19,7 +19,8 @@
 //! (default `10,20,30,40,60,80,120,160`, each a multiple of `k`),
 //! `LIST_SCALES` (default `1`), `BUDGETS` and `QUEUES` (unset: the width sweep
 //! above), `CONCURRENCY` (default 1), `CACHE_MB` (default 4096), `TARGET`
-//! (default 95), `WARMUP` (default: every query), `RESIDENT_EDGES` (default
+//! (default 95), `WARMUP` (default: every query), `TIMED_REPEATS` (default 1,
+//! see "Timed repeats" below), `RESIDENT_EDGES` (default
 //! 0), `REFERENCE_POSITION` (`last` or `both`, default `last`), `ARMS`
 //! (`scan`, `walk` or both, default both), `DATASET_DIR` (unset: temporary
 //! directories thrown away at the end), `HNSW_EFS` (unset: no HNSW arm),
@@ -183,6 +184,20 @@
 //! purpose, so the mean alone cannot say what the slowest queries paid, and one
 //! mean recall can hide two spreads of it. Both are exact counts that repeat
 //! from pass to pass to the digit.
+//!
+//! **Timed repeats.** At twelve in flight a row of this crate's arm times its
+//! two hundred queries in as little as a few milliseconds, and a burst of
+//! interference that long moves the row by tens of per cent. `TIMED_REPEATS=n`
+//! times every query `n` times after the row's one warmup, with the clock
+//! running over all of them, so the window is `n` times longer without paying
+//! for the ground truth again. Every repeat has to answer every query exactly
+//! as the first did - neighbours, coded neighbours, distances counted and
+//! bytes read - or the stand stops the pass. So recall and the
+//! work line are the first repeat's, the byte columns read the same over all
+//! repeats as over one, and only the times change. The re-score line counts the
+//! reads of every repeat. A third comment, `# repeats of the row above:`, gives
+//! the spread of the repeats' wall time per query. Lance's arms are timed once
+//! whatever this says.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -507,6 +522,10 @@ struct Fixture<'a> {
     /// measurement and reproduces badly; enough of them that throughput has
     /// stopped growing is a throughput one, and that is the reproducible state.
     concurrency: usize,
+    /// How many times a row of this crate's arms times every query after its
+    /// one warmup, the clock running over all of them; Lance's arms are timed
+    /// once whatever this says.
+    timed_repeats: usize,
     /// Whether the walk holds `__neighbors` across queries instead of fetching
     /// a hop at a time. Reaches the `Flat` arm too and is ignored there, which
     /// is what makes the pass a comparison rather than two.
@@ -577,7 +596,7 @@ async fn measure_vamana(
     mode: WalkMode,
     beam_width: usize,
     prefetch_ahead: usize,
-) -> (Cost, RescoreReads, Work) {
+) -> (Cost, RescoreReads, Work, Vec<f64>) {
     let Fixture {
         queries,
         truth,
@@ -587,6 +606,7 @@ async fn measure_vamana(
         cache_bytes,
         warmup,
         concurrency,
+        timed_repeats,
         resident_edges,
         // This arm carries its own queue as `list_size`; `ef` is the same knob
         // spelled the way Lance spells it, and only its arms read it.
@@ -634,18 +654,24 @@ async fn measure_vamana(
     let cache_before = index.cache_stats().await;
     let cpu_before = cpu_micros();
     let started = Instant::now();
-    let mut answers = run_clients(queries.len(), concurrency, {
-        let (index, params, queries) = (index.clone(), params.clone(), Arc::clone(&queries));
-        move |at| {
+    let mut repeats = Vec::with_capacity(timed_repeats);
+    for _ in 0..timed_repeats {
+        let repeat_started = Instant::now();
+        let answers = run_clients(queries.len(), concurrency, {
             let (index, params, queries) = (index.clone(), params.clone(), Arc::clone(&queries));
-            async move {
-                let call = Instant::now();
-                let result = index.search(&queries[at], &params).await.unwrap();
-                (at, call.elapsed().as_micros() as f64, result)
+            move |at| {
+                let (index, params, queries) =
+                    (index.clone(), params.clone(), Arc::clone(&queries));
+                async move {
+                    let call = Instant::now();
+                    let result = index.search(&queries[at], &params).await.unwrap();
+                    (at, call.elapsed().as_micros() as f64, result)
+                }
             }
-        }
-    })
-    .await;
+        })
+        .await;
+        repeats.push((repeat_started.elapsed().as_micros() as f64, answers));
+    }
     let micros = started.elapsed().as_micros() as f64;
     let cpu = cpu_micros() - cpu_before;
 
@@ -657,39 +683,70 @@ async fn measure_vamana(
     // recall that falls exactly between two printed digits, as one over a
     // hundred neighbours can, would otherwise round by which client finished
     // first.
-    answers.sort_unstable_by_key(|(at, _, _)| *at);
+    for (_, answers) in &mut repeats {
+        answers.sort_unstable_by_key(|(at, _, _)| *at);
+    }
+    // A repeat that answered a query differently would have timed some other
+    // row's work, so it is refused query by query; that is what lets recall and
+    // the work line be the first repeat's whatever the count.
+    let (first, later) = repeats.split_first().expect("TIMED_REPEATS is at least 1");
+    for (repeat, (_, answers)) in later.iter().enumerate() {
+        for ((at, _, result), (_, _, original)) in answers.iter().zip(&first.1) {
+            assert!(
+                result.neighbors == original.neighbors
+                    && result.coded_neighbors == original.coded_neighbors
+                    && result.comparisons == original.comparisons
+                    && result.search.bytes_read == original.search.bytes_read
+                    && result.rescore.bytes_read == original.rescore.bytes_read,
+                "timed repeat {} answered query {at} unlike the first repeat, so its time is not \
+                 the same row's",
+                repeat + 2
+            );
+        }
+    }
     let addresses = |neighbors: &[Neighbor]| {
         neighbors
             .iter()
             .map(|neighbor| positions[&neighbor.row_addr])
             .collect::<Vec<_>>()
     };
-    let reports = answers
+    let reports = repeats
         .iter()
-        .map(|(at, latency, result)| {
-            // Checked rather than trusted: a coded answer that came back empty
-            // would be reported as a recall of zero, which reads as a finding
-            // rather than as a switch nobody turned on.
-            assert_eq!(
-                result.coded_neighbors.len(),
-                k,
-                "the index answered {} coded neighbours rather than k = {k}",
-                result.coded_neighbors.len()
-            );
-            Reported {
-                recall: recall_of(&addresses(&result.neighbors), &truth[*at]),
-                coded_recall: recall_of(&addresses(&result.coded_neighbors), &truth[*at]),
-                latency_micros: *latency,
-                search_micros: result.search.elapsed.as_micros() as f64,
-                rescore_micros: result.rescore.elapsed.as_micros() as f64,
-                search_bytes: result.search.bytes_read as f64,
-                rescore_bytes: result.rescore.bytes_read as f64,
-                comparisons: result.comparisons,
-            }
+        .map(|(_, answers)| {
+            answers
+                .iter()
+                .map(|(at, latency, result)| {
+                    // Checked rather than trusted: a coded answer that came back
+                    // empty would be reported as a recall of zero, which reads as
+                    // a finding rather than as a switch nobody turned on.
+                    assert_eq!(
+                        result.coded_neighbors.len(),
+                        k,
+                        "the index answered {} coded neighbours rather than k = {k}",
+                        result.coded_neighbors.len()
+                    );
+                    Reported {
+                        recall: recall_of(&addresses(&result.neighbors), &truth[*at]),
+                        coded_recall: recall_of(&addresses(&result.coded_neighbors), &truth[*at]),
+                        latency_micros: *latency,
+                        search_micros: result.search.elapsed.as_micros() as f64,
+                        rescore_micros: result.rescore.elapsed.as_micros() as f64,
+                        search_bytes: result.search.bytes_read as f64,
+                        rescore_bytes: result.rescore.bytes_read as f64,
+                        comparisons: result.comparisons,
+                    }
+                })
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let totals = reports.iter().fold(Reported::default(), Reported::plus);
-    let each = reports
+    // Recall from the first repeat alone: the same fractions summed again would
+    // round a mean that falls between two printed digits by the repeat count.
+    let first_totals = reports[0].iter().fold(Reported::default(), Reported::plus);
+    let totals = reports
+        .iter()
+        .flatten()
+        .fold(Reported::default(), Reported::plus);
+    let each = reports[0]
         .iter()
         .map(|reported| (reported.comparisons, reported.recall))
         .collect::<Vec<_>>();
@@ -723,25 +780,35 @@ async fn measure_vamana(
          both sinks"
     );
 
+    let timed = (queries.len() * timed_repeats) as f64;
     let queries = queries.len() as f64;
     let cost = Cost {
-        recall: totals.recall / queries,
-        bytes: bytes / queries,
-        iops: (after.iops - before.iops) as f64 / queries,
-        requests: (after.requests - before.requests) as f64 / queries,
-        micros: micros / queries,
-        cpu_micros: cpu / queries,
+        recall: first_totals.recall / queries,
+        bytes: bytes / timed,
+        iops: (after.iops - before.iops) as f64 / timed,
+        requests: (after.requests - before.requests) as f64 / timed,
+        micros: micros / timed,
+        cpu_micros: cpu / timed,
         hit_ratio,
         loads,
         held_bytes,
-        coded_recall: totals.coded_recall / queries,
-        latency_micros: totals.latency_micros / queries,
-        search_micros: totals.search_micros / queries,
-        rescore_micros: totals.rescore_micros / queries,
-        search_bytes: totals.search_bytes / queries,
-        rescore_bytes: totals.rescore_bytes / queries,
+        coded_recall: first_totals.coded_recall / queries,
+        latency_micros: totals.latency_micros / timed,
+        search_micros: totals.search_micros / timed,
+        rescore_micros: totals.rescore_micros / timed,
+        search_bytes: totals.search_bytes / timed,
+        rescore_bytes: totals.rescore_bytes / timed,
     };
-    (cost, reads_after.since(&reads_before), Work::of(&each))
+    let repeat_micros = repeats
+        .iter()
+        .map(|(wall, _)| wall / queries)
+        .collect::<Vec<_>>();
+    (
+        cost,
+        reads_after.since(&reads_before),
+        Work::of(&each),
+        repeat_micros,
+    )
 }
 
 /// What the queries of one row measured one by one, where [`Cost`] has only
@@ -1273,6 +1340,11 @@ async fn main() {
     let target = env_usize("TARGET", 95) as f64 / 100.0;
     let warmup = env_usize("WARMUP", num_queries).min(num_queries);
     let concurrency = env_usize("CONCURRENCY", 1).max(1);
+    let timed_repeats = env_usize("TIMED_REPEATS", 1);
+    assert!(
+        timed_repeats >= 1,
+        "TIMED_REPEATS is how many times a row times its queries, at least 1, not 0"
+    );
     let resident_edges = env_usize("RESIDENT_EDGES", 0) != 0;
     let rescore_from_dataset = match std::env::var("RESCORE_FROM").as_deref() {
         Err(_) | Ok("index") => false,
@@ -1294,6 +1366,9 @@ async fn main() {
         "REFERENCE_POSITION is `last` or `both`, not {reference_position:?}"
     );
 
+    if timed_repeats > 1 {
+        println!("this crate's rows time every query {timed_repeats} times after their warmup");
+    }
     if !stop_margins.is_empty() {
         println!(
             "walk stop margins {} at a list cap of {stop_cap}",
@@ -1512,6 +1587,7 @@ async fn main() {
         cache_bytes,
         warmup,
         concurrency,
+        timed_repeats,
         resident_edges,
         ef: None,
         rescore_from_dataset,
@@ -1641,7 +1717,7 @@ async fn main() {
             let label = format!("vamana {name}{}", curve.suffix);
             let mut measured = Vec::with_capacity(curve.points.len());
             for point in &curve.points {
-                let (cost, reads, work) = measure_vamana(
+                let (cost, reads, work, repeat_micros) = measure_vamana(
                     &vamana_dataset,
                     &vamana_fixture,
                     point,
@@ -1663,6 +1739,24 @@ async fn main() {
                      {}; worst tenth of queries at recall {:.4}",
                     work.mean, work.median, work.p99, work.most, work.worst_tenth
                 );
+                if repeat_micros.len() > 1 {
+                    let mut sorted = repeat_micros;
+                    sorted.sort_by(f64::total_cmp);
+                    let middle = sorted.len() / 2;
+                    let median = if sorted.len() % 2 == 0 {
+                        (sorted[middle - 1] + sorted[middle]) / 2.0
+                    } else {
+                        sorted[middle]
+                    };
+                    println!(
+                        "# repeats of the row above: {} timed, wall time per query min {:.1}, \
+                         median {:.1}, max {:.1} us",
+                        sorted.len(),
+                        sorted[0],
+                        median,
+                        sorted[sorted.len() - 1]
+                    );
+                }
                 measured.push((point.axis.clone(), cost));
             }
             sweeps.push((label, measured));
