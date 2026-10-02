@@ -715,24 +715,30 @@ of the dataset as a query does. Five things keep those reads cheap:
   deletion file, rather than a read per run of consecutive rows.
 
 The re-score of an index that keeps its vectors can be pointed at the dataset
-too, per query, with `SearchParams::rescore_from_dataset`, which is how the two
-reads were measured against each other on one index: the stand
-(`examples/ivf_rq_ab.rs`) switched between them in one binary on SIFT1M,
-GloVe-200, Cohere and GIST1M at one partition and their recall bars (0.99,
-0.85, 0.98, 0.95), with a re-score budget of 20, eight-bit scalar codes and
-resident edges, under the `performance` power profile. With one query in flight
-the dataset's read took 30.5, 36.5, 42.5 and 46.5 us against the copy's 28.5,
-32.5, 42.0 and 44.0 - GloVe's vectors sit in two data files, and its re-score
-made 1.9 requests a query to the copy's 1.0 - and the whole query moved with
-the search before it, which is the same code on both arms. With twelve in
-flight SIFT and GloVe paid nothing a query. GIST's search phase took 1.06 times
-as long in both pairs measured, and its time a query with it; Cohere's search
-phase took 1.09 in one pair and 1.01 in the other, and its time a query 1.04
-overall. GIST's reads were the same on both arms in count, bytes and place, so
-that is the same work costing more cycles at saturation, somewhere in the
-memory hierarchy; the mechanism was not established. All of it was timed before
-the reads above were reworked, which repeat its work to the digit and were not
-timed again.
+too, per query, with `SearchParams::rescore_from_dataset`.
+
+An index without vectors was measured against its twin with them, one build
+each, equal bit for bit but for `__vector` and answering the same to the digit:
+the stand (`examples/ivf_rq_ab.rs`) ran SIFT1M, GloVe-200, Cohere and GIST1M at
+one partition and their recall bars (0.99, 0.85, 0.98, 0.95), with eight-bit
+scalar codes and resident edges, under the `performance` power profile, for the
+top 10 at a re-score budget of 20 and the top 100 at a budget of 200. Every row
+timed its queries many times over (`TIMED_REPEATS`, 50 times with one query in
+flight and 100 with twelve), because one pass over two hundred queries is a
+window of milliseconds that a single burst of interference moves by tens of per
+cent. With one query in flight the re-score from the dataset took 2.0, 7.5, 1.5
+and 3.5 us more at the top 10 and 18, 27.5, 4.5 and 11.5 us more at the top
+100, and a query 1.0 to 2.3 per cent more, but for GloVe's top 10, which cost
+nothing. With twelve in flight the index without vectors lost under 1 per cent
+of its queries a second on Cohere and GIST at either k and on GloVe at the top
+10, 1.8 per cent on SIFT at the top 100, and between 1 and 4.5 per cent on SIFT
+at the top 10, depending on how its clock is read. GloVe's top 100 is the one
+real cost: its vectors sit in two data files, so its re-score reads two places
+and gathers the answer, and with twelve in flight that took 12 per cent longer
+than reading the copy while the queries beside it searched 3 per cent slower,
+for 5 per cent fewer queries a second. An earlier measurement, which timed each
+row once, had found GIST's search phase 1.06 times as long with twelve in
+flight; with the longer clock it was 1.00 at the top 10 and 0.99 at the top 100.
 
 ## Testing
 
