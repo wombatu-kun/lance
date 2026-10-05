@@ -127,6 +127,10 @@ pub(crate) struct LazyProbe<'a> {
     pub(crate) codes: &'a CodeStore,
     pub(crate) row_ids: &'a [u64],
     pub(crate) medoid: u32,
+    /// Where a walk asked to start at entry points chooses its start:
+    /// [`crate::entry_points`], ascending and never empty. `None` starts at
+    /// `medoid`.
+    pub(crate) entries: Option<&'a [u32]>,
     pub(crate) max_degree: u32,
     pub(crate) search_list_size: usize,
     /// How many vertices one hop expands, and therefore how many rows of
@@ -185,6 +189,17 @@ impl LazyProbe<'_> {
                 ),
             ));
         }
+        // Checked here as well as where the entry points were handed over, for
+        // the medoid's reason: what a walk indexes by has to fit the partition
+        // whose codes it was given.
+        if let Some(&entry) = self.entries.and_then(|entries| entries.last())
+            && entry as usize >= num_rows
+        {
+            return Err(Error::internal(format!(
+                "a Vamana walk was handed entry point {entry}, outside a partition of \
+                 {num_rows} vertices"
+            )));
+        }
         if self.beam_width == 0 {
             return Err(Error::invalid_input(
                 "Vamana beam width must be greater than zero".to_string(),
@@ -199,9 +214,24 @@ impl LazyProbe<'_> {
             Some(stop) => SearchList::with_margin(self.search_list_size, num_rows, stop),
         };
         scratch.begin();
-        scratch.mark(self.medoid);
-        comparisons.record(1);
-        list.offer(self.medoid, coded.distance(self.medoid));
+        let (start, distance, measured) = match self.entries {
+            None => (self.medoid, coded.distance(self.medoid), 1),
+            Some(entries) => {
+                let Some((start, distance)) = nearest_entry(entries, |entry| coded.distance(entry))
+                else {
+                    return Err(Error::internal(
+                        "a Vamana walk was handed no entry points to start at".to_string(),
+                    ));
+                };
+                (start, distance, entries.len() as u64)
+            }
+        };
+        // Only the start is marked. An entry point it was chosen over is left
+        // for the walk to reach like any other vertex, and is measured again if
+        // it is: marking it without offering it would hide it from every hop.
+        scratch.mark(start);
+        comparisons.record(measured);
+        list.offer(start, distance);
 
         let width = self.max_degree as usize;
         let reader = match self.edges {
@@ -495,6 +525,30 @@ pub(crate) fn fresh_neighbours(
     Ok(())
 }
 
+/// The entry point a walk starts at, and its distance: the nearest of
+/// `entries`, which are ascending. `None` only when there are none.
+///
+/// The first of the nearest on a tie, so a lower id wins it. A distance that
+/// is not below infinity - a NaN, or the infinity a RaBitQ estimate reaches
+/// once a huge query's offset from the centroid overflows - is passed over,
+/// and if every one is, the walk starts at the first entry point at the
+/// distance it measured there rather than nowhere. Each distance is asked for
+/// once and alone, as the counted experiment asked for them
+/// (`examples/entry_points_walk.rs`): a batched kernel would be free to round
+/// differently, and a second ask would be a distance nobody counted.
+fn nearest_entry(entries: &[u32], distance: impl Fn(u32) -> f32) -> Option<(u32, f32)> {
+    let mut first = None;
+    let mut nearest: Option<(u32, f32)> = None;
+    for &entry in entries {
+        let measured = distance(entry);
+        first.get_or_insert((entry, measured));
+        if measured < nearest.map_or(f32::INFINITY, |(_, closest)| closest) {
+            nearest = Some((entry, measured));
+        }
+    }
+    nearest.or(first)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::format::NO_NEIGHBOR;
@@ -646,5 +700,49 @@ mod tests {
 
         assert_eq!(from_column, vec![1, 4, 7, 5, 9]);
         assert_eq!(from_column, from_request);
+    }
+
+    /// The start is the nearest entry point, the lower id on a tie.
+    ///
+    /// Ties never occur among random vectors, so no walk over a fixture can see
+    /// which of two equally near entry points it started at - and the counted
+    /// experiment this walk has to equal broke them towards the lower id.
+    #[test]
+    fn a_walk_starts_at_the_nearest_entry_point_and_the_lower_id_on_a_tie() {
+        let distance = |entry: u32| match entry {
+            3 => 2.0,
+            8 | 12 => 0.5,
+            20 => 1.0,
+            _ => unreachable!("asked for entry point {entry}"),
+        };
+        assert_eq!(nearest_entry(&[3, 8, 12, 20], distance), Some((8, 0.5)));
+        assert_eq!(nearest_entry(&[3, 12, 20], distance), Some((12, 0.5)));
+        assert_eq!(nearest_entry(&[20], distance), Some((20, 1.0)));
+        assert_eq!(nearest_entry(&[], distance), None);
+    }
+
+    /// A distance that is not below infinity is passed over, and a walk whose
+    /// entry points all measure one still starts somewhere - at a distance it
+    /// measured, each entry point asked for once.
+    #[test]
+    fn a_walk_passes_over_an_entry_point_no_distance_compares_to() {
+        for passed_over in [f32::NAN, f32::INFINITY] {
+            let (start, distance) = nearest_entry(&[3, 8], |entry| match entry {
+                3 => passed_over,
+                _ => 1.0,
+            })
+            .unwrap();
+            assert_eq!((start, distance), (8, 1.0));
+
+            let asked = std::cell::Cell::new(0);
+            let (start, distance) = nearest_entry(&[3, 8], |_| {
+                asked.set(asked.get() + 1);
+                passed_over
+            })
+            .unwrap();
+            assert_eq!(start, 3);
+            assert_eq!(distance.to_bits(), passed_over.to_bits());
+            assert_eq!(asked.get(), 2, "an entry point was measured twice");
+        }
     }
 }

@@ -278,6 +278,25 @@ two are meant to say the same thing.
   fewer distances; the slowest percentile of its queries measured 1.1-1.7
   times as many.
 
+  A lazy walk can also start nearer its query than the partition's medoid.
+  `VamanaIndex::train_entry_points` clusters each partition's live vectors
+  with k-means - 64 centroids by default, trained on 256 vectors a centroid -
+  and keeps the live vertex nearest each centroid;
+  `VamanaIndex::with_entry_points` hands them to an index, and
+  `SearchParams::with_start(WalkStart::NearestEntry)` starts a walk at the one
+  nearest its query by code, for one coded distance an entry point. Nothing is
+  stored yet: training reads every vector of every partition, which at a
+  million vectors a partition took 1.1-1.3 s on SIFT, 1.9-3.0 on GloVe-200,
+  7-13 on Cohere and 9.6-10.6 on GIST. Measured on those four at one partition
+  and their recall bars, each start at its own margin pair, the walk from the
+  nearest entry point measured 11.6, 7.3, 14.5 and 9.9 per cent fewer
+  distances at the top 10, and its search phase took 0.91 / 0.92 / 0.89 / 0.91
+  of the medoid start's with one query in flight; with twelve in flight the
+  time a query was 1.00 / 0.94 / 0.90 / 0.92 - SIFT's query takes 32 us there,
+  and its two pairs measured 0.98 and 1.03. At the top 100 the search phase
+  took 0.90 / 0.97 / 0.96 / 0.94 and the time a query at twelve in flight
+  0.94 / 0.98 / 0.98 / 0.97.
+
   On SIFT1M at 65536 rows a partition, four probes and equal recall
   (`examples/lazy_walk.rs`), that is **18.2 MB a query against 198.6 MB** read
   whole, and **18.6 ms of warm CPU against 130.5 ms** - decoding two hundred

@@ -117,8 +117,8 @@
 //! holds back the fragments the index covers - see the crate README, and the
 //! tests that pin it.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -149,6 +149,7 @@ use crate::builder::{live_fragments, routing_distance_type, supported_distance_t
 use crate::cache;
 use crate::codes::{self, CODE_COLUMN};
 use crate::dataset_vectors::{DatasetVectors, FileAccess};
+use crate::entry_points::{self, EntryPointParams, EntryPoints, PartitionEntryPoints};
 use crate::format::{
     FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, NEIGHBORS_COLUMN, ROW_ID_COLUMN, RowIdMode,
     VECTOR_COLUMN, VectorSource,
@@ -160,7 +161,7 @@ use crate::io::{
     read_partition, read_partition_batch, read_segment, scan_scheduler,
 };
 use crate::lazy::{self, Candidate, LazyProbe};
-use crate::partition::{Partition, graph_from_batch, row_ids_from_batch};
+use crate::partition::{Partition, graph_from_batch, row_ids_from_batch, vectors_of};
 use crate::search::{
     Comparisons, ScratchPool, SearchScratch, StopRule, flat_storage, greedy_search,
 };
@@ -264,6 +265,40 @@ impl WalkMode {
     fn needs_codes(self) -> bool {
         matches!(self, Self::Coded | Self::Lazy | Self::Flat)
     }
+}
+
+/// Where a [`WalkMode::Lazy`] walk starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalkStart {
+    /// The partition's medoid, the vertex nearest the mean of its vectors: one
+    /// vertex for every query, which the walk then has to get from to wherever
+    /// the query is.
+    #[default]
+    Medoid,
+    /// The partition's entry point nearest the query by code, out of the
+    /// [`EntryPoints`] given to the index with [`VamanaIndex::with_entry_points`].
+    ///
+    /// Choosing costs one coded distance per entry point of the partition,
+    /// which [`QueryResult::comparisons`] counts. Only the start is marked
+    /// visited, so an entry point it was chosen over is measured again if the
+    /// walk reaches it. A partition trained no entry points - one with no more
+    /// live vertices than [`crate::EntryPointParams::num_entries`] - starts at
+    /// its medoid.
+    ///
+    /// Counted at equal recall on four million-vector datasets at one
+    /// partition (`examples/entry_points_walk.rs`), 64 entry points measured 15,
+    /// 6, 16 and 9 per cent fewer distances than the medoid at top-10 on SIFT,
+    /// GloVe-200, Cohere and GIST, the choice included, and 2 to 8 per cent at
+    /// top-100. Timed on the same indexes (`examples/ivf_rq_ab.rs`), each start
+    /// at its own margin pair at the recall bar, the search phase took 0.91,
+    /// 0.92, 0.89 and 0.91 of the medoid start's at top-10 with one query in
+    /// flight, and the time a query at twelve in flight 1.00, 0.94, 0.90 and
+    /// 0.92; at top-100 the search phase took 0.90, 0.97, 0.96 and 0.94. See
+    /// [`crate::entry_points`].
+    ///
+    /// Refused for every mode but [`WalkMode::Lazy`], and for an index that was
+    /// given no entry points.
+    NearestEntry,
 }
 
 /// How far a query is allowed to look.
@@ -452,6 +487,9 @@ pub struct SearchParams {
     /// Refused as well, before anything is read, when the dataset cannot supply
     /// the vectors the index was built over.
     pub rescore_from_dataset: bool,
+    /// Where a [`WalkMode::Lazy`] walk starts: the medoid, or the entry point
+    /// nearest the query ([`WalkStart`]).
+    pub start: WalkStart,
 }
 
 impl SearchParams {
@@ -470,6 +508,7 @@ impl SearchParams {
             stop_margin: None,
             report_coded: false,
             rescore_from_dataset: false,
+            start: WalkStart::default(),
         }
     }
 
@@ -531,6 +570,11 @@ impl SearchParams {
 
     pub fn with_rescore_from_dataset(mut self, rescore_from_dataset: bool) -> Self {
         self.rescore_from_dataset = rescore_from_dataset;
+        self
+    }
+
+    pub fn with_start(mut self, start: WalkStart) -> Self {
+        self.start = start;
         self
     }
 }
@@ -629,7 +673,9 @@ pub struct QueryResult {
     /// Nearest first.
     pub neighbors: Vec<Neighbor>,
     /// Every distance this query computed: one per centroid of every segment it
-    /// routed through, plus one per vertex any graph walk considered.
+    /// routed through, plus one per vertex any graph walk considered - every
+    /// entry point a walk chose its start among included, and again any it
+    /// then reached.
     ///
     /// Routing is counted because it is paid unconditionally and does not scale
     /// with `nprobes` - a segment of 4096 centroids charges 4096 distances
@@ -714,6 +760,11 @@ pub struct VamanaIndex {
     /// its own file; an index keeping its own reads it only for a query that
     /// asks with [`SearchParams::rescore_from_dataset`].
     dataset_vectors: DatasetVectors,
+    /// Where a walk asked to start at entry points ([`WalkStart::NearestEntry`])
+    /// finds them, checked against this index's partitions by
+    /// [`Self::with_entry_points`]. `None` until it is called, and such a walk is
+    /// refused.
+    entry_points: Option<Arc<EntryPoints>>,
 }
 
 /// The stored vertices a walk must not return.
@@ -1295,6 +1346,7 @@ impl VamanaIndex {
             store,
             direct: Arc::new(DirectReads::default()),
             dataset_vectors,
+            entry_points: None,
         })
     }
 
@@ -1358,6 +1410,101 @@ impl VamanaIndex {
     pub async fn cache_stats(&self) -> Option<CacheStats> {
         let cache = self.cache.as_ref()?;
         Some(cache.stats().await)
+    }
+
+    /// Train entry points for every partition of this index, for
+    /// [`Self::with_entry_points`] to hand to this index or to another opening
+    /// of it.
+    ///
+    /// Reads each partition's live vectors once, one partition at a time - its
+    /// own `__vector`, or the dataset's for an index that leaves its vectors
+    /// there, which a cosine index reads normalised either way, so the two
+    /// train to the same entry points. Those reads go through this index's
+    /// scheduler, so they count in [`Self::io_stats`] - all but the dataset's
+    /// rows that only Lance's take can reach, which count in
+    /// [`Self::rescore_reads`] instead: train on an opening that is not being
+    /// measured, or take differences. Nothing is left in this index's cache.
+    ///
+    /// How a partition's entry points are picked is [`crate::entry_points`]'s
+    /// business, and how many and from what sample is `params`'s.
+    pub async fn train_entry_points(&self, params: &EntryPointParams) -> Result<EntryPoints> {
+        params.validate()?;
+        // Where the layout of each data file a vector-less index reads is kept
+        // for the length of the training, so that it is read once rather than
+        // once for every partition with rows in the file - the cache a pass
+        // that rewrites partitions is given, and dropped with it.
+        let layouts = LanceCache::with_capacity(MAINTENANCE_CACHE_BYTES);
+        let mut partitions = Vec::new();
+        for segment in &self.segments {
+            for entry in segment.manifest.partitions() {
+                let (row_ids, vectors) = self.partition_vectors(segment, entry, &layouts).await?;
+                let live = row_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, stored)| !self.rows.rejects(segment.uuid, **stored))
+                    .map(|(local_id, _)| local_id as u32)
+                    .collect::<Vec<_>>();
+                let entries = entry_points::train_partition(
+                    vectors,
+                    row_ids,
+                    live,
+                    self.metadata.distance_type,
+                    params,
+                )
+                .await?;
+                partitions.push(PartitionEntryPoints {
+                    segment: segment.uuid,
+                    partition_id: entry.partition_id,
+                    num_rows: entry.num_rows,
+                    entries,
+                });
+            }
+        }
+        EntryPoints::from_partitions(params.clone(), partitions)
+    }
+
+    /// Let walks asked to start at entry points ([`WalkStart::NearestEntry`])
+    /// find them.
+    ///
+    /// Refused unless `entry_points` names exactly this index's partitions -
+    /// every segment's, at the vertex count each holds - which is what tells
+    /// one index's apart from another's, or from this one's before rows were
+    /// added. Rows deleted since they were trained do not: a deleted vertex is
+    /// still a vertex of the graph, and a walk may start at it.
+    pub fn with_entry_points(mut self, entry_points: Arc<EntryPoints>) -> Result<Self> {
+        let mut listed = HashSet::new();
+        for segment in &self.segments {
+            for entry in segment.manifest.partitions() {
+                let Some(trained) = entry_points.of(segment.uuid, entry.partition_id) else {
+                    return Err(Error::invalid_input(format!(
+                        "the entry points were trained for another index: they have none for \
+                         partition {} of segment {}",
+                        entry.partition_id, segment.uuid
+                    )));
+                };
+                if trained.num_rows != entry.num_rows {
+                    return Err(Error::invalid_input(format!(
+                        "the entry points were trained over {} vertices of partition {} of \
+                         segment {}, which holds {}",
+                        trained.num_rows, entry.partition_id, segment.uuid, entry.num_rows
+                    )));
+                }
+                listed.insert((segment.uuid, entry.partition_id));
+            }
+        }
+        if let Some(extra) = entry_points
+            .partitions()
+            .iter()
+            .find(|trained| !listed.contains(&(trained.segment, trained.partition_id)))
+        {
+            return Err(Error::invalid_input(format!(
+                "the entry points were trained for another index: this one has no partition {} \
+                 of segment {}",
+                extra.partition_id, extra.segment
+            )));
+        }
+        self.entry_points = Some(entry_points);
+        Ok(self)
     }
 
     /// Open one probed partition's file, or take the one this index already has
@@ -1608,6 +1755,25 @@ impl VamanaIndex {
                      search_list_size {} caps each walk's list below that",
                     stop.keep, params.search_list_size
                 )));
+            }
+        }
+        if params.start == WalkStart::NearestEntry {
+            // Refused rather than ignored, like a stop margin: no other mode
+            // walks from a start this could move.
+            if params.mode != WalkMode::Lazy {
+                return Err(Error::invalid_input(format!(
+                    "start NearestEntry was set for {:?}, which does not start from entry \
+                     points: only a WalkMode::Lazy walk does",
+                    params.mode
+                )));
+            }
+            if self.entry_points.is_none() {
+                return Err(Error::invalid_input(
+                    "start NearestEntry was set, but this index was given no entry points; \
+                     train them with VamanaIndex::train_entry_points and hand them over with \
+                     VamanaIndex::with_entry_points"
+                        .to_string(),
+                ));
             }
         }
         if self.metadata.vector_source == VectorSource::Dataset
@@ -2044,12 +2210,34 @@ impl VamanaIndex {
         )
         .await?;
 
+        let entries = match params.start {
+            WalkStart::Medoid => None,
+            WalkStart::NearestEntry => {
+                let trained = self
+                    .entry_points
+                    .as_ref()
+                    .and_then(|entry_points| {
+                        entry_points.of(probe.segment, probe.entry.partition_id)
+                    })
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "partition {} of segment {} has no entry points, though the index \
+                             accepted them",
+                            probe.entry.partition_id, probe.segment
+                        ))
+                    })?;
+                // Empty for a partition too small for entry points to pay,
+                // which starts at its medoid.
+                (!trained.entries.is_empty()).then_some(trained.entries.as_slice())
+            }
+        };
         let (candidates, comparisons) = {
             let probing = LazyProbe {
                 file: &file,
                 codes: &resident.codes,
                 row_ids: &resident.row_ids,
                 medoid: probe.entry.medoid,
+                entries,
                 max_degree: probe.max_degree,
                 search_list_size: params.search_list_size,
                 beam_width: params.beam_width,
@@ -2212,9 +2400,59 @@ impl VamanaIndex {
                 let graph =
                     graph_from_batch(&read_partition_batch(&reader, entry.num_rows).await?)?;
                 let vectors = self
-                    .vectors_from_dataset(segment, graph.row_ids(), vertices)
+                    .vectors_from_dataset(segment, graph.row_ids(), vertices, &self.file_access())
                     .await?;
                 Partition::try_new(graph, vectors)
+            }
+        }
+    }
+
+    /// One partition's row ids and vectors, in local-id order, for training its
+    /// entry points.
+    ///
+    /// Of the partition file only `__row_id` and, where the segment keeps them,
+    /// `__vector`: the codes and the edges are most of the rest of the file and
+    /// training needs neither. A segment that leaves its vectors to the dataset
+    /// has the live vertices' read out of it the way a pass that rewrites a
+    /// partition reads them - through the scheduler, which reads thousands of
+    /// scattered rows several at a time, with each data file's layout kept in
+    /// `layouts` rather than in this index's cache - and gives a dead vertex
+    /// zeros, which training never reads.
+    async fn partition_vectors(
+        &self,
+        segment: &Segment,
+        entry: &PartitionEntry,
+        layouts: &LanceCache,
+    ) -> Result<(Vec<u64>, FixedSizeListArray)> {
+        let path = segment.dir.clone().join(entry.file.as_str());
+        let size_bytes = segment.file_sizes.get(&entry.file).copied();
+        let metadata = segment.manifest.metadata();
+        match metadata.vector_source {
+            VectorSource::Index => {
+                let columns = [ROW_ID_COLUMN, VECTOR_COLUMN];
+                let reader = open_file(&self.scheduler, &path, Some(&columns), size_bytes).await?;
+                let batch = read_partition_batch(&reader, entry.num_rows).await?;
+                Ok((
+                    row_ids_from_batch(&batch)?,
+                    vectors_of(&batch, metadata.dimension)?,
+                ))
+            }
+            VectorSource::Dataset => {
+                let columns = [ROW_ID_COLUMN];
+                let reader = open_file(&self.scheduler, &path, Some(&columns), size_bytes).await?;
+                let row_ids =
+                    row_ids_from_batch(&read_partition_batch(&reader, entry.num_rows).await?)?;
+                let access = FileAccess {
+                    scheduler: &self.scheduler,
+                    cache: Some(layouts),
+                    local_reads: false,
+                    store: &self.store,
+                    direct: &self.direct,
+                };
+                let vectors = self
+                    .vectors_from_dataset(segment, &row_ids, Vertices::Live, &access)
+                    .await?;
+                Ok((row_ids, vectors))
             }
         }
     }
@@ -2257,12 +2495,13 @@ impl VamanaIndex {
     }
 
     /// The vectors of one partition's vertices, in local-id order, out of the
-    /// dataset.
+    /// dataset, read on `access`'s terms.
     async fn vectors_from_dataset(
         &self,
         segment: &Segment,
         row_ids: &[u64],
         vertices: Vertices,
+        access: &FileAccess<'_>,
     ) -> Result<FixedSizeListArray> {
         let (mut live, mut live_at) = (Vec::new(), Vec::new());
         let (mut dead, mut dead_at) = (Vec::new(), Vec::new());
@@ -2279,11 +2518,7 @@ impl VamanaIndex {
             }
         }
         let stats = IoStats::new();
-        let access = self.file_access();
-        let read = self
-            .dataset_vectors
-            .fetch(&live_at, &stats, &access)
-            .await?;
+        let read = self.dataset_vectors.fetch(&live_at, &stats, access).await?;
         if dead.is_empty() {
             return Ok(read);
         }
@@ -2294,7 +2529,7 @@ impl VamanaIndex {
         if vertices == Vertices::All {
             let read = self
                 .dataset_vectors
-                .fetch_deleted(&dead_at, &stats, &access)
+                .fetch_deleted(&dead_at, &stats, access)
                 .await?;
             place(&mut values, &dead, &read, width)?;
         }
@@ -3035,5 +3270,131 @@ mod tests {
             (0, FRAGMENTS as u64, FRAGMENTS),
             "{stats:?}"
         );
+    }
+
+    /// Rows and the bits of their distances, so that two answers are held equal
+    /// to the last bit rather than to `f32`'s equality.
+    fn bits(neighbors: &[Neighbor]) -> Vec<(u64, u32)> {
+        neighbors
+            .iter()
+            .map(|neighbor| (neighbor.row_addr, neighbor.distance.to_bits()))
+            .collect()
+    }
+
+    /// A walk whose only entry point is its partition's medoid is the walk from
+    /// the medoid, to the last bit.
+    ///
+    /// One entry point costs the one distance the medoid does and can only be
+    /// chosen, so the entry-point start has to come out as the medoid start
+    /// does: a start offered at another distance, or charged otherwise, or the
+    /// entry points of another partition - the two partitions' medoids differ -
+    /// would each show up here as an inequality, where a recall bar would call
+    /// it noise. What one entry point cannot show - the marks and the charge of
+    /// the ones not chosen - is `tests/lazy_index.rs`'s to pin. Both kinds of
+    /// code, because each walks another store, and with and without the stop
+    /// margin, because the margin's list is the one that drops what it is
+    /// offered.
+    #[tokio::test]
+    async fn a_walk_from_the_medoid_as_its_only_entry_point_is_the_medoid_walk() {
+        const ROWS: usize = 1200;
+        const WIDTH: i32 = 16;
+        let mut rng = SmallRng::seed_from_u64(9);
+        let values = (0..ROWS * WIDTH as usize)
+            .map(|_| rng.random::<f32>())
+            .collect::<Vec<_>>();
+        let queries = (0..24)
+            .map(|_| (0..WIDTH).map(|_| rng.random::<f32>()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        for codes in [
+            CodeSpec::Scalar { num_bits: 8 },
+            CodeSpec::Rabit { num_bits: 3 },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let batch = RecordBatch::try_from_iter(vec![(
+                "vec",
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(values.clone()),
+                        WIDTH,
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+            )])
+            .unwrap();
+            let schema = batch.schema();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                dir.path().to_str().unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+            create_index(
+                &mut dataset,
+                "vamana_idx",
+                &IndexParams::new("vec", 2).with_codes(codes),
+            )
+            .await
+            .unwrap();
+
+            let plain = VamanaIndex::open(&dataset, "vamana_idx").await.unwrap();
+            let medoids = plain
+                .segments()
+                .iter()
+                .flat_map(|segment| {
+                    segment
+                        .manifest
+                        .partitions()
+                        .iter()
+                        .map(|entry| PartitionEntryPoints {
+                            segment: segment.uuid,
+                            partition_id: entry.partition_id,
+                            num_rows: entry.num_rows,
+                            entries: vec![entry.medoid],
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                medoids.len() > 1
+                    && medoids.iter().all(|one| medoids
+                        .iter()
+                        .filter(|other| other.entries == one.entries)
+                        .count()
+                        == 1),
+                "a start taken from another partition shows only where the medoids differ: {medoids:?}"
+            );
+            let entry_points =
+                EntryPoints::from_partitions(EntryPointParams::new(1), medoids).unwrap();
+            let given = VamanaIndex::open(&dataset, "vamana_idx")
+                .await
+                .unwrap()
+                .with_entry_points(Arc::new(entry_points))
+                .unwrap();
+
+            let walk = SearchParams::new(10)
+                .with_nprobes(2)
+                .with_search_list_size(30)
+                .with_mode(WalkMode::Lazy)
+                .with_report_coded(true);
+            let margin = walk.clone().with_rescore_budget(20).with_stop_margin(0.05);
+            for params in [walk, margin] {
+                for (n, query) in queries.iter().enumerate() {
+                    let medoid = plain.search(query, &params).await.unwrap();
+                    let entry = given
+                        .search(query, &params.clone().with_start(WalkStart::NearestEntry))
+                        .await
+                        .unwrap();
+                    let what = format!("{codes:?}, margin {:?}, query {n}", params.stop_margin);
+                    assert_eq!(bits(&entry.neighbors), bits(&medoid.neighbors), "{what}");
+                    assert_eq!(
+                        bits(&entry.coded_neighbors),
+                        bits(&medoid.coded_neighbors),
+                        "{what}"
+                    );
+                    assert_eq!(entry.comparisons, medoid.comparisons, "{what}");
+                    assert_eq!(entry.partitions_read, medoid.partitions_read, "{what}");
+                }
+            }
+        }
     }
 }

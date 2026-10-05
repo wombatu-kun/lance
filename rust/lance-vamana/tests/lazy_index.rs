@@ -22,6 +22,7 @@
 //! must answer exactly what a walk that re-read them answers, whatever the
 //! budget does with them in between.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::future::join_all;
@@ -30,12 +31,17 @@ use lance_core::cache::LanceCache;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::codes::{CodeParams, CodeSpec};
+use lance_vamana::entry_points::{EntryPointParams, EntryPoints, PartitionEntryPoints};
 use lance_vamana::format::VectorSource;
 use lance_vamana::inserter::insert_as_segment;
-use lance_vamana::query::{QueryResult, SearchParams, VamanaIndex, WalkMode};
+use lance_vamana::io::{read_segment, scan_scheduler};
+use lance_vamana::query::{
+    Neighbor, QueryResult, SearchParams, VamanaIndex, WalkMode, WalkStart, committed_segments,
+};
 
 mod common;
-use arrow_array::types::Float32Type;
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float32Type, UInt64Type};
 use arrow_array::{FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use common::{
@@ -2558,4 +2564,880 @@ async fn a_re_score_from_a_cleaned_up_version_names_the_file_it_lost() {
         refused, BOTH_WAYS,
         "a re-score read rows of a version that is gone"
     );
+}
+
+/// How many entry points a partition of these fixtures trains: few enough to
+/// train in a test, more than one so that there is a choice to make.
+const ENTRIES: usize = 8;
+
+/// Every query's answer, its coded answer and its count, rows paired with the
+/// bits of their distances so that two runs are held equal to the last bit.
+async fn walked(
+    index: &VamanaIndex,
+    params: &SearchParams,
+    queries: &[Vec<f32>],
+) -> Vec<(Vec<(u64, u32)>, Vec<(u64, u32)>, u64)> {
+    let bits = |neighbors: &[Neighbor]| {
+        neighbors
+            .iter()
+            .map(|neighbor| (neighbor.row_addr, neighbor.distance.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    let mut answers = Vec::with_capacity(queries.len());
+    for query in queries {
+        let result = index.search(query, params).await.unwrap();
+        answers.push((
+            bits(&result.neighbors),
+            bits(&result.coded_neighbors),
+            result.comparisons,
+        ));
+    }
+    answers
+}
+
+/// The walk with a list and the walk with a stop margin, each answering its
+/// coded neighbours too.
+fn both_walks() -> [SearchParams; 2] {
+    let walk = search(WalkMode::Lazy).with_report_coded(true);
+    let margin = walk
+        .clone()
+        .with_rescore_budget(2 * K)
+        .with_stop_margin(0.05);
+    [walk, margin]
+}
+
+/// An index given entry points it is not asked to use walks from the medoid
+/// exactly as an index never given them.
+///
+/// What lets a timed round hand the same entry points to both of its arms, so
+/// that the start is the only thing between them.
+#[tokio::test]
+async fn entry_points_a_walk_does_not_ask_for_change_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let dataset = coded_dataset(dir.path().to_str().unwrap(), SCALAR).await;
+    let plain = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let trained = plain
+        .train_entry_points(&EntryPointParams::new(ENTRIES))
+        .await
+        .unwrap();
+    let given = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .unwrap()
+        .with_entry_points(Arc::new(trained))
+        .unwrap();
+    let queries = random_vectors(QUERIES, 4242);
+    for params in both_walks() {
+        assert_eq!(
+            walked(&given, &params, &queries).await,
+            walked(&plain, &params, &queries).await,
+            "margin {:?}",
+            params.stop_margin
+        );
+    }
+}
+
+/// What the start is for: the same neighbours from a start nearer the query.
+///
+/// Recall only. That the start is the chosen entry point, and what choosing
+/// costs, are [`a_walk_charges_the_entry_points_it_did_not_choose_and_leaves_them_unmarked`]'s.
+async fn a_walk_from_the_nearest_entry_point_finds_the_neighbours(codes: CodeSpec) {
+    let dir = tempfile::tempdir().unwrap();
+    let dataset = coded_dataset(dir.path().to_str().unwrap(), codes).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let trained = index
+        .train_entry_points(&EntryPointParams::new(ENTRIES))
+        .await
+        .unwrap();
+    let index = index.with_entry_points(Arc::new(trained)).unwrap();
+    let queries = random_vectors(QUERIES, 4242);
+    let truth = ground_truth(&dataset, &queries).await;
+
+    let medoid = measure(&index, &queries, &truth, &search(WalkMode::Lazy)).await;
+    let entry = measure(
+        &index,
+        &queries,
+        &truth,
+        &search(WalkMode::Lazy).with_start(WalkStart::NearestEntry),
+    )
+    .await;
+    assert!(
+        entry.recall >= 0.9 && entry.recall > medoid.recall - 0.02,
+        "from the entry points recall {} against {} from the medoid",
+        entry.recall,
+        medoid.recall
+    );
+}
+
+/// One entry point a partition, its medoid, for every partition of every
+/// committed segment: the entry points under which the walk from the nearest
+/// one is the walk from the medoid.
+async fn medoids(dataset: &Dataset) -> Vec<PartitionEntryPoints> {
+    let store = dataset.object_store(None).await.unwrap();
+    let scheduler = scan_scheduler(&store);
+    let mut partitions = Vec::new();
+    for index in committed_segments(dataset, INDEX_NAME).await.unwrap() {
+        let dir = dataset.indices_dir().join(index.uuid.to_string());
+        let manifest = read_segment(&scheduler, &dir, None).await.unwrap();
+        partitions.extend(
+            manifest
+                .partitions()
+                .iter()
+                .map(|entry| PartitionEntryPoints {
+                    segment: index.uuid,
+                    partition_id: entry.partition_id,
+                    num_rows: entry.num_rows,
+                    entries: vec![entry.medoid],
+                }),
+        );
+    }
+    partitions
+}
+
+/// The entry points a walk measured and did not choose are charged, one
+/// distance each, and left unmarked, so that the walk can still reach them -
+/// and the one it did choose is where it starts.
+///
+/// One partition, and the query is its medoid's own vector, so of the medoid
+/// and two vertices the medoid's walk ended near, the medoid is the nearest by
+/// code and the walk is the medoid's walk with two more distances. Marking the
+/// two it passed over would keep them out of the list they ended in; charging
+/// one entry point, or every one the parameters allow, would miss the count.
+/// A single entry point that is not the medoid, at the cost of the medoid's
+/// one distance, has to walk differently, or the start never reached the walk.
+#[tokio::test]
+async fn a_walk_charges_the_entry_points_it_did_not_choose_and_leaves_them_unmarked() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut dataset = wide_fixture().write(dir.path().to_str().unwrap()).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &IndexParams::new(VECTOR_COLUMN, 1)
+            .with_graph_params(BuildParams {
+                max_degree: MAX_DEGREE,
+                search_list_size: 64,
+                ..Default::default()
+            })
+            .with_codes(SCALAR),
+    )
+    .await
+    .unwrap();
+    let [only] = medoids(&dataset).await.try_into().unwrap();
+    let medoid = only.entries[0];
+    let segments = common::read_committed_batches(&dataset, INDEX_NAME).await;
+    let batch = &segments[0].1[0];
+    let rows = batch["__row_id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    let vectors = batch["__vector"].as_fixed_size_list();
+    let query = vectors
+        .value(medoid as usize)
+        .as_primitive::<Float32Type>()
+        .values()
+        .to_vec();
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let local = |row_addr: u64| rows.iter().position(|&row| row == row_addr).unwrap() as u32;
+    let given = |entries: Vec<u32>| {
+        let entry_points = EntryPoints::from_partitions(
+            EntryPointParams::new(ENTRIES),
+            vec![PartitionEntryPoints {
+                entries,
+                ..only.clone()
+            }],
+        )
+        .unwrap();
+        let dataset = &dataset;
+        async move {
+            VamanaIndex::open(dataset, INDEX_NAME)
+                .await
+                .unwrap()
+                .with_entry_points(Arc::new(entry_points))
+                .unwrap()
+        }
+    };
+    let bits = |neighbors: &[Neighbor]| {
+        neighbors
+            .iter()
+            .map(|neighbor| (neighbor.row_addr, neighbor.distance.to_bits()))
+            .collect::<Vec<_>>()
+    };
+
+    for params in both_walks() {
+        let params = params.with_nprobes(1);
+        let what = format!("margin {:?}", params.stop_margin);
+        let from_medoid = index.search(&query, &params).await.unwrap();
+        let mut near = from_medoid
+            .coded_neighbors
+            .iter()
+            .map(|neighbor| local(neighbor.row_addr))
+            .filter(|&id| id != medoid)
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            near.len(),
+            2,
+            "{what}: the medoid's walk ended near fewer than two others"
+        );
+        let entry = params.clone().with_start(WalkStart::NearestEntry);
+
+        let mut three = vec![medoid, near[0], near[1]];
+        three.sort_unstable();
+        let from_three = given(three).await.search(&query, &entry).await.unwrap();
+        assert_eq!(
+            bits(&from_three.neighbors),
+            bits(&from_medoid.neighbors),
+            "{what}"
+        );
+        assert_eq!(
+            bits(&from_three.coded_neighbors),
+            bits(&from_medoid.coded_neighbors),
+            "{what}"
+        );
+        assert_eq!(
+            from_three.comparisons,
+            from_medoid.comparisons + 2,
+            "{what}"
+        );
+
+        let elsewhere = given(vec![near.pop().unwrap()]).await;
+        let queries = random_vectors_of(BOTH_WAYS, WIDE_DIM, 4242);
+        assert_ne!(
+            walked(&elsewhere, &entry, &queries).await,
+            walked(&index, &params, &queries).await,
+            "{what}: a walk from one entry point that is not the medoid walked the medoid's walk"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_rabit_walk_from_the_nearest_entry_point_finds_the_neighbours() {
+    a_walk_from_the_nearest_entry_point_finds_the_neighbours(RABIT).await;
+}
+
+#[tokio::test]
+async fn a_scalar_walk_from_the_nearest_entry_point_finds_the_neighbours() {
+    a_walk_from_the_nearest_entry_point_finds_the_neighbours(SCALAR).await;
+}
+
+/// Training twice trains the same entry points, in the shape a walk relies on:
+/// ascending, distinct, inside the partition, no more than asked for - and
+/// [`EntryPoints::from_partitions`] takes back exactly what it trained.
+#[tokio::test]
+async fn entry_points_train_the_same_every_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let dataset = coded_dataset(dir.path().to_str().unwrap(), SCALAR).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let params = EntryPointParams::new(ENTRIES);
+    let first = index.train_entry_points(&params).await.unwrap();
+    assert_eq!(first, index.train_entry_points(&params).await.unwrap());
+    assert_eq!(first.params(), &params);
+    assert_eq!(first.partitions().len(), PARTITIONS as usize);
+    for partition in first.partitions() {
+        let entries = &partition.entries;
+        assert!(
+            !entries.is_empty() && entries.len() <= ENTRIES,
+            "{partition:?}"
+        );
+        assert!(
+            entries.windows(2).all(|pair| pair[0] < pair[1]),
+            "{partition:?}"
+        );
+        assert!(
+            entries.iter().all(|&entry| entry < partition.num_rows),
+            "{partition:?}"
+        );
+    }
+    let rebuilt =
+        EntryPoints::from_partitions(first.params().clone(), first.partitions().to_vec()).unwrap();
+    assert_eq!(rebuilt, first);
+}
+
+/// A partition with no more live vertices than entry points asked for trains
+/// none, and its walks are the medoid's.
+#[tokio::test]
+async fn a_partition_no_larger_than_its_entry_points_starts_at_its_medoid() {
+    let dir = tempfile::tempdir().unwrap();
+    let dataset = coded_dataset(dir.path().to_str().unwrap(), SCALAR).await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let rows = fixture().fragments * fixture().rows_per_fragment;
+    let trained = index
+        .train_entry_points(&EntryPointParams::new(rows))
+        .await
+        .unwrap();
+    assert!(
+        trained
+            .partitions()
+            .iter()
+            .all(|partition| partition.entries.is_empty()),
+        "{trained:?}"
+    );
+    let index = index.with_entry_points(Arc::new(trained)).unwrap();
+    let queries = random_vectors(QUERIES, 4242);
+    for params in both_walks() {
+        assert_eq!(
+            walked(
+                &index,
+                &params.clone().with_start(WalkStart::NearestEntry),
+                &queries
+            )
+            .await,
+            walked(&index, &params, &queries).await,
+            "margin {:?}",
+            params.stop_margin
+        );
+    }
+}
+
+/// The bound is inclusive: a partition of exactly as many live vertices as
+/// entry points asked for trains none, and one a vertex larger trains them.
+#[tokio::test]
+async fn a_partition_of_exactly_k_vertices_trains_no_entry_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let dataset = scalar_index(
+        dir.path().to_str().unwrap(),
+        &wide_fixture(),
+        DistanceType::L2,
+        VectorSource::Index,
+    )
+    .await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let shape = index
+        .train_entry_points(&EntryPointParams::new(ENTRIES))
+        .await
+        .unwrap();
+    let smallest = shape
+        .partitions()
+        .iter()
+        .map(|partition| partition.num_rows)
+        .min()
+        .unwrap();
+    assert!(
+        shape
+            .partitions()
+            .iter()
+            .any(|partition| partition.num_rows > smallest),
+        "every partition is as small as the smallest, so the bound has nothing to split"
+    );
+    let trained = index
+        .train_entry_points(&EntryPointParams::new(smallest as usize))
+        .await
+        .unwrap();
+    for partition in trained.partitions() {
+        assert_eq!(
+            partition.entries.is_empty(),
+            partition.num_rows <= smallest,
+            "{partition:?}"
+        );
+    }
+}
+
+/// Each partition's row addresses in local-id order, by partition id, off the
+/// files of the index's only segment.
+async fn row_addresses(dataset: &Dataset) -> HashMap<u32, Vec<u64>> {
+    let segments = common::read_committed_batches(dataset, INDEX_NAME).await;
+    assert_eq!(segments.len(), 1, "the fixture has one segment");
+    let (manifest, batches) = &segments[0];
+    manifest
+        .partitions()
+        .iter()
+        .zip(batches)
+        .map(|(entry, batch)| {
+            let rows = batch["__row_id"].as_primitive::<UInt64Type>().values();
+            (entry.partition_id, rows.to_vec())
+        })
+        .collect()
+}
+
+/// A deleted row is never an entry point: training is over the live vertices
+/// only, and a partition left with none starts at its medoid.
+///
+/// The rows deleted are exactly the entry points the first training chose, so
+/// a training that read the dead vertices too would choose some of them again.
+#[tokio::test]
+async fn a_deleted_row_is_never_an_entry_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut dataset = coded_dataset(dir.path().to_str().unwrap(), SCALAR).await;
+    let params = EntryPointParams::new(ENTRIES);
+    let before = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .unwrap()
+        .train_entry_points(&params)
+        .await
+        .unwrap();
+    let addresses = row_addresses(&dataset).await;
+    let emptied = before.partitions()[0].partition_id;
+    let mut deleted = HashSet::new();
+    for partition in before.partitions() {
+        let rows = &addresses[&partition.partition_id];
+        if partition.partition_id == emptied {
+            deleted.extend(rows.iter().copied());
+        } else {
+            deleted.extend(partition.entries.iter().map(|&entry| rows[entry as usize]));
+        }
+    }
+    let listed = deleted
+        .iter()
+        .map(|row| row.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    dataset
+        .delete(&format!("_rowid IN ({listed})"))
+        .await
+        .unwrap();
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let after = index.train_entry_points(&params).await.unwrap();
+    for partition in after.partitions() {
+        let rows = &addresses[&partition.partition_id];
+        assert_eq!(
+            partition.entries.is_empty(),
+            partition.partition_id == emptied,
+            "{partition:?}"
+        );
+        for &entry in &partition.entries {
+            assert!(
+                !deleted.contains(&rows[entry as usize]),
+                "partition {} chose deleted vertex {entry}",
+                partition.partition_id
+            );
+        }
+    }
+    let index = index.with_entry_points(Arc::new(after)).unwrap();
+    for query in random_vectors(QUERIES, 4243) {
+        let result = index
+            .search(
+                &query,
+                &search(WalkMode::Lazy).with_start(WalkStart::NearestEntry),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.neighbors.len(), K);
+        assert!(
+            result
+                .neighbors
+                .iter()
+                .all(|neighbor| !deleted.contains(&neighbor.row_addr)),
+            "a deleted row came back"
+        );
+    }
+}
+
+/// An index that keeps no vectors trains the entry points its twin with
+/// vectors trains: the dataset's vectors are the partitions' copy to the last
+/// bit, normalised alike under cosine. Its walks start at them too.
+async fn an_index_without_vectors_trains_the_entry_points_its_twin_trains(
+    distance_type: DistanceType,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let params = EntryPointParams::new(ENTRIES);
+    let mut datasets = Vec::new();
+    for vector_source in [VectorSource::Index, VectorSource::Dataset] {
+        let uri = dir.path().join(vector_source.to_string());
+        datasets.push(
+            scalar_index(
+                uri.to_str().unwrap(),
+                &wide_fixture(),
+                distance_type,
+                vector_source,
+            )
+            .await,
+        );
+    }
+    let mut trained = Vec::new();
+    let mut indexes = Vec::new();
+    for dataset in &datasets {
+        let index = VamanaIndex::open(dataset, INDEX_NAME).await.unwrap();
+        trained.push(index.train_entry_points(&params).await.unwrap());
+        indexes.push(index);
+    }
+    // The twins' segments are two directories under two uuids.
+    let entries = |entry_points: &EntryPoints| {
+        entry_points
+            .partitions()
+            .iter()
+            .map(|partition| {
+                (
+                    partition.partition_id,
+                    partition.num_rows,
+                    partition.entries.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        entries(&trained[0]),
+        entries(&trained[1]),
+        "{distance_type:?}"
+    );
+    assert!(
+        trained[1]
+            .partitions()
+            .iter()
+            .any(|partition| !partition.entries.is_empty()),
+        "every partition was too small to train, so the twins agree on nothing"
+    );
+
+    // With rows deleted the twin without vectors reads only the live ones out
+    // of the dataset, and the two still agree - on entry points none of which
+    // is a deleted row.
+    let mut after = Vec::new();
+    for dataset in &mut datasets {
+        dataset.delete("_rowid % 5 = 0").await.unwrap();
+        let index = VamanaIndex::open(dataset, INDEX_NAME).await.unwrap();
+        after.push(index.train_entry_points(&params).await.unwrap());
+    }
+    assert_eq!(
+        entries(&after[0]),
+        entries(&after[1]),
+        "{distance_type:?}, deleted"
+    );
+    let addresses = row_addresses(&datasets[1]).await;
+    for partition in after[1].partitions() {
+        for &entry in &partition.entries {
+            assert_ne!(
+                addresses[&partition.partition_id][entry as usize] % 5,
+                0,
+                "{distance_type:?}: partition {} chose a deleted vertex",
+                partition.partition_id
+            );
+        }
+    }
+
+    let without = indexes
+        .pop()
+        .unwrap()
+        .with_entry_points(Arc::new(trained.pop().unwrap()))
+        .unwrap();
+    assert_eq!(without.metadata().vector_source, VectorSource::Dataset);
+    for query in random_vectors_of(BOTH_WAYS, WIDE_DIM, 4242) {
+        let result = without
+            .search(
+                &query,
+                &search(WalkMode::Lazy).with_start(WalkStart::NearestEntry),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.neighbors.len(), K, "{distance_type:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_l2_index_without_vectors_trains_the_entry_points_its_twin_trains() {
+    an_index_without_vectors_trains_the_entry_points_its_twin_trains(DistanceType::L2).await;
+}
+
+#[tokio::test]
+async fn a_cosine_index_without_vectors_trains_the_entry_points_its_twin_trains() {
+    an_index_without_vectors_trains_the_entry_points_its_twin_trains(DistanceType::Cosine).await;
+}
+
+/// A column holding nulls trains and walks from its entry points: a null row is
+/// no vertex, so training reads nothing for it, and the walk answers `k` live
+/// rows.
+#[tokio::test]
+async fn a_column_with_nulls_trains_entry_points_over_its_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let sparse = DatasetFixture {
+        null_every: Some(7),
+        ..wide_fixture()
+    };
+    let dataset = scalar_index(
+        dir.path().to_str().unwrap(),
+        &sparse,
+        DistanceType::L2,
+        VectorSource::Index,
+    )
+    .await;
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let trained = index
+        .train_entry_points(&EntryPointParams::new(ENTRIES))
+        .await
+        .unwrap();
+    let live = common::live_row_ids(&dataset).await;
+    assert!(
+        trained
+            .partitions()
+            .iter()
+            .any(|partition| !partition.entries.is_empty()),
+        "every partition was too small to train, so nulls were never in the way"
+    );
+    let index = index.with_entry_points(Arc::new(trained)).unwrap();
+    for query in random_vectors_of(BOTH_WAYS, WIDE_DIM, 4242) {
+        let result = index
+            .search(
+                &query,
+                &search(WalkMode::Lazy).with_start(WalkStart::NearestEntry),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.neighbors.len(), K);
+        assert!(
+            result
+                .neighbors
+                .iter()
+                .all(|neighbor| live.contains(&neighbor.row_addr))
+        );
+    }
+}
+
+/// Every segment of an index trains its own partitions' entry points, and the
+/// entry points of the index before a segment was added are refused once it
+/// has been: they name too few partitions.
+#[tokio::test]
+async fn every_segment_trains_entry_points_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let dataset = coded_dataset(uri, SCALAR).await;
+    let params = EntryPointParams::new(ENTRIES);
+    let before = Arc::new(
+        VamanaIndex::open(&dataset, INDEX_NAME)
+            .await
+            .unwrap()
+            .train_entry_points(&params)
+            .await
+            .unwrap(),
+    );
+    // Other rows than the first segment's, or the second is a copy of it and a
+    // lookup under the wrong segment would find the same entry points there.
+    DatasetFixture {
+        seed: 12,
+        ..fixture()
+    }
+    .append(uri)
+    .await;
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    insert_as_segment(&mut dataset, INDEX_NAME).await.unwrap();
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert!(
+        index.num_segments() > 1,
+        "the append wrote no second segment"
+    );
+    let refused = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .unwrap()
+        .with_entry_points(before)
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("trained for another index"),
+        "{refused}"
+    );
+
+    let trained = index.train_entry_points(&params).await.unwrap();
+    let segments = trained
+        .partitions()
+        .iter()
+        .map(|partition| partition.segment)
+        .collect::<HashSet<_>>();
+    assert_eq!(segments.len(), index.num_segments());
+
+    // Each segment's medoids as its only entry points walk the medoid's walks,
+    // which a lookup under the other segment's uuid would not: the two
+    // segments' partitions have other medoids.
+    let medoids = medoids(&dataset).await;
+    for one in &medoids {
+        assert!(
+            medoids
+                .iter()
+                .filter(|other| other.partition_id == one.partition_id)
+                .all(|other| other.segment == one.segment || other.entries != one.entries),
+            "partition {} has the same medoid in two segments: {medoids:?}",
+            one.partition_id
+        );
+    }
+    let as_medoids = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .unwrap()
+        .with_entry_points(Arc::new(
+            EntryPoints::from_partitions(EntryPointParams::new(1), medoids).unwrap(),
+        ))
+        .unwrap();
+    let queries = random_vectors(QUERIES, 4244);
+    for params in both_walks() {
+        assert_eq!(
+            walked(
+                &as_medoids,
+                &params.clone().with_start(WalkStart::NearestEntry),
+                &queries
+            )
+            .await,
+            walked(&as_medoids, &params, &queries).await,
+            "margin {:?}",
+            params.stop_margin
+        );
+    }
+
+    let index = index.with_entry_points(Arc::new(trained)).unwrap();
+    for query in random_vectors(QUERIES, 4242) {
+        let result = index
+            .search(
+                &query,
+                &search(WalkMode::Lazy).with_start(WalkStart::NearestEntry),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.neighbors.len(), K);
+    }
+}
+
+/// Entry points in a shape no training produces are refused before an index
+/// ever sees them, and so are parameters no training can run with.
+#[test]
+fn entry_points_out_of_shape_are_refused() {
+    let segment = uuid::Uuid::new_v4();
+    let partition = |partition_id: u32, entries: Vec<u32>| PartitionEntryPoints {
+        segment,
+        partition_id,
+        num_rows: 100,
+        entries,
+    };
+    let refused = |params: EntryPointParams, partitions: Vec<PartitionEntryPoints>| {
+        let error = EntryPoints::from_partitions(params, partitions).unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{error}"
+        );
+        error.to_string()
+    };
+    let four = || EntryPointParams::new(4);
+    for (partitions, expected) in [
+        (vec![partition(0, vec![5, 3])], "ascending and distinct"),
+        (vec![partition(0, vec![3, 3])], "ascending and distinct"),
+        (vec![partition(0, vec![3, 100])], "outside partition 0"),
+        (
+            vec![partition(0, vec![1, 2, 3, 4, 5])],
+            "more than num_entries 4",
+        ),
+        (
+            vec![partition(0, vec![1]), partition(0, vec![2])],
+            "listed twice",
+        ),
+    ] {
+        let message = refused(four(), partitions);
+        assert!(message.contains(expected), "{message}");
+    }
+    assert!(
+        EntryPoints::from_partitions(
+            four(),
+            vec![partition(0, vec![]), partition(1, vec![0, 99])]
+        )
+        .is_ok()
+    );
+
+    for (params, expected) in [
+        (EntryPointParams::new(0), "num_entries must be at least 1"),
+        (
+            EntryPointParams::new(4).with_sample_size(3),
+            "smaller than num_entries 4",
+        ),
+        (
+            EntryPointParams::new(4).with_sample_size(4 * 512 + 1),
+            "over 512 vectors per entry point",
+        ),
+    ] {
+        let message = refused(params, Vec::new());
+        assert!(message.contains(expected), "{message}");
+    }
+    // Both ends of the sample's range are inside it.
+    for sample_size in [4, 4 * 512] {
+        assert!(
+            EntryPoints::from_partitions(
+                EntryPointParams::new(4).with_sample_size(sample_size),
+                Vec::new()
+            )
+            .is_ok(),
+            "sample_size {sample_size}"
+        );
+    }
+}
+
+/// A walk asked to start at entry points is refused by an index given none,
+/// and by every mode but the lazy walk, rather than quietly started at the
+/// medoid.
+#[tokio::test]
+async fn a_start_at_entry_points_is_refused_where_there_is_none_to_take() {
+    let dir = tempfile::tempdir().unwrap();
+    let dataset = coded_dataset(dir.path().to_str().unwrap(), SCALAR).await;
+    let query = random_vectors(1, 4242).remove(0);
+    let entry = |mode: WalkMode| search(mode).with_start(WalkStart::NearestEntry);
+
+    let plain = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let error = plain
+        .search(&query, &entry(WalkMode::Lazy))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, lance_core::Error::InvalidInput { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("given no entry points"),
+        "{error}"
+    );
+    let error = plain
+        .train_entry_points(&EntryPointParams::new(0))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("num_entries must be at least 1"),
+        "{error}"
+    );
+
+    let trained = plain
+        .train_entry_points(&EntryPointParams::new(ENTRIES))
+        .await
+        .unwrap();
+
+    // Entry points that name the index's partitions at another size, or a
+    // partition it does not have, are another index's.
+    let refused = |partitions: Vec<PartitionEntryPoints>| {
+        let entry_points =
+            Arc::new(EntryPoints::from_partitions(trained.params().clone(), partitions).unwrap());
+        let dataset = &dataset;
+        async move {
+            VamanaIndex::open(dataset, INDEX_NAME)
+                .await
+                .unwrap()
+                .with_entry_points(entry_points)
+                .unwrap_err()
+        }
+    };
+    let mut grown = trained.partitions().to_vec();
+    grown[0].num_rows += 1;
+    let error = refused(grown).await;
+    assert!(
+        matches!(error, lance_core::Error::InvalidInput { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("which holds"), "{error}");
+    let mut extra = trained.partitions().to_vec();
+    extra.push(PartitionEntryPoints {
+        segment: uuid::Uuid::new_v4(),
+        ..extra[0].clone()
+    });
+    let error = refused(extra).await;
+    assert!(
+        matches!(error, lance_core::Error::InvalidInput { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("this one has no partition"),
+        "{error}"
+    );
+
+    let given = plain.with_entry_points(Arc::new(trained)).unwrap();
+    for mode in [WalkMode::Exact, WalkMode::Coded, WalkMode::Flat] {
+        let error = given.search(&query, &entry(mode)).await.unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("only a WalkMode::Lazy walk does"),
+            "{mode:?}: {error}"
+        );
+    }
+    assert!(given.search(&query, &entry(WalkMode::Lazy)).await.is_ok());
 }

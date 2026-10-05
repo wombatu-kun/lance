@@ -230,8 +230,9 @@ use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::codes::CodeSpec;
+use lance_vamana::entry_points::{EntryPointParams, EntryPoints, PartitionEntryPoints};
 use lance_vamana::format::VectorSource;
-use lance_vamana::query::{Neighbor, RescoreReads, SearchParams, VamanaIndex, WalkMode};
+use lance_vamana::query::{Neighbor, RescoreReads, SearchParams, VamanaIndex, WalkMode, WalkStart};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -415,26 +416,130 @@ fn cpu_micros() -> f64 {
 ///
 /// `false` says the narrowest width already cleared the target, so what comes
 /// back is an upper bound and the true crossing is off the bottom of the grid.
-fn at_recall(points: &[(String, Cost)], target: f64) -> Option<(Cost, bool)> {
+fn at_recall(points: &[(String, Cost)], target: f64) -> Option<(Cost, Option<f64>)> {
     let first = points.first()?;
     if first.1.recall >= target {
-        return Some((first.1, false));
+        return Some((first.1, None));
     }
-    points
-        .windows(2)
-        .find_map(|pair| {
-            let (below, above) = (&pair[0].1, &pair[1].1);
-            (below.recall < target && above.recall >= target).then(|| {
-                let span = above.recall - below.recall;
-                let fraction = if span > 0.0 {
-                    (target - below.recall) / span
-                } else {
-                    0.0
-                };
-                below.between(above, fraction)
-            })
+    points.windows(2).find_map(|pair| {
+        let (below, above) = (&pair[0].1, &pair[1].1);
+        (below.recall < target && above.recall >= target).then(|| {
+            let span = above.recall - below.recall;
+            let fraction = if span > 0.0 {
+                (target - below.recall) / span
+            } else {
+                0.0
+            };
+            (below.between(above, fraction), Some(fraction))
         })
-        .map(|cost| (cost, true))
+    })
+}
+
+/// The time columns of `cost` to two places, which the row prints in whole
+/// microseconds: at 33 us a query, one printed unit is 3 per cent.
+fn exact_times(cost: &Cost) -> String {
+    format!(
+        "us warm {:.2}, lat {:.2}, search {:.2}, rescore {:.2}, cpu {:.2}",
+        cost.micros, cost.latency_micros, cost.search_micros, cost.rescore_micros, cost.cpu_micros
+    )
+}
+
+/// The entry points `params` asks for: read back from `file` when an earlier
+/// pass wrote it, trained on an opening of the index no row measures otherwise
+/// - and then written to `file`, if one is named.
+///
+/// Read back rather than trained by every pass because training reads every
+/// vector of the partition, 3.8 GB at GIST's width, which would crowd the page
+/// cache the timed passes are meant to find warm. The line printed names the
+/// entry points by an fnv of their ids, partition after partition, which is the
+/// one `examples/entry_points_walk.rs` prints for the same set.
+async fn entry_points_for(
+    dataset: &Dataset,
+    params: &EntryPointParams,
+    file: Option<&str>,
+) -> EntryPoints {
+    let describe = |entry_points: &EntryPoints, how: String| {
+        let ids = entry_points
+            .partitions()
+            .iter()
+            .flat_map(|partition| partition.entries.iter().map(|&entry| u64::from(entry)));
+        let fnv = ids.fold(0xcbf2_9ce4_8422_2325_u64, |hash, word| {
+            (hash ^ word).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        let distinct = entry_points
+            .partitions()
+            .iter()
+            .map(|partition| partition.entries.len())
+            .sum::<usize>();
+        println!(
+            "entry points: K {}, sample {}, seed {}, {distinct} distinct in {} partitions, fnv \
+             {fnv:016x}, {how}",
+            params.num_entries,
+            params.resolved_sample_size(),
+            params.seed,
+            entry_points.partitions().len()
+        );
+    };
+
+    if let Some(path) = file
+        && std::fs::metadata(path).is_ok()
+    {
+        let stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let number = |value: &serde_json::Value| value.as_u64().unwrap();
+        let stored_params = EntryPointParams {
+            num_entries: number(&stored["num_entries"]) as usize,
+            sample_size: stored["sample_size"].as_u64().map(|size| size as usize),
+            seed: number(&stored["seed"]),
+        };
+        assert_eq!(
+            &stored_params, params,
+            "ENTRY_FILE {path} holds entry points trained under other settings"
+        );
+        let partitions = stored["partitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|partition| PartitionEntryPoints {
+                segment: uuid::Uuid::parse_str(partition["segment"].as_str().unwrap()).unwrap(),
+                partition_id: number(&partition["partition_id"]) as u32,
+                num_rows: number(&partition["num_rows"]) as u32,
+                entries: partition["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| number(entry) as u32)
+                    .collect(),
+            })
+            .collect();
+        let entry_points = EntryPoints::from_partitions(stored_params, partitions).unwrap();
+        describe(&entry_points, format!("loaded from {path}"));
+        return entry_points;
+    }
+
+    let index = VamanaIndex::open(dataset, VAMANA_INDEX).await.unwrap();
+    let started = Instant::now();
+    let entry_points = index.train_entry_points(params).await.unwrap();
+    describe(
+        &entry_points,
+        format!("trained in {:.2} s", started.elapsed().as_secs_f64()),
+    );
+    if let Some(path) = file {
+        let stored = serde_json::json!({
+            "num_entries": params.num_entries,
+            "sample_size": params.sample_size,
+            "seed": params.seed,
+            "partitions": entry_points.partitions().iter().map(|partition| serde_json::json!({
+                "segment": partition.segment.to_string(),
+                "partition_id": partition.partition_id,
+                "num_rows": partition.num_rows,
+                "entries": partition.entries,
+            })).collect::<Vec<_>>(),
+        });
+        std::fs::write(path, serde_json::to_string(&stored).unwrap()).unwrap();
+        println!("entry points written to {path}");
+    }
+    entry_points
 }
 
 async fn write_dataset(uri: &str, vectors: &FixedSizeListArray) -> Dataset {
@@ -540,6 +645,11 @@ struct Fixture<'a> {
     /// does so whatever this says. Lance's arms have no such choice and ignore
     /// it.
     rescore_from_dataset: bool,
+    /// Entry points handed to every row's index, `None` when none were asked
+    /// for; held by every arm alike, whether its walks start at them or not.
+    entry_points: Option<&'a Arc<EntryPoints>>,
+    /// Where the crate's walks start. Lance's arms have no such choice.
+    start: WalkStart,
 }
 
 /// Runs `query(i)` for every `i` in `0..count` from `concurrency` clients and
@@ -612,6 +722,8 @@ async fn measure_vamana(
         // spelled the way Lance spells it, and only its arms read it.
         ef: _,
         rescore_from_dataset,
+        entry_points,
+        start,
     } = *fixture;
     let params = SearchParams::new(k)
         .with_nprobes(nprobes)
@@ -622,17 +734,20 @@ async fn measure_vamana(
         .with_resident_edges(resident_edges)
         .with_report_coded(true)
         .with_rescore_budget(point.budget)
-        .with_rescore_from_dataset(rescore_from_dataset);
+        .with_rescore_from_dataset(rescore_from_dataset)
+        .with_start(start);
     let params = match point.stop_margin {
         Some(margin) => params.with_stop_margin(margin),
         None => params,
     };
-    let index = Arc::new(
-        VamanaIndex::open(dataset, VAMANA_INDEX)
-            .await
-            .unwrap()
-            .with_cache(LanceCache::with_capacity(cache_bytes)),
-    );
+    let index = VamanaIndex::open(dataset, VAMANA_INDEX)
+        .await
+        .unwrap()
+        .with_cache(LanceCache::with_capacity(cache_bytes));
+    let index = Arc::new(match entry_points {
+        Some(entry_points) => index.with_entry_points(entry_points.clone()).unwrap(),
+        None => index,
+    });
     let queries: Arc<[Vec<f32>]> = Arc::from(queries);
     // At the pass's own concurrency: the index keeps a visited-mark scratch for
     // every walk that has run at once, so a warmup one query at a time would
@@ -665,7 +780,7 @@ async fn measure_vamana(
                 async move {
                     let call = Instant::now();
                     let result = index.search(&queries[at], &params).await.unwrap();
-                    (at, call.elapsed().as_micros() as f64, result)
+                    (at, call.elapsed().as_secs_f64() * 1e6, result)
                 }
             }
         })
@@ -729,8 +844,8 @@ async fn measure_vamana(
                         recall: recall_of(&addresses(&result.neighbors), &truth[*at]),
                         coded_recall: recall_of(&addresses(&result.coded_neighbors), &truth[*at]),
                         latency_micros: *latency,
-                        search_micros: result.search.elapsed.as_micros() as f64,
-                        rescore_micros: result.rescore.elapsed.as_micros() as f64,
+                        search_micros: result.search.elapsed.as_secs_f64() * 1e6,
+                        rescore_micros: result.rescore.elapsed.as_secs_f64() * 1e6,
                         search_bytes: result.search.bytes_read as f64,
                         rescore_bytes: result.rescore.bytes_read as f64,
                         comparisons: result.comparisons,
@@ -1356,6 +1471,46 @@ async fn main() {
         Ok("dataset") => VectorSource::Dataset,
         Ok(other) => panic!("VECTOR_SOURCE is `index` or `dataset`, not `{other}`"),
     };
+    // Entry points for the crate's walks: trained once for the pass - or read
+    // back from ENTRY_FILE, which the first pass to train them writes - and
+    // handed to every row's index whatever START says, so that the arms of a
+    // round do the same work at open and differ only in where they start.
+    let entry_params = std::env::var("ENTRY_POINTS").ok().map(|raw| {
+        let num_entries = raw
+            .parse::<usize>()
+            .unwrap_or_else(|_| panic!("ENTRY_POINTS is a count, not {raw:?}"));
+        let mut params = EntryPointParams::new(num_entries);
+        if let Ok(raw) = std::env::var("ENTRY_SAMPLE") {
+            params = params.with_sample_size(
+                raw.parse()
+                    .unwrap_or_else(|_| panic!("ENTRY_SAMPLE is a count, not {raw:?}")),
+            );
+        }
+        if let Ok(raw) = std::env::var("ENTRY_SEED") {
+            params = params.with_seed(
+                raw.parse()
+                    .unwrap_or_else(|_| panic!("ENTRY_SEED is a number, not {raw:?}")),
+            );
+        }
+        params
+    });
+    let entry_file = std::env::var("ENTRY_FILE").ok();
+    let start = match std::env::var("START").as_deref() {
+        Err(_) | Ok("medoid") => WalkStart::Medoid,
+        Ok("entry") => WalkStart::NearestEntry,
+        Ok(other) => panic!("START is `medoid` or `entry`, not `{other}`"),
+    };
+    assert!(
+        entry_params.is_some() || (start == WalkStart::Medoid && entry_file.is_none()),
+        "START=entry and ENTRY_FILE are about entry points, and ENTRY_POINTS says how many"
+    );
+    // The harness that counted the entry points refused it too: with it set,
+    // Lance's k-means assigns through an HNSW it builds in parallel, and the
+    // same partition would not train the same entry points twice.
+    assert!(
+        entry_params.is_none() || std::env::var_os("LANCE_USE_HNSW_SPEEDUP_INDEXING").is_none(),
+        "LANCE_USE_HNSW_SPEEDUP_INDEXING is set, so entry points would not train reproducibly"
+    );
     // A pass charges its later rows more than its earlier ones - one and the
     // same reference point cost 1812 us after two vamana rows and 2028 after
     // thirty-two - so `both` reads the reference at each end and brackets the
@@ -1400,6 +1555,13 @@ async fn main() {
             "dataset"
         } else {
             "index"
+        }
+    );
+    println!(
+        "walks start at {}",
+        match start {
+            WalkStart::Medoid => "the medoid",
+            WalkStart::NearestEntry => "the nearest entry point",
         }
     );
     println!(
@@ -1499,6 +1661,13 @@ async fn main() {
         dataset
     };
 
+    let entry_points = match &entry_params {
+        None => None,
+        Some(params) => Some(Arc::new(
+            entry_points_for(&vamana_dataset, params, entry_file.as_deref()).await,
+        )),
+    };
+
     if std::fs::metadata(&rq_uri).is_ok() {
         let dataset = Dataset::open(&rq_uri).await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), rows);
@@ -1591,6 +1760,8 @@ async fn main() {
         resident_edges,
         ef: None,
         rescore_from_dataset,
+        entry_points: entry_points.as_ref(),
+        start,
     };
     let rq_fixture = Fixture {
         positions: &rq_positions,
@@ -1739,6 +1910,7 @@ async fn main() {
                      {}; worst tenth of queries at recall {:.4}",
                     work.mean, work.median, work.p99, work.most, work.worst_tenth
                 );
+                println!("# exact times of the row above: {}", exact_times(&cost));
                 if repeat_micros.len() > 1 {
                     let mut sorted = repeat_micros;
                     sorted.sort_by(f64::total_cmp);
@@ -1839,30 +2011,36 @@ async fn main() {
                     .map(|(_, cost)| cost.recall)
                     .fold(0.0, f64::max)
             ),
-            Some((cost, bracketed)) => println!(
-                "{label:<22} {:>8.4} {:>12.0} {:>11.0} {:>11.0} {:>8.0} {:>9.1} {:>10.0} \
+            Some((cost, fraction)) => {
+                println!(
+                    "{label:<22} {:>8.4} {:>12.0} {:>11.0} {:>11.0} {:>8.0} {:>9.1} {:>10.0} \
                  {:>8.0} {:>10.0} {:>11.0} {:>9.0} {:>10}{}",
-                cost.coded_recall,
-                cost.bytes,
-                cost.search_bytes,
-                cost.rescore_bytes,
-                cost.iops,
-                cost.requests,
-                cost.micros,
-                cost.latency_micros,
-                cost.search_micros,
-                cost.rescore_micros,
-                cost.cpu_micros,
-                match reference {
-                    Some(reference) => format!("{:.2}x", cost.bytes / reference.bytes),
-                    None => "-".to_string(),
-                },
-                if bracketed {
-                    ""
-                } else {
-                    "  (upper bound: the narrowest width already cleared it)"
-                }
-            ),
+                    cost.coded_recall,
+                    cost.bytes,
+                    cost.search_bytes,
+                    cost.rescore_bytes,
+                    cost.iops,
+                    cost.requests,
+                    cost.micros,
+                    cost.latency_micros,
+                    cost.search_micros,
+                    cost.rescore_micros,
+                    cost.cpu_micros,
+                    match reference {
+                        Some(reference) => format!("{:.2}x", cost.bytes / reference.bytes),
+                        None => "-".to_string(),
+                    },
+                    match fraction {
+                        Some(_) => "",
+                        None => "  (upper bound: the narrowest width already cleared it)",
+                    }
+                );
+                println!(
+                    "# exact times at the bar of the row above: fraction {}, {}",
+                    fraction.map_or("-".to_string(), |fraction| format!("{fraction:.4}")),
+                    exact_times(&cost)
+                );
+            }
         }
     }
 }
