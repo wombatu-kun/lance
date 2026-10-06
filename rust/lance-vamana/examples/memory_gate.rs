@@ -83,7 +83,7 @@ use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::format::{INDEX_FILE_NAME, NEIGHBORS_COLUMN, ROW_ID_COLUMN, VECTOR_COLUMN};
 use lance_vamana::io::{open_file, read_partition, read_segment, scan_scheduler};
 use lance_vamana::partition::Partition;
-use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
+use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode, committed_segments};
 use lance_vamana::search::{Comparisons, SearchScratch, flat_storage, greedy_search};
 use lance_vamana::segment::{PartitionEntry, SegmentManifest};
 use object_store::path::Path;
@@ -639,12 +639,16 @@ async fn main() {
         create_index(
             &mut dataset,
             INDEX_NAME,
+            // Without codes, and the whole arm walked exactly below: the
+            // settings the README's figures were taken at, before either
+            // default changed.
             &IndexParams::new(VECTOR_FIELD, partitions)
                 .with_distance_type(DISTANCE_TYPE)
                 .with_graph_params(BuildParams {
                     max_degree: degree,
                     ..Default::default()
-                }),
+                })
+                .without_codes(),
         )
         .await
         .unwrap();
@@ -677,6 +681,7 @@ async fn main() {
                 continue;
             }
             let params = SearchParams::new(K)
+                .with_mode(WalkMode::Exact)
                 .with_nprobes(nprobes)
                 .with_search_list_size(tuning_beam);
             let measured = graded(&index, &queries, &truth, &ids, &params, grid_queries).await;
@@ -706,6 +711,7 @@ async fn main() {
         );
         for beam in &beams {
             let params = SearchParams::new(K)
+                .with_mode(WalkMode::Exact)
                 .with_nprobes(nprobes)
                 .with_search_list_size(*beam);
             let measured = graded(&index, &queries, &truth, &ids, &params, grid_queries).await;
@@ -723,6 +729,7 @@ async fn main() {
         // The chosen beam over the whole stream, which is the arm the lazy ones
         // are compared against.
         let params = SearchParams::new(K)
+            .with_mode(WalkMode::Exact)
             .with_nprobes(nprobes)
             .with_search_list_size(beam);
         let whole = measure(&index, &queries, &truth, &ids, &params).await;

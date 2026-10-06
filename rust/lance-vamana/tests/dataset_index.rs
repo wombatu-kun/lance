@@ -607,9 +607,7 @@ async fn a_build_that_cannot_leave_its_vectors_to_the_dataset_writes_nothing() {
         .await;
         let mut params =
             IndexParams::new(VECTOR_COLUMN, 1).with_vector_source(VectorSource::Dataset);
-        if let Some(codes) = codes {
-            params = params.with_codes(codes);
-        }
+        params.codes = codes;
         let segment_dir = dir.path().join(format!("segment_{dimension}"));
         let error = build_segment(
             &dataset,

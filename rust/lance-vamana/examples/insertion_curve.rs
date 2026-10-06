@@ -66,7 +66,7 @@ use lance_linalg::distance::DistanceType;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::inserter::insert_as_segment;
 use lance_vamana::merger::merge_index;
-use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
+use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode, committed_segments};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -288,8 +288,13 @@ async fn main() {
         rows,
         rows_per_fragment,
         vectors,
-        index: IndexParams::new(VECTOR_COLUMN, partitions).with_distance_type(DISTANCE_TYPE),
+        // Without codes and walked exactly: the settings the README's figures
+        // were taken at, before either default changed.
+        index: IndexParams::new(VECTOR_COLUMN, partitions)
+            .with_distance_type(DISTANCE_TYPE)
+            .without_codes(),
         search: SearchParams::new(K)
+            .with_mode(WalkMode::Exact)
             .with_nprobes(nprobes)
             .with_search_list_size(search_list_size),
         queries: query_vectors,

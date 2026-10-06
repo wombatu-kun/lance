@@ -55,14 +55,18 @@
 //!   data files. Once a compaction and `cleanup_old_versions` have removed
 //!   them, a re-score that has to open one fails, naming it, until the index is
 //!   opened again - the rule Lance's own indices live by.
-//! - **A partition is read whole unless the walk is told not to.**
-//!   [`WalkMode::Lazy`] keeps the row ids and the codes and fetches the rest as
-//!   it turns out to need it; [`WalkMode::Flat`] keeps the same and fetches even
-//!   less, because it scores every vertex instead of following edges to a few of
-//!   them. Which of the three is right is a property of the deployment rather
-//!   than of the index, and it was measured rather than assumed - except for an
-//!   index that leaves its vectors to the dataset, which only the last two can
-//!   walk.
+//! - **The default walk steers by codes.** [`WalkMode::Lazy`], the default,
+//!   keeps the row ids and the codes and fetches the rest as it turns out to
+//!   need it; [`WalkMode::Flat`] keeps the same and fetches even less, because
+//!   it scores every vertex instead of following edges to a few of them. Both
+//!   need the codes a build writes unless told not to
+//!   ([`crate::IndexParams::without_codes`]): an index built without them is
+//!   searched by [`WalkMode::Exact`] only, which reads every partition it probes
+//!   whole, and a query that does not ask for it is refused rather than
+//!   downgraded. Which of the three is right is a property of the deployment
+//!   rather than of the index, and it was measured rather than assumed - except
+//!   for an index that leaves its vectors to the dataset, which only
+//!   [`WalkMode::Lazy`] and [`WalkMode::Flat`] can walk.
 //!
 //!   Reading only what a walk touches does not pay on its own
 //!   (`examples/memory_gate.rs`): a walk expands a few dozen vertices in a
@@ -186,24 +190,26 @@ pub struct Neighbor {
 pub enum WalkMode {
     /// Read the partition whole and measure against the vectors it stores.
     ///
-    /// Refused for an index that leaves its vectors to the dataset
-    /// ([`VectorSource::Dataset`]), whose partitions store none.
-    #[default]
+    /// The one mode an index built without codes
+    /// ([`crate::IndexParams::without_codes`]) answers, so the one to ask for
+    /// there: every other mode steers by codes. Refused for an index that leaves
+    /// its vectors to the dataset ([`VectorSource::Dataset`]), whose partitions
+    /// store none.
     Exact,
     /// Read the partition whole and measure against its codes, with the
     /// candidate list re-scored exactly before it is answered from.
     ///
-    /// Only for an index built with [`crate::IndexParams::with_codes`], and
-    /// refused rather than quietly downgraded for one that was not - and for
-    /// one that leaves its vectors to the dataset, whose partitions it would
-    /// read whole for vectors they do not store. On its own
+    /// Only for an index built with codes, which a build writes unless told not
+    /// to, and refused rather than quietly downgraded for one that was not -
+    /// and for one that leaves its vectors to the dataset, whose partitions it
+    /// would read whole for vectors they do not store. On its own
     /// it costs a few per cent more comparisons and reads no fewer bytes: it is
     /// [`Self::Lazy`] with the reading left alone, which is the useful arm to
     /// hold a walk against when what is in question is the *steering*.
     Coded,
     /// Read the row ids and the codes, and nothing else until the walk asks for
     /// it: the out-edges of a vertex when it expands one, the vectors of the
-    /// candidate list when there is one to re-score.
+    /// candidate list when there is one to re-score. The default.
     ///
     /// What the codes were built for. On SIFT1M at 65536 rows a partition and
     /// equal recall it reads 18.2 MB a query against 198.6 MB
@@ -222,6 +228,7 @@ pub enum WalkMode {
     /// cache.
     ///
     /// Requires codes, same as [`Self::Coded`].
+    #[default]
     Lazy,
     /// Do not use the graph at all: score every vertex of the partition against
     /// its code, keep the nearest [`SearchParams::search_list_size`], and
@@ -340,12 +347,12 @@ pub struct SearchParams {
     /// early is free where the code was resident anyway and is a memory latency
     /// hidden where it was not.
     ///
-    /// **Only scalar codes are asked.** The ask is `DistCalculator::prefetch`,
-    /// and of the code stores this crate can hold only
-    /// `ScalarQuantizationStorage` implements it; `RabitDistCalculator`
-    /// inherits the trait's empty default, so on
-    /// [`crate::codes::CodeSpec::Rabit`] - the default kind - every depth is a
-    /// call that returns. A RaBitQ code is not one run of bytes either: the
+    /// **Only scalar codes are asked**, the kind a build writes by default. The
+    /// ask is `DistCalculator::prefetch`, and of the code stores this crate can
+    /// hold only `ScalarQuantizationStorage` implements it;
+    /// `RabitDistCalculator` inherits the trait's empty default, so on
+    /// [`crate::codes::CodeSpec::Rabit`] every depth is a call that returns. A
+    /// RaBitQ code is not one run of bytes either: the
     /// binary code, the blocked extended code and two factor arrays are four
     /// places a vertex has to be fetched from, which is presumably why Lance
     /// never wrote one.
@@ -371,7 +378,7 @@ pub struct SearchParams {
     ///
     /// Off by default, because it is memory the alternative does not spend: 256
     /// bytes a vertex at `R = 64`, against the 68 a three-bit code occupies at
-    /// `d = 128` and the 376 at `d = 960`. What it buys is every request a walk
+    /// `d = 128` and the 380 at `d = 960`. What it buys is every request a walk
     /// makes before its re-score, which after the codes are resident is every
     /// request a walk makes at all. It changes no answer - the same hops, the
     /// same candidate list - and it is ignored by [`WalkMode::Flat`], which
@@ -957,15 +964,16 @@ struct Probing {
 /// The bound is on memory: this many partitions' worth of resident data however
 /// many a query probes, which for the walks that read whole is this many whole
 /// partitions and for [`WalkMode::Lazy`] is this many partitions' row ids and
-/// codes - a tenth of that at `d = 128`. It bounds what a query holds *of its
-/// own*; an index given a cache holds that cache's budget beside it, and holds
-/// it whether or not a query is running. The scheduler's byte budget bounds
-/// neither, for the reason [`crate::io::scan_scheduler`] spells out. Four rather
-/// than one because a walk
-/// cannot start until a read finishes and a store with any latency would then
-/// sit idle through every walk; four rather than `nprobes` because that is not a
-/// bound at all. What the number should be on a high-latency store is a
-/// measurement nobody has taken, so it is deliberately on the small side.
+/// codes - at `d = 128` a tenth of that with three-bit RaBitQ codes, a seventh
+/// with the scalar ones a build writes by default. It bounds what a query holds
+/// *of its own*; an index given a cache holds that cache's budget beside it,
+/// and holds it whether or not a query is running. The scheduler's byte budget
+/// bounds neither, for the reason [`crate::io::scan_scheduler`] spells out.
+/// Four rather than one because a walk cannot start until a read finishes and a
+/// store with any latency would then sit idle through every walk; four rather
+/// than `nprobes` because that is not a bound at all. What the number should be
+/// on a high-latency store is a measurement nobody has taken, so it is
+/// deliberately on the small side.
 ///
 /// Per search call, and there is nothing above it: a server answering `n`
 /// queries at once holds up to `n` times this many partitions, so an index whose
@@ -1263,7 +1271,10 @@ impl VamanaIndex {
             // the width, the codes and where the vectors are may not, because a
             // query mixes their answers - and one segment coded where another is
             // not would make the walk mode mean two different things in one
-            // query.
+            // query. Two segments built apart mint codes of their own, which
+            // disagree at equal settings unless they happen to agree: a RaBitQ
+            // rotation never does, scalar bounds only when both segments' samples
+            // share their extremes.
             if (
                 other.dimension,
                 other.distance_type,
@@ -1277,9 +1288,16 @@ impl VamanaIndex {
                 &metadata.codes,
                 metadata.vector_source,
             ) {
+                let remedy = if other.codes != metadata.codes {
+                    "; a segment joining an index takes its codes from it, as insert_as_segment \
+                     does, while two built apart each mint their own unless both are built \
+                     without codes"
+                } else {
+                    ""
+                };
                 return Err(Error::index(format!(
                     "index '{index_name}' has segments that disagree about the vectors they hold: \
-                     {:?} against {:?}",
+                     {:?} against {:?}{remedy}",
                     metadata, other
                 )));
             }
@@ -1790,11 +1808,13 @@ impl VamanaIndex {
         // walk is asking about cost, and quietly giving them a walk that reads
         // every vector would be an answer to a different question.
         if params.mode.needs_codes() && self.metadata.codes.is_none() {
-            return Err(Error::invalid_input(
-                "this Vamana index was built without codes, so it cannot be walked by them; \
-                 rebuild it with IndexParams::with_codes"
-                    .to_string(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "this Vamana index was built without codes, so a {:?} walk, which steers by \
+                 them, cannot search it; search it with WalkMode::Exact (--mode exact on the \
+                 command line), or rebuild it with the codes IndexParams::new writes unless told \
+                 not to",
+                params.mode
+            )));
         }
         // Nothing downstream would report this. Every distance against a
         // non-finite query is NaN, every ordering here goes through `total_cmp`,
@@ -2182,8 +2202,9 @@ impl VamanaIndex {
     ///
     /// The read of the row ids and the codes is the one thing here that is
     /// proportional to the partition. It is also what makes both modes possible
-    /// at all, and it is a tenth of what reading the partition whole would be at
-    /// `d = 128`.
+    /// at all, and at `d = 128` it is a tenth of what reading the partition
+    /// whole would be with three-bit RaBitQ codes, a seventh with the scalar
+    /// ones a build writes by default.
     async fn probe_lazily(
         &self,
         probe: Probe,
@@ -2974,6 +2995,15 @@ mod tests {
         let params = SearchParams::new(usize::MAX);
         assert_eq!(params.search_list_size, usize::MAX);
         assert!(params.search_list_size >= params.k);
+    }
+
+    /// A query walks lazily unless it asks otherwise, over the codes a build
+    /// writes unless it is told otherwise: the pair every walk this crate
+    /// measured against Lance's own indices ran as.
+    #[test]
+    fn a_query_walks_lazily_by_default() {
+        assert_eq!(WalkMode::default(), WalkMode::Lazy);
+        assert_eq!(SearchParams::new(10).mode, WalkMode::Lazy);
     }
 
     /// The rule a margin stands for: the bar hangs off the `k`-th candidate,

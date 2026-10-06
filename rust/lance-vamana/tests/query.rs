@@ -160,6 +160,7 @@ async fn top_k_matches_lance_brute_force() {
     let queries = random_vectors(QUERIES, 4242);
     let truth = ground_truth(&dataset, &queries).await;
     let search = SearchParams::new(K)
+        .with_mode(WalkMode::Exact)
         .with_nprobes(PARTITIONS as usize)
         .with_search_list_size(BEAM);
     let measured = measure(&index, &queries, &truth, &search).await;
@@ -341,7 +342,9 @@ async fn a_partition_disagreeing_with_its_segment_is_refused() {
         let error = index
             .search(
                 &random_vectors(1, 7)[0],
-                &SearchParams::new(K).with_search_list_size(BEAM),
+                &SearchParams::new(K)
+                    .with_mode(WalkMode::Exact)
+                    .with_search_list_size(BEAM),
             )
             .await
             .unwrap_err();
@@ -445,6 +448,7 @@ async fn a_cosine_index_matches_lance_cosine_brute_force() {
     assert_eq!(index.metadata().distance_type, DistanceType::Cosine);
 
     let search = SearchParams::new(K)
+        .with_mode(WalkMode::Exact)
         .with_nprobes(PARTITIONS as usize)
         .with_search_list_size(BEAM);
     let queries = random_vectors(QUERIES, 4242);
@@ -564,7 +568,9 @@ async fn a_narrow_probe_costs_recall_and_buys_work() {
 
     let queries = random_vectors(QUERIES, 4242);
     let truth = ground_truth(&dataset, &queries).await;
-    let base = SearchParams::new(K).with_search_list_size(BEAM);
+    let base = SearchParams::new(K)
+        .with_mode(WalkMode::Exact)
+        .with_search_list_size(BEAM);
     let narrow = measure(&index, &queries, &truth, &base.clone().with_nprobes(1)).await;
     let wide = measure(
         &index,
@@ -657,7 +663,9 @@ async fn routing_is_charged_for_every_centroid_not_every_probe() {
     let result = index
         .search(
             &random_vectors(1, 7)[0],
-            &SearchParams::new(1).with_nprobes(1),
+            &SearchParams::new(1)
+                .with_mode(WalkMode::Exact)
+                .with_nprobes(1),
         )
         .await
         .unwrap();
@@ -845,6 +853,7 @@ async fn an_index_follows_its_rows_through_a_deferred_compaction() {
 
     let queries = random_vectors(4, 4242);
     let exact = SearchParams::new(K)
+        .with_mode(WalkMode::Exact)
         .with_nprobes(PARTITIONS as usize)
         .with_search_list_size(BEAM);
     let modes = [
@@ -1882,12 +1891,13 @@ async fn segments_that_disagree_about_their_vectors_are_refused() {
     // the field under test - a wider graph and a different pruning slack too -
     // because degree and alpha are *allowed* to differ between segments and the
     // check must not be reading those.
-    let (left, _) = build_index_segment(&dataset, &params(), &[0])
+    let (left, _) = build_index_segment(&dataset, &params().without_codes(), &[0])
         .await
         .unwrap();
     let (right, _) = build_index_segment(
         &dataset,
         &params()
+            .without_codes()
             .with_distance_type(DistanceType::Cosine)
             .with_graph_params(BuildParams {
                 max_degree: 24,
@@ -1911,6 +1921,34 @@ async fn segments_that_disagree_about_their_vectors_are_refused() {
         error.to_string().contains("disagree about the vectors"),
         "{error}"
     );
+    assert!(
+        !error.to_string().contains("insert_as_segment"),
+        "the codes agree, so the refusal has no business advising on them: {error}"
+    );
+
+    // Two segments built apart at equal settings, with the codes a build writes
+    // by default: each minted its own scalar bounds from its own rows, so they
+    // disagree on the codes alone. The commit goes through and the open says
+    // how such segments are built instead.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = small_fixture().write(uri).await;
+    let (left, _) = build_index_segment(&dataset, &params(), &[0])
+        .await
+        .unwrap();
+    let (right, _) = build_index_segment(&dataset, &params(), &[1])
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments(INDEX_NAME, VECTOR_COLUMN, vec![left, right])
+        .await
+        .unwrap();
+    let error = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("disagree about the vectors"), "{error}");
+    assert!(error.contains("insert_as_segment"), "{error}");
 
     // The other two fields of the same check, which no build can disagree on -
     // the width comes from the column and the identifier space from the dataset,
@@ -2059,10 +2097,10 @@ async fn an_index_of_several_segments_answers_from_all_of_them() {
     let fixture = measurement_fixture();
     let mut dataset = fixture.write(uri).await;
 
-    let (left, _) = build_index_segment(&dataset, &params(), &[0, 1])
+    let (left, _) = build_index_segment(&dataset, &params().without_codes(), &[0, 1])
         .await
         .unwrap();
-    let (right, _) = build_index_segment(&dataset, &params(), &[2, 3])
+    let (right, _) = build_index_segment(&dataset, &params().without_codes(), &[2, 3])
         .await
         .unwrap();
     dataset
@@ -2076,6 +2114,7 @@ async fn an_index_of_several_segments_answers_from_all_of_them() {
     let queries = random_vectors(QUERIES, 4242);
     let truth = ground_truth(&dataset, &queries).await;
     let search = SearchParams::new(K)
+        .with_mode(WalkMode::Exact)
         .with_nprobes(PARTITIONS as usize)
         .with_search_list_size(BEAM);
     let measured = measure(&index, &queries, &truth, &search).await;
@@ -2368,6 +2407,7 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
         .search(
             &query,
             &SearchParams::new(K)
+                .with_mode(WalkMode::Exact)
                 .with_nprobes(CENTROIDS as usize)
                 .with_search_list_size(BEAM_OVER_PARTITION),
         )
@@ -2397,6 +2437,7 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
         .search(
             &onto_empty,
             &SearchParams::new(K)
+                .with_mode(WalkMode::Exact)
                 .with_nprobes(1)
                 .with_search_list_size(BEAM_OVER_PARTITION),
         )
@@ -2420,6 +2461,7 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
             .search(
                 &query,
                 &SearchParams::new(K)
+                    .with_mode(WalkMode::Exact)
                     .with_nprobes(1)
                     .with_search_list_size(BEAM_OVER_PARTITION),
             )
@@ -2559,7 +2601,9 @@ async fn a_partition_holding_a_non_finite_vector_is_reported_as_corrupt() {
         let error = index
             .search(
                 &random_vectors(1, 21)[0],
-                &SearchParams::new(ROWS).with_search_list_size(BEAM),
+                &SearchParams::new(ROWS)
+                    .with_mode(WalkMode::Exact)
+                    .with_search_list_size(BEAM),
             )
             .await
             .expect_err("a walk that measured a non-finite distance must not answer with it");

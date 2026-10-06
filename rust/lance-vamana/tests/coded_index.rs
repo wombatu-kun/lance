@@ -24,7 +24,7 @@ use lance::dataset::WriteParams;
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
-use lance_vamana::codes::CodeSpec;
+use lance_vamana::codes::{CODE_COLUMN, CodeSpec};
 use lance_vamana::consolidator::consolidate_index;
 use lance_vamana::inserter::{insert_as_segment, insert_in_place};
 use lance_vamana::merger::merge_index;
@@ -32,7 +32,8 @@ use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode};
 
 mod common;
 use common::{
-    DatasetFixture, VECTOR_COLUMN, brute_force, random_vectors, read_committed_segments, recall,
+    DatasetFixture, VECTOR_COLUMN, brute_force, random_vectors, read_committed_batches,
+    read_committed_segments, recall,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
@@ -41,16 +42,15 @@ const K: usize = 10;
 const BEAM: usize = 30;
 const QUERIES: usize = 40;
 
-/// The measured working point. Below it a walk needs a wider beam to reach the
-/// same recall, which is the whole finding the default rests on.
+/// RaBitQ's measured working point. Below it a walk needs a wider beam to reach
+/// the same recall.
 const CODE_BITS: u8 = 3;
 
 /// The two kinds a segment can carry, named once.
 ///
-/// Scalar codes are four times the bytes and not a working point at all; what
-/// they are for is the comparison against Lance's own `IVF_HNSW_SQ`, which
-/// steers by exactly this representation. Eight bits because Lance quantises to
-/// a byte whatever width it is asked for.
+/// Scalar codes are the kind a build writes by default, and the representation
+/// Lance's own `IVF_HNSW_SQ` steers by. Eight bits because Lance quantises to a
+/// byte whatever width it is asked for.
 const RABIT: CodeSpec = CodeSpec::Rabit {
     num_bits: CODE_BITS,
 };
@@ -181,8 +181,8 @@ async fn a_rabit_walk_lands_where_the_exact_one_does() {
 
 /// The same bar over scalar codes, which reach the walk by a different route:
 /// no rotation, no residual against the centroid, and no term beside the query.
-/// Nothing here is a working point - it is the representation Lance's own
-/// `IVF_HNSW_SQ` steers by, and this is the test that the walk can be given it.
+/// They are the codes a build writes by default, and the representation Lance's
+/// own `IVF_HNSW_SQ` steers by.
 #[tokio::test]
 async fn a_scalar_walk_lands_where_the_exact_one_does() {
     a_coded_walk_lands_where_the_exact_one_does(SCALAR).await;
@@ -262,34 +262,51 @@ async fn an_exact_walk_does_not_read_the_code_column() {
 }
 
 /// Asked for something the index cannot do, and told so, rather than quietly
-/// given the other walk.
+/// given the other walk - the default walk included, which steers by codes, and
+/// is told which walk does not.
 #[tokio::test]
 async fn an_index_without_codes_refuses_the_coded_walk() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut dataset = fixture().write(uri).await;
-    let mut plain = params(RABIT);
-    plain.codes = None;
-    create_index(&mut dataset, INDEX_NAME, &plain)
+    create_index(&mut dataset, INDEX_NAME, &params(RABIT).without_codes())
         .await
         .unwrap();
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert!(index.metadata().codes.is_none());
+    for (_, batches) in read_committed_batches(&dataset, INDEX_NAME).await {
+        for batch in batches {
+            assert!(batch.column_by_name(CODE_COLUMN).is_none());
+        }
+    }
 
-    let error = index
-        .search(&random_vectors(1, 1)[0], &search(WalkMode::Coded))
-        .await
-        .unwrap_err();
-    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
-    assert!(error.to_string().contains("without codes"), "{error}");
+    let query = &random_vectors(1, 1)[0];
+    for asked in [search(WalkMode::Coded), SearchParams::new(K)] {
+        let error = index.search(query, &asked).await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        let error = error.to_string();
+        assert!(error.contains("without codes"), "{error}");
+        assert!(
+            error.contains(&format!("a {:?} walk", asked.mode)),
+            "{error}"
+        );
+        assert!(error.contains("WalkMode::Exact"), "{error}");
+    }
+    let answered = index.search(query, &search(WalkMode::Exact)).await.unwrap();
+    assert_eq!(answered.neighbors.len(), K);
 }
 
-/// A dimension RaBitQ cannot pack is refused at build time, not at query time.
+/// Codes a build cannot mint are refused at build time, not at query time, and
+/// before a row is read: a dimension RaBitQ cannot pack, a RaBitQ width outside
+/// one to nine, and scalar codes of any width but eight.
 ///
 /// The alternative - building an index that silently has no codes - would be
 /// found out by a query that ran slower than it was meant to, which is the worst
-/// place to find it out.
+/// place to find it out. The last vector holds a null coordinate, which the read
+/// of the column refuses, so a build that read the column before asking would
+/// stop on that, with another error, first.
 #[tokio::test]
-async fn a_dimension_rabit_cannot_pack_refuses_a_coded_build() {
+async fn codes_a_build_cannot_mint_are_refused_before_a_row_is_read() {
     const ODD_DIM: i32 = 12;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -305,7 +322,10 @@ async fn a_dimension_rabit_cannot_pack_refuses_a_coded_build() {
             .map(|row| {
                 Some(
                     (0..ODD_DIM)
-                        .map(|d| Some((row * ODD_DIM + d) as f32))
+                        .map(|d| match (row, d) {
+                            (63, 0) => None,
+                            _ => Some((row * ODD_DIM + d) as f32),
+                        })
                         .collect::<Vec<_>>(),
                 )
             })
@@ -321,17 +341,51 @@ async fn a_dimension_rabit_cannot_pack_refuses_a_coded_build() {
     .await
     .unwrap();
 
+    let with = |codes| IndexParams::new(VECTOR_COLUMN, 2).with_codes(codes);
+    let error = create_index(&mut dataset, INDEX_NAME, &with(RABIT))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, lance_core::Error::InvalidInput { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("multiple of 8"), "{error}");
+
     let error = create_index(
         &mut dataset,
         INDEX_NAME,
-        &IndexParams::new(VECTOR_COLUMN, 2).with_codes(CodeSpec::Rabit {
-            num_bits: CODE_BITS,
-        }),
+        &with(CodeSpec::Rabit { num_bits: 0 }),
     )
     .await
     .unwrap_err();
-    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
-    assert!(error.to_string().contains("multiple of 8"), "{error}");
+    assert!(
+        matches!(error, lance_core::Error::InvalidInput { .. }),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("num_bits must be in 1..=9, got 0"),
+        "{error}"
+    );
+
+    let error = create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &with(CodeSpec::Scalar { num_bits: 4 }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, lance_core::Error::NotSupported { .. }),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("scalar codes are 8 bits a dimension; 4 was asked for"),
+        "{error}"
+    );
 }
 
 /// Every pass that writes a segment inherits the rotation, and a partition it

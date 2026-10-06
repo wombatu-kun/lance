@@ -31,7 +31,7 @@ use lance_vamana::codes::CodeSpec;
 use lance_vamana::consolidator::{ConsolidateStats, consolidate_index};
 use lance_vamana::format::{ROW_ID_COLUMN, VectorSource};
 use lance_vamana::merger::merge_index;
-use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
+use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode, committed_segments};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -60,6 +60,7 @@ async fn indexed_dataset(uri: &str) -> Dataset {
 
 fn search() -> SearchParams {
     SearchParams::new(K)
+        .with_mode(WalkMode::Exact)
         .with_nprobes(PARTITIONS as usize)
         .with_search_list_size(64)
 }
@@ -90,7 +91,7 @@ async fn committed_uuid(dataset: &Dataset) -> Uuid {
 async fn commit_segment_over(dataset: &mut Dataset, fragments: &[u32]) -> Uuid {
     let (segment, _) = build_index_segment(
         dataset,
-        &IndexParams::new(VECTOR_COLUMN, PARTITIONS),
+        &IndexParams::new(VECTOR_COLUMN, PARTITIONS).without_codes(),
         fragments,
     )
     .await
@@ -208,9 +209,7 @@ async fn moved_index(
         })
         .with_distance_type(distance_type)
         .with_vector_source(vector_source);
-    if let Some(codes) = codes {
-        params = params.with_codes(codes);
-    }
+    params.codes = codes;
     create_index(&mut dataset, INDEX_NAME, &params)
         .await
         .unwrap();
@@ -782,6 +781,7 @@ async fn consolidation_reads_fewer_bytes_for_the_same_answers() {
         truth.push(brute_force(&dataset, query, K).await);
     }
     let narrow = SearchParams::new(K)
+        .with_mode(WalkMode::Exact)
         .with_nprobes(PARTITIONS as usize)
         .with_search_list_size(12);
 

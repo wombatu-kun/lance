@@ -8,18 +8,24 @@
 //! and a walk given one measures its distances against that column instead of
 //! `__vector`. What the column is *for* is the disk
 //! traversal: codes small enough to keep resident are what leaves a walk with
-//! only the edges of the vertices it expands to fetch. On their own they buy
-//! nothing - a partition is still read whole - and cost thirteen per cent of the
-//! index at `d = 128`.
+//! only the edges of the vertices it expands to fetch.
 //!
-//! The measurement behind the parameters is `examples/coded_walk.rs`. A walk on
-//! RaBitQ residual codes reaches the exact walk's recall for two to thirteen per
-//! cent more comparisons from **three bits a dimension**, 68 bytes a vertex at
-//! `d = 128`; one bit needs a beam one and a half to three and a half times
-//! wider, which multiplies the very reads the codes were there to save. The
-//! answer has to be re-scored from the whole candidate list rather than its
-//! nearest `k`, because a coded walk's own ordering tops out around 0.95 recall
-//! at any width.
+//! A build writes eight-bit scalar codes unless it is told otherwise, because
+//! the default walk, [`crate::query::WalkMode::Lazy`], steers by them. They cost
+//! a byte a dimension a vertex: 128 bytes at `d = 128`, about a seventh of a
+//! partition file at `R = 70`. An index built without them
+//! ([`crate::IndexParams::without_codes`]) can only be searched by
+//! [`crate::query::WalkMode::Exact`], which reads every partition it probes
+//! whole.
+//!
+//! The measurement behind RaBitQ's parameters is `examples/coded_walk.rs`. A
+//! walk on RaBitQ residual codes reaches the exact walk's recall for two to
+//! thirteen per cent more comparisons from **three bits a dimension**, 68 bytes
+//! a vertex at `d = 128`; one bit needs a beam one and a half to three and a
+//! half times wider, which multiplies the very reads the codes were there to
+//! save. The answer has to be re-scored from the whole candidate list rather
+//! than its nearest `k`, because a coded walk's own ordering tops out around
+//! 0.95 recall at any width.
 //!
 //! The quantiser is Lance's own (`lance_index::vector::bq`) rather than one of
 //! ours: what is being asked of it is to steer a walk, and a hand-rolled
@@ -109,6 +115,21 @@ pub enum CodeSpec {
 }
 
 impl CodeSpec {
+    /// Refuse what [`Self::mint`] would refuse, from the dimension alone.
+    ///
+    /// A build asks before it reads a row: minting needs the vectors, so a
+    /// width it cannot build would otherwise be refused only after the whole
+    /// column had been read and the router trained.
+    pub fn validate(&self, dimension: u32) -> Result<()> {
+        match *self {
+            Self::Rabit { num_bits } => {
+                validate_rq_num_bits(num_bits)?;
+                check_dimension(dimension)
+            }
+            Self::Scalar { num_bits } => validate_sq_num_bits(num_bits),
+        }
+    }
+
     /// Mint what a segment will carry, from the vectors the codes will quantise.
     ///
     /// `vectors` must already be in coding space: cosine is stored and routed as
@@ -175,10 +196,11 @@ pub enum CodeParams {
     },
     /// Lance's own scalar quantisation, which quantises the vector itself.
     ///
-    /// Four times the bytes of a three-bit RaBitQ code at `d = 960`, so it is
-    /// not what a walk would pick to keep resident. What it is for is the
-    /// comparison: it is the representation Lance's own `IVF_HNSW_SQ` steers by,
-    /// and a walk given the same one leaves the graph as the only difference.
+    /// The kind a build writes by default, and the one `examples/ivf_rq_ab.rs`
+    /// measures the walk on. A byte a dimension: 1.9 times a three-bit RaBitQ
+    /// code at `d = 128`, 128 bytes against 68. It is also the representation
+    /// Lance's own `IVF_HNSW_SQ` steers by, so a walk given it leaves the graph
+    /// as the only difference between the two.
     Scalar {
         num_bits: u16,
         /// The range every code of this index was scaled against, taken over a
@@ -1029,10 +1051,12 @@ mod tests {
     }
 
     /// The width the measurement reported, pinned so that a change in Lance's
-    /// blocked ex-code layout shows up here rather than as an index that grew.
+    /// blocked ex-code layout shows up here rather than as an index that grew -
+    /// and at `d = 960`, the other width the documentation quotes.
     #[test]
     fn three_bits_are_sixty_eight_bytes_at_d_128() {
         assert_eq!(CodeParams::rabit(3, 128).unwrap().stride(128).unwrap(), 68);
+        assert_eq!(CodeParams::rabit(3, 960).unwrap().stride(960).unwrap(), 380);
     }
 
     #[test]

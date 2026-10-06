@@ -28,7 +28,7 @@ use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
 use lance_vamana::inserter::insert_as_segment;
 use lance_vamana::merger::{MergeStats, merge_index};
-use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
+use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode, committed_segments};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -58,11 +58,16 @@ fn base_graph() -> BuildParams {
 }
 
 async fn indexed_dataset(uri: &str) -> Dataset {
+    indexed_dataset_with(uri, IndexParams::new(VECTOR_COLUMN, PARTITIONS)).await
+}
+
+/// [`indexed_dataset`] built from `params`, with the fixture's own graph.
+async fn indexed_dataset_with(uri: &str, params: IndexParams) -> Dataset {
     let mut dataset = DatasetFixture::default().write(uri).await;
     create_index(
         &mut dataset,
         INDEX_NAME,
-        &IndexParams::new(VECTOR_COLUMN, PARTITIONS).with_graph_params(base_graph()),
+        &params.with_graph_params(base_graph()),
     )
     .await
     .unwrap();
@@ -110,6 +115,7 @@ async fn append_vectors(uri: &str, vectors: &[Vec<f32>]) -> Dataset {
 
 fn search() -> SearchParams {
     SearchParams::new(K)
+        .with_mode(WalkMode::Exact)
         .with_nprobes(PARTITIONS as usize)
         .with_search_list_size(64)
 }
@@ -603,16 +609,22 @@ async fn every_partition_read_back_respects_the_degree() {
 /// under. So the centroids themselves are compared, before anything is read.
 #[tokio::test]
 async fn merging_segments_that_disagree_is_refused() {
+    // Without codes on both sides of both halves: two segments built apart mint
+    // codes of their own, and opening the index would refuse them before the
+    // merge got to say what it refuses them for.
+    let without_codes = || IndexParams::new(VECTOR_COLUMN, PARTITIONS).without_codes();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    indexed_dataset(uri).await;
+    indexed_dataset_with(uri, without_codes()).await;
 
     // Same width, its own router: partition n of this segment is a different
     // region of the space than partition n of the base.
     let mut dataset = with_new_rows(uri, 99).await;
     let (stranger, _) = build_index_segment(
         &dataset,
-        &IndexParams::new(VECTOR_COLUMN, PARTITIONS - 3).with_graph_params(base_graph()),
+        &IndexParams::new(VECTOR_COLUMN, PARTITIONS - 3)
+            .with_graph_params(base_graph())
+            .without_codes(),
         &[3, 4, 5],
     )
     .await
@@ -634,11 +646,11 @@ async fn merging_segments_that_disagree_is_refused() {
     // does not.
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    indexed_dataset(uri).await;
+    indexed_dataset_with(uri, without_codes()).await;
     let mut dataset = with_new_rows(uri, 99).await;
     let (odd, _) = build_index_segment(
         &dataset,
-        &IndexParams::new(VECTOR_COLUMN, PARTITIONS).with_graph_params(BuildParams {
+        &without_codes().with_graph_params(BuildParams {
             max_degree: 20,
             ..base_graph()
         }),

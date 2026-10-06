@@ -95,7 +95,7 @@ pub(crate) struct Resident {
     /// itself. What it saves is the walk's own reads and nothing else - after
     /// the codes are resident those are all that is left of a probe besides the
     /// re-score - and what it costs is 256 bytes a vertex at `R = 64`, against
-    /// the 68 a code occupies at `d = 128` and the 376 at `d = 960`.
+    /// the 68 a code occupies at `d = 128` and the 380 at `d = 960`.
     pub(crate) edges: Option<Vec<u32>>,
 }
 

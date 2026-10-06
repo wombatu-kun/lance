@@ -347,8 +347,8 @@ fn rabit_store(probe: &Probe, num_bits: u8) -> RabitQuantizationStorage {
 /// Scalar codes for one partition: a byte a dimension, the generous control.
 ///
 /// Four times the bytes of a one-bit RaBitQ code at `d = 128` and eight times at
-/// `d = 960`, so it is not a candidate for what stays resident - it is here to
-/// separate "codes cannot steer a walk" from "one bit cannot steer a walk".
+/// `d = 960`; here it separates "codes cannot steer a walk" from "one bit cannot
+/// steer a walk".
 /// Bounds come from the whole dataset rather than from the partition, because that
 /// is what Lance's own `IVF_SQ` build does.
 fn scalar_store(probe: &Probe, num_bits: u16, bounds: Range<f64>) -> ScalarQuantizationStorage {
@@ -941,12 +941,15 @@ async fn granularity(
     create_index(
         &mut dataset,
         INDEX_NAME,
+        // Without codes, as the README's figures were taken before codes
+        // became the default.
         &IndexParams::new(VECTOR_FIELD, partitions)
             .with_distance_type(DISTANCE_TYPE)
             .with_graph_params(BuildParams {
                 max_degree: grid.degree,
                 ..Default::default()
-            }),
+            })
+            .without_codes(),
     )
     .await
     .unwrap();

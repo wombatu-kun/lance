@@ -174,12 +174,15 @@ async fn main() {
     create_index(
         &mut dataset,
         INDEX_NAME,
+        // Without codes, as the README's figures were taken before codes
+        // became the default.
         &IndexParams::new(VECTOR_FIELD, partitions)
             .with_distance_type(DISTANCE_TYPE)
             .with_graph_params(BuildParams {
                 max_degree: degree,
                 ..Default::default()
-            }),
+            })
+            .without_codes(),
     )
     .await
     .unwrap();

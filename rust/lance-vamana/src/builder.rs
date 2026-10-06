@@ -101,20 +101,28 @@ pub struct IndexParams {
     /// and it takes the *front* of it, so a larger rate would quietly stop being
     /// a random sample of the dataset.
     pub kmeans_sample_rate: usize,
-    /// Bits a dimension for the resident code column, or `None` for no codes.
+    /// The codes the partitions carry, or `None` for none.
     ///
-    /// Off by default because codes are not free and, on their own, buy nothing:
-    /// a partition is still read whole, so all they do today is add thirteen per
-    /// cent to the index at `d = 128`. They are what the disk-resident traversal
-    /// will steer by, and the measured working point is **three** - see
-    /// [`crate::codes`].
+    /// Eight-bit scalar codes by default, because the default walk,
+    /// [`crate::query::WalkMode::Lazy`], steers by them: they are what lets a
+    /// walk fetch the edges of the vertices it expands and leave the rest of a
+    /// partition unread, and the representation the walk was measured on
+    /// against Lance's own indices (`examples/ivf_rq_ab.rs`). They cost a byte a
+    /// dimension a vertex, about a seventh of a partition file at `d = 128` and
+    /// `R = 70`. [`Self::without_codes`] builds without them, for an index that
+    /// only [`crate::query::WalkMode::Exact`] searches: it reads every
+    /// partition it probes whole, and is the one mode such an index answers.
     ///
-    /// RaBitQ is refused, not ignored, when the dimension is not a multiple of
-    /// eight, which is what it packs a bit a dimension into. Scalar codes carry
-    /// four times the bytes and are not a working point at all: they are here so
-    /// that a walk can be given the same representation Lance's own
-    /// `IVF_HNSW_SQ` steers by, which leaves the graph as the only difference
-    /// between the two.
+    /// RaBitQ is the smaller code - 68 bytes a vertex at three bits and
+    /// `d = 128`, the working point [`crate::codes`] measured for it - and is
+    /// refused, not ignored, when the dimension is not a multiple of eight,
+    /// which is what it packs a bit a dimension into. Either kind is checked
+    /// before a row is read.
+    ///
+    /// A segment joining an index takes the index's codes, whatever this says.
+    /// Two segments built apart each mint their own - scalar bounds from their
+    /// own rows, a RaBitQ rotation of their own - and do not open as one index
+    /// unless the two happen to agree, which RaBitQ rotations never do.
     pub codes: Option<CodeSpec>,
     /// Whether the partitions keep a copy of the vectors, or the re-score reads
     /// them from the dataset. [`VectorSource::Index`] by default.
@@ -138,7 +146,7 @@ impl IndexParams {
             graph: BuildParams::default(),
             kmeans_max_iters: 50,
             kmeans_sample_rate: 256,
-            codes: None,
+            codes: Some(CodeSpec::Scalar { num_bits: 8 }),
             vector_source: VectorSource::Index,
         }
     }
@@ -165,6 +173,13 @@ impl IndexParams {
 
     pub fn with_codes(mut self, codes: CodeSpec) -> Self {
         self.codes = Some(codes);
+        self
+    }
+
+    /// Build without codes, for an index only
+    /// [`crate::query::WalkMode::Exact`] searches. See [`Self::codes`].
+    pub fn without_codes(mut self) -> Self {
+        self.codes = None;
         self
     }
 
@@ -319,6 +334,16 @@ pub(crate) fn index_column(dataset: &Dataset, index_name: &str, fields: &[i32]) 
 /// a fragment that is gone narrows the index and is logged, while one that is
 /// still there and was rewritten is refused, because that is the shape of an
 /// index whose data moved underneath it.
+///
+/// A segment built here mints codes of its own - scalar bounds from its own
+/// rows, or a RaBitQ rotation drawn afresh - so it does not open beside another
+/// segment built here under the same name unless the two happen to agree, which
+/// RaBitQ rotations never do: [`crate::query::VamanaIndex::open`] refuses
+/// segments whose codes differ, though the commit itself goes through.
+/// A segment meant to join an index is built by
+/// [`crate::inserter::insert_as_segment`], which takes the index's; segments
+/// built here to be committed together are built
+/// [`IndexParams::without_codes`].
 pub async fn build_index_segment(
     dataset: &Dataset,
     params: &IndexParams,
@@ -411,6 +436,8 @@ pub(crate) async fn build_index_segment_inheriting(
 /// rather than "everything": a segment's committed coverage is what Lance trusts
 /// it to hold, and a segment naming two fragments while physically holding the
 /// whole dataset would put every other row into two segments at once.
+///
+/// Its codes are its own, as [`build_index_segment`]'s are.
 pub async fn build_segment(
     dataset: &Dataset,
     params: &IndexParams,
@@ -527,6 +554,16 @@ pub(crate) async fn build_segment_inheriting(
             )));
         }
     };
+    // Asked of the schema as well: minting needs the vectors, so codes the build
+    // cannot mint would otherwise be refused after the whole column had been
+    // read and the router trained. A segment joining an index takes the codes
+    // the index already minted, whatever its own parameters say, and has
+    // nothing to check.
+    if inherited.is_none()
+        && let Some(spec) = &params.codes
+    {
+        spec.validate(width)?;
+    }
     // Asked of the schema too, and for the same reason: a segment that leaves
     // its vectors to the dataset has to steer by codes and read the dataset's
     // rows by offset, and a build that could not do both would find out only
@@ -539,8 +576,9 @@ pub(crate) async fn build_segment_inheriting(
         if !has_codes {
             return Err(Error::invalid_input(format!(
                 "Vamana cannot leave the vectors of column '{}' to the dataset without codes: a \
-                 walk that reads no vectors steers by codes; build with IndexParams::with_codes \
-                 (--code-bits on the command line) as well",
+                 walk that reads no vectors steers by codes; keep the codes IndexParams::new \
+                 writes rather than calling IndexParams::without_codes (--codes none on the \
+                 command line)",
                 params.column
             )));
         }
@@ -1016,6 +1054,15 @@ mod tests {
 
     use super::*;
     use crate::format::partition_file_name;
+
+    /// A build writes eight-bit scalar codes unless it is told not to, because
+    /// the default walk steers by them; told not to, it writes none.
+    #[test]
+    fn a_build_writes_scalar_codes_unless_told_not_to() {
+        let params = IndexParams::new("vector", 4);
+        assert_eq!(params.codes, Some(CodeSpec::Scalar { num_bits: 8 }));
+        assert_eq!(params.without_codes().codes, None);
+    }
 
     /// A partition whose centroid drew nothing gets no file and no row in the
     /// segment table, and the partitions after it keep their own ids. Writing

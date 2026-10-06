@@ -33,7 +33,7 @@ use lance_vamana::consolidator::consolidate_index;
 use lance_vamana::format::VectorSource;
 use lance_vamana::inserter::{InsertStats, insert_as_segment, insert_in_place};
 use lance_vamana::merger::merge_index;
-use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
+use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode, committed_segments};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -118,6 +118,7 @@ async fn append_vectors(uri: &str, vectors: &[Vec<f32>]) -> Dataset {
 
 fn search() -> SearchParams {
     SearchParams::new(K)
+        .with_mode(WalkMode::Exact)
         .with_nprobes(PARTITIONS as usize)
         .with_search_list_size(64)
 }
@@ -387,15 +388,29 @@ async fn a_second_delta_inherits_from_the_base_and_not_from_the_first() {
 async fn a_delta_takes_its_shape_from_the_base_and_not_from_the_newest_segment() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    indexed_dataset(uri).await;
+    // Without codes, base and odd segment alike: two segments built apart mint
+    // codes of their own and would not open as one index, and what is asked
+    // here is the degree.
+    let mut dataset = DatasetFixture::default().write(uri).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &IndexParams::new(VECTOR_COLUMN, PARTITIONS)
+            .with_graph_params(base_graph())
+            .without_codes(),
+    )
+    .await
+    .unwrap();
 
     let mut dataset = with_new_rows(uri, 99).await;
     let (odd, _) = build_index_segment(
         &dataset,
-        &IndexParams::new(VECTOR_COLUMN, PARTITIONS).with_graph_params(BuildParams {
-            max_degree: 20,
-            ..base_graph()
-        }),
+        &IndexParams::new(VECTOR_COLUMN, PARTITIONS)
+            .with_graph_params(BuildParams {
+                max_degree: 20,
+                ..base_graph()
+            })
+            .without_codes(),
         &[3, 4, 5],
     )
     .await

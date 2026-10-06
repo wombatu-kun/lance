@@ -149,8 +149,8 @@ pub enum VectorSource {
     /// The partitions hold no vectors, so only the walks that steer by codes and
     /// read the vectors of the candidates they end with -
     /// [`crate::query::WalkMode::Lazy`] and [`crate::query::WalkMode::Flat`] -
-    /// can search the segment; `Exact`, the default, and `Coded` read partitions
-    /// whole, vectors included, and are refused. The segment must have codes,
+    /// can search the segment; `Exact` and `Coded` read partitions whole,
+    /// vectors included, and are refused. The segment must have codes,
     /// and the dataset's vectors must be at least [`MIN_DATASET_VECTOR_DIMENSION`]
     /// wide. A query needs the data files of the dataset version the index was
     /// opened at, so once a compaction and a cleanup have removed them a
@@ -203,11 +203,11 @@ pub struct IndexMetadata {
     pub fragments: Vec<u32>,
     /// How this segment's [`CODE_COLUMN`] was built, when it has one.
     ///
-    /// `None` says the partitions carry no codes and every walk over them
-    /// measures against the stored vectors. It is not a version marker - codes
-    /// are opt-in at build time and cost thirteen per cent of the index at
-    /// `d = 128` - and it is also what a dimension RaBitQ cannot quantise
-    /// leaves behind.
+    /// `None` says the partitions carry no codes, so only
+    /// [`crate::query::WalkMode::Exact`], which measures against the stored
+    /// vectors, can search them. It is not a version marker: a build writes
+    /// eight-bit scalar codes unless it is told not to
+    /// ([`crate::IndexParams::without_codes`]).
     ///
     /// Inherited wholesale by every maintenance pass, which is what makes the
     /// rotation inside it one per index rather than one per segment.
@@ -302,8 +302,8 @@ struct Versioned {
 /// answer to re-score. Separate columns are what makes each of those a
 /// projection.
 ///
-/// `code_stride` is `None` for a segment built without codes, which is the
-/// default and what a dimension RaBitQ cannot quantise leaves behind. The code
+/// `code_stride` is `None` for a segment built without codes
+/// ([`crate::IndexParams::without_codes`]). The code
 /// column goes last so that a reader projecting the others by name is
 /// unaffected by its presence. `__vector` is there only for
 /// [`VectorSource::Index`].

@@ -74,7 +74,7 @@ use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::consolidator::consolidate_index;
 use lance_vamana::inserter::insert_in_place;
 use lance_vamana::merger::merge_index;
-use lance_vamana::query::{SearchParams, VamanaIndex, committed_segments};
+use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode, committed_segments};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -274,9 +274,13 @@ async fn main() {
         mode.label()
     );
 
-    let index_params =
-        IndexParams::new(VECTOR_COLUMN, partitions).with_distance_type(DISTANCE_TYPE);
+    // Without codes and walked exactly: the settings the README's figures were
+    // taken at, before either default changed.
+    let index_params = IndexParams::new(VECTOR_COLUMN, partitions)
+        .with_distance_type(DISTANCE_TYPE)
+        .without_codes();
     let search = SearchParams::new(K)
+        .with_mode(WalkMode::Exact)
         .with_nprobes(nprobes)
         .with_search_list_size(search_list_size);
     let queries = (0..num_queries)

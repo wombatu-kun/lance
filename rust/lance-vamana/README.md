@@ -9,7 +9,9 @@ compiles against is the one an out-of-tree crate sees.
 let built = lance_vamana::create_index(&mut dataset, "vamana_idx", &IndexParams::new("vec", 64)).await?;
 println!("{} vectors cost {} distance computations to index", built.vectors, built.comparisons);
 
-let index = VamanaIndex::open(&dataset, "vamana_idx").await?;
+let index = VamanaIndex::open(&dataset, "vamana_idx")
+    .await?
+    .with_cache(LanceCache::with_capacity(4 << 30));
 let answer = index.search(&query, &SearchParams::new(10).with_nprobes(8)).await?;
 println!("answered in {} distance computations", answer.comparisons);
 for neighbor in &answer.neighbors {
@@ -20,6 +22,13 @@ for neighbor in &answer.neighbors {
 Both halves of the cost are returned rather than logged: a graph is a trade
 between what a build pays and what a query pays, and a change that improves one
 by spending the other is not visible from either number alone.
+
+By default a build writes eight-bit scalar codes and a query walks
+`WalkMode::Lazy` over them: it reads a partition's row ids and codes, the edges
+of the vertices it expands and the vectors of the candidates it re-scores, and
+nothing else. The cache keeps the row ids and codes between queries, which such
+a walk otherwise reads again for every partition it probes. `IndexParams::without_codes` builds an index that
+only `WalkMode::Exact` searches, reading every partition it probes whole.
 
 ## Without writing any Rust
 
@@ -45,7 +54,7 @@ The whole loop on SIFT1M, at the working point the figures below are quoted at:
 ```
 vamana ingest --fvecs sift_base.fvecs --dataset sift.lance
 vamana build  --dataset sift.lance --index-name idx \
-              --rows-per-partition 8192 --code-bits 3
+              --rows-per-partition 8192 --codes rabitq --code-bits 3
 vamana search --dataset sift.lance --index-name idx \
               --fvecs sift_query.fvecs --limit 200 \
               --truth sift_groundtruth.ivecs \
@@ -216,7 +225,12 @@ two are meant to say the same thing.
   files. Once a compaction and `cleanup_old_versions` have removed them, a
   re-score that has to open one fails, naming it, until the index is opened
   again - the rule Lance's own indices live by.
-- **A partition is read whole unless the walk is told otherwise.** Reading only
+- **The default walk steers by codes, and an index without them is read
+  whole.** A build writes eight-bit scalar codes and a query walks
+  `WalkMode::Lazy` unless told otherwise; an index built with
+  `IndexParams::without_codes` is searched by `WalkMode::Exact` only, which
+  reads every partition it probes whole, and a query that does not ask for that
+  is refused rather than downgraded. Reading only
   the vertices a walk touches was measured instead of assumed
   (`examples/memory_gate.rs`): on its own it halves the pages moved at best and
   costs *more* CPU at fine granularity, because a walk scores `R` neighbours for
@@ -224,10 +238,11 @@ two are meant to say the same thing.
   expands. It pays with quantised codes standing in for those vectors, and only
   while the cache holds a fraction of the index - replaying real probe sequences
   through an LRU that holds all of it serves 25 to 250 queries per load, far past
-  the crossover where reading whole was cheaper. Three bits a dimension is what
-  "codes" has to mean (`examples/coded_walk.rs`): at three the walk spends two to
-  thirteen per cent more comparisons than an exact one at equal recall, at one it
-  needs a beam one and a half to three and a half times wider, and either way the
+  the crossover where reading whole was cheaper. For RaBitQ, three bits a
+  dimension is what "codes" has to mean (`examples/coded_walk.rs`): at three
+  the walk spends two to thirteen per cent more comparisons than an exact one at
+  equal recall, at one it needs a beam one and a half to three and a half times
+  wider, and either way the
   answer has to be re-scored from the whole candidate list rather than from its
   nearest `K`. Reading a vertex's vector as it is expanded - which DiskANN gets
   free, because one page carries a vertex's edges next to its vector - was
@@ -236,17 +251,17 @@ two are meant to say the same thing.
   and so the walk expands more for it - three times more at one bit. At equal
   work a wider beam on plain codes reaches higher recall.
 
-  Both halves are here. `IndexParams::with_codes` with three-bit RaBitQ codes
-  builds a partition file with a `__code` column beside its edges and, unless
-  the index leaves them to the dataset, its vectors;
-  `SearchParams::with_mode(WalkMode::Coded)` walks by it and re-scores the whole
-  candidate list exactly, still reading the partition whole; and
-  `WalkMode::Lazy` keeps the row ids and the codes and fetches the rest as it
-  goes - the out-edges of a vertex when it expands one,
-  `SearchParams::with_beam_width` vertices to a request, then the vectors of the
-  candidate list in one more. An index that leaves its vectors to the dataset
-  has no partition to read whole, so only `WalkMode::Lazy` and `WalkMode::Flat`
-  search it, and `Exact`, the default, and `Coded` are refused.
+  Both halves are here. A build writes a partition file with a `__code` column
+  beside its edges and, unless the index leaves them to the dataset, its
+  vectors - eight-bit scalar codes by default, three-bit RaBitQ ones through
+  `IndexParams::with_codes`; `SearchParams::with_mode(WalkMode::Coded)` walks by
+  it and re-scores the whole candidate list exactly, still reading the
+  partition whole; and `WalkMode::Lazy`, the default, keeps the row ids and the
+  codes and fetches the rest as it goes - the out-edges of a vertex when it
+  expands one, `SearchParams::with_beam_width` vertices to a request, then the
+  vectors of the candidate list in one more. An index that leaves its vectors
+  to the dataset has no partition to read whole, so only `WalkMode::Lazy` and
+  `WalkMode::Flat` search it, and `Exact` and `Coded` are refused.
 
   A hop of a lazy walk collects every neighbour it has not already seen before it
   measures any of them, and asks the processor for the code of the one
@@ -354,8 +369,9 @@ two are meant to say the same thing.
   52 kB that is left. Granularity and the cache are chosen together, and neither
   choice survives the other being changed.
 
-  Codes are off by default, and refused rather than skipped for a dimension that
-  is not a multiple of eight, which is what RaBitQ packs a bit a dimension into.
+  RaBitQ codes are refused rather than skipped for a dimension that is not a
+  multiple of eight, which is what RaBitQ packs a bit a dimension into; scalar
+  codes, the default, take any dimension.
 - **A probe is taken whether or not it can help.** RaBitQ carries a per-vector
   error factor, so a partition whose nearest possible vertex cannot beat the
   answer assembled so far need not be walked at all, and whether that check pays
@@ -658,11 +674,16 @@ reads nothing from the dataset for it - so that Lance can drop the record.
   for why.
 - Address-style row ids only. A dataset created with `enable_stable_row_ids` is
   refused at build and at open.
-- `with_codes` mints what the codes are taken under - a RaBitQ rotation, or the
+- A build mints what its codes are taken under - a RaBitQ rotation, or the
   scalar bounds - once for the whole index, and every later segment inherits
   it, because a partition copied between two segments carries its codes
   unchanged and a code says nothing about what it was taken under. A copy
-  between segments that disagree is refused.
+  between segments that disagree is refused, and so is opening an index whose
+  segments were built apart (`build_index_segment` twice under one name): each
+  minted codes of its own, and they disagree unless they happen to agree, which
+  RaBitQ rotations never do. A segment that joins an index is built with
+  `insert_as_segment`, which takes the index's, and segments built apart to be
+  committed together are built without codes.
 - A build is reproducible from `BuildParams::seed`, except for two things: Lance
   re-seeds from the OS when a k-means iteration leaves a cluster empty, which is
   outside this crate's control, and RaBitQ's rotation is drawn fresh every build
@@ -697,8 +718,8 @@ What it asks for in return:
   four bytes a dimension that is 64. A build that cannot meet either is refused
   before it reads a row. A copy in the index has no such floor, because a
   partition file asks Lance for full-zip explicitly.
-- `WalkMode::Lazy` or `WalkMode::Flat`, chosen by the query: `Exact`, the
-  default, and `Coded` read a partition whole and are refused.
+- `WalkMode::Lazy`, the default, or `WalkMode::Flat`: `Exact` and `Coded`
+  read a partition whole and are refused.
 - Data files an offset can reach. A fragment none can - a file older than Lance
   2.1, a column that is compressed or holds nulls, an overlay the column already
   had when the index was built, a file under another base path, a row count the

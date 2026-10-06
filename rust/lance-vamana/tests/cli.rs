@@ -97,7 +97,7 @@ impl Fixture {
 
     fn built() -> Self {
         let fixture = Self::ingest();
-        fixture.build(&["--code-bits", "3"]);
+        fixture.build(&["--codes", "rabitq", "--code-bits", "3"]);
         fixture
     }
 
@@ -316,7 +316,7 @@ async fn the_whole_lifecycle_runs_from_a_file_of_vectors() {
         (0..ROWS as u64).collect::<Vec<_>>()
     );
 
-    let built = fixture.build(&["--code-bits", "3"]);
+    let built = fixture.build(&["--codes", "rabitq", "--code-bits", "3"]);
     assert!(
         built.contains(&format!(
             "indexed {ROWS} vectors into {PARTITIONS} partitions"
@@ -331,7 +331,12 @@ async fn the_whole_lifecycle_runs_from_a_file_of_vectors() {
 
     // `exact` because the RaBitQ rotation is drawn afresh per build, which makes
     // any coded arm's recall a different number every run.
-    let searched = fixture.search(&["--truth", fixture.truth.to_str().unwrap()]);
+    let searched = fixture.search(&[
+        "--mode",
+        "exact",
+        "--truth",
+        fixture.truth.to_str().unwrap(),
+    ]);
     assert!(recall_of(&searched) >= 0.99, "{searched}");
 
     append(
@@ -397,7 +402,7 @@ async fn the_whole_lifecycle_runs_from_a_file_of_vectors() {
         .collect::<Vec<_>>();
     let truth = fixture._dir.path().join("truth-after.ivecs");
     write_ivecs(&truth, &nearest_positions(&live, &fixture.query_vectors, K));
-    let searched = fixture.search(&["--truth", truth.to_str().unwrap()]);
+    let searched = fixture.search(&["--mode", "exact", "--truth", truth.to_str().unwrap()]);
     assert!(
         recall_of(&searched) >= 0.99,
         "maintenance must leave the index answering: {searched}"
@@ -504,6 +509,8 @@ async fn a_build_records_the_parameters_it_was_given() {
         "40",
         "--alpha",
         "1.0",
+        "--codes",
+        "rabitq",
         "--code-bits",
         "5",
     ]);
@@ -515,6 +522,45 @@ async fn a_build_records_the_parameters_it_was_given() {
     assert_eq!(segment["search_list_size"], 40);
     assert_eq!(segment["alpha"], 1.0);
     assert_eq!(segment["codes"]["num_bits"], 5);
+    assert!(segment["codes"]["rotation_signs"].is_array(), "{segment}");
+
+    // Unnamed, the codes are the library's: eight-bit scalar ones, whose bounds
+    // say which kind they are where a width of eight alone would not.
+    fixture.build(&[]);
+    let info = fixture.info();
+    let codes = &info["first_segment"]["codes"];
+    assert_eq!(codes["num_bits"], 8);
+    assert!(codes["bounds"].is_object(), "{codes}");
+    for scalar in [
+        &["--codes", "scalar"][..],
+        &["--codes", "scalar", "--code-bits", "8"],
+    ] {
+        fixture.build(scalar);
+        let info = fixture.info();
+        let codes = &info["first_segment"]["codes"];
+        assert_eq!(codes["num_bits"], 8, "{scalar:?}");
+        assert!(codes["bounds"].is_object(), "{scalar:?}: {codes}");
+    }
+    fixture.build(&["--codes", "none"]);
+    assert!(fixture.info()["first_segment"]["codes"].is_null());
+
+    let error = refused(&[
+        "build",
+        "--dataset",
+        &fixture.dataset,
+        "--index-name",
+        "idx",
+        "--rows-per-partition",
+        ROWS_PER_PARTITION,
+        "--codes",
+        "scalar",
+        "--code-bits",
+        "4",
+    ]);
+    assert!(
+        error.contains("scalar codes are 8 bits a dimension; 4 was asked for"),
+        "{error}"
+    );
 }
 
 /// `--vectors dataset` builds an index that keeps none, which `info` says and a
@@ -554,7 +600,7 @@ async fn an_index_may_leave_its_vectors_to_the_dataset() {
     };
 
     let wide = ingested(64);
-    let built = build(&wide, &["--code-bits", "3"]);
+    let built = build(&wide, &["--codes", "rabitq", "--code-bits", "3"]);
     assert!(
         built.status.success(),
         "{}",
@@ -602,16 +648,20 @@ async fn an_index_may_leave_its_vectors_to_the_dataset() {
         "idx",
         "--vector",
         &query,
+        "--mode",
+        "exact",
     ]);
     assert!(
         error.contains("leaves its vectors to the dataset"),
         "{error}"
     );
 
-    let error = String::from_utf8(build(&wide, &[]).stderr).unwrap();
+    let error = String::from_utf8(build(&wide, &["--codes", "none"]).stderr).unwrap();
     assert!(error.contains("to the dataset without codes"), "{error}");
     let narrow = ingested(VECTOR_DIM);
-    let error = String::from_utf8(build(&narrow, &["--code-bits", "3"]).stderr).unwrap();
+    let error =
+        String::from_utf8(build(&narrow, &["--codes", "rabitq", "--code-bits", "3"]).stderr)
+            .unwrap();
     assert!(
         error.contains("they have 16 dimensions and at least 64 are needed"),
         "{error}"
@@ -646,6 +696,8 @@ async fn a_build_over_files_no_offset_reaches_warns() {
         "2",
         "--vectors",
         "dataset",
+        "--codes",
+        "rabitq",
         "--code-bits",
         "3",
     ]);
@@ -671,6 +723,10 @@ async fn a_coded_walk_answers_too() {
     assert_eq!(reported["settings"]["prefetch_ahead"], 7);
     assert_eq!(reported["answers"].as_array().unwrap().len(), QUERIES);
     assert_eq!(reported["answers"][0].as_array().unwrap().len(), K);
+
+    // Unnamed, the mode is the one the library walks by default.
+    let reported: Value = serde_json::from_str(&fixture.search(&["--json"])).unwrap();
+    assert_eq!(reported["settings"]["mode"], "lazy");
 }
 
 #[tokio::test]
@@ -695,6 +751,8 @@ async fn the_columns_of_a_neighbour_can_be_fetched_with_it() {
         "3",
         "--nprobes",
         &PARTITIONS.to_string(),
+        "--mode",
+        "exact",
         "--take",
         "id",
     ]);
@@ -759,7 +817,7 @@ async fn a_run_of_no_queries_is_refused() {
 #[tokio::test]
 async fn what_the_index_cannot_do_is_refused() {
     let fixture = Fixture::ingest();
-    fixture.build(&[]);
+    fixture.build(&["--codes", "none"]);
     let zeroes = vec!["0"; VECTOR_DIM as usize].join(",");
 
     let error = refused(&[
@@ -789,11 +847,13 @@ async fn what_the_index_cannot_do_is_refused() {
         "1",
         "--rescore-budget",
         "8",
+        "--mode",
+        "exact",
     ]);
     assert!(error.contains("which cannot spend it"), "{error}");
 
     // A margin is refused rather than ignored by a walk that does not stop by
-    // it, and the default mode is one.
+    // it, and an exact one is such a walk.
     let error = refused(&[
         "search",
         "--dataset",
@@ -804,6 +864,8 @@ async fn what_the_index_cannot_do_is_refused() {
         &zeroes,
         "--stop-margin",
         "0.1",
+        "--mode",
+        "exact",
     ]);
     assert!(error.contains("does not stop by it"), "{error}");
 
@@ -840,6 +902,8 @@ async fn what_the_index_cannot_do_is_refused() {
         "idx",
         "--vector",
         &zeroes,
+        "--mode",
+        "exact",
         "--take",
         "nope",
     ]);
@@ -926,6 +990,37 @@ fn the_parser_refuses_what_it_can_refuse_alone() {
         "dot",
     ]);
     assert!(error.contains("l2") && error.contains("cosine"), "{error}");
+
+    // A width with no kind named is refused, so that `--code-bits 3`, which
+    // once meant RaBitQ, cannot quietly build codes of another kind now that
+    // the default is scalar.
+    let build = |codes: &[&str]| {
+        let mut args = vec![
+            "build",
+            "--dataset",
+            "unused",
+            "--index-name",
+            "idx",
+            "--partitions",
+            "4",
+        ];
+        args.extend_from_slice(codes);
+        refused(&args)
+    };
+    let error = build(&["--code-bits", "3"]);
+    assert!(error.contains("--codes"), "{error}");
+    let error = build(&["--codes", "none", "--code-bits", "3"]);
+    assert!(error.contains("--codes none writes none"), "{error}");
+    let error = build(&["--codes", "rabitq"]);
+    assert!(
+        error.contains("--codes rabitq needs --code-bits"),
+        "{error}"
+    );
+    let error = build(&["--codes", "sq8"]);
+    assert!(
+        error.contains("none") && error.contains("scalar") && error.contains("rabitq"),
+        "{error}"
+    );
 
     let error = refused(&[
         "search",

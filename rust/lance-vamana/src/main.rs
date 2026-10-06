@@ -120,15 +120,22 @@ struct BuildArgs {
     rows_per_partition: Option<usize>,
     #[arg(long, value_enum, default_value_t = MetricArg::L2)]
     metric: MetricArg,
-    /// RaBitQ bits a dimension for the resident code column. Omitted, no codes
-    /// are written and only `--mode exact` can search the index. Scalar codes
-    /// are a library option only; nothing but a measurement wants them.
-    #[arg(long, value_name = "BITS")]
+    /// Codes the partitions carry, which every mode but `--mode exact` steers
+    /// by. `scalar`, what the library builds when this is omitted, is a byte a
+    /// dimension (SQ8); `rabitq` takes its width from `--code-bits` and a
+    /// dimension that is a multiple of 8, and at three bits, the measured working
+    /// point, is 68 bytes a vertex at `d = 128` against scalar's 128; `none`
+    /// writes no codes, and only `--mode exact` can search such an index.
+    #[arg(long, value_enum, value_name = "KIND")]
+    codes: Option<CodesArg>,
+    /// Bits a dimension for the codes `--codes` names: required for `rabitq`,
+    /// and 8, the only width there is, for `scalar`.
+    #[arg(long, value_name = "BITS", requires = "codes")]
     code_bits: Option<u8>,
     /// Where the full vectors a re-score measures against are read from: a
     /// copy in the index, or the dataset's own data files. `dataset` makes the
-    /// index smaller, needs `--code-bits` and at least 64 dimensions, and is
-    /// searched with `--mode lazy` or `--mode flat` only.
+    /// index smaller, needs codes (any `--codes` but `none`) and at least 64
+    /// dimensions, and is searched with `--mode lazy` or `--mode flat` only.
     #[arg(long, value_enum, default_value_t = VectorsArg::Index)]
     vectors: VectorsArg,
     /// `R`: the fixed width of every vertex's neighbour list.
@@ -175,11 +182,12 @@ struct SearchArgs {
     /// `--stop-margin` it is a cap instead.
     #[arg(short = 'L', long, value_name = "N")]
     search_list_size: Option<usize>,
-    /// How a walk reads a partition. `exact` and `coded` read it whole,
-    /// vectors included, and are refused for an index built with
-    /// `--vectors dataset`; `lazy` and `flat` steer by codes and read only the
-    /// vectors they re-score.
-    #[arg(long, value_enum, default_value_t = ModeArg::Exact)]
+    /// How a walk reads a partition. `lazy`, the default, and `flat` steer by
+    /// codes and read only the vectors they re-score; `coded` steers by codes
+    /// and reads it whole; `exact` reads it whole, vectors included, and is the
+    /// one mode an index built with `--codes none` answers. `exact` and `coded`
+    /// are refused for an index built with `--vectors dataset`.
+    #[arg(long, value_enum, default_value_t = ModeArg::from(WalkMode::default()))]
     mode: ModeArg,
     /// `W`: vertices one hop of a lazy walk expands at a time.
     #[arg(short = 'W', long, default_value_t = 4, value_name = "N")]
@@ -292,6 +300,59 @@ impl From<ModeArg> for WalkMode {
     }
 }
 
+/// The way back, so that `--mode` defaults to whatever the library walks by
+/// default rather than to a copy of it that could drift.
+impl From<WalkMode> for ModeArg {
+    fn from(mode: WalkMode) -> Self {
+        match mode {
+            WalkMode::Exact => Self::Exact,
+            WalkMode::Coded => Self::Coded,
+            WalkMode::Lazy => Self::Lazy,
+            WalkMode::Flat => Self::Flat,
+        }
+    }
+}
+
+/// Mirrors [`CodeSpec`], whose width `--code-bits` carries, plus `none`.
+#[derive(Clone, Copy, ValueEnum)]
+enum CodesArg {
+    None,
+    Scalar,
+    #[value(name = "rabitq")]
+    Rabit,
+}
+
+/// The codes `--codes` and `--code-bits` ask for, or the library's own when
+/// neither is given.
+///
+/// Settled before the dataset is opened, so that a contradiction costs no
+/// read. A width the library cannot build - scalar codes of other than eight
+/// bits, RaBitQ outside one to nine or over a dimension it cannot pack - is
+/// the library's to refuse, before it reads a row.
+fn requested_codes(codes: Option<CodesArg>, code_bits: Option<u8>) -> Result<Option<CodeSpec>> {
+    match (codes, code_bits) {
+        (None, None) => Ok(IndexParams::new("", 1).codes),
+        // Unreachable from the command line, where clap refuses a width without
+        // a kind (`requires = "codes"`) first; kept so that this stays total.
+        (None, Some(bits)) => Err(Error::invalid_input(format!(
+            "--code-bits {bits} is a width for the codes --codes names, and none was named"
+        ))),
+        (Some(CodesArg::None), None) => Ok(None),
+        (Some(CodesArg::None), Some(bits)) => Err(Error::invalid_input(format!(
+            "--code-bits {bits} is a width for codes, and --codes none writes none"
+        ))),
+        (Some(CodesArg::Scalar), bits) => Ok(Some(CodeSpec::Scalar {
+            num_bits: bits.map_or(8, u16::from),
+        })),
+        (Some(CodesArg::Rabit), Some(num_bits)) => Ok(Some(CodeSpec::Rabit { num_bits })),
+        (Some(CodesArg::Rabit), None) => Err(Error::invalid_input(
+            "--codes rabitq needs --code-bits: RaBitQ has no width of its own, and three bits a \
+             dimension is the working point the crate measured"
+                .to_string(),
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
@@ -367,6 +428,7 @@ async fn build(args: BuildArgs) -> Result<()> {
             "--rows-per-partition must be at least one".to_string(),
         ));
     }
+    let codes = requested_codes(args.codes, args.code_bits)?;
     let mut dataset = Dataset::open(&args.target.dataset).await?;
     let partitions = match (args.partitions, args.rows_per_partition) {
         (Some(partitions), None) => partitions,
@@ -397,9 +459,10 @@ async fn build(args: BuildArgs) -> Result<()> {
             alpha: args.alpha,
             seed: args.seed,
         });
-    if let Some(num_bits) = args.code_bits {
-        params = params.with_codes(CodeSpec::Rabit { num_bits });
-    }
+    params = match codes {
+        Some(codes) => params.with_codes(codes),
+        None => params.without_codes(),
+    };
 
     let started = Instant::now();
     let stats = create_index(&mut dataset, &args.target.index_name, &params).await?;

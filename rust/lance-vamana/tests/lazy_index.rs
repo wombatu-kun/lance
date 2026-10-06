@@ -2090,6 +2090,9 @@ async fn an_index_without_vectors_refuses_the_modes_that_read_them_all() {
             "{mode:?}: {error}"
         );
     }
+    // A query that names no mode walks lazily, which this index can answer.
+    let answered = index.search(&query, &SearchParams::new(K)).await.unwrap();
+    assert_eq!(answered.neighbors.len(), K);
 }
 
 /// A segment added beside an index without vectors keeps none either, though
