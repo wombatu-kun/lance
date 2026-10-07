@@ -53,6 +53,14 @@
 //! margin has to print exactly. A pass may carry that curve alone, with
 //! `QUEUES` unset. `QUEUES` and `STOP_MARGINS` are given in ascending order.
 //!
+//! `RECORDS` (unset: none) names a file this example creates, refusing one that
+//! already exists, and writes one JSON line into for every row of this crate's
+//! arms once the row is printed: its label and axis, the knobs it ran at, and
+//! each query's distance count, recall and partitions read, in query order,
+//! from the row's first timed repeat. A row's printed means say how two passes
+//! differ; these say which queries the difference came from, which is what a
+//! paired comparison between two passes resamples.
+//!
 //! `LANCE_RQ_PRUNE_STATS=1` is Lance's own knob, not this example's: `IVF_RQ`
 //! tallies how many rows its two-stage estimator threw away on the binary code
 //! alone and reports them through `log`. A binary with no logger installed
@@ -200,6 +208,7 @@
 //! whatever this says.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -699,6 +708,9 @@ where
 
 /// This crate's own arms, both with one pooled budget of exact distances:
 /// `Flat` throws the graph away, `Lazy` walks it.
+///
+/// The last element is what the first timed repeat reported for each query,
+/// in query order, for `RECORDS`.
 async fn measure_vamana(
     dataset: &Dataset,
     fixture: &Fixture<'_>,
@@ -706,7 +718,7 @@ async fn measure_vamana(
     mode: WalkMode,
     beam_width: usize,
     prefetch_ahead: usize,
-) -> (Cost, RescoreReads, Work, Vec<f64>) {
+) -> (Cost, RescoreReads, Work, Vec<f64>, Vec<Reported>) {
     let Fixture {
         queries,
         truth,
@@ -849,6 +861,7 @@ async fn measure_vamana(
                         search_bytes: result.search.bytes_read as f64,
                         rescore_bytes: result.rescore.bytes_read as f64,
                         comparisons: result.comparisons,
+                        partitions_read: result.partitions_read,
                     }
                 })
                 .collect::<Vec<_>>()
@@ -918,11 +931,16 @@ async fn measure_vamana(
         .iter()
         .map(|(wall, _)| wall / queries)
         .collect::<Vec<_>>();
+    let first_repeat = reports
+        .into_iter()
+        .next()
+        .expect("TIMED_REPEATS is at least 1");
     (
         cost,
         reads_after.since(&reads_before),
         Work::of(&each),
         repeat_micros,
+        first_repeat,
     )
 }
 
@@ -977,6 +995,7 @@ struct Reported {
     search_bytes: f64,
     rescore_bytes: f64,
     comparisons: u64,
+    partitions_read: usize,
 }
 
 impl Reported {
@@ -990,6 +1009,7 @@ impl Reported {
             search_bytes: self.search_bytes + other.search_bytes,
             rescore_bytes: self.rescore_bytes + other.rescore_bytes,
             comparisons: self.comparisons + other.comparisons,
+            partitions_read: self.partitions_read + other.partitions_read,
         }
     }
 }
@@ -1520,6 +1540,16 @@ async fn main() {
         matches!(reference_position.as_str(), "last" | "both"),
         "REFERENCE_POSITION is `last` or `both`, not {reference_position:?}"
     );
+    // Created rather than truncated or appended to, and before the ground truth
+    // is paid for: a pass whose rows landed in another pass's file would hand a
+    // scorer two passes as one.
+    let mut records = std::env::var("RECORDS").ok().map(|path| {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap_or_else(|error| panic!("RECORDS {path} cannot be created: {error}"))
+    });
 
     if timed_repeats > 1 {
         println!("this crate's rows time every query {timed_repeats} times after their warmup");
@@ -1888,7 +1918,7 @@ async fn main() {
             let label = format!("vamana {name}{}", curve.suffix);
             let mut measured = Vec::with_capacity(curve.points.len());
             for point in &curve.points {
-                let (cost, reads, work, repeat_micros) = measure_vamana(
+                let (cost, reads, work, repeat_micros, queried) = measure_vamana(
                     &vamana_dataset,
                     &vamana_fixture,
                     point,
@@ -1928,6 +1958,34 @@ async fn main() {
                         median,
                         sorted[sorted.len() - 1]
                     );
+                }
+                if let Some(file) = records.as_mut() {
+                    let comparisons = queried.iter().map(|query| query.comparisons);
+                    let recall = queried.iter().map(|query| query.recall);
+                    let partitions_read = queried.iter().map(|query| query.partitions_read);
+                    let line = serde_json::json!({
+                        "label": label,
+                        "axis": point.axis,
+                        "k": k,
+                        "nprobes": vamana_nprobes,
+                        "start": match start {
+                            WalkStart::Medoid => "medoid",
+                            WalkStart::NearestEntry => "entry",
+                        },
+                        "budget": point.budget,
+                        "list_size": point.list_size,
+                        // The margin as the axis printed it, the form the pass
+                        // was asked for in: its `f32` widened to JSON's `f64`
+                        // would print 0.054999999701976776 for 0.0550.
+                        "stop_margin": point.stop_margin.map(|_| point.axis.clone()),
+                        "queries": queried.len(),
+                        "comparisons": comparisons.collect::<Vec<_>>(),
+                        "recall": recall.collect::<Vec<_>>(),
+                        "partitions_read": partitions_read.collect::<Vec<_>>(),
+                    });
+                    // One write a line, so that a pass killed mid-row leaves
+                    // whole lines behind it.
+                    file.write_all(format!("{line}\n").as_bytes()).unwrap();
                 }
                 measured.push((point.axis.clone(), cost));
             }
