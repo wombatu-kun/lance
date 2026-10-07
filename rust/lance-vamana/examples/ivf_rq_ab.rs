@@ -1459,12 +1459,18 @@ async fn main() {
         "every budget must be at least k = {k}: a query that re-scores fewer vectors than it \
          returns could never return k neighbours, and the crate refuses it"
     );
+    // Across the probes, not in each: a budget is the whole query's, so a queue
+    // of `k` per probe still hands seven probes' worth of candidates to a budget
+    // of `2k`, and only a query whose probes together hold fewer than the budget
+    // would measure a shorter list than its label claims.
     assert!(
-        queues
-            .iter()
-            .all(|queue| budgets.iter().all(|budget| queue >= budget)),
-        "every queue must be at least as long as every budget, or the budget cannot be spent and \
-         the point measures a shorter list than its label claims"
+        queues.iter().all(|queue| {
+            budgets
+                .iter()
+                .all(|budget| queue.saturating_mul(vamana_nprobes) >= *budget)
+        }),
+        "every queue times VAMANA_NPROBES = {vamana_nprobes} must be at least every budget, or \
+         the budget cannot be spent and the point measures a shorter list than its label claims"
     );
     let beam_width = env_usize("BEAM_WIDTH", 4);
     // Neighbours ahead of the one being measured whose code a lazy hop asks the
