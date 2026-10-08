@@ -23,12 +23,7 @@ Both halves of the cost are returned rather than logged: a graph is a trade
 between what a build pays and what a query pays, and a change that improves one
 by spending the other is not visible from either number alone.
 
-By default a build writes eight-bit scalar codes and a query walks
-`WalkMode::Lazy` over them: it reads a partition's row ids and codes, the edges
-of the vertices it expands and the vectors of the candidates it re-scores, and
-nothing else. The cache keeps the row ids and codes between queries, which such
-a walk otherwise reads again for every partition it probes. `IndexParams::without_codes` builds an index that
-only `WalkMode::Exact` searches, reading every partition it probes whole.
+By default a build writes eight-bit scalar codes and each partition's entry points, and a query walks `WalkMode::Lazy` over the codes from the entry point nearest it: it reads a partition's row ids and codes, the edges of the vertices it expands and the vectors of the candidates it re-scores, and nothing else. The cache keeps the row ids and codes between queries, which such a walk otherwise reads again for every partition it probes. `IndexParams::without_codes` builds an index that only `WalkMode::Exact` searches, reading every partition it probes whole, and stores no entry points.
 
 ## Without writing any Rust
 
@@ -293,24 +288,9 @@ two are meant to say the same thing.
   fewer distances; the slowest percentile of its queries measured 1.1-1.7
   times as many.
 
-  A lazy walk can also start nearer its query than the partition's medoid.
-  `VamanaIndex::train_entry_points` clusters each partition's live vectors
-  with k-means - 64 centroids by default, trained on 256 vectors a centroid -
-  and keeps the live vertex nearest each centroid;
-  `VamanaIndex::with_entry_points` hands them to an index, and
-  `SearchParams::with_start(WalkStart::NearestEntry)` starts a walk at the one
-  nearest its query by code, for one coded distance an entry point. Nothing is
-  stored yet: training reads every vector of every partition, which at a
-  million vectors a partition took 1.1-1.3 s on SIFT, 1.9-3.0 on GloVe-200,
-  7-13 on Cohere and 9.6-10.6 on GIST. Measured on those four at one partition
-  and their recall bars, each start at its own margin pair, the walk from the
-  nearest entry point measured 11.6, 7.3, 14.5 and 9.9 per cent fewer
-  distances at the top 10, and its search phase took 0.91 / 0.92 / 0.89 / 0.91
-  of the medoid start's with one query in flight; with twelve in flight the
-  time a query was 1.00 / 0.94 / 0.90 / 0.92 - SIFT's query takes 32 us there,
-  and its two pairs measured 0.98 and 1.03. At the top 100 the search phase
-  took 0.90 / 0.97 / 0.96 / 0.94 and the time a query at twelve in flight
-  0.94 / 0.98 / 0.98 / 0.97.
+  A lazy walk starts nearer its query than the partition's medoid: at the partition's entry point nearest the query by code, for one coded distance an entry point. A build trains each partition's entry points right after its graph, while its vectors are in memory - k-means over a sample of 256 vectors a centroid, keeping the vertex nearest each centroid, 16 centroids in a partition of at most 23 170 rows and 64 in a larger one (`EntryPointParams::default`) - and stores them beside the medoid; every maintenance pass that rewrites a partition trains them again under the parameters the index records, and one that only copies a partition carries its list. `IndexParams::without_entry_points` (`--entry-points none` on the command line) stores none, and so does an index without codes. `SearchParams::with_start` says where a walk starts: `WalkStart::PreferNearestEntry`, the default, at the nearest entry point where a partition has any and at the medoid otherwise; `WalkStart::NearestEntry` the same, but refused outside `WalkMode::Lazy`, and for an index with a segment that stores none unless entry points were handed over to it; `WalkStart::Medoid` at the medoid. `VamanaIndex::train_entry_points` trains a set at open under any parameters, by reading every vector of every partition, and `VamanaIndex::with_entry_points` hands it to one opening in place of the stored ones, to try other parameters without a rebuild; under the parameters an index records it trains exactly the list the index stores for every partition none of whose vertices died after its list was trained.
+
+  Measured on SIFT, GloVe-200, Cohere and GIST at one partition and their recall bars, each start at its own margin pair, the walk from the nearest of 64 entry points measured 11.6, 7.3, 14.5 and 9.9 per cent fewer distances at the top 10, and its search phase took 0.91 / 0.92 / 0.89 / 0.91 of the medoid start's with one query in flight; with twelve in flight the time a query was 1.00 / 0.94 / 0.90 / 0.92 - SIFT's query takes 32 us there, and its two pairs measured 0.98 and 1.03. At the top 100 the search phase took 0.90 / 0.97 / 0.96 / 0.94 and the time a query at twelve in flight 0.94 / 0.98 / 0.98 / 0.97. On SIFT1M at 8 192 and 65 536 rows a partition, probing 20 and 6 partitions, entry points measured 8 to 10 per cent fewer distances at the top 10, and at the top 100, at equal walk width, 1.5 to 5 per cent fewer at the narrowest walk and within 1 per cent of the medoid at the widest; 16 measured as few as 64 at 8 192 rows and trained in a quarter of the time, which is where the rule splits. A build trains them in 0.03 to 0.16 per cent of its time with a million vectors in one partition: 0.36 s of 585 on SIFT, 0.55 s of 1 622 on GloVe-200, 3.1 s of 1 986 on Cohere and 4.3 s of 2 747 on GIST. With many partitions it trains each alongside other partitions' graphs and has no share of its own to report; training at open took 2.8 per cent of the build at 8 192 rows a partition and 2.5 per cent at 65 536. They are why the format is at version 7: an index written before them is refused at open and has to be rebuilt.
 
   On SIFT1M at 65536 rows a partition, four probes and equal recall
   (`examples/lazy_walk.rs`), that is **18.2 MB a query against 198.6 MB** read
@@ -706,8 +686,7 @@ scalar codes answer alike, and so does one index re-scored from its copy and
 from the dataset. On SIFT1M at one partition, `R = 70` and eight-bit scalar
 codes, the partition file is 410.4 MB against 922.4 MB. `vamana info` prints
 which kind an index is on its `vectors` line. The choice is recorded in the
-index, which is why the format is at version 6: an index written before it is
-refused at open and has to be rebuilt.
+index, which is why the format moved to version 6, and an index written before it is refused at open and has to be rebuilt.
 
 What it asks for in return:
 

@@ -23,6 +23,7 @@ use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::DistanceType;
 use lance_vamana::PartitionEntry;
 use lance_vamana::codes::CodeParams;
+use lance_vamana::entry_points::EntryPointParams;
 use lance_vamana::format::{
     FORMAT_VERSION, INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata,
     ROW_ID_COLUMN, RowIdMode, VectorSource, partition_file_name,
@@ -56,6 +57,7 @@ fn index_metadata() -> IndexMetadata {
         row_id_mode: RowIdMode::Address,
         fragments: vec![0],
         codes: None,
+        entry_point_params: None,
         vector_source: VectorSource::Index,
     }
 }
@@ -95,7 +97,7 @@ async fn write_sample_segment(
         let partition = sample_partition(MAX_DEGREE, vertices, DIMENSION);
         let medoid = (vertices / 3) as u32;
         writer
-            .write_partition(partition_id, medoid, &partition)
+            .write_partition(partition_id, medoid, Arc::from([]), &partition)
             .await
             .unwrap();
         written.insert(partition_id, (medoid, partition));
@@ -200,7 +202,12 @@ async fn the_writer_rejects_an_empty_partition() {
     let mut writer = SegmentWriter::new(store, path, index_metadata(), ivf_model());
 
     let error = writer
-        .write_partition(0, 0, &sample_partition(MAX_DEGREE, 0, DIMENSION))
+        .write_partition(
+            0,
+            0,
+            Arc::from([]),
+            &sample_partition(MAX_DEGREE, 0, DIMENSION),
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("is empty"), "{error}");
@@ -215,7 +222,12 @@ async fn the_writer_rejects_a_partition_of_the_wrong_degree() {
     let mut writer = SegmentWriter::new(store, path, index_metadata(), ivf_model());
 
     let error = writer
-        .write_partition(0, 0, &sample_partition(MAX_DEGREE * 2, 4, DIMENSION))
+        .write_partition(
+            0,
+            0,
+            Arc::from([]),
+            &sample_partition(MAX_DEGREE * 2, 4, DIMENSION),
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("max_degree 64"), "{error}");
@@ -232,7 +244,12 @@ async fn the_writer_rejects_a_medoid_outside_the_partition() {
     let mut writer = SegmentWriter::new(store, path, index_metadata(), ivf_model());
 
     let error = writer
-        .write_partition(0, 4, &sample_partition(MAX_DEGREE, 4, DIMENSION))
+        .write_partition(
+            0,
+            4,
+            Arc::from([]),
+            &sample_partition(MAX_DEGREE, 4, DIMENSION),
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("medoid 4"), "{error}");
@@ -246,7 +263,12 @@ async fn the_writer_rejects_a_partition_of_the_wrong_dimension() {
     let mut writer = SegmentWriter::new(store, path, index_metadata(), ivf_model());
 
     let error = writer
-        .write_partition(0, 0, &sample_partition(MAX_DEGREE, 4, DIMENSION + 1))
+        .write_partition(
+            0,
+            0,
+            Arc::from([]),
+            &sample_partition(MAX_DEGREE, 4, DIMENSION + 1),
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("dimension 7"), "{error}");
@@ -262,10 +284,19 @@ async fn the_writer_rejects_partitions_out_of_order() {
     let mut writer = SegmentWriter::new(store, path, index_metadata(), ivf_model());
 
     let partition = sample_partition(MAX_DEGREE, 4, DIMENSION);
-    writer.write_partition(3, 0, &partition).await.unwrap();
-    let error = writer.write_partition(1, 0, &partition).await.unwrap_err();
+    writer
+        .write_partition(3, 0, Arc::from([]), &partition)
+        .await
+        .unwrap();
+    let error = writer
+        .write_partition(1, 0, Arc::from([]), &partition)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("ascending order"), "{error}");
-    let error = writer.write_partition(3, 0, &partition).await.unwrap_err();
+    let error = writer
+        .write_partition(3, 0, Arc::from([]), &partition)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("ascending order"), "{error}");
     // The rule belongs to the table, not to one way of adding a row to it.
     let error = writer
@@ -333,7 +364,10 @@ async fn a_copied_partition_is_the_one_it_was_copied_from() {
         .await
         .unwrap();
     let fresh = sample_partition(MAX_DEGREE, 9, DIMENSION);
-    writer.write_partition(2, 1, &fresh).await.unwrap();
+    writer
+        .write_partition(2, 1, Arc::from([]), &fresh)
+        .await
+        .unwrap();
     writer
         .copy_partition(&source_path, &source_manifest, 3)
         .await
@@ -401,6 +435,7 @@ async fn a_copy_follows_the_source_table_and_writes_the_canonical_name() {
         vec![PartitionEntry {
             partition_id: 4,
             medoid: 2,
+            entry_points: Arc::from([]),
             num_rows: partition.len() as u32,
             file: RENAMED.to_string(),
         }],
@@ -502,6 +537,7 @@ async fn copying_from_a_segment_of_another_shape_is_refused() {
             vec![PartitionEntry {
                 partition_id: 0,
                 medoid: 0,
+                entry_points: Arc::from([]),
                 num_rows: 4,
                 file: partition_file_name(0),
             }],
@@ -542,6 +578,7 @@ async fn copying_between_segments_whose_codes_disagree_is_refused() {
             vec![PartitionEntry {
                 partition_id: 0,
                 medoid: 0,
+                entry_points: Arc::from([]),
                 num_rows: 4,
                 file: partition_file_name(0),
             }],
@@ -602,6 +639,144 @@ async fn copying_between_segments_whose_codes_disagree_is_refused() {
     }
 }
 
+/// A segment keeping entry points under one set of parameters, with scalar
+/// codes, which a segment keeping entry points cannot be without.
+fn keeping_entry_points(params: Option<EntryPointParams>) -> IndexMetadata {
+    IndexMetadata {
+        codes: Some(CodeParams::Scalar {
+            num_bits: 8,
+            bounds: 0.0..1.0,
+        }),
+        entry_point_params: params,
+        ..index_metadata()
+    }
+}
+
+/// A carried list was trained under its source's parameters, and the segment
+/// it is carried into records that every list of it was trained under its
+/// own: a copy between two segments that disagree is refused, whichever side
+/// keeps none.
+#[tokio::test]
+async fn copying_between_segments_whose_entry_points_disagree_is_refused() {
+    let four = Some(EntryPointParams::new(4));
+    let reseeded = Some(EntryPointParams::new(4).with_seed(7));
+    for (what, mine, theirs, carried) in [
+        ("another seed", four.clone(), reseeded, &[0, 2][..]),
+        ("none kept here", None, four.clone(), &[0, 2][..]),
+        ("none kept there", four, None, &[][..]),
+    ] {
+        let source = lance_vamana::SegmentManifest::try_new(
+            keeping_entry_points(theirs),
+            ivf_model(),
+            vec![PartitionEntry {
+                partition_id: 0,
+                medoid: 0,
+                entry_points: Arc::from(carried),
+                num_rows: 4,
+                file: partition_file_name(0),
+            }],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (store, path) = segment_dir(&dir);
+        let mut writer =
+            SegmentWriter::new(store, path.clone(), keeping_entry_points(mine), ivf_model());
+        let error = writer.copy_partition(&path, &source, 0).await.unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{what}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("entry points were trained under different parameters"),
+            "{what}: {error}"
+        );
+    }
+}
+
+/// A list no training under the writer's parameters could have produced is
+/// refused when its partition is written, not when the table is: by then every
+/// partition file of the segment would be on disk. So are parameters no build
+/// records, which the list would otherwise be judged by.
+#[tokio::test]
+async fn a_partition_written_with_entry_points_out_of_shape_is_refused_at_once() {
+    let partition = sample_partition(MAX_DEGREE, 8, DIMENSION);
+    for (what, metadata, entry_points, expected) in [
+        (
+            "out of order",
+            keeping_entry_points(Some(EntryPointParams::new(4))),
+            &[3, 1][..],
+            "3 comes before 1",
+        ),
+        (
+            "outside",
+            keeping_entry_points(Some(EntryPointParams::new(4))),
+            &[1, 8][..],
+            "entry point 8 but holds only 8 vertices",
+        ),
+        (
+            "too many",
+            keeping_entry_points(Some(EntryPointParams::new(2))),
+            &[1, 2, 3][..],
+            "more than the 2",
+        ),
+        (
+            "kept by none",
+            keeping_entry_points(None),
+            &[1][..],
+            "a segment that keeps none",
+        ),
+        (
+            "trained on no sample",
+            keeping_entry_points(Some(EntryPointParams::new(4).with_sample_rate(0))),
+            &[][..],
+            "sample_rate 0",
+        ),
+        (
+            "kept without codes",
+            IndexMetadata {
+                entry_point_params: Some(EntryPointParams::new(4)),
+                ..index_metadata()
+            },
+            &[1][..],
+            "carries no codes",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, path) = segment_dir(&dir);
+        let mut writer = SegmentWriter::new(store, path.clone(), metadata, ivf_model());
+        let error = writer
+            .write_partition(0, 0, Arc::from(entry_points), &partition)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{what}"
+        );
+        assert!(error.to_string().contains(expected), "{what}: {error}");
+        assert!(
+            !dir.path().join(partition_file_name(0)).exists(),
+            "{what}: the refused partition was written"
+        );
+    }
+    // Where a partition the writer accepts does land, so that the absence
+    // above is the refusal's and not the path's.
+    let dir = tempfile::tempdir().unwrap();
+    let (store, path) = segment_dir(&dir);
+    let mut writer = SegmentWriter::new(
+        store,
+        path,
+        keeping_entry_points(Some(EntryPointParams::new(4))),
+        ivf_model(),
+    );
+    writer
+        .write_partition(0, 0, Arc::from([1, 3]), &partition)
+        .await
+        .unwrap();
+    assert!(dir.path().join(partition_file_name(0)).exists());
+}
+
 /// A partition file either holds the vectors or leaves them to the dataset, and
 /// the segment it is copied into declares which; nothing reads the file's
 /// schema back against that, so a copy across the two would leave a re-score
@@ -635,6 +810,7 @@ async fn copying_between_segments_that_keep_their_vectors_apart_is_refused() {
             vec![PartitionEntry {
                 partition_id: 0,
                 medoid: 0,
+                entry_points: Arc::from([]),
                 num_rows: 4,
                 file: partition_file_name(0),
             }],
@@ -778,7 +954,10 @@ async fn a_partition_is_found_through_the_table_not_the_naming_convention() {
     let partition = sample_partition(MAX_DEGREE, 40, DIMENSION);
 
     let mut writer = SegmentWriter::new(store.clone(), path.clone(), index_metadata(), ivf_model());
-    writer.write_partition(2, 7, &partition).await.unwrap();
+    writer
+        .write_partition(2, 7, Arc::from([]), &partition)
+        .await
+        .unwrap();
     writer.finish().await.unwrap();
 
     std::fs::rename(
@@ -792,6 +971,7 @@ async fn a_partition_is_found_through_the_table_not_the_naming_convention() {
         vec![lance_vamana::PartitionEntry {
             partition_id: 2,
             medoid: 7,
+            entry_points: Arc::from([]),
             num_rows: partition.len() as u32,
             file: RENAMED.to_string(),
         }],
@@ -1028,38 +1208,56 @@ async fn the_free_writer_refuses_an_empty_partition() {
 ///
 /// Reached with a table of no rows, so the columns are beyond reproach and the
 /// refusal comes from the parameters - which is the half of the constructor that
-/// still reported bad input.
+/// still reported bad input. Among them the entry points' a maintenance pass
+/// would train under.
 #[tokio::test]
 async fn a_segment_breaking_a_rule_of_the_format_is_reported_as_corrupt() {
-    let dir = tempfile::tempdir().unwrap();
-    let (store, path) = segment_dir(&dir);
-    let broken = IndexMetadata {
-        max_degree: 0,
-        ..index_metadata()
-    };
-    write_hand_made_index(
-        &store,
-        &path,
-        &[
-            (INDEX_METADATA_KEY, broken.to_json().unwrap()),
-            (IVF_POSITION_KEY, "1".to_string()),
-        ],
-        Some(prost::Message::encode_to_vec(
-            &lance_index::pb::Ivf::try_from(&ivf_model()).unwrap(),
-        )),
-        SEGMENT_FILE_VERSION,
-        0,
-    )
-    .await;
+    for (broken, expected) in [
+        (
+            IndexMetadata {
+                max_degree: 0,
+                ..index_metadata()
+            },
+            "max_degree 0",
+        ),
+        (
+            keeping_entry_points(Some(EntryPointParams::default().with_sample_rate(0))),
+            "sample_rate 0",
+        ),
+        (
+            IndexMetadata {
+                entry_point_params: Some(EntryPointParams::default()),
+                ..index_metadata()
+            },
+            "carries no codes",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, path) = segment_dir(&dir);
+        write_hand_made_index(
+            &store,
+            &path,
+            &[
+                (INDEX_METADATA_KEY, broken.to_json().unwrap()),
+                (IVF_POSITION_KEY, "1".to_string()),
+            ],
+            Some(prost::Message::encode_to_vec(
+                &lance_index::pb::Ivf::try_from(&ivf_model()).unwrap(),
+            )),
+            SEGMENT_FILE_VERSION,
+            0,
+        )
+        .await;
 
-    let error = read_segment(&scan_scheduler(&store), &path, None)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, lance_core::Error::CorruptFile { .. }),
-        "a value that arrived out of a file was reported as bad input: {error:?}"
-    );
-    assert!(error.to_string().contains("max_degree 0"), "{error}");
+        let error = read_segment(&scan_scheduler(&store), &path, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::CorruptFile { .. }),
+            "a value that arrived out of a file was reported as bad input: {error:?}"
+        );
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 }
 
 /// The writer pins the file version, so the reader has to check it. A projection

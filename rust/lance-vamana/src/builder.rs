@@ -15,6 +15,7 @@
 //! concern.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
@@ -40,6 +41,7 @@ use uuid::Uuid;
 use crate::build::{BuildParams, build_partition};
 use crate::codes::{CodeParams, CodeSpec};
 use crate::dataset_vectors::DatasetVectors;
+use crate::entry_points::{EntryPointParams, train_stored};
 use crate::format::{
     FORMAT_VERSION, IndexMetadata, MIN_DATASET_VECTOR_DIMENSION, RowIdMode, VectorSource,
 };
@@ -124,6 +126,20 @@ pub struct IndexParams {
     /// own rows, a RaBitQ rotation of their own - and do not open as one index
     /// unless the two happen to agree, which RaBitQ rotations never do.
     pub codes: Option<CodeSpec>,
+    /// Whether the partitions store entry points, which a
+    /// [`crate::query::WalkMode::Lazy`] walk starts at instead of the medoid
+    /// ([`crate::entry_points`]), and trained under what.
+    ///
+    /// [`EntryPointRequest::Default`] by default: the measured rule,
+    /// [`EntryPointParams::default`], whenever the index carries codes - a walk
+    /// chooses among entry points by code - and none when it does not. Training
+    /// runs per partition right after its graph is built, while its vectors are
+    /// in memory: 2.8 per cent of a SIFT1M build at 8 192 rows a partition and
+    /// 2.5 per cent at 65 536, measured as training at open.
+    ///
+    /// A segment joining an index trains under the index's parameters,
+    /// whatever this says.
+    pub entry_points: EntryPointRequest,
     /// Whether the partitions keep a copy of the vectors, or the re-score reads
     /// them from the dataset. [`VectorSource::Index`] by default.
     ///
@@ -147,6 +163,7 @@ impl IndexParams {
             kmeans_max_iters: 50,
             kmeans_sample_rate: 256,
             codes: Some(CodeSpec::Scalar { num_bits: 8 }),
+            entry_points: EntryPointRequest::Default,
             vector_source: VectorSource::Index,
         }
     }
@@ -171,6 +188,10 @@ impl IndexParams {
         self
     }
 
+    /// Build with `codes`. See [`Self::codes`].
+    ///
+    /// After [`Self::without_codes`] the default entry points come back with
+    /// them, but not ones asked for by name before it, which that call dropped.
     pub fn with_codes(mut self, codes: CodeSpec) -> Self {
         self.codes = Some(codes);
         self
@@ -178,14 +199,82 @@ impl IndexParams {
 
     /// Build without codes, for an index only
     /// [`crate::query::WalkMode::Exact`] searches. See [`Self::codes`].
+    ///
+    /// Takes the entry points with them: an index without codes keeps none by
+    /// default, and entry points asked for by name earlier in the chain cannot
+    /// outlive the codes they are chosen by - the later call wins.
+    /// [`Self::without_entry_points`] stays as it was.
     pub fn without_codes(mut self) -> Self {
         self.codes = None;
+        if let EntryPointRequest::With(_) = self.entry_points {
+            self.entry_points = EntryPointRequest::Default;
+        }
+        self
+    }
+
+    /// Store entry points trained under `params` rather than the default rule;
+    /// refused before a row is read if the index has no codes.
+    pub fn with_entry_point_params(mut self, params: EntryPointParams) -> Self {
+        self.entry_points = EntryPointRequest::With(params);
+        self
+    }
+
+    /// Store no entry points: walks start at their partition's medoid unless
+    /// some are handed over to an opened index
+    /// ([`crate::query::VamanaIndex::with_entry_points`]), and the build
+    /// trains nothing beyond the graphs. See [`Self::entry_points`].
+    pub fn without_entry_points(mut self) -> Self {
+        self.entry_points = EntryPointRequest::Without;
         self
     }
 
     pub fn with_vector_source(mut self, vector_source: VectorSource) -> Self {
         self.vector_source = vector_source;
         self
+    }
+}
+
+/// Whether a build stores entry points, and trained under what
+/// ([`IndexParams::entry_points`]).
+///
+/// Three states rather than an `Option` because the default follows the codes:
+/// an index built without codes keeps no entry points either, however its codes
+/// were turned off - [`IndexParams::without_codes`] or the field set by hand -
+/// while entry points asked for by name without codes are refused.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EntryPointRequest {
+    /// [`EntryPointParams::default`] when the index carries codes, none when it
+    /// does not.
+    #[default]
+    Default,
+    /// Entry points trained under these; refused without codes.
+    With(EntryPointParams),
+    /// No entry points: walks start at their partition's medoid unless some are
+    /// handed over to an opened index.
+    Without,
+}
+
+impl EntryPointRequest {
+    /// What a build of `column` stores, given whether it carries codes, or why
+    /// it cannot.
+    pub(crate) fn resolve(
+        &self,
+        column: &str,
+        has_codes: bool,
+    ) -> Result<Option<EntryPointParams>> {
+        match (self, has_codes) {
+            (Self::Default, true) => Ok(Some(EntryPointParams::default())),
+            (Self::Default | Self::Without, _) => Ok(None),
+            (Self::With(params), true) => {
+                params.validate()?;
+                Ok(Some(params.clone()))
+            }
+            (Self::With(_), false) => Err(Error::invalid_input(format!(
+                "Vamana cannot store entry points for column '{column}' without codes: a walk \
+                 chooses among entry points by code; keep the codes IndexParams::new writes, or \
+                 call IndexParams::without_entry_points (--entry-points none on the command line)"
+            ))),
+        }
     }
 }
 
@@ -216,6 +305,11 @@ pub struct BuildStats {
     /// microseconds; the build goes ahead and says so in the log. Zero for a
     /// segment that keeps its vectors.
     pub fragments_through_lance: usize,
+    /// Time spent training entry points, summed over the partitions: exact at
+    /// one partition, and an upper bound on what training added to the build
+    /// when several partitions were built at once. Zero for a segment that
+    /// keeps none.
+    pub entry_point_training: Duration,
 }
 
 /// Reject the metrics this crate cannot answer correctly.
@@ -370,6 +464,11 @@ pub(crate) struct Inherited {
     /// Where the base keeps its vectors, taken over [`IndexParams::vector_source`]
     /// for the same reason.
     pub vector_source: VectorSource,
+    /// What the base trains its entry points under, taken over
+    /// [`IndexParams::entry_points`]: every list of an index is trained under
+    /// the one set of parameters, so that a partition carried between two of
+    /// its segments is one their metadata describes.
+    pub entry_point_params: Option<EntryPointParams>,
 }
 
 /// [`build_index_segment`], for a segment joining an index that already exists.
@@ -450,10 +549,11 @@ pub async fn build_segment(
 /// [`build_segment`], taking the routing and the codes from an index this
 /// segment is joining rather than choosing its own.
 ///
-/// `params.num_partitions`, the two k-means knobs, `params.codes` and
-/// `params.vector_source` are then unused: how many buckets there are is a
-/// property of the model, and the model, the rotation and where the vectors are
-/// kept belong to the index rather than to this segment.
+/// `params.num_partitions`, the two k-means knobs, `params.codes`,
+/// `params.entry_points` and `params.vector_source` are then unused: how many
+/// buckets there are is a property of the model, and the model, the rotation,
+/// the entry point parameters and where the vectors are kept belong to the
+/// index rather than to this segment.
 pub(crate) async fn build_segment_inheriting(
     dataset: &Dataset,
     params: &IndexParams,
@@ -595,6 +695,35 @@ pub(crate) async fn build_segment_inheriting(
         }
     }
 
+    // Resolved before the rows are read too: entry points asked for by name on
+    // an index without codes are refused here rather than after the router is
+    // trained.
+    let entry_point_params = match &inherited {
+        Some(inherited) => inherited.entry_point_params.clone(),
+        None => params.entry_points.resolve(&params.column, has_codes)?,
+    };
+    // Warned about rather than refused: entry points trained this way still
+    // start walks near their queries, but a rebuild would not train the same
+    // ones, and a default build must not fail on vectors this wide.
+    if let Some(entry_params) = &entry_point_params
+        && entry_params.trains_approximately(
+            width as usize,
+            std::env::var("LANCE_USE_HNSW_SPEEDUP_INDEXING")
+                .ok()
+                .as_deref(),
+        )
+    {
+        log::warn!(
+            "Vamana entry points for column '{}' will not train reproducibly: {} entry points \
+             of {width} dimensions are {} centroid values, and from a million on, or with \
+             LANCE_USE_HNSW_SPEEDUP_INDEXING=enabled, Lance's k-means assigns through an HNSW it \
+             builds in parallel; LANCE_USE_HNSW_SPEEDUP_INDEXING=disabled keeps it exhaustive",
+            params.column,
+            entry_params.num_entries,
+            entry_params.num_entries.saturating_mul(width as usize)
+        );
+    }
+
     // Counted from the manifest before the rows are read, and warned about
     // rather than refused: such a segment answers correctly, only slower, and
     // how the dataset stores its vectors is the dataset's to change.
@@ -706,6 +835,7 @@ pub(crate) async fn build_segment_inheriting(
         row_id_mode: RowIdMode::Address,
         fragments: fragments.to_vec(),
         codes,
+        entry_point_params,
         vector_source,
     };
     // Off the model rather than off the request, because the two are the same
@@ -742,7 +872,9 @@ pub(crate) async fn build_segment_inheriting(
 /// Graphs are built [`partitions_in_flight`] at a time and written one at a
 /// time. `buffered` and not `buffer_unordered`: the writer takes ids in
 /// ascending order only, and holding a finished graph back until its turn costs
-/// nothing next to building it.
+/// nothing next to building it. Each partition's entry points are trained in
+/// the same future, after its graph and under the writer's parameters, so that
+/// they train as many at once as the graphs build.
 async fn write_partitions(
     writer: &mut SegmentWriter,
     members_by_partition: Vec<Vec<u32>>,
@@ -754,6 +886,8 @@ async fn write_partitions(
         vectors: vectors.len(),
         ..Default::default()
     };
+    let entry_point_params = writer.metadata().entry_point_params.clone();
+    let distance_type = params.distance_type;
     let mut built = stream::iter(
         members_by_partition
             .into_iter()
@@ -763,20 +897,34 @@ async fn write_partitions(
                 let vectors = vectors.clone();
                 let row_ids = row_ids.clone();
                 let params = params.clone();
+                let entry_point_params = entry_point_params.clone();
                 async move {
                     let built =
                         spawn_cpu(move || build_one(&members, &row_ids, &vectors, &params)).await?;
-                    Ok::<_, Error>((partition_id as u32, built))
+                    let started = Instant::now();
+                    let entry_points = train_stored(
+                        &built.partition,
+                        distance_type,
+                        entry_point_params.as_ref(),
+                        (0..built.partition.len() as u32).collect(),
+                    )
+                    .await?;
+                    let training = match entry_point_params {
+                        Some(_) => started.elapsed(),
+                        None => Duration::ZERO,
+                    };
+                    Ok::<_, Error>((partition_id as u32, built, entry_points, training))
                 }
             }),
     )
     .buffered(partitions_in_flight());
-    while let Some((partition_id, built)) = built.try_next().await? {
+    while let Some((partition_id, built, entry_points, training)) = built.try_next().await? {
         writer
-            .write_partition(partition_id, built.medoid, &built.partition)
+            .write_partition(partition_id, built.medoid, entry_points, &built.partition)
             .await?;
         stats.partitions += 1;
         stats.comparisons = stats.comparisons.saturating_add(built.comparisons);
+        stats.entry_point_training += training;
     }
     Ok(stats)
 }
@@ -1064,6 +1212,71 @@ mod tests {
         assert_eq!(params.without_codes().codes, None);
     }
 
+    /// Entry points follow the codes unless asked for by name: the default
+    /// stores the measured rule exactly when the index has codes, an explicit
+    /// request without codes is refused, and the last call of the builder
+    /// wins - `without_codes` takes an explicit request with it, but not an
+    /// explicit refusal, and the codes coming back bring the default back.
+    #[test]
+    fn entry_points_follow_the_codes_unless_asked_for_by_name() {
+        let rule = EntryPointParams::default();
+        let four = EntryPointParams::new(4);
+        let params = IndexParams::new("vector", 4);
+        assert_eq!(params.entry_points, EntryPointRequest::Default);
+        for (request, has_codes, stored) in [
+            (EntryPointRequest::Default, true, Some(rule.clone())),
+            (EntryPointRequest::Default, false, None),
+            (
+                EntryPointRequest::With(four.clone()),
+                true,
+                Some(four.clone()),
+            ),
+            (EntryPointRequest::Without, true, None),
+            (EntryPointRequest::Without, false, None),
+        ] {
+            assert_eq!(
+                request.resolve("vector", has_codes).unwrap(),
+                stored,
+                "{request:?} with codes {has_codes}"
+            );
+        }
+        let error = EntryPointRequest::With(four.clone())
+            .resolve("vector", false)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("without codes"), "{error}");
+        let error = EntryPointRequest::With(EntryPointParams::new(0))
+            .resolve("vector", true)
+            .unwrap_err();
+        assert!(error.to_string().contains("num_entries 0"), "{error}");
+
+        let asked = params.clone().with_entry_point_params(four.clone());
+        assert_eq!(asked.entry_points, EntryPointRequest::With(four.clone()));
+        assert_eq!(
+            asked.clone().without_codes().entry_points,
+            EntryPointRequest::Default
+        );
+        assert_eq!(
+            asked
+                .without_codes()
+                .with_codes(CodeSpec::Scalar { num_bits: 8 })
+                .entry_points,
+            EntryPointRequest::Default
+        );
+        assert_eq!(
+            params
+                .clone()
+                .without_codes()
+                .with_entry_point_params(four.clone())
+                .entry_points,
+            EntryPointRequest::With(four)
+        );
+        assert_eq!(
+            params.without_entry_points().without_codes().entry_points,
+            EntryPointRequest::Without
+        );
+    }
+
     /// A partition whose centroid drew nothing gets no file and no row in the
     /// segment table, and the partitions after it keep their own ids. Writing
     /// them under a running count instead would produce a segment that routes a
@@ -1115,6 +1328,7 @@ mod tests {
             row_id_mode: RowIdMode::Address,
             fragments: vec![0],
             codes: None,
+            entry_point_params: None,
             vector_source: VectorSource::Index,
         };
         let mut writer =
@@ -1226,6 +1440,7 @@ mod tests {
             row_id_mode: RowIdMode::Address,
             fragments: vec![0],
             codes: None,
+            entry_point_params: None,
             vector_source: VectorSource::Index,
         };
         let mut writer =

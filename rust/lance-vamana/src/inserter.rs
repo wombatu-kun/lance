@@ -99,6 +99,7 @@ use crate::builder::{
     build_index_segment_inheriting, build_one, gather, group_by_partition, index_column,
     read_vectors,
 };
+use crate::entry_points::train_stored;
 use crate::format::{FORMAT_VERSION, IndexMetadata};
 use crate::insert::{Inserted, insert_into_partition};
 use crate::io::{SegmentWriter, check_partition_shape, partitions_in_flight};
@@ -188,6 +189,7 @@ pub async fn insert_as_segment(dataset: &mut Dataset, index_name: &str) -> Resul
             router: base.manifest.ivf().clone(),
             codes: base.manifest.metadata().codes.clone(),
             vector_source: base.manifest.metadata().vector_source,
+            entry_point_params: base.manifest.metadata().entry_point_params.clone(),
         }),
     )
     .await?;
@@ -432,9 +434,13 @@ enum Landed {
     /// A centroid the base drew nothing for and this batch did. Built rather
     /// than inserted into: there is no graph to insert into, and no entry point
     /// to search from.
-    Created(BuiltOne),
+    Created {
+        built: BuiltOne,
+        entry_points: Arc<[u32]>,
+    },
     Grown {
         inserted: Inserted,
+        entry_points: Arc<[u32]>,
         comparisons: u64,
     },
 }
@@ -457,10 +463,20 @@ async fn insert_one(growth: &Growth<'_>, partition_id: u32, members: &[u32]) -> 
             let row_ids = growth.row_ids.clone();
             let vectors = growth.vectors.clone();
             let params = growth.params.clone();
-            Ok(Landed::Created(
+            let built =
                 spawn_cpu(move || build_one(&members, row_ids.as_slice(), &vectors, &params))
-                    .await?,
-            ))
+                    .await?;
+            let entry_points = train_stored(
+                &built.partition,
+                growth.metadata.distance_type,
+                growth.metadata.entry_point_params.as_ref(),
+                (0..built.partition.len() as u32).collect(),
+            )
+            .await?;
+            Ok(Landed::Created {
+                built,
+                entry_points,
+            })
         }
         (Some(entry), false) => {
             let partition = growth
@@ -479,7 +495,21 @@ async fn insert_one(growth: &Growth<'_>, partition_id: u32, members: &[u32]) -> 
             let vectors = growth.vectors.clone();
             let params = growth.params.clone();
             let entry_point = entry.medoid;
-            let (inserted, comparisons) = spawn_cpu(move || {
+            let (rows, target) = (growth.index.row_filter().clone(), growth.target.uuid);
+            let (inserted, live, comparisons) = spawn_cpu(move || {
+                // The vertices already there keep their local ids and the new
+                // ones follow them, so the live ones are the old ones the
+                // dataset still holds and every new one. The new ones are
+                // counted by position and never asked of the filter: once any
+                // segment of the index has moved, it admits only rows inside
+                // the coverage each segment had when the index was opened, and
+                // the fragments they came from are not in it.
+                let first_new = partition.len() as u32;
+                let mut live = (0..first_new)
+                    .filter(|&local_id| {
+                        !rows.rejects(target, partition.graph().row_ids()[local_id as usize])
+                    })
+                    .collect::<Vec<_>>();
                 let batch = gather(&vectors, &members)?;
                 let batch_row_ids = members
                     .iter()
@@ -495,11 +525,23 @@ async fn insert_one(growth: &Growth<'_>, partition_id: u32, members: &[u32]) -> 
                     &params.graph,
                     &comparisons,
                 )?;
-                Ok::<_, Error>((inserted, comparisons.get()))
+                live.extend(first_new..inserted.partition.len() as u32);
+                Ok::<_, Error>((inserted, live, comparisons.get()))
             })
+            .await?;
+            // Retrained however little it grew. Carrying the old list over would
+            // need no format change, should retraining ever cost a pass too
+            // much: the old local ids keep their meaning.
+            let entry_points = train_stored(
+                &inserted.partition,
+                growth.metadata.distance_type,
+                growth.metadata.entry_point_params.as_ref(),
+                live,
+            )
             .await?;
             Ok(Landed::Grown {
                 inserted,
+                entry_points,
                 comparisons,
             })
         }
@@ -541,19 +583,28 @@ async fn grow_segment(
                     .await?;
                 stats.partitions_copied += 1;
             }
-            Landed::Created(built) => {
+            Landed::Created {
+                built,
+                entry_points,
+            } => {
                 writer
-                    .write_partition(partition_id, built.medoid, &built.partition)
+                    .write_partition(partition_id, built.medoid, entry_points, &built.partition)
                     .await?;
                 stats.comparisons = stats.comparisons.saturating_add(built.comparisons);
                 stats.partitions_created += 1;
             }
             Landed::Grown {
                 inserted,
+                entry_points,
                 comparisons,
             } => {
                 writer
-                    .write_partition(partition_id, inserted.medoid, &inserted.partition)
+                    .write_partition(
+                        partition_id,
+                        inserted.medoid,
+                        entry_points,
+                        &inserted.partition,
+                    )
                     .await?;
                 stats.comparisons = stats.comparisons.saturating_add(comparisons);
                 stats.partitions_grown += 1;

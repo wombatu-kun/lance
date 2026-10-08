@@ -32,6 +32,7 @@ use lance_vamana::builder::{
     live_fragments,
 };
 use lance_vamana::codes::CodeSpec;
+use lance_vamana::entry_points::EntryPointParams;
 use lance_vamana::format::{INDEX_FILE_NAME, IndexMetadata, VectorSource};
 use lance_vamana::io::{open_file, read_partition, read_partition_batch, scan_scheduler};
 use lance_vamana::partition::Partition;
@@ -40,13 +41,19 @@ use lance_vamana::segment::SegmentManifest;
 use object_store::path::Path;
 
 mod common;
-use common::{DatasetFixture, VECTOR_COLUMN, live_row_ids, read_committed_segment, twin_params};
+use common::{
+    DatasetFixture, VECTOR_COLUMN, assert_twins_hold_the_same, committed_manifests, live_row_ids,
+    read_committed_segment, retrained_entry_points, stored_entry_points, twin_params, twins,
+    wide_fixture,
+};
 
 const INDEX_NAME: &str = "vamana_idx";
 const PARTITIONS: u32 = 8;
 
+/// Without entry points: they have tests of their own, and training them
+/// would cost a debug build several times its graph.
 fn params() -> IndexParams {
-    IndexParams::new(VECTOR_COLUMN, PARTITIONS)
+    IndexParams::new(VECTOR_COLUMN, PARTITIONS).without_entry_points()
 }
 
 async fn read_committed(dataset: &Dataset) -> (SegmentManifest, HashMap<u32, Partition>) {
@@ -633,6 +640,195 @@ async fn a_build_that_cannot_leave_its_vectors_to_the_dataset_writes_nothing() {
             "the refused build wrote into {}",
             segment_dir.display()
         );
+    }
+}
+
+/// A build stores entry points under the measured rule by default and says
+/// what training them cost; told not to, it stores none and trains none.
+#[tokio::test]
+async fn a_build_stores_entry_points_unless_told_not_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let dataset = DatasetFixture::default()
+        .write(dir.path().join("data").to_str().unwrap())
+        .await;
+    for (name, params, stored) in [
+        (
+            "default",
+            IndexParams::new(VECTOR_COLUMN, PARTITIONS),
+            Some(EntryPointParams::default()),
+        ),
+        (
+            "without",
+            IndexParams::new(VECTOR_COLUMN, PARTITIONS).without_entry_points(),
+            None,
+        ),
+    ] {
+        let segment_dir = dir.path().join(name);
+        let (manifest, stats) = build_segment(
+            &dataset,
+            &params,
+            &Path::from_absolute_path(&segment_dir).unwrap(),
+            &live_fragments(&dataset),
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest.metadata().entry_point_params, stored, "{name}");
+        let lists = manifest
+            .partitions()
+            .iter()
+            .map(|entry| (entry.num_rows, entry.entry_points.len()))
+            .collect::<Vec<_>>();
+        if stored.is_some() {
+            // Every partition here is larger than the sixteen the rule gives a
+            // partition of its size, so every one trains some.
+            assert!(
+                lists
+                    .iter()
+                    .all(|&(rows, len)| rows > 16 && len > 0 && len <= 16),
+                "{name}: {lists:?}"
+            );
+            assert!(stats.entry_point_training > Duration::ZERO, "{name}");
+        } else {
+            assert!(lists.iter().all(|&(_, len)| len == 0), "{name}: {lists:?}");
+            assert_eq!(stats.entry_point_training, Duration::ZERO, "{name}");
+        }
+    }
+}
+
+/// Entry points asked for by name are refused before a row is read when the
+/// index has no codes to choose among them by, and nothing is written. Codes
+/// turned off by setting the field take the default entry points with them,
+/// and the build goes ahead without either.
+#[tokio::test]
+async fn entry_points_asked_for_without_codes_are_refused_before_a_row_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let dataset = DatasetFixture {
+        fragments: 1,
+        rows_per_fragment: 64,
+        ..Default::default()
+    }
+    .write(dir.path().join("data").to_str().unwrap())
+    .await;
+    // The data files out of reach, so that a refusal that came after the
+    // first row was read would fail on them instead - as a build with nothing
+    // to refuse does.
+    let data_files = dir.path().join("data").join("data");
+    let away = dir.path().join("data.away");
+    std::fs::rename(&data_files, &away).unwrap();
+    let unread = build_segment(
+        &dataset,
+        &IndexParams::new(VECTOR_COLUMN, 1),
+        &Path::from_absolute_path(dir.path().join("unread")).unwrap(),
+        &live_fragments(&dataset),
+    )
+    .await
+    .unwrap_err();
+    assert!(!unread.to_string().contains("entry points"), "{unread}");
+    for params in [
+        IndexParams::new(VECTOR_COLUMN, 1)
+            .without_codes()
+            .with_entry_point_params(EntryPointParams::new(4)),
+        {
+            let mut params = IndexParams::new(VECTOR_COLUMN, 1)
+                .with_entry_point_params(EntryPointParams::new(4));
+            params.codes = None;
+            params
+        },
+    ] {
+        let segment_dir = dir.path().join("refused");
+        let error = build_segment(
+            &dataset,
+            &params,
+            &Path::from_absolute_path(&segment_dir).unwrap(),
+            &live_fragments(&dataset),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("cannot store entry points for column 'vec' without codes"),
+            "{error}"
+        );
+        assert!(!segment_dir.exists(), "the refused build wrote into it");
+    }
+    std::fs::rename(&away, &data_files).unwrap();
+
+    let mut by_hand = IndexParams::new(VECTOR_COLUMN, 1);
+    by_hand.codes = None;
+    let (manifest, stats) = build_segment(
+        &dataset,
+        &by_hand,
+        &Path::from_absolute_path(dir.path().join("by_hand")).unwrap(),
+        &live_fragments(&dataset),
+    )
+    .await
+    .unwrap();
+    assert_eq!(manifest.metadata().entry_point_params, None);
+    assert!(
+        manifest
+            .partitions()
+            .iter()
+            .all(|entry| entry.entry_points.is_empty())
+    );
+    assert_eq!(stats.entry_point_training, Duration::ZERO);
+}
+
+/// What a build stores is what training at open trains under the parameters
+/// it records, list for list: the build trains over the vectors its graph was
+/// built over - in local-id order, normalised under cosine, and from memory
+/// rather than from the dataset for an index without vectors - under the same
+/// rule, here with its bound lowered so that partitions on both sides of it
+/// occur.
+#[tokio::test]
+async fn a_build_stores_what_training_at_open_trains() {
+    const BOUND: usize = 150;
+    let rule = EntryPointParams::new(6).with_small_partitions(BOUND, 3);
+    for distance_type in [DistanceType::L2, DistanceType::Cosine] {
+        let dir = tempfile::tempdir().unwrap();
+        let params = twin_params(4)
+            .with_distance_type(distance_type)
+            .with_entry_point_params(rule.clone());
+        let twins = twins(dir.path(), &wide_fixture(), INDEX_NAME, &params).await;
+        for (uri, dataset) in &twins {
+            let stored = stored_entry_points(dataset, INDEX_NAME).await;
+            let (mut small, mut large) = (false, false);
+            for (uuid, manifest) in committed_manifests(dataset, INDEX_NAME).await {
+                assert_eq!(
+                    manifest.metadata().entry_point_params.as_ref(),
+                    Some(&rule),
+                    "{distance_type:?} {uri}"
+                );
+                for entry in manifest.partitions() {
+                    let entries = &stored[&(uuid, entry.partition_id)];
+                    if entry.num_rows as usize <= BOUND {
+                        small = true;
+                        assert!(
+                            (1..=3).contains(&entries.len()),
+                            "{distance_type:?} {uri}: partition {} of {} rows trained {entries:?}",
+                            entry.partition_id,
+                            entry.num_rows
+                        );
+                    } else {
+                        large |= entries.len() > 3;
+                    }
+                }
+            }
+            assert!(
+                small && large,
+                "{distance_type:?} {uri}: the rule's two counts did not both occur: {stored:?}"
+            );
+            assert_eq!(
+                stored,
+                retrained_entry_points(dataset, INDEX_NAME).await,
+                "{distance_type:?} {uri}"
+            );
+        }
+        assert_twins_hold_the_same(&twins[0].1, &twins[1].1, INDEX_NAME).await;
     }
 }
 

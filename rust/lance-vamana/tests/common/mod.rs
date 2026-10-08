@@ -7,7 +7,7 @@
 //! them needs still lands in the others.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -27,12 +27,13 @@ use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::codes::CodeSpec;
+use lance_vamana::entry_points::EntryPointParams;
 use lance_vamana::format::{IndexMetadata, VectorSource};
 use lance_vamana::io::{
     open_file, read_partition, read_partition_batch, read_segment, scan_scheduler,
 };
 use lance_vamana::partition::{Partition, PartitionGraph};
-use lance_vamana::query::committed_segments;
+use lance_vamana::query::{VamanaIndex, committed_segments};
 use lance_vamana::segment::SegmentManifest;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -276,6 +277,71 @@ pub async fn read_committed_segments(dataset: &Dataset, index_name: &str) -> Vec
     segments
 }
 
+/// Every committed segment of `index_name`, read off its `index.idx` alone,
+/// in manifest order: what an index without vectors reads like any other.
+pub async fn committed_manifests(
+    dataset: &Dataset,
+    index_name: &str,
+) -> Vec<(uuid::Uuid, SegmentManifest)> {
+    let scheduler = scan_scheduler(&dataset.object_store(None).await.unwrap());
+    let mut manifests = Vec::new();
+    for index in committed_segments(dataset, index_name).await.unwrap() {
+        let dir = dataset.indices_dir().join(index.uuid.to_string());
+        manifests.push((
+            index.uuid,
+            read_segment(&scheduler, &dir, None).await.unwrap(),
+        ));
+    }
+    manifests
+}
+
+/// The entry points every committed segment of `index_name` stores, by segment
+/// and partition id.
+pub async fn stored_entry_points(
+    dataset: &Dataset,
+    index_name: &str,
+) -> BTreeMap<(uuid::Uuid, u32), Vec<u32>> {
+    committed_manifests(dataset, index_name)
+        .await
+        .into_iter()
+        .flat_map(|(uuid, manifest)| {
+            manifest
+                .partitions()
+                .iter()
+                .map(|entry| ((uuid, entry.partition_id), entry.entry_points.to_vec()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// What training at open trains under the parameters the index records, keyed
+/// like [`stored_entry_points`]: every segment's are the base's, which every
+/// segment of an index inherits.
+pub async fn retrained_entry_points(
+    dataset: &Dataset,
+    index_name: &str,
+) -> BTreeMap<(uuid::Uuid, u32), Vec<u32>> {
+    let index = VamanaIndex::open(dataset, index_name).await.unwrap();
+    let params = index
+        .metadata()
+        .entry_point_params
+        .clone()
+        .expect("the index stores no entry points to train again");
+    index
+        .train_entry_points(&params)
+        .await
+        .unwrap()
+        .partitions()
+        .iter()
+        .map(|partition| {
+            (
+                (partition.segment, partition.partition_id),
+                partition.entries.clone(),
+            )
+        })
+        .collect()
+}
+
 /// Locate the one committed segment of `index_name` and read every partition of
 /// it back off disk.
 pub async fn read_committed_segment(
@@ -309,8 +375,21 @@ pub fn wide_fixture() -> DatasetFixture {
     }
 }
 
+/// What the indexes of the maintenance tests train their entry points under:
+/// the default rule, but a seed and a sample rate of their own, so that a pass
+/// training under anything but the parameters the index records trains other
+/// lists than training at open does. Sixteen entry points sample 32 vectors
+/// here, fewer than the partitions those tests write hold, so the sample is
+/// drawn.
+pub fn maintained_entry_point_params() -> EntryPointParams {
+    EntryPointParams::default().with_seed(7).with_sample_rate(2)
+}
+
 /// What twins are built with: the codes the stand measures, which also carry
-/// no random rotation for the twins to differ by, over a narrow graph.
+/// no random rotation for the twins to differ by, over a narrow graph, and
+/// four entry points a partition - few, because a debug build pays for every
+/// one, and some, because a twin trains its entry points over vectors it reads
+/// from the dataset, which the twin keeping its own does not.
 pub fn twin_params(num_partitions: u32) -> IndexParams {
     IndexParams::new(VECTOR_COLUMN, num_partitions)
         .with_codes(CodeSpec::Scalar { num_bits: 8 })
@@ -319,6 +398,7 @@ pub fn twin_params(num_partitions: u32) -> IndexParams {
             search_list_size: 32,
             ..Default::default()
         })
+        .with_entry_point_params(EntryPointParams::new(4))
 }
 
 /// The same rows written twice, under `dir`, each with `params` built over them:

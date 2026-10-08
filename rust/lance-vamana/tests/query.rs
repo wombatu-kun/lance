@@ -34,17 +34,20 @@ use lance_vamana::builder::{
     live_fragments,
 };
 use lance_vamana::codes::{CodeParams, CodeSpec};
+use lance_vamana::entry_points::EntryPointParams;
 use lance_vamana::format::{FORMAT_VERSION, IndexMetadata, RowIdMode, VectorSource};
 use lance_vamana::io::{SegmentWriter, read_segment, scan_scheduler};
 use lance_vamana::partition::Partition;
-use lance_vamana::query::{Neighbor, SearchParams, VamanaIndex, WalkMode, committed_segments};
+use lance_vamana::query::{
+    Neighbor, SearchParams, VamanaIndex, WalkMode, WalkStart, committed_segments,
+};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 mod common;
 use common::{
-    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, commit_overlay, compact_indexed,
-    random_vectors, recall, sample_partition,
+    DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, brute_force, commit_overlay, committed_manifests,
+    compact_indexed, random_vectors, recall, sample_partition,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
@@ -78,13 +81,17 @@ fn small_fixture() -> DatasetFixture {
 }
 
 /// A narrower graph than the default, so the tests build in seconds. The working
-/// point measured on SIFT is R=64; nothing here is a quality statement.
+/// point measured on SIFT is R=64; nothing here is a quality statement. Without
+/// entry points for the same reason: training them would cost a debug build
+/// several times its graph, and they have tests of their own.
 fn params() -> IndexParams {
-    IndexParams::new(VECTOR_COLUMN, PARTITIONS).with_graph_params(BuildParams {
-        max_degree: 16,
-        search_list_size: 64,
-        ..Default::default()
-    })
+    IndexParams::new(VECTOR_COLUMN, PARTITIONS)
+        .with_graph_params(BuildParams {
+            max_degree: 16,
+            search_list_size: 64,
+            ..Default::default()
+        })
+        .without_entry_points()
 }
 
 async fn indexed_dataset(uri: &str, fixture: &DatasetFixture) -> Dataset {
@@ -300,7 +307,10 @@ async fn a_partition_disagreeing_with_its_segment_is_refused() {
             lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
         );
         let declared = sample_partition(16, 8, VECTOR_DIM as u32);
-        writer.write_partition(0, 0, &declared).await.unwrap();
+        writer
+            .write_partition(0, 0, Arc::from([]), &declared)
+            .await
+            .unwrap();
         let manifest = writer.finish().await.unwrap();
 
         // Written over the file the segment already holds, and before the
@@ -1782,7 +1792,10 @@ async fn hand_made_segment(dataset: &Dataset, metadata: IndexMetadata) -> IndexS
         metadata,
         lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
     );
-    writer.write_partition(0, 0, &partition).await.unwrap();
+    writer
+        .write_partition(0, 0, Arc::from([]), &partition)
+        .await
+        .unwrap();
     writer.finish().await.unwrap();
 
     IndexSegment::new(
@@ -1844,6 +1857,7 @@ fn declaring(fragments: Vec<u32>) -> IndexMetadata {
         row_id_mode: RowIdMode::Address,
         fragments,
         codes: None,
+        entry_point_params: None,
         vector_source: VectorSource::Index,
     }
 }
@@ -2345,6 +2359,7 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
             row_id_mode: RowIdMode::Address,
             fragments: covered.clone(),
             codes: None,
+            entry_point_params: None,
             vector_source: VectorSource::Index,
         },
         lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
@@ -2372,7 +2387,7 @@ async fn a_probed_partition_that_holds_nothing_is_skipped() {
         .unwrap();
         let graph = Partition::try_new(built.graph, taken).unwrap();
         writer
-            .write_partition(partition, built.medoid, &graph)
+            .write_partition(partition, built.medoid, Arc::from([]), &graph)
             .await
             .unwrap();
     }
@@ -2566,12 +2581,13 @@ async fn a_partition_holding_a_non_finite_vector_is_reported_as_corrupt() {
                 row_id_mode: RowIdMode::Address,
                 fragments: covered.clone(),
                 codes: None,
+                entry_point_params: None,
                 vector_source: VectorSource::Index,
             },
             lance_index::vector::ivf::storage::IvfModel::new(centroids, None),
         );
         writer
-            .write_partition(0, built.medoid, &partition)
+            .write_partition(0, built.medoid, Arc::from([]), &partition)
             .await
             .unwrap();
         writer.finish().await.unwrap();
@@ -2613,4 +2629,122 @@ async fn a_partition_holding_a_non_finite_vector_is_reported_as_corrupt() {
             "the error should name the row whose vector is not a number: {error}"
         );
     }
+}
+
+/// A walk asked by name to start at entry points asks for that wherever it
+/// walks, so it is refused for an index one of whose segments stores none -
+/// unless entry points were handed over for every segment at open. The default
+/// start walks the same index without complaint, from the medoid where a
+/// segment stores none. Every build of one index inherits its base's
+/// parameters, so the segment storing none is written by hand.
+#[tokio::test]
+async fn a_strict_start_is_refused_where_one_segment_stores_no_entry_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = small_fixture();
+    let mut dataset = fixture.write(uri).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &params().with_entry_point_params(EntryPointParams::new(4)),
+    )
+    .await
+    .unwrap();
+    let mut dataset = fixture.append(uri).await;
+
+    let (_, base) = committed_manifests(&dataset, INDEX_NAME).await.remove(0);
+    let covered = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .filter(|id| !base.metadata().fragments.contains(id))
+        .collect::<Vec<_>>();
+    assert!(!covered.is_empty(), "the append added no fragment");
+    let uuid = Uuid::new_v4();
+    let mut writer = SegmentWriter::new(
+        dataset.object_store(None).await.unwrap(),
+        dataset.indices_dir().join(uuid.to_string()),
+        IndexMetadata {
+            fragments: covered.clone(),
+            entry_point_params: None,
+            ..base.metadata().clone()
+        },
+        base.ivf().clone(),
+    );
+    writer
+        .write_partition(
+            0,
+            0,
+            Arc::from([]),
+            &sample_partition(base.metadata().max_degree, 8, VECTOR_DIM as u32),
+        )
+        .await
+        .unwrap();
+    writer.finish().await.unwrap();
+    dataset
+        .commit_existing_index_segments(
+            INDEX_NAME,
+            VECTOR_COLUMN,
+            vec![IndexSegment::new(
+                uuid,
+                covered,
+                [dataset.schema().field(VECTOR_COLUMN).unwrap().id],
+                Arc::new(prost_types::Any {
+                    type_url: INDEX_DETAILS_TYPE_URL.to_string(),
+                    value: Vec::new(),
+                }),
+                FORMAT_VERSION as i32,
+                dataset.manifest.version,
+                vec![],
+            )],
+        )
+        .await
+        .unwrap();
+
+    let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(index.num_segments(), 2);
+    let query = &random_vectors(1, 7)[0];
+    let walk = SearchParams::new(K).with_nprobes(PARTITIONS as usize);
+    let error = index
+        .search(query, &walk.clone().with_start(WalkStart::NearestEntry))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, lance_core::Error::InvalidInput { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains(&format!(
+            "segment {uuid} of this index stores no entry points"
+        )),
+        "{error}"
+    );
+    // The default start walks the base from its entry points still: it falls
+    // back to the medoid where a segment stores none, not everywhere.
+    let mut costs = (0, 0);
+    for query in &random_vectors(8, 11) {
+        costs.0 += index.search(query, &walk).await.unwrap().comparisons;
+        costs.1 += index
+            .search(query, &walk.clone().with_start(WalkStart::Medoid))
+            .await
+            .unwrap()
+            .comparisons;
+    }
+    assert_ne!(
+        costs.0, costs.1,
+        "the default start walked every segment from its medoid"
+    );
+
+    let trained = index
+        .train_entry_points(&EntryPointParams::new(4))
+        .await
+        .unwrap();
+    VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .unwrap()
+        .with_entry_points(Arc::new(trained))
+        .unwrap()
+        .search(query, &walk.with_start(WalkStart::NearestEntry))
+        .await
+        .unwrap();
 }

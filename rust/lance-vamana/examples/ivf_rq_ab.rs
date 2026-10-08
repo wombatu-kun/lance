@@ -61,6 +61,31 @@
 //! differ; these say which queries the difference came from, which is what a
 //! paired comparison between two passes resamples.
 //!
+//! `BUILD_ENTRY_POINTS` (unset: the library's default, entry points under its
+//! size rule whenever the index has codes, which this example always builds;
+//! a count: that many in every partition; `none`: none) says what the index
+//! this example builds stores beside each medoid, and a reused index has to
+//! store what it asks for. The index's own are printed on a line of their own,
+//! `entry points: <parameters>, ... fnv <hash>, stored in the index`.
+//!
+//! `START` (`medoid`, `entry` or `prefer-entry`, as `search --start` spells
+//! them; default `medoid`) says where the crate's walks start: `entry` at the
+//! nearest entry point, and refused for an index storing none unless
+//! `ENTRY_POINTS` hands some over; `prefer-entry` likewise where a partition
+//! has any and at the medoid otherwise. The scan arm has no start and ignores
+//! it. The default stays the medoid whatever the library's is, so that a pass
+//! repeats the passes taken before it.
+//!
+//! `ENTRY_POINTS` (unset: the index's own) hands the walks entry points
+//! trained at open in place of the stored ones: a count trains that many in
+//! every partition, under `ENTRY_SAMPLE_RATE` (vectors a sample per entry
+//! point, default 256) and `ENTRY_SEED` (default 42), which tune nothing
+//! else; `stored` trains them under the parameters the index records and
+//! checks that they are the lists it stores. `ENTRY_FILE` keeps what one pass
+//! trained for the next to read back. `LANCE_USE_HNSW_SPEEDUP_INDEXING=enabled`
+//! is refused unless `BUILD_ENTRY_POINTS=none` and `ENTRY_POINTS` is unset,
+//! since entry points would not train reproducibly under it.
+//!
 //! `LANCE_RQ_PRUNE_STATS=1` is Lance's own knob, not this example's: `IVF_RQ`
 //! tallies how many rows its two-stage estimator threw away on the binary code
 //! alone and reports them through `log`. A binary with no logger installed
@@ -237,11 +262,14 @@ use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
-use lance_vamana::builder::{IndexParams, create_index};
+use lance_vamana::builder::{EntryPointRequest, IndexParams, create_index};
 use lance_vamana::codes::CodeSpec;
 use lance_vamana::entry_points::{EntryPointParams, EntryPoints, PartitionEntryPoints};
-use lance_vamana::format::VectorSource;
-use lance_vamana::query::{Neighbor, RescoreReads, SearchParams, VamanaIndex, WalkMode, WalkStart};
+use lance_vamana::format::{INDEX_FILE_NAME, VectorSource};
+use lance_vamana::io::{read_segment, scan_scheduler};
+use lance_vamana::query::{
+    Neighbor, RescoreReads, SearchParams, VamanaIndex, WalkMode, WalkStart, committed_segments,
+};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -453,54 +481,89 @@ fn exact_times(cost: &Cost) -> String {
     )
 }
 
+/// Print a set of entry points as one line: the parameters they were trained
+/// under, how many there are in how many partitions, and an fnv of their ids,
+/// partition after partition - the one `examples/entry_points_walk.rs` prints
+/// for the same set, and no uuid in it, so that a rebuilt index storing the
+/// same lists prints the same hash.
+fn describe_entry_points<'a>(
+    params: &EntryPointParams,
+    lists: impl Iterator<Item = &'a [u32]>,
+    how: &str,
+) {
+    let (mut fnv, mut distinct, mut partitions) = (0xcbf2_9ce4_8422_2325_u64, 0, 0);
+    for list in lists {
+        partitions += 1;
+        distinct += list.len();
+        for &entry in list {
+            fnv = (fnv ^ u64::from(entry)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    println!(
+        "entry points: {params}, {distinct} distinct in {partitions} partitions, fnv \
+         {fnv:016x}, {how}"
+    );
+}
+
+/// The entry points the index stores and the parameters it records for them,
+/// read off its one segment's partition table; `None` for an index storing
+/// none.
+async fn stored_entry_points(dataset: &Dataset) -> Option<(EntryPointParams, Vec<Arc<[u32]>>)> {
+    let committed = committed_segments(dataset, VAMANA_INDEX).await.unwrap();
+    let [segment] = committed.as_slice() else {
+        panic!(
+            "expected one committed segment of {VAMANA_INDEX}, found {}",
+            committed.len()
+        );
+    };
+    let sizes = segment
+        .files
+        .iter()
+        .flatten()
+        .map(|file| (file.path.clone(), file.size_bytes))
+        .collect::<HashMap<_, _>>();
+    let manifest = read_segment(
+        &scan_scheduler(&dataset.object_store(None).await.unwrap()),
+        &dataset.indices_dir().join(segment.uuid.to_string()),
+        sizes.get(INDEX_FILE_NAME).copied(),
+    )
+    .await
+    .unwrap();
+    let params = manifest.metadata().entry_point_params.clone()?;
+    let lists = manifest
+        .partitions()
+        .iter()
+        .map(|entry| entry.entry_points.clone())
+        .collect();
+    Some((params, lists))
+}
+
 /// The entry points `params` asks for: read back from `file` when an earlier
 /// pass wrote it, trained on an opening of the index no row measures otherwise
 /// - and then written to `file`, if one is named.
 ///
 /// Read back rather than trained by every pass because training reads every
 /// vector of the partition, 3.8 GB at GIST's width, which would crowd the page
-/// cache the timed passes are meant to find warm. The line printed names the
-/// entry points by an fnv of their ids, partition after partition, which is the
-/// one `examples/entry_points_walk.rs` prints for the same set.
+/// cache the timed passes are meant to find warm.
 async fn entry_points_for(
     dataset: &Dataset,
     params: &EntryPointParams,
     file: Option<&str>,
 ) -> EntryPoints {
-    let describe = |entry_points: &EntryPoints, how: String| {
-        let ids = entry_points
-            .partitions()
-            .iter()
-            .flat_map(|partition| partition.entries.iter().map(|&entry| u64::from(entry)));
-        let fnv = ids.fold(0xcbf2_9ce4_8422_2325_u64, |hash, word| {
-            (hash ^ word).wrapping_mul(0x0000_0100_0000_01b3)
-        });
-        let distinct = entry_points
-            .partitions()
-            .iter()
-            .map(|partition| partition.entries.len())
-            .sum::<usize>();
-        println!(
-            "entry points: K {}, sample {}, seed {}, {distinct} distinct in {} partitions, fnv \
-             {fnv:016x}, {how}",
-            params.num_entries,
-            params.resolved_sample_size(),
-            params.seed,
-            entry_points.partitions().len()
-        );
-    };
-
     if let Some(path) = file
         && std::fs::metadata(path).is_ok()
     {
         let stored: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let number = |value: &serde_json::Value| value.as_u64().unwrap();
-        let stored_params = EntryPointParams {
-            num_entries: number(&stored["num_entries"]) as usize,
-            sample_size: stored["sample_size"].as_u64().map(|size| size as usize),
-            seed: number(&stored["seed"]),
-        };
+        let stored_params = serde_json::from_value::<EntryPointParams>(stored["params"].clone())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "ENTRY_FILE {path} records no entry point parameters this stand reads \
+                     ({error}); it was written before entry points were stored, so train them \
+                     again"
+                )
+            });
         assert_eq!(
             &stored_params, params,
             "ENTRY_FILE {path} holds entry points trained under other settings"
@@ -522,22 +585,31 @@ async fn entry_points_for(
             })
             .collect();
         let entry_points = EntryPoints::from_partitions(stored_params, partitions).unwrap();
-        describe(&entry_points, format!("loaded from {path}"));
+        describe_entry_points(
+            params,
+            entry_points
+                .partitions()
+                .iter()
+                .map(|partition| &partition.entries[..]),
+            &format!("loaded from {path}"),
+        );
         return entry_points;
     }
 
     let index = VamanaIndex::open(dataset, VAMANA_INDEX).await.unwrap();
     let started = Instant::now();
     let entry_points = index.train_entry_points(params).await.unwrap();
-    describe(
-        &entry_points,
-        format!("trained in {:.2} s", started.elapsed().as_secs_f64()),
+    describe_entry_points(
+        params,
+        entry_points
+            .partitions()
+            .iter()
+            .map(|partition| &partition.entries[..]),
+        &format!("trained in {:.2} s", started.elapsed().as_secs_f64()),
     );
     if let Some(path) = file {
         let stored = serde_json::json!({
-            "num_entries": params.num_entries,
-            "sample_size": params.sample_size,
-            "seed": params.seed,
+            "params": params,
             "partitions": entry_points.partitions().iter().map(|partition| serde_json::json!({
                 "segment": partition.segment.to_string(),
                 "partition_id": partition.partition_id,
@@ -549,6 +621,24 @@ async fn entry_points_for(
         println!("entry points written to {path}");
     }
     entry_points
+}
+
+/// Where an arm's walks start: the scan has no start, so it keeps the medoid
+/// whatever `START` says, and a strict start is never refused for it.
+fn arm_start(start: WalkStart, mode: WalkMode) -> WalkStart {
+    match mode {
+        WalkMode::Flat => WalkStart::Medoid,
+        _ => start,
+    }
+}
+
+/// `START`'s spelling of a start, as `RECORDS` writes it.
+fn start_name(start: WalkStart) -> &'static str {
+    match start {
+        WalkStart::Medoid => "medoid",
+        WalkStart::NearestEntry => "entry",
+        WalkStart::PreferNearestEntry => "prefer-entry",
+    }
 }
 
 async fn write_dataset(uri: &str, vectors: &FixedSizeListArray) -> Dataset {
@@ -747,7 +837,7 @@ async fn measure_vamana(
         .with_report_coded(true)
         .with_rescore_budget(point.budget)
         .with_rescore_from_dataset(rescore_from_dataset)
-        .with_start(start);
+        .with_start(arm_start(start, mode));
     let params = match point.stop_margin {
         Some(margin) => params.with_stop_margin(margin),
         None => params,
@@ -1497,19 +1587,58 @@ async fn main() {
         Ok("dataset") => VectorSource::Dataset,
         Ok(other) => panic!("VECTOR_SOURCE is `index` or `dataset`, not `{other}`"),
     };
-    // Entry points for the crate's walks: trained once for the pass - or read
-    // back from ENTRY_FILE, which the first pass to train them writes - and
-    // handed to every row's index whatever START says, so that the arms of a
-    // round do the same work at open and differ only in where they start.
-    let entry_params = std::env::var("ENTRY_POINTS").ok().map(|raw| {
+    // What the build stores beside each medoid: unset, the library's default.
+    let build_entry_points = match std::env::var("BUILD_ENTRY_POINTS").as_deref() {
+        Err(_) => EntryPointRequest::Default,
+        Ok("none") => EntryPointRequest::Without,
+        Ok(raw) => EntryPointRequest::With(EntryPointParams::new(
+            raw.parse()
+                .ok()
+                .filter(|&count| count > 0)
+                .unwrap_or_else(|| {
+                    panic!("BUILD_ENTRY_POINTS is a count of at least 1 or `none`, not {raw:?}")
+                }),
+        )),
+    };
+    // Entry points handed to the crate's walks in place of the stored ones:
+    // trained once for the pass - or read back from ENTRY_FILE, which the first
+    // pass to train them writes - and handed to every row's index whatever
+    // START says, so that the arms of a round do the same work at open and
+    // differ only in where they start. `stored` is resolved once the index is
+    // open, from what it records.
+    assert!(
+        std::env::var_os("ENTRY_SAMPLE").is_none(),
+        "ENTRY_SAMPLE is retired: ENTRY_SAMPLE_RATE says how many vectors a sample per entry \
+         point"
+    );
+    let tuned =
+        std::env::var_os("ENTRY_SAMPLE_RATE").is_some() || std::env::var_os("ENTRY_SEED").is_some();
+    assert!(
+        !tuned || std::env::var_os("ENTRY_POINTS").is_some(),
+        "ENTRY_SAMPLE_RATE and ENTRY_SEED tune the entry points ENTRY_POINTS trains, and it is \
+         unset; BUILD_ENTRY_POINTS takes no tuning"
+    );
+    let entry_knob = std::env::var("ENTRY_POINTS").ok().map(|raw| {
+        if raw == "stored" {
+            assert!(
+                !tuned,
+                "ENTRY_POINTS=stored trains under the parameters the index records, so \
+                 ENTRY_SAMPLE_RATE and ENTRY_SEED have nothing to change"
+            );
+            return None;
+        }
         let num_entries = raw
             .parse::<usize>()
-            .unwrap_or_else(|_| panic!("ENTRY_POINTS is a count, not {raw:?}"));
+            .ok()
+            .filter(|&count| count > 0)
+            .unwrap_or_else(|| {
+                panic!("ENTRY_POINTS is a count of at least 1 or `stored`, not {raw:?}")
+            });
         let mut params = EntryPointParams::new(num_entries);
-        if let Ok(raw) = std::env::var("ENTRY_SAMPLE") {
-            params = params.with_sample_size(
+        if let Ok(raw) = std::env::var("ENTRY_SAMPLE_RATE") {
+            params = params.with_sample_rate(
                 raw.parse()
-                    .unwrap_or_else(|_| panic!("ENTRY_SAMPLE is a count, not {raw:?}")),
+                    .unwrap_or_else(|_| panic!("ENTRY_SAMPLE_RATE is a count, not {raw:?}")),
             );
         }
         if let Ok(raw) = std::env::var("ENTRY_SEED") {
@@ -1518,24 +1647,41 @@ async fn main() {
                     .unwrap_or_else(|_| panic!("ENTRY_SEED is a number, not {raw:?}")),
             );
         }
-        params
+        Some(params)
     });
     let entry_file = std::env::var("ENTRY_FILE").ok();
     let start = match std::env::var("START").as_deref() {
         Err(_) | Ok("medoid") => WalkStart::Medoid,
         Ok("entry") => WalkStart::NearestEntry,
-        Ok(other) => panic!("START is `medoid` or `entry`, not `{other}`"),
+        Ok("prefer-entry") => WalkStart::PreferNearestEntry,
+        Ok(other) => panic!("START is `medoid`, `entry` or `prefer-entry`, not `{other}`"),
     };
     assert!(
-        entry_params.is_some() || (start == WalkStart::Medoid && entry_file.is_none()),
-        "START=entry and ENTRY_FILE are about entry points, and ENTRY_POINTS says how many"
+        entry_knob.is_some() || entry_file.is_none(),
+        "ENTRY_FILE keeps entry points trained at open, and ENTRY_POINTS says how"
     );
-    // The harness that counted the entry points refused it too: with it set,
+    // A reused index has to store what BUILD_ENTRY_POINTS asks for, so these are
+    // known to fail before the ground truth is paid for.
+    if build_entry_points == EntryPointRequest::Without {
+        assert!(
+            !matches!(entry_knob, Some(None)),
+            "ENTRY_POINTS=stored trains under the parameters the index records, and \
+             BUILD_ENTRY_POINTS=none records none"
+        );
+        assert!(
+            start != WalkStart::NearestEntry || entry_knob.is_some(),
+            "START=entry walks from entry points, and BUILD_ENTRY_POINTS=none stores none \
+             while ENTRY_POINTS hands none over"
+        );
+    }
+    // The harness that counted the entry points refused it too: enabled,
     // Lance's k-means assigns through an HNSW it builds in parallel, and the
-    // same partition would not train the same entry points twice.
+    // same partition would not train the same entry points twice. `disabled`
+    // never builds one, and any other value only at a million centroid values.
     assert!(
-        entry_params.is_none() || std::env::var_os("LANCE_USE_HNSW_SPEEDUP_INDEXING").is_none(),
-        "LANCE_USE_HNSW_SPEEDUP_INDEXING is set, so entry points would not train reproducibly"
+        (entry_knob.is_none() && build_entry_points == EntryPointRequest::Without)
+            || std::env::var("LANCE_USE_HNSW_SPEEDUP_INDEXING").as_deref() != Ok("enabled"),
+        "LANCE_USE_HNSW_SPEEDUP_INDEXING=enabled, so entry points would not train reproducibly"
     );
     // A pass charges its later rows more than its earlier ones - one and the
     // same reference point cost 1812 us after two vamana rows and 2028 after
@@ -1598,6 +1744,8 @@ async fn main() {
         match start {
             WalkStart::Medoid => "the medoid",
             WalkStart::NearestEntry => "the nearest entry point",
+            WalkStart::PreferNearestEntry =>
+                "the nearest entry point where a partition has any, else the medoid",
         }
     );
     println!(
@@ -1671,38 +1819,94 @@ async fn main() {
             Some(vamana_codes)
         );
         assert_eq!(metadata.vector_source, vector_source);
+        // This example always builds with codes, so the default resolves to
+        // the library's rule.
+        let built_entry_points = match &build_entry_points {
+            EntryPointRequest::Default => Some(EntryPointParams::default()),
+            EntryPointRequest::With(params) => Some(params.clone()),
+            EntryPointRequest::Without => None,
+        };
+        assert_eq!(
+            metadata.entry_point_params, built_entry_points,
+            "the index at {vamana_uri} stores entry points under other parameters than \
+             BUILD_ENTRY_POINTS asks for"
+        );
         println!("reusing the vamana index at {vamana_uri}");
         dataset
     } else {
         let mut dataset = write_dataset(&vamana_uri, &vectors).await;
         let started = Instant::now();
-        create_index(
-            &mut dataset,
-            VAMANA_INDEX,
-            &IndexParams::new(VECTOR_FIELD, vamana_partitions)
-                .with_distance_type(DISTANCE_TYPE)
-                .with_codes(vamana_codes)
-                .with_vector_source(vector_source)
-                .with_graph_params(BuildParams {
-                    max_degree: degree,
-                    ..Default::default()
-                }),
-        )
-        .await
-        .unwrap();
-        println!(
-            "vamana indexed in {:.1}s at {vamana_uri}",
-            started.elapsed().as_secs_f64()
-        );
+        let mut params = IndexParams::new(VECTOR_FIELD, vamana_partitions)
+            .with_distance_type(DISTANCE_TYPE)
+            .with_codes(vamana_codes)
+            .with_vector_source(vector_source)
+            .with_graph_params(BuildParams {
+                max_degree: degree,
+                ..Default::default()
+            });
+        params.entry_points = build_entry_points.clone();
+        let stats = create_index(&mut dataset, VAMANA_INDEX, &params)
+            .await
+            .unwrap();
+        let seconds = started.elapsed().as_secs_f64();
+        // Scripts read this line by its words: keep it as it is.
+        println!("vamana indexed in {seconds:.1}s at {vamana_uri}");
+        if !stats.entry_point_training.is_zero() {
+            let training = stats.entry_point_training.as_secs_f64();
+            // Summed over partitions trained alongside other partitions' graphs,
+            // each one's time stretched by the others, so a share of the build
+            // only where there is one partition.
+            if stats.partitions == 1 {
+                println!(
+                    "entry points trained in {training:.2} s, {:.2}% of the build",
+                    100.0 * training / seconds
+                );
+            } else {
+                println!(
+                    "entry points trained in {training:.2} s summed over {} partitions built \
+                     together, more than they added to the build",
+                    stats.partitions
+                );
+            }
+        }
         dataset
     };
 
+    let stored = stored_entry_points(&vamana_dataset).await;
+    match &stored {
+        Some((params, lists)) => describe_entry_points(
+            params,
+            lists.iter().map(|list| &list[..]),
+            "stored in the index",
+        ),
+        None => println!("entry points: none stored in the index"),
+    }
+    let from_stored = matches!(entry_knob, Some(None));
+    let entry_params = entry_knob.map(|params| {
+        params.unwrap_or_else(|| {
+            stored
+                .as_ref()
+                .map(|(params, _)| params.clone())
+                .expect("ENTRY_POINTS=stored, and the index stores no entry points")
+        })
+    });
     let entry_points = match &entry_params {
         None => None,
         Some(params) => Some(Arc::new(
             entry_points_for(&vamana_dataset, params, entry_file.as_deref()).await,
         )),
     };
+    if from_stored && let (Some(trained), Some((_, lists))) = (&entry_points, &stored) {
+        assert!(
+            trained
+                .partitions()
+                .iter()
+                .map(|partition| &partition.entries[..])
+                .eq(lists.iter().map(|list| &list[..])),
+            "ENTRY_POINTS=stored trained other entry points than the index stores"
+        );
+        println!("entry points: trained at open as the index stores them");
+    }
 
     if std::fs::metadata(&rq_uri).is_ok() {
         let dataset = Dataset::open(&rq_uri).await.unwrap();
@@ -1974,10 +2178,7 @@ async fn main() {
                         "axis": point.axis,
                         "k": k,
                         "nprobes": vamana_nprobes,
-                        "start": match start {
-                            WalkStart::Medoid => "medoid",
-                            WalkStart::NearestEntry => "entry",
-                        },
+                        "start": start_name(arm_start(start, mode)),
                         "budget": point.budget,
                         "list_size": point.list_size,
                         // The margin as the axis printed it, the form the pass

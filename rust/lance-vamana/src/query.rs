@@ -204,8 +204,9 @@ pub enum WalkMode {
     /// and for one that leaves its vectors to the dataset, whose partitions it
     /// would read whole for vectors they do not store. On its own
     /// it costs a few per cent more comparisons and reads no fewer bytes: it is
-    /// [`Self::Lazy`] with the reading left alone, which is the useful arm to
-    /// hold a walk against when what is in question is the *steering*.
+    /// [`Self::Lazy`] from the medoid ([`WalkStart::Medoid`]), where every walk
+    /// of this mode starts, with the reading left alone, which is the useful
+    /// arm to hold a walk against when what is in question is the *steering*.
     Coded,
     /// Read the row ids and the codes, and nothing else until the walk asks for
     /// it: the out-edges of a vertex when it expands one, the vectors of the
@@ -279,18 +280,19 @@ impl WalkMode {
 pub enum WalkStart {
     /// The partition's medoid, the vertex nearest the mean of its vectors: one
     /// vertex for every query, which the walk then has to get from to wherever
-    /// the query is.
-    #[default]
+    /// the query is. Never refused.
     Medoid,
-    /// The partition's entry point nearest the query by code, out of the
-    /// [`EntryPoints`] given to the index with [`VamanaIndex::with_entry_points`].
+    /// The partition's entry point nearest the query by code: out of the
+    /// [`EntryPoints`] given to the index with [`VamanaIndex::with_entry_points`]
+    /// when it was given any, and otherwise out of the ones its segments store
+    /// ([`crate::IndexParams::entry_points`]).
     ///
     /// Choosing costs one coded distance per entry point of the partition,
     /// which [`QueryResult::comparisons`] counts. Only the start is marked
     /// visited, so an entry point it was chosen over is measured again if the
-    /// walk reaches it. A partition trained no entry points - one with no more
-    /// live vertices than [`crate::EntryPointParams::num_entries`] - starts at
-    /// its medoid.
+    /// walk reaches it. A partition with no entry points of its own - one with
+    /// no more live vertices than [`crate::EntryPointParams::entries_for`] its
+    /// size when they were trained - starts at its medoid.
     ///
     /// Counted at equal recall on four million-vector datasets at one
     /// partition (`examples/entry_points_walk.rs`), 64 entry points measured 15,
@@ -300,12 +302,24 @@ pub enum WalkStart {
     /// at its own margin pair at the recall bar, the search phase took 0.91,
     /// 0.92, 0.89 and 0.91 of the medoid start's at top-10 with one query in
     /// flight, and the time a query at twelve in flight 1.00, 0.94, 0.90 and
-    /// 0.92; at top-100 the search phase took 0.90, 0.97, 0.96 and 0.94. See
-    /// [`crate::entry_points`].
+    /// 0.92; at top-100 the search phase took 0.90, 0.97, 0.96 and 0.94. At
+    /// 8 192 and 65 536 rows a partition of SIFT1M they measured 8 to 10 per
+    /// cent fewer distances at top-10, and at top-100 1.5 to 5 per cent fewer
+    /// at the narrowest walk and within 1 per cent of the medoid at the
+    /// widest. See [`crate::entry_points`].
     ///
-    /// Refused for every mode but [`WalkMode::Lazy`], and for an index that was
-    /// given no entry points.
+    /// Refused for every mode but [`WalkMode::Lazy`], and, unless entry points
+    /// were given with [`VamanaIndex::with_entry_points`], for an index with a
+    /// segment that stores none: what this asks for is a walk from entry points
+    /// wherever it walks.
     NearestEntry,
+    /// [`Self::NearestEntry`] where it can be had - a lazy walk of a partition
+    /// with entry points - and [`Self::Medoid`] everywhere else. Never refused,
+    /// which is what lets it be the default: a segment built without codes or
+    /// [`crate::IndexParams::without_entry_points`] stores none, and the other
+    /// modes start every walk at the medoid.
+    #[default]
+    PreferNearestEntry,
 }
 
 /// How far a query is allowed to look.
@@ -495,7 +509,8 @@ pub struct SearchParams {
     /// the vectors the index was built over.
     pub rescore_from_dataset: bool,
     /// Where a [`WalkMode::Lazy`] walk starts: the medoid, or the entry point
-    /// nearest the query ([`WalkStart`]).
+    /// nearest the query ([`WalkStart`]). The nearest entry point where the
+    /// partition has any by default.
     pub start: WalkStart,
 }
 
@@ -767,10 +782,10 @@ pub struct VamanaIndex {
     /// its own file; an index keeping its own reads it only for a query that
     /// asks with [`SearchParams::rescore_from_dataset`].
     dataset_vectors: DatasetVectors,
-    /// Where a walk asked to start at entry points ([`WalkStart::NearestEntry`])
-    /// finds them, checked against this index's partitions by
-    /// [`Self::with_entry_points`]. `None` until it is called, and such a walk is
-    /// refused.
+    /// Entry points that a walk starting at entry points takes in place of the
+    /// ones the segments store, checked against this index's partitions by
+    /// [`Self::with_entry_points`]. `None` until it is called, and the stored
+    /// ones are walked from.
     entry_points: Option<Arc<EntryPoints>>,
 }
 
@@ -901,7 +916,8 @@ struct Walked {
 /// by a stream that reads them concurrently. Borrowing would tie every read to
 /// the segment vector for as long as the stream lives and leave the shape of
 /// `route` fighting the borrow checker for nothing - the clones are one small
-/// string and two numbers per partition actually read.
+/// string, three numbers and an `Arc` of the entry points per partition
+/// actually read.
 #[derive(Debug)]
 struct Probe {
     path: Path,
@@ -1444,7 +1460,13 @@ impl VamanaIndex {
     /// measured, or take differences. Nothing is left in this index's cache.
     ///
     /// How a partition's entry points are picked is [`crate::entry_points`]'s
-    /// business, and how many and from what sample is `params`'s.
+    /// business, and how many and from what sample is `params`'s. Under the
+    /// parameters a segment records
+    /// ([`crate::format::IndexMetadata::entry_point_params`]) this trains the
+    /// very list the segment stores for every partition none of whose vertices
+    /// died after the list was trained - which is how the stored ones are
+    /// checked. A partition an in-place insert copied keeps the list it had,
+    /// dead entry points and all.
     pub async fn train_entry_points(&self, params: &EntryPointParams) -> Result<EntryPoints> {
         params.validate()?;
         // Where the layout of each data file a vector-less index reads is kept
@@ -1481,8 +1503,10 @@ impl VamanaIndex {
         EntryPoints::from_partitions(params.clone(), partitions)
     }
 
-    /// Let walks asked to start at entry points ([`WalkStart::NearestEntry`])
-    /// find them.
+    /// Let walks that start at entry points ([`WalkStart::NearestEntry`],
+    /// [`WalkStart::PreferNearestEntry`]) start at these rather than at the
+    /// ones the segments store, for this opening: to try other parameters
+    /// without rebuilding, or to check the stored ones against a training.
     ///
     /// Refused unless `entry_points` names exactly this index's partitions -
     /// every segment's, at the vertex count each holds - which is what tells
@@ -1775,25 +1799,6 @@ impl VamanaIndex {
                 )));
             }
         }
-        if params.start == WalkStart::NearestEntry {
-            // Refused rather than ignored, like a stop margin: no other mode
-            // walks from a start this could move.
-            if params.mode != WalkMode::Lazy {
-                return Err(Error::invalid_input(format!(
-                    "start NearestEntry was set for {:?}, which does not start from entry \
-                     points: only a WalkMode::Lazy walk does",
-                    params.mode
-                )));
-            }
-            if self.entry_points.is_none() {
-                return Err(Error::invalid_input(
-                    "start NearestEntry was set, but this index was given no entry points; \
-                     train them with VamanaIndex::train_entry_points and hand them over with \
-                     VamanaIndex::with_entry_points"
-                        .to_string(),
-                ));
-            }
-        }
         if self.metadata.vector_source == VectorSource::Dataset
             && matches!(params.mode, WalkMode::Exact | WalkMode::Coded)
         {
@@ -1815,6 +1820,34 @@ impl VamanaIndex {
                  not to",
                 params.mode
             )));
+        }
+        if params.start == WalkStart::NearestEntry {
+            // Refused rather than ignored, like a stop margin: no other mode
+            // walks from a start this could move.
+            if params.mode != WalkMode::Lazy {
+                return Err(Error::invalid_input(format!(
+                    "start NearestEntry was set for {:?}, which does not start from entry \
+                     points: only a WalkMode::Lazy walk does",
+                    params.mode
+                )));
+            }
+            // Strict where the default is not: a walk asked for by name starts
+            // at entry points in every segment, so a segment storing none is
+            // refused unless entry points were handed over for all of them.
+            if self.entry_points.is_none()
+                && let Some(segment) = self
+                    .segments
+                    .iter()
+                    .find(|segment| segment.manifest.metadata().entry_point_params.is_none())
+            {
+                return Err(Error::invalid_input(format!(
+                    "start NearestEntry was set, but segment {} of this index stores no entry \
+                     points; build it with them (the default whenever it has codes), or train \
+                     them with VamanaIndex::train_entry_points and hand them over with \
+                     VamanaIndex::with_entry_points",
+                    segment.uuid
+                )));
+            }
         }
         // Nothing downstream would report this. Every distance against a
         // non-finite query is NaN, every ordering here goes through `total_cmp`,
@@ -2233,23 +2266,26 @@ impl VamanaIndex {
 
         let entries = match params.start {
             WalkStart::Medoid => None,
-            WalkStart::NearestEntry => {
-                let trained = self
-                    .entry_points
-                    .as_ref()
-                    .and_then(|entry_points| {
-                        entry_points.of(probe.segment, probe.entry.partition_id)
-                    })
-                    .ok_or_else(|| {
-                        Error::internal(format!(
-                            "partition {} of segment {} has no entry points, though the index \
-                             accepted them",
-                            probe.entry.partition_id, probe.segment
-                        ))
-                    })?;
-                // Empty for a partition too small for entry points to pay,
-                // which starts at its medoid.
-                (!trained.entries.is_empty()).then_some(trained.entries.as_slice())
+            // A scan has no start, and it is the one other mode that gets here.
+            WalkStart::PreferNearestEntry if params.mode != WalkMode::Lazy => None,
+            WalkStart::NearestEntry | WalkStart::PreferNearestEntry => {
+                let entries = match &self.entry_points {
+                    Some(entry_points) => entry_points
+                        .of(probe.segment, probe.entry.partition_id)
+                        .map(|trained| trained.entries.as_slice())
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "partition {} of segment {} has no entry points, though the \
+                                 index accepted them",
+                                probe.entry.partition_id, probe.segment
+                            ))
+                        })?,
+                    None => &probe.entry.entry_points[..],
+                };
+                // Empty for a partition too small for entry points to pay, and
+                // for every partition of a segment that keeps none: those
+                // start at the medoid.
+                (!entries.is_empty()).then_some(entries)
             }
         };
         let (candidates, comparisons) = {
@@ -3362,7 +3398,9 @@ mod tests {
             create_index(
                 &mut dataset,
                 "vamana_idx",
-                &IndexParams::new("vec", 2).with_codes(codes),
+                &IndexParams::new("vec", 2)
+                    .with_codes(codes)
+                    .without_entry_points(),
             )
             .await
             .unwrap();
@@ -3405,6 +3443,7 @@ mod tests {
                 .with_nprobes(2)
                 .with_search_list_size(30)
                 .with_mode(WalkMode::Lazy)
+                .with_start(WalkStart::Medoid)
                 .with_report_coded(true);
             let margin = walk.clone().with_rescore_budget(20).with_stop_margin(0.05);
             for params in [walk, margin] {

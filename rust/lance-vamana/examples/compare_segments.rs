@@ -11,15 +11,20 @@
 //! than bytes, because the Lance versions that wrote the two sides may encode
 //! the same values differently.
 //!
-//! Compared: the segment metadata without `format_version` and `vector_source`,
-//! the IVF model, the partition table, and every partition's `__row_id`,
-//! `__neighbors`, `__code` and `__vector`, bit for bit. With
-//! `--right-without-vectors` the right index must leave its vectors to the
-//! dataset: its partitions hold no `__vector` and everything else is equal.
+//! Compared: the segment metadata without `format_version`, `vector_source`
+//! and `entry_point_params`, the IVF model, the entry point parameters, the
+//! partition table, and every partition's `__row_id`, `__neighbors`, `__code`
+//! and `__vector`, bit for bit. With `--right-without-vectors` the right index
+//! must leave its vectors to the dataset: its partitions hold no `__vector`
+//! and everything else is equal. With `--right-adds-entry-points` the left
+//! index must store no entry points, as format 6 did not - only the missing
+//! column and parameters are checked, not the version - and the right one
+//! must store them: entry point parameters and an `__entry_points` column on
+//! the right only, and everything else equal.
 //!
-//! Usage: `compare_segments <left dataset> <right dataset> [--right-without-vectors]`,
-//! `INDEX_NAME` (default `vamana_idx`). Prints one line per item and exits 1
-//! when anything differs.
+//! Usage: `compare_segments <left dataset> <right dataset> [--right-without-vectors]
+//! [--right-adds-entry-points]`, `INDEX_NAME` (default `vamana_idx`). Prints one
+//! line per item and exits 1 when anything differs.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,8 +39,9 @@ use lance_index::pb;
 use lance_io::scheduler::ScanScheduler;
 use lance_vamana::codes::CODE_COLUMN;
 use lance_vamana::format::{
-    FILE_COLUMN, INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, MEDOID_COLUMN,
-    NEIGHBORS_COLUMN, NUM_ROWS_COLUMN, PARTITION_ID_COLUMN, ROW_ID_COLUMN, VECTOR_COLUMN,
+    ENTRY_POINTS_COLUMN, FILE_COLUMN, INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY,
+    MEDOID_COLUMN, NEIGHBORS_COLUMN, NUM_ROWS_COLUMN, PARTITION_ID_COLUMN, ROW_ID_COLUMN,
+    VECTOR_COLUMN,
 };
 use lance_vamana::io::{open_file, read_rows, scan_scheduler};
 use lance_vamana::query::committed_segments;
@@ -225,23 +231,60 @@ async fn compare_partition(
     }
 }
 
-/// The segment metadata without the two fields a format bump may change, and
-/// those two: the format version and where the vectors are.
-fn segment_metadata(reader: &FileReader) -> (Value, Value, Value) {
+/// What a segment says about itself, split into the fields a format bump may
+/// change and the rest.
+struct SegmentMetadata {
+    version: Value,
+    /// Where the vectors are; format 5 predates the field and kept every
+    /// vector in the index.
+    source: Value,
+    /// `null` for a segment that keeps no entry points, which is every segment
+    /// of format 6, written before there were any.
+    entry_point_params: Value,
+    rest: Value,
+}
+
+fn segment_metadata(reader: &FileReader) -> SegmentMetadata {
     let json = &reader.schema().metadata[INDEX_METADATA_KEY];
-    let mut value = serde_json::from_str::<Value>(json).unwrap();
-    let fields = value.as_object_mut().unwrap();
-    let version = fields.remove("format_version").unwrap();
-    // Format 5 predates the field and kept every vector in the index.
-    let source = fields
-        .remove("vector_source")
-        .unwrap_or_else(|| Value::from("index"));
-    (version, source, value)
+    let mut rest = serde_json::from_str::<Value>(json).unwrap();
+    let fields = rest.as_object_mut().unwrap();
+    SegmentMetadata {
+        version: fields.remove("format_version").unwrap(),
+        source: fields
+            .remove("vector_source")
+            .unwrap_or_else(|| Value::from("index")),
+        entry_point_params: fields.remove("entry_point_params").unwrap_or(Value::Null),
+        rest,
+    }
+}
+
+/// How the two sides' entry point parameters differ from what the comparison
+/// expects: equal parameters, or with `right_adds_entry_points` none on the
+/// left and some on the right.
+fn entry_point_params_difference(
+    left: &Value,
+    right: &Value,
+    right_adds_entry_points: bool,
+) -> Option<String> {
+    if right_adds_entry_points {
+        (!left.is_null() || right.is_null()).then(|| {
+            format!("expected none on the left and some on the right, found {left} and {right}")
+        })
+    } else {
+        (left != right).then(|| format!("left {left}, right {right}"))
+    }
 }
 
 /// The columns of the partition table on which two segments disagree.
-fn table_difference(left: &RecordBatch, right: &RecordBatch) -> Vec<&'static str> {
-    [
+///
+/// [`ENTRY_POINTS_COLUMN`] is compared where both sides have it; with
+/// `right_adds_entry_points` the left must not have it and the right must.
+fn table_difference(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    right_adds_entry_points: bool,
+) -> Vec<&'static str> {
+    let mut differing = [
         PARTITION_ID_COLUMN,
         MEDOID_COLUMN,
         NUM_ROWS_COLUMN,
@@ -249,7 +292,19 @@ fn table_difference(left: &RecordBatch, right: &RecordBatch) -> Vec<&'static str
     ]
     .into_iter()
     .filter(|column| left[*column].to_data() != right[*column].to_data())
-    .collect()
+    .collect::<Vec<_>>();
+    let has = |table: &RecordBatch| table.column_by_name(ENTRY_POINTS_COLUMN).is_some();
+    let entry_points_differ = match (has(left), has(right), right_adds_entry_points) {
+        (false, true, true) | (false, false, false) => false,
+        (true, true, false) => {
+            left[ENTRY_POINTS_COLUMN].to_data() != right[ENTRY_POINTS_COLUMN].to_data()
+        }
+        _ => true,
+    };
+    if entry_points_differ {
+        differing.push(ENTRY_POINTS_COLUMN);
+    }
+    differing
 }
 
 async fn ivf_model(reader: &FileReader) -> pb::Ivf {
@@ -327,6 +382,7 @@ async fn compare(
     right_uri: &str,
     index_name: &str,
     right_without_vectors: bool,
+    right_adds_entry_points: bool,
 ) -> Report {
     let mut report = Report::default();
     let left = Segment::open(left_uri, index_name).await;
@@ -334,11 +390,13 @@ async fn compare(
     let left_index = left.read(INDEX_FILE_NAME, None).await;
     let right_index = right.read(INDEX_FILE_NAME, None).await;
 
-    let (left_version, left_source, left_metadata) = segment_metadata(&left_index);
-    let (right_version, right_source, right_metadata) = segment_metadata(&right_index);
+    let left_metadata = segment_metadata(&left_index);
+    let right_metadata = segment_metadata(&right_index);
+    let (left_source, right_source) = (&left_metadata.source, &right_metadata.source);
     report.lines.push(format!(
-        "format versions: left {left_version}, right {right_version}; vectors: left in \
-         {left_source}, right in {right_source}"
+        "format versions: left {}, right {}; vectors: left in {left_source}, right in \
+         {right_source}",
+        left_metadata.version, right_metadata.version
     ));
     let expected_source = if right_without_vectors {
         "dataset"
@@ -347,13 +405,25 @@ async fn compare(
     };
     report.record(
         "vector sources",
-        (left_source != "index" || right_source != expected_source)
+        (*left_source != "index" || *right_source != expected_source)
             .then(|| format!("expected the left in index and the right in {expected_source}")),
     );
+    report.lines.push(format!(
+        "entry point params: left {}, right {}",
+        left_metadata.entry_point_params, right_metadata.entry_point_params
+    ));
+    report.record(
+        "entry point params",
+        entry_point_params_difference(
+            &left_metadata.entry_point_params,
+            &right_metadata.entry_point_params,
+            right_adds_entry_points,
+        ),
+    );
+    let (left_rest, right_rest) = (&left_metadata.rest, &right_metadata.rest);
     report.record(
         "metadata",
-        (left_metadata != right_metadata)
-            .then(|| format!("left {left_metadata}, right {right_metadata}")),
+        (left_rest != right_rest).then(|| format!("left {left_rest}, right {right_rest}")),
     );
 
     let (left_ivf, right_ivf) = (ivf_model(&left_index).await, ivf_model(&right_index).await);
@@ -372,12 +442,18 @@ async fn compare(
     }
     let left_table = read_rows(&left_index, 0..left_rows).await.unwrap();
     let right_table = read_rows(&right_index, 0..right_rows).await.unwrap();
-    let table_differs = table_difference(&left_table, &right_table);
+    let table_differs = table_difference(&left_table, &right_table, right_adds_entry_points);
     report.record(
         &format!("partition table ({left_rows} partitions)"),
         (!table_differs.is_empty()).then(|| format!("columns {table_differs:?}")),
     );
-    if !table_differs.is_empty() {
+    // A medoid or a list of entry points apart still leaves the partitions
+    // comparable: the rows only have to agree on which files to read and how
+    // long each is.
+    if table_differs
+        .iter()
+        .any(|column| [PARTITION_ID_COLUMN, NUM_ROWS_COLUMN, FILE_COLUMN].contains(column))
+    {
         return report;
     }
 
@@ -402,16 +478,27 @@ async fn compare(
 async fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let right_without_vectors = args.iter().any(|arg| arg == "--right-without-vectors");
+    let right_adds_entry_points = args.iter().any(|arg| arg == "--right-adds-entry-points");
     let uris = args
         .iter()
         .filter(|arg| !arg.starts_with("--"))
         .collect::<Vec<_>>();
     let [left, right] = uris.as_slice() else {
-        panic!("usage: compare_segments <left dataset> <right dataset> [--right-without-vectors]");
+        panic!(
+            "usage: compare_segments <left dataset> <right dataset> [--right-without-vectors] \
+             [--right-adds-entry-points]"
+        );
     };
     let index_name = std::env::var("INDEX_NAME").unwrap_or_else(|_| "vamana_idx".to_string());
     println!("left  {left}\nright {right}\nindex {index_name}");
-    let report = compare(left, right, &index_name, right_without_vectors).await;
+    let report = compare(
+        left,
+        right,
+        &index_name,
+        right_without_vectors,
+        right_adds_entry_points,
+    )
+    .await;
     for line in &report.lines {
         println!("{line}");
     }
@@ -427,6 +514,7 @@ async fn main() {
 mod tests {
     use super::*;
 
+    use arrow_array::builder::{ListBuilder, UInt32Builder};
     use arrow_array::{
         FixedSizeListArray, Float32Array, RecordBatchIterator, StringArray, UInt32Array,
         UInt64Array,
@@ -437,7 +525,8 @@ mod tests {
     use lance_vamana::build::BuildParams;
     use lance_vamana::builder::{IndexParams, create_index};
     use lance_vamana::codes::CodeSpec;
-    use lance_vamana::format::{VectorSource, index_schema};
+    use lance_vamana::entry_points::EntryPointParams;
+    use lance_vamana::format::{VectorSource, entry_point_item, index_schema};
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
@@ -586,30 +675,106 @@ mod tests {
         );
     }
 
+    /// One partition's row of the table as this build writes it.
+    fn table(
+        partition: u32,
+        medoid: u32,
+        entry_points: &[u32],
+        rows: u32,
+        file: &str,
+    ) -> RecordBatch {
+        let mut lists = ListBuilder::new(UInt32Builder::new()).with_field(entry_point_item());
+        lists.values().append_slice(entry_points);
+        lists.append(true);
+        RecordBatch::try_new(
+            Arc::new(index_schema()),
+            vec![
+                Arc::new(UInt32Array::from(vec![partition])),
+                Arc::new(UInt32Array::from(vec![medoid])),
+                Arc::new(lists.finish()),
+                Arc::new(UInt32Array::from(vec![rows])),
+                Arc::new(StringArray::from(vec![file])),
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn every_column_of_the_partition_table_is_compared() {
-        let table = |partition: u32, medoid: u32, rows: u32, file: &str| {
-            RecordBatch::try_new(
-                Arc::new(index_schema()),
-                vec![
-                    Arc::new(UInt32Array::from(vec![partition])),
-                    Arc::new(UInt32Array::from(vec![medoid])),
-                    Arc::new(UInt32Array::from(vec![rows])),
-                    Arc::new(StringArray::from(vec![file])),
-                ],
-            )
-            .unwrap()
-        };
-        let base = table(0, 5, 100, "part_00000.idx");
-        assert!(table_difference(&base, &base).is_empty());
+        let base = table(0, 5, &[1, 7], 100, "part_00000.idx");
+        assert!(table_difference(&base, &base, false).is_empty());
         for (changed, column) in [
-            (table(1, 5, 100, "part_00000.idx"), PARTITION_ID_COLUMN),
-            (table(0, 6, 100, "part_00000.idx"), MEDOID_COLUMN),
-            (table(0, 5, 101, "part_00000.idx"), NUM_ROWS_COLUMN),
-            (table(0, 5, 100, "part_00001.idx"), FILE_COLUMN),
+            (
+                table(1, 5, &[1, 7], 100, "part_00000.idx"),
+                PARTITION_ID_COLUMN,
+            ),
+            (table(0, 6, &[1, 7], 100, "part_00000.idx"), MEDOID_COLUMN),
+            (
+                table(0, 5, &[1, 8], 100, "part_00000.idx"),
+                ENTRY_POINTS_COLUMN,
+            ),
+            (
+                table(0, 5, &[1], 100, "part_00000.idx"),
+                ENTRY_POINTS_COLUMN,
+            ),
+            (table(0, 5, &[1, 7], 101, "part_00000.idx"), NUM_ROWS_COLUMN),
+            (table(0, 5, &[1, 7], 100, "part_00001.idx"), FILE_COLUMN),
         ] {
-            assert_eq!(table_difference(&base, &changed), [column]);
+            assert_eq!(table_difference(&base, &changed, false), [column]);
         }
+    }
+
+    /// A format-6 segment has neither entry point parameters nor the column,
+    /// and one rebuilt at format 7 adds both: with the flag that is what is
+    /// expected and nothing else is, and without it, a difference. Built in
+    /// memory, since no file of the old format is kept to read.
+    #[test]
+    fn a_right_side_adding_entry_points_is_told_apart() {
+        let params = serde_json::to_value(EntryPointParams::default()).unwrap();
+        let none = Value::Null;
+        assert_eq!(entry_point_params_difference(&none, &params, true), None);
+        assert_eq!(entry_point_params_difference(&params, &params, false), None);
+        assert_eq!(entry_point_params_difference(&none, &none, false), None);
+        for (left, right, adds) in [
+            (&none, &params, false),
+            (&params, &params, true),
+            (&none, &none, true),
+            (&params, &none, false),
+        ] {
+            assert!(
+                entry_point_params_difference(left, right, adds).is_some(),
+                "{left} and {right}, adding {adds}"
+            );
+        }
+
+        let newer = table(0, 5, &[1, 7], 100, "part_00000.idx");
+        let older_schema = Arc::new(Schema::new(
+            index_schema()
+                .fields()
+                .iter()
+                .filter(|field| field.name() != ENTRY_POINTS_COLUMN)
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        let older = newer
+            .project(&[0, 1, 3, 4])
+            .unwrap()
+            .with_schema(older_schema)
+            .unwrap();
+        assert!(table_difference(&older, &newer, true).is_empty());
+        assert!(table_difference(&older, &older, false).is_empty());
+        assert_eq!(
+            table_difference(&older, &newer, false),
+            [ENTRY_POINTS_COLUMN]
+        );
+        assert_eq!(
+            table_difference(&newer, &newer, true),
+            [ENTRY_POINTS_COLUMN]
+        );
+        assert_eq!(
+            table_difference(&newer, &older, true),
+            [ENTRY_POINTS_COLUMN]
+        );
     }
 
     #[tokio::test]
@@ -641,19 +806,19 @@ mod tests {
         )
         .await;
 
-        let same = compare(&first, &again, INDEX, false).await;
+        let same = compare(&first, &again, INDEX, false, false).await;
         assert!(same.differing.is_empty(), "{:?}", same.lines);
         // The router trains on a sample drawn with the graph's seed, so its
         // centroid moves with the seed too; the codes are scalar, bounded by
         // every vector, and do not.
-        let seeds = compare(&first, &reseeded, INDEX, false).await;
+        let seeds = compare(&first, &reseeded, INDEX, false, false).await;
         assert_eq!(
             seeds.differing,
             ["ivf model", "part_00000.idx __neighbors"],
             "{:?}",
             seeds.lines
         );
-        let beams = compare(&first, &wider, INDEX, false).await;
+        let beams = compare(&first, &wider, INDEX, false, false).await;
         assert_eq!(
             beams.differing,
             ["metadata", "part_00000.idx __neighbors"],
@@ -691,14 +856,24 @@ mod tests {
 
         // Two fragments instead of three: the same vectors at other addresses,
         // and a fragment list of its own.
-        let layouts = compare(&first, &relaid, INDEX, false).await;
+        let layouts = compare(&first, &relaid, INDEX, false, false).await;
         assert_eq!(
             layouts.differing,
             ["metadata", "part_00000.idx __row_id"],
             "{:?}",
             layouts.lines
         );
-        let nudge = compare(&first, &nudged, INDEX, false).await;
+        let nudge = compare(&first, &nudged, INDEX, false, false).await;
+        // The nudge moves the partition table too - the medoid or an entry
+        // point - which must not stop the partitions being compared.
+        assert!(
+            nudge
+                .differing
+                .iter()
+                .any(|item| item.starts_with("partition table")),
+            "{:?}",
+            nudge.lines
+        );
         for column in [ROW_ID_COLUMN, "metadata"] {
             assert!(
                 !nudge.differing.iter().any(|item| item.ends_with(column)),
@@ -729,16 +904,16 @@ mod tests {
         )
         .await;
 
-        let expected = compare(&full, &bare, INDEX, true).await;
+        let expected = compare(&full, &bare, INDEX, true, false).await;
         assert!(expected.differing.is_empty(), "{:?}", expected.lines);
-        let unexpected = compare(&full, &bare, INDEX, false).await;
+        let unexpected = compare(&full, &bare, INDEX, false, false).await;
         assert_eq!(
             unexpected.differing,
             ["vector sources", "part_00000.idx __vector"],
             "{:?}",
             unexpected.lines
         );
-        let reversed = compare(&bare, &full, INDEX, true).await;
+        let reversed = compare(&bare, &full, INDEX, true, false).await;
         assert!(
             reversed.differing.contains(&"vector sources".to_string()),
             "{:?}",

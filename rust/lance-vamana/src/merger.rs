@@ -75,6 +75,7 @@ use crate::builder::{
     read_vectors,
 };
 use crate::consolidator::dead_by_partition;
+use crate::entry_points::{describe_entry_point_params, train_stored};
 use crate::format::{FORMAT_VERSION, IndexMetadata};
 use crate::insert::concat_vectors;
 use crate::inserter::inherited_params;
@@ -229,6 +230,21 @@ pub async fn merge_index(dataset: &mut Dataset, index_name: &str) -> Result<Merg
                 segment.uuid, base.uuid
             )));
         }
+        // Refused before anything is read rather than found out partway: a
+        // partition the merge writes is retrained under the base's parameters
+        // whatever its segment used, while one copied over from that segment is
+        // refused by the writer, which takes only lists its metadata describes.
+        let entry_point_params = &segment.manifest.metadata().entry_point_params;
+        if *entry_point_params != base.manifest.metadata().entry_point_params {
+            return Err(Error::invalid_input(format!(
+                "Vamana cannot merge index '{index_name}': segment {} trained its entry points \
+                 under {} where segment {} trained them under {}; rebuild the index",
+                segment.uuid,
+                describe_entry_point_params(entry_point_params.as_ref()),
+                base.uuid,
+                describe_entry_point_params(base.manifest.metadata().entry_point_params.as_ref())
+            )));
+        }
     }
 
     let column = index_column(dataset, index_name, &base.fields)?;
@@ -335,11 +351,12 @@ pub async fn merge_index(dataset: &mut Dataset, index_name: &str) -> Result<Merg
             Folded::Written {
                 partition,
                 medoid,
+                entry_points,
                 rebuilt,
                 comparisons,
             } => {
                 writer
-                    .write_partition(partition_id, medoid, &partition)
+                    .write_partition(partition_id, medoid, entry_points, &partition)
                     .await?;
                 stats.comparisons = stats.comparisons.saturating_add(comparisons);
                 stats.partitions_written += 1;
@@ -494,6 +511,7 @@ enum Folded<'a> {
     Written {
         partition: Partition,
         medoid: u32,
+        entry_points: Arc<[u32]>,
         rebuilt: bool,
         comparisons: u64,
     },
@@ -700,12 +718,23 @@ async fn fold_partition<'a>(
         Ok::<_, Error>((partition, medoid, rebuilt, comparisons.get()))
     })
     .await?;
+    // Retrained whichever way the partition was made: its vertices are the
+    // live ones of every source it folded and the rows that arrived, all
+    // renumbered, so no stored list keeps its meaning.
+    let entry_points = train_stored(
+        &partition,
+        distance_type,
+        fold.metadata.entry_point_params.as_ref(),
+        (0..partition.len() as u32).collect(),
+    )
+    .await?;
 
     Ok((
         folding,
         Folded::Written {
             partition,
             medoid,
+            entry_points,
             rebuilt,
             comparisons,
         },

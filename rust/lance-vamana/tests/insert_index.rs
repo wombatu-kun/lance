@@ -15,7 +15,7 @@
 //! duplicates the recall numbers below would still move, but they would move
 //! because ties broke differently.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
@@ -26,10 +26,12 @@ use lance::dataset::index::frag_reuse::cleanup_frag_reuse_index;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
+use lance_core::utils::address::RowAddress;
 use lance_file::version::LanceFileVersion;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, build_index_segment, create_index, live_fragments};
 use lance_vamana::consolidator::consolidate_index;
+use lance_vamana::entry_points::EntryPointParams;
 use lance_vamana::format::VectorSource;
 use lance_vamana::inserter::{InsertStats, insert_as_segment, insert_in_place};
 use lance_vamana::merger::merge_index;
@@ -40,8 +42,9 @@ use uuid::Uuid;
 mod common;
 use common::{
     DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, WIDE_DIM, assert_twins_hold_the_same, brute_force,
-    commit_overlay_of, live_row_ids, random_vectors, random_vectors_of, read_committed_segments,
-    recall, twin_params, twins, wide_fixture,
+    commit_overlay_of, live_row_ids, maintained_entry_point_params, random_vectors,
+    random_vectors_of, read_committed_segments, recall, retrained_entry_points,
+    stored_entry_points, twin_params, twins, wide_fixture,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
@@ -64,13 +67,17 @@ fn base_graph() -> BuildParams {
     }
 }
 
-/// Three fragments of 512 rows, indexed over eight partitions.
+/// Three fragments of 512 rows, indexed over eight partitions, without entry
+/// points: the tests of entry points build them on purpose, and training them
+/// in every pass would cost a debug build several times its graph.
 async fn indexed_dataset(uri: &str) -> Dataset {
     let mut dataset = DatasetFixture::default().write(uri).await;
     create_index(
         &mut dataset,
         INDEX_NAME,
-        &IndexParams::new(VECTOR_COLUMN, PARTITIONS).with_graph_params(base_graph()),
+        &IndexParams::new(VECTOR_COLUMN, PARTITIONS)
+            .with_graph_params(base_graph())
+            .without_entry_points(),
     )
     .await
     .unwrap();
@@ -929,5 +936,231 @@ async fn inserting_in_place_refuses_a_segment_whose_fragments_are_gone() {
         error.contains("the dataset no longer has")
             && error.contains("consolidate the index first"),
         "the refusal does not name the cause and the remedy: {error}"
+    );
+}
+
+/// [`indexed_dataset`] with entry points ([`maintained_entry_point_params`]).
+async fn indexed_with_entry_points(uri: &str) -> Dataset {
+    let mut dataset = DatasetFixture::default().write(uri).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &IndexParams::new(VECTOR_COLUMN, PARTITIONS)
+            .with_graph_params(base_graph())
+            .with_entry_point_params(maintained_entry_point_params()),
+    )
+    .await
+    .unwrap();
+    dataset
+}
+
+/// One segment's stored or retrained entry points by partition id.
+fn of_segment(
+    entry_points: &BTreeMap<(Uuid, u32), Vec<u32>>,
+    segment: Uuid,
+) -> BTreeMap<u32, Vec<u32>> {
+    entry_points
+        .iter()
+        .filter(|((uuid, _), _)| *uuid == segment)
+        .map(|((_, partition_id), entries)| (*partition_id, entries.clone()))
+        .collect()
+}
+
+/// The row an entry point of `partition_id` of the base stands for.
+async fn entry_point_row(dataset: &Dataset, partition_id: u32) -> u64 {
+    let segments = read_committed_segments(dataset, INDEX_NAME).await;
+    let entry = segments[0].manifest.partition(partition_id).unwrap();
+    segments[0].partitions[&partition_id].graph().row_ids()[entry.entry_points[0] as usize]
+}
+
+/// An insert in place trains the entry points of the partition it grows over
+/// the vertices still live and the new ones, and carries the list of a
+/// partition it copies as it is. Rows aimed at one partition grow it alone,
+/// and an entry point is deleted from it and from a partition left to be
+/// copied: the grown one's list is what training at open trains, the copied
+/// one's still names its deleted vertex, which training at open would not.
+#[tokio::test]
+async fn an_insert_trains_what_it_grows_and_carries_what_it_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_with_entry_points(uri).await;
+    let segments = read_committed_segments(&dataset, INDEX_NAME).await;
+    let mut ids = segments[0].partitions.keys().copied().collect::<Vec<_>>();
+    ids.sort_unstable();
+    let (grown, copied) = (ids[0], ids[1]);
+    let aimed = {
+        let partition = &segments[0].partitions[&grown];
+        (0..partition.len() as u32)
+            .map(|local| partition.vector(local).unwrap().to_vec())
+            .collect::<Vec<_>>()
+    };
+    for partition_id in [grown, copied] {
+        let row = entry_point_row(&dataset, partition_id).await;
+        dataset.delete(&format!("_rowid = {row}")).await.unwrap();
+    }
+    let before = stored_entry_points(&dataset, INDEX_NAME).await;
+    let base = segments[0].uuid;
+
+    let mut dataset = append_vectors(uri, &aimed).await;
+    let stats = insert_in_place(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(
+        (stats.partitions_grown, stats.partitions_created),
+        (1, 0),
+        "{stats:?}"
+    );
+    let segment = read_committed_segments(&dataset, INDEX_NAME).await[0].uuid;
+    let stored = of_segment(&stored_entry_points(&dataset, INDEX_NAME).await, segment);
+    let retrained = of_segment(&retrained_entry_points(&dataset, INDEX_NAME).await, segment);
+    let before = of_segment(&before, base);
+    assert_eq!(stored[&grown], retrained[&grown]);
+    assert_eq!(stored[&copied], before[&copied]);
+    assert_ne!(
+        stored[&copied], retrained[&copied],
+        "the copied partition's deleted entry point did not change what training at open trains, \
+         so nothing here tells carrying from retraining"
+    );
+}
+
+/// A partition consolidation dropped and an insert creates again trains its
+/// entry points as a build would: every one of its vertices is new.
+#[tokio::test]
+async fn a_partition_an_insert_creates_trains_its_entry_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_with_entry_points(uri).await;
+    let segments = read_committed_segments(&dataset, INDEX_NAME).await;
+    let (emptied, partition) = segments[0]
+        .partitions
+        .iter()
+        .min_by_key(|(_, partition)| partition.len())
+        .unwrap();
+    let emptied = *emptied;
+    let doomed = partition.graph().row_ids().to_vec();
+    let vectors = (0..partition.len() as u32)
+        .map(|local| partition.vector(local).unwrap().to_vec())
+        .collect::<Vec<_>>();
+    dataset
+        .delete(&format!(
+            "_rowid IN ({})",
+            doomed
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .await
+        .unwrap();
+    let consolidated = consolidate_index(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(consolidated.partitions_dropped, 1, "{consolidated:?}");
+
+    let mut dataset = append_vectors(uri, &vectors).await;
+    let stats = insert_in_place(&mut dataset, INDEX_NAME).await.unwrap();
+    assert!(stats.partitions_created > 0, "{stats:?}");
+    let stored = stored_entry_points(&dataset, INDEX_NAME).await;
+    let segment = read_committed_segments(&dataset, INDEX_NAME).await[0].uuid;
+    assert!(!stored[&(segment, emptied)].is_empty());
+    assert_eq!(stored, retrained_entry_points(&dataset, INDEX_NAME).await);
+}
+
+/// The new rows of a grown partition are live by position, not by the row
+/// filter: once another segment has moved, the filter of the index the insert
+/// opened admits only rows inside the coverage each segment had then, and the
+/// new fragments are in none of it. Here the delta moves and the base does
+/// not, so the insert goes ahead and the trap is armed; the base's lists still
+/// come out as training at open trains them, new rows included.
+#[tokio::test]
+async fn an_insert_beside_a_moved_segment_counts_its_new_rows_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    indexed_with_entry_points(uri).await;
+    let mut dataset = with_new_rows(uri, 99).await;
+    insert_as_segment(&mut dataset, INDEX_NAME).await.unwrap();
+    let delta = committed_uuids(&dataset).await[1];
+    // One deleted row makes the delta's first fragment, and only that one,
+    // worth rewriting.
+    let row = RowAddress::new_from_parts(3, 7);
+    dataset
+        .delete(&format!("_rowid = {}", u64::from(row)))
+        .await
+        .unwrap();
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            target_rows_per_fragment: 512,
+            materialize_deletions_threshold: 0.001,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (metrics.fragments_removed, metrics.fragments_added),
+        (1, 1),
+        "{metrics:?}"
+    );
+    let moved = u64::from(RowAddress::new_from_parts(3, 0));
+    assert_ne!(
+        dataset
+            .frag_reuse_index()
+            .await
+            .unwrap()
+            .expect("the compaction left no record of the move")
+            .remap_row_id(moved),
+        Some(moved),
+        "the delta did not move"
+    );
+
+    let mut dataset = with_new_rows(uri, 1234).await;
+    let stats = insert_in_place(&mut dataset, INDEX_NAME).await.unwrap();
+    assert!(stats.partitions_grown > 0, "{stats:?}");
+    let uuids = committed_uuids(&dataset).await;
+    assert_eq!(uuids.len(), 2);
+    assert!(uuids.contains(&delta), "the moved delta did not survive");
+    let base = *uuids.iter().find(|uuid| **uuid != delta).unwrap();
+    let stored = of_segment(&stored_entry_points(&dataset, INDEX_NAME).await, base);
+    assert!(
+        stored.values().any(|entries| !entries.is_empty()),
+        "the base stores no entry points: {stored:?}"
+    );
+    assert_eq!(
+        stored,
+        of_segment(&retrained_entry_points(&dataset, INDEX_NAME).await, base)
+    );
+}
+
+/// A delta trains its entry points under the base's parameters, not under the
+/// default its own build parameters would ask for.
+#[tokio::test]
+async fn a_delta_trains_its_entry_points_under_the_bases_parameters() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let params = EntryPointParams::new(4).with_seed(7);
+    let mut dataset = DatasetFixture::default().write(uri).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &IndexParams::new(VECTOR_COLUMN, PARTITIONS)
+            .with_graph_params(base_graph())
+            .with_entry_point_params(params.clone()),
+    )
+    .await
+    .unwrap();
+    let mut dataset = with_new_rows(uri, 99).await;
+    insert_as_segment(&mut dataset, INDEX_NAME).await.unwrap();
+
+    let segments = read_committed_segments(&dataset, INDEX_NAME).await;
+    assert_eq!(segments.len(), 2);
+    for segment in &segments {
+        assert_eq!(
+            segment.manifest.metadata().entry_point_params,
+            Some(params.clone())
+        );
+    }
+    let delta = segments[1].uuid;
+    assert_eq!(
+        of_segment(&stored_entry_points(&dataset, INDEX_NAME).await, delta),
+        of_segment(&retrained_entry_points(&dataset, INDEX_NAME).await, delta)
     );
 }

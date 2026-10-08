@@ -32,7 +32,7 @@ mod raw;
 pub mod search;
 pub mod segment;
 
-pub use builder::{BuildStats, IndexParams, create_index};
+pub use builder::{BuildStats, EntryPointRequest, IndexParams, create_index};
 pub use codes::{CodeParams, CodeSpec};
 pub use consolidate::{Consolidated, consolidate_partition};
 pub use consolidator::{ConsolidateStats, consolidate_index};

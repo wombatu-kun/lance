@@ -107,7 +107,7 @@ use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, create_index};
 use lance_vamana::codes::CodeSpec;
-use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode};
+use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode, WalkStart};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -633,10 +633,13 @@ async fn main() {
     for arm in &arms {
         let mut points = Vec::with_capacity(beams.len());
         for beam in &beams {
+            // At the medoid, where the figures quoted from this example were
+            // taken: the index it builds stores entry points by default.
             let mut params = SearchParams::new(K)
                 .with_nprobes(nprobes)
                 .with_search_list_size(*beam)
                 .with_mode(arm.mode)
+                .with_start(WalkStart::Medoid)
                 .with_beam_width(arm.width);
             if arm.pooled {
                 params = params.with_rescore_budget(*beam);

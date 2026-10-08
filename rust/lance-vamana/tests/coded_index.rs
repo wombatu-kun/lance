@@ -67,6 +67,9 @@ fn fixture() -> DatasetFixture {
     }
 }
 
+/// Without entry points: what is asked here is the codes, and training entry
+/// points in every build and pass would cost a debug build several times its
+/// graph.
 fn params(codes: CodeSpec) -> IndexParams {
     IndexParams::new(VECTOR_COLUMN, PARTITIONS)
         .with_graph_params(BuildParams {
@@ -75,6 +78,7 @@ fn params(codes: CodeSpec) -> IndexParams {
             ..Default::default()
         })
         .with_codes(codes)
+        .without_entry_points()
 }
 
 async fn coded_dataset(uri: &str, codes: CodeSpec) -> Dataset {
@@ -341,7 +345,11 @@ async fn codes_a_build_cannot_mint_are_refused_before_a_row_is_read() {
     .await
     .unwrap();
 
-    let with = |codes| IndexParams::new(VECTOR_COLUMN, 2).with_codes(codes);
+    let with = |codes| {
+        IndexParams::new(VECTOR_COLUMN, 2)
+            .with_codes(codes)
+            .without_entry_points()
+    };
     let error = create_index(&mut dataset, INDEX_NAME, &with(RABIT))
         .await
         .unwrap_err();

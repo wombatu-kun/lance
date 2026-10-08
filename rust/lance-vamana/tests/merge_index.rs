@@ -25,8 +25,13 @@ use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_vamana::build::BuildParams;
-use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
+use lance_vamana::builder::{
+    INDEX_DETAILS_TYPE_URL, IndexParams, build_index_segment, create_index,
+};
+use lance_vamana::consolidator::consolidate_index;
+use lance_vamana::format::{FORMAT_VERSION, IndexMetadata};
 use lance_vamana::inserter::insert_as_segment;
+use lance_vamana::io::SegmentWriter;
 use lance_vamana::merger::{MergeStats, merge_index};
 use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode, committed_segments};
 use roaring::RoaringBitmap;
@@ -35,8 +40,9 @@ use uuid::Uuid;
 mod common;
 use common::{
     DatasetFixture, VECTOR_COLUMN, VECTOR_DIM, assert_twins_hold_the_same, brute_force,
-    compact_indexed, live_row_ids, random_vectors, read_committed_segments, recall, twin_params,
-    twins, wide_fixture,
+    committed_manifests, compact_indexed, live_row_ids, maintained_entry_point_params,
+    random_vectors, read_committed_segments, recall, retrained_entry_points, sample_partition,
+    stored_entry_points, twin_params, twins, wide_fixture,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
@@ -57,8 +63,14 @@ fn base_graph() -> BuildParams {
     }
 }
 
+/// Without entry points: the tests of entry points build them on purpose, and
+/// training them in every pass would cost a debug build several times its graph.
 async fn indexed_dataset(uri: &str) -> Dataset {
-    indexed_dataset_with(uri, IndexParams::new(VECTOR_COLUMN, PARTITIONS)).await
+    indexed_dataset_with(
+        uri,
+        IndexParams::new(VECTOR_COLUMN, PARTITIONS).without_entry_points(),
+    )
+    .await
 }
 
 /// [`indexed_dataset`] built from `params`, with the fixture's own graph.
@@ -709,5 +721,189 @@ async fn a_merged_index_answers_as_well_as_a_rebuild() {
     assert!(
         grown_recall >= built_recall - 0.02,
         "a merged index answers at {grown_recall} where one built whole answers at {built_recall}"
+    );
+}
+
+/// [`indexed_dataset`] with entry points ([`maintained_entry_point_params`]).
+async fn indexed_with_entry_points(uri: &str) -> Dataset {
+    indexed_dataset_with(
+        uri,
+        IndexParams::new(VECTOR_COLUMN, PARTITIONS)
+            .with_entry_point_params(maintained_entry_point_params()),
+    )
+    .await
+}
+
+/// A merge trains the entry points of every partition it writes - a base's
+/// with a delta's folded in and a deleted entry point taken out, and one no
+/// segment holds that only new rows fill - so that afterwards every list is
+/// what training at open trains. The delta is aimed at the folded partition
+/// alone, so that no segment holds the emptied one when the merge runs.
+#[tokio::test]
+async fn a_merge_trains_the_entry_points_of_what_it_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = indexed_with_entry_points(uri).await;
+    let segments = read_committed_segments(&dataset, INDEX_NAME).await;
+    // The smallest partition is emptied and consolidated away, and its rows
+    // come back as new ones, which only a merge's new-partition path takes in.
+    let (emptied, partition) = segments[0]
+        .partitions
+        .iter()
+        .min_by_key(|(_, partition)| partition.len())
+        .unwrap();
+    let emptied = *emptied;
+    let doomed = partition.graph().row_ids().to_vec();
+    let vectors = (0..partition.len() as u32)
+        .map(|local| partition.vector(local).unwrap().to_vec())
+        .collect::<Vec<_>>();
+    dataset
+        .delete(&format!(
+            "_rowid IN ({})",
+            doomed
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .await
+        .unwrap();
+    let consolidated = consolidate_index(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(consolidated.partitions_dropped, 1, "{consolidated:?}");
+
+    let base = &read_committed_segments(&dataset, INDEX_NAME).await[0];
+    let folded = base
+        .manifest
+        .partitions()
+        .iter()
+        .find(|entry| entry.partition_id != emptied)
+        .unwrap();
+    let aimed = {
+        let partition = &base.partitions[&folded.partition_id];
+        (0..partition.len() as u32)
+            .map(|local| partition.vector(local).unwrap().to_vec())
+            .collect::<Vec<_>>()
+    };
+    let row =
+        base.partitions[&folded.partition_id].graph().row_ids()[folded.entry_points[0] as usize];
+    let mut dataset = append_vectors(uri, &aimed).await;
+    insert_as_segment(&mut dataset, INDEX_NAME).await.unwrap();
+    dataset.delete(&format!("_rowid = {row}")).await.unwrap();
+    let segments = read_committed_segments(&dataset, INDEX_NAME).await;
+    assert_eq!(
+        segments[1].partitions.keys().copied().collect::<Vec<_>>(),
+        vec![folded.partition_id],
+        "the delta holds other partitions than the one it was aimed at"
+    );
+    assert!(
+        segments
+            .iter()
+            .all(|segment| !segment.partitions.contains_key(&emptied)),
+        "a segment holds partition {emptied}, so the merge folds it rather than writes it new"
+    );
+    let mut dataset = append_vectors(uri, &vectors).await;
+
+    let stats = merge_index(&mut dataset, INDEX_NAME).await.unwrap();
+    assert!(
+        stats.partitions_written > 0 && stats.vertices_removed > 0,
+        "{stats:?}"
+    );
+    let stored = stored_entry_points(&dataset, INDEX_NAME).await;
+    let segment = committed_uuids(&dataset).await[0];
+    assert!(
+        !stored[&(segment, emptied)].is_empty(),
+        "partition {emptied} came back without entry points"
+    );
+    assert_eq!(stored, retrained_entry_points(&dataset, INDEX_NAME).await);
+}
+
+/// A merge of segments whose entry points were trained under different
+/// parameters is refused before anything is read: a partition it writes would
+/// be retrained under the base's whatever its segment used, and one it copies
+/// is a list the merged segment's metadata does not describe. Every build of
+/// one index inherits its base's, so the other segment is written by hand.
+#[tokio::test]
+async fn a_merge_of_segments_trained_apart_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    indexed_with_entry_points(uri).await;
+    let mut dataset = with_new_rows(uri, 99).await;
+    let (base_uuid, base) = committed_manifests(&dataset, INDEX_NAME).await.remove(0);
+    let covered = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .filter(|id| !base.metadata().fragments.contains(id))
+        .collect::<Vec<_>>();
+    let other = maintained_entry_point_params().with_seed(8);
+    let uuid = Uuid::new_v4();
+    let mut writer = SegmentWriter::new(
+        dataset.object_store(None).await.unwrap(),
+        dataset.indices_dir().join(uuid.to_string()),
+        IndexMetadata {
+            fragments: covered.clone(),
+            entry_point_params: Some(other.clone()),
+            ..base.metadata().clone()
+        },
+        base.ivf().clone(),
+    );
+    writer
+        .write_partition(
+            0,
+            0,
+            Arc::from([]),
+            &sample_partition(base.metadata().max_degree, 8, VECTOR_DIM as u32),
+        )
+        .await
+        .unwrap();
+    writer.finish().await.unwrap();
+    dataset
+        .commit_existing_index_segments(
+            INDEX_NAME,
+            VECTOR_COLUMN,
+            vec![lance::index::IndexSegment::new(
+                uuid,
+                covered,
+                [dataset.schema().field(VECTOR_COLUMN).unwrap().id],
+                Arc::new(prost_types::Any {
+                    type_url: INDEX_DETAILS_TYPE_URL.to_string(),
+                    value: Vec::new(),
+                }),
+                FORMAT_VERSION as i32,
+                dataset.manifest.version,
+                vec![],
+            )],
+        )
+        .await
+        .unwrap();
+    // Rows no segment covers, which the merge would read as arrivals before
+    // a refusal that came after them.
+    let indexed = dataset.get_fragments().len();
+    let mut dataset = with_new_rows(uri, 1234).await;
+    assert!(dataset.get_fragments().len() > indexed, "nothing arrived");
+    let version = dataset.manifest.version;
+
+    // The data files out of reach, so that a refusal after the arrivals were
+    // read would fail on them instead.
+    let data_files = dir.path().join("data");
+    assert!(std::fs::read_dir(&data_files).unwrap().count() > 0);
+    let away = dir.path().join("data.away");
+    std::fs::rename(&data_files, &away).unwrap();
+    let error = merge_index(&mut dataset, INDEX_NAME).await.unwrap_err();
+    std::fs::rename(&away, &data_files).unwrap();
+    assert!(
+        matches!(error, lance_core::Error::InvalidInput { .. }),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!(
+            "segment {uuid} trained its entry points under {other}"
+        )) && message.contains(&format!("where segment {base_uuid} trained them under")),
+        "{message}"
+    );
+    assert_eq!(
+        dataset.manifest.version, version,
+        "the refused merge committed"
     );
 }

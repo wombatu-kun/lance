@@ -5,15 +5,18 @@
 
 use std::sync::Arc;
 
+use arrow_array::builder::{ListBuilder, UInt32Builder};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt32Type;
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use lance_core::{Error, Result};
 use lance_index::vector::ivf::storage::IvfModel;
 
+use crate::entry_points::EntryPointParams;
 use crate::format::{
-    FILE_COLUMN, FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata, MAX_PARTITION_ROWS, MEDOID_COLUMN,
-    MIN_DATASET_VECTOR_DIMENSION, NUM_ROWS_COLUMN, PARTITION_ID_COLUMN, VectorSource, index_schema,
+    ENTRY_POINTS_COLUMN, FILE_COLUMN, FORMAT_VERSION, INDEX_FILE_NAME, IndexMetadata,
+    MAX_PARTITION_ROWS, MEDOID_COLUMN, MIN_DATASET_VECTOR_DIMENSION, NUM_ROWS_COLUMN,
+    PARTITION_ID_COLUMN, VectorSource, entry_point_item, index_schema,
 };
 
 /// One non-empty partition of a segment.
@@ -23,6 +26,16 @@ pub struct PartitionEntry {
     /// Local id of the vertex a search starts from, recomputed on every
     /// consolidation: after deletions the old entry point may be gone.
     pub medoid: u32,
+    /// Local ids of the vertices a walk may start at instead, ascending: the
+    /// vertex nearest each centroid of a k-means over the partition's live
+    /// vectors, trained under the segment's
+    /// [`IndexMetadata::entry_point_params`] when the partition was last
+    /// written from its vectors. Empty in a segment that keeps none, and in a
+    /// partition too small to train any.
+    ///
+    /// Behind an `Arc` because every probe of a query clones the entry it
+    /// reads.
+    pub entry_points: Arc<[u32]>,
     pub num_rows: u32,
     /// File name within the segment directory, never a path.
     ///
@@ -101,6 +114,11 @@ impl SegmentManifest {
                 )));
             }
         }
+        // Refused by the builder too. Here they also stop parameters off disk
+        // that a maintenance pass would train under: a sample rate of zero
+        // panics inside the sampler, and a rule giving a smaller partition more
+        // entry points breaks the length check on every list below.
+        check_entry_point_params(&metadata)?;
 
         // Lance packs every partition into one file, so its own `IvfModel`
         // doubles as a row-count table. Ours does not: the partition table is
@@ -159,6 +177,12 @@ impl SegmentManifest {
                     entry.partition_id, entry.medoid, entry.num_rows
                 )));
             }
+            check_entry_points(
+                metadata.entry_point_params.as_ref(),
+                entry.partition_id,
+                &entry.entry_points,
+                entry.num_rows,
+            )?;
             // `NO_NEIGHBOR` takes the top local id, and the bound keeps a
             // partition's ids clear of it with one row to spare - the ids of an
             // `n`-row partition stop at `n - 1`, so this refuses one count
@@ -225,6 +249,27 @@ impl SegmentManifest {
             .iter()
             .map(|entry| entry.medoid)
             .collect::<Vec<_>>();
+        // The builder panics past `i32` offsets rather than failing, so the
+        // total is checked before it is asked.
+        let total = self
+            .partitions
+            .iter()
+            .map(|entry| entry.entry_points.len())
+            .sum::<usize>();
+        if i32::try_from(total).is_err() {
+            return Err(Error::invalid_input(format!(
+                "Vamana partition table lists {total} entry points, more than one column of it \
+                 can hold"
+            )));
+        }
+        let mut entry_points =
+            ListBuilder::with_capacity(UInt32Builder::with_capacity(total), self.partitions.len())
+                .with_field(entry_point_item());
+        for entry in &self.partitions {
+            entry_points.values().append_slice(&entry.entry_points);
+            entry_points.append(true);
+        }
+        let entry_points = entry_points.finish();
         let num_rows = self
             .partitions
             .iter()
@@ -241,6 +286,7 @@ impl SegmentManifest {
             vec![
                 Arc::new(UInt32Array::from(partition_ids)),
                 Arc::new(UInt32Array::from(medoids)),
+                Arc::new(entry_points),
                 Arc::new(UInt32Array::from(num_rows)),
                 Arc::new(StringArray::from(files)),
             ],
@@ -254,6 +300,7 @@ impl SegmentManifest {
     ) -> Result<Self> {
         let partition_ids = u32_column(batch, PARTITION_ID_COLUMN)?;
         let medoids = u32_column(batch, MEDOID_COLUMN)?;
+        let entry_points = entry_points_column(batch)?;
         let num_rows = u32_column(batch, NUM_ROWS_COLUMN)?;
         let files = batch
             .column_by_name(FILE_COLUMN)
@@ -278,15 +325,129 @@ impl SegmentManifest {
         })?;
 
         let partitions = (0..batch.num_rows())
-            .map(|row| PartitionEntry {
-                partition_id: partition_ids[row],
-                medoid: medoids[row],
-                num_rows: num_rows[row],
-                file: files.value(row).to_string(),
+            .map(|row| {
+                Ok(PartitionEntry {
+                    partition_id: partition_ids[row],
+                    medoid: medoids[row],
+                    entry_points: entry_points.of(row)?,
+                    num_rows: num_rows[row],
+                    file: files.value(row).to_string(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Self::try_new(metadata, ivf, partitions)
     }
+}
+
+/// What a segment's entry point parameters have to be: ones training can run
+/// with, and kept only beside codes, which a walk chooses among them by.
+pub(crate) fn check_entry_point_params(metadata: &IndexMetadata) -> Result<()> {
+    if let Some(params) = &metadata.entry_point_params {
+        params.validate()?;
+        if metadata.codes.is_none() {
+            return Err(Error::invalid_input(
+                "Vamana segment keeps entry points but carries no codes, and a walk chooses among \
+                 its entry points by code"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What a partition's stored entry points have to be for the segment listing
+/// them: none where the segment keeps none, and otherwise what training under
+/// its parameters could have produced ([`EntryPointParams::list_problem`]).
+pub(crate) fn check_entry_points(
+    params: Option<&EntryPointParams>,
+    partition_id: u32,
+    entry_points: &[u32],
+    num_rows: u32,
+) -> Result<()> {
+    let problem = match params {
+        Some(params) => params.list_problem(entry_points, num_rows),
+        None if entry_points.is_empty() => None,
+        None => Some(format!(
+            "lists {} entry points in a segment that keeps none",
+            entry_points.len()
+        )),
+    };
+    match problem {
+        Some(problem) => Err(Error::invalid_input(format!(
+            "Vamana partition {partition_id} {problem}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The [`ENTRY_POINTS_COLUMN`] of a partition table, read row by row.
+struct EntryPointLists<'a> {
+    offsets: &'a [i32],
+    ids: &'a [u32],
+}
+
+impl EntryPointLists<'_> {
+    fn of(&self, row: usize) -> Result<Arc<[u32]>> {
+        let corrupt = || {
+            Error::corrupt_file_named(
+                ENTRY_POINTS_COLUMN,
+                format!(
+                    "Vamana partition table column {ENTRY_POINTS_COLUMN} has offsets that do not \
+                     bracket row {row} inside its {} entry points",
+                    self.ids.len()
+                ),
+            )
+        };
+        let (Some(&start), Some(&end)) = (self.offsets.get(row), self.offsets.get(row + 1)) else {
+            return Err(corrupt());
+        };
+        let (start, end) = (
+            usize::try_from(start).map_err(|_| corrupt())?,
+            usize::try_from(end).map_err(|_| corrupt())?,
+        );
+        Ok(Arc::from(self.ids.get(start..end).ok_or_else(corrupt)?))
+    }
+}
+
+/// The table's entry point lists, refusing a null list or a null id inside
+/// one for the reason [`u32_column`] refuses a null: `values()` reads through
+/// the mask, and a null id would become vertex 0.
+fn entry_points_column(batch: &RecordBatch) -> Result<EntryPointLists<'_>> {
+    let column = batch
+        .column_by_name(ENTRY_POINTS_COLUMN)
+        .ok_or_else(|| missing_column(ENTRY_POINTS_COLUMN))?;
+    let wrong_type = || {
+        Error::corrupt_file_named(
+            ENTRY_POINTS_COLUMN,
+            format!(
+                "Vamana partition table column {ENTRY_POINTS_COLUMN} has type {}, expected a \
+                 list of UInt32",
+                column.data_type()
+            ),
+        )
+    };
+    if column.null_count() != 0 {
+        return Err(Error::corrupt_file_named(
+            ENTRY_POINTS_COLUMN,
+            format!("Vamana partition table column {ENTRY_POINTS_COLUMN} holds nulls"),
+        ));
+    }
+    let lists = column.as_list_opt::<i32>().ok_or_else(wrong_type)?;
+    if lists.values().null_count() != 0 {
+        return Err(Error::corrupt_file_named(
+            ENTRY_POINTS_COLUMN,
+            format!("Vamana partition table column {ENTRY_POINTS_COLUMN} holds null entry points"),
+        ));
+    }
+    let ids = lists
+        .values()
+        .as_primitive_opt::<UInt32Type>()
+        .ok_or_else(wrong_type)?
+        .values();
+    Ok(EntryPointLists {
+        offsets: lists.value_offsets(),
+        ids,
+    })
 }
 
 /// A name a segment may give one of its partition files.
@@ -345,7 +506,7 @@ fn u32_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a [u32]> {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, ListArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_linalg::distance::DistanceType;
@@ -365,7 +526,21 @@ mod tests {
             row_id_mode: RowIdMode::Address,
             fragments: vec![0],
             codes: None,
+            entry_point_params: None,
             vector_source: VectorSource::Index,
+        }
+    }
+
+    /// A segment keeping entry points: codes, and four a partition above
+    /// eight live vertices, two at or below it.
+    fn keeping_entry_points(dimension: u32) -> IndexMetadata {
+        IndexMetadata {
+            codes: Some(CodeParams::Scalar {
+                num_bits: 8,
+                bounds: 0.0..1.0,
+            }),
+            entry_point_params: Some(EntryPointParams::new(4).with_small_partitions(8, 2)),
+            ..metadata(dimension)
         }
     }
 
@@ -381,9 +556,15 @@ mod tests {
         PartitionEntry {
             partition_id,
             medoid: num_rows / 2,
+            entry_points: Arc::from(Vec::new()),
             num_rows,
             file: partition_file_name(partition_id),
         }
+    }
+
+    fn with_entry_points(mut entry: PartitionEntry, ids: &[u32]) -> PartitionEntry {
+        entry.entry_points = Arc::from(ids);
+        entry
     }
 
     #[test]
@@ -398,6 +579,110 @@ mod tests {
             SegmentManifest::try_from_batch(metadata(4), ivf(8, 4), &manifest.to_batch().unwrap())
                 .unwrap();
         assert_eq!(restored.partitions(), manifest.partitions());
+
+        // Lists of every length the rule allows here, an empty one between two
+        // that are not, so that an offset off by one moves ids across rows.
+        let manifest = SegmentManifest::try_new(
+            keeping_entry_points(4),
+            ivf(8, 4),
+            vec![
+                with_entry_points(entry(0, 10), &[1, 4, 7, 9]),
+                entry(3, 7),
+                with_entry_points(entry(5, 8), &[0, 6]),
+                entry(7, 1),
+            ],
+        )
+        .unwrap();
+        let batch = manifest.to_batch().unwrap();
+        assert_eq!(batch.schema().as_ref(), &index_schema());
+        let restored =
+            SegmentManifest::try_from_batch(keeping_entry_points(4), ivf(8, 4), &batch).unwrap();
+        assert_eq!(restored.partitions(), manifest.partitions());
+    }
+
+    /// Lists no training under the segment's parameters could have produced.
+    /// Each expectation names its own rule, so that a check removed shows as
+    /// another error or none.
+    #[test]
+    fn entry_points_the_segment_could_not_have_trained_are_rejected() {
+        for (metadata, entry, expected) in [
+            (
+                metadata(4),
+                with_entry_points(entry(0, 10), &[3]),
+                "1 entry points in a segment that keeps none",
+            ),
+            (
+                keeping_entry_points(4),
+                with_entry_points(entry(0, 10), &[0, 1, 2, 3, 4]),
+                "more than the 4 its parameters train in a partition of 10 vertices",
+            ),
+            (
+                keeping_entry_points(4),
+                with_entry_points(entry(0, 8), &[0, 1, 2]),
+                "more than the 2 its parameters train in a partition of 8 vertices",
+            ),
+            (
+                keeping_entry_points(4),
+                with_entry_points(entry(0, 10), &[4, 2]),
+                "4 comes before 2",
+            ),
+            (
+                keeping_entry_points(4),
+                with_entry_points(entry(0, 10), &[2, 2]),
+                "2 comes before 2",
+            ),
+            (
+                keeping_entry_points(4),
+                with_entry_points(entry(0, 10), &[1, 10]),
+                "entry point 10 but holds only 10 vertices",
+            ),
+        ] {
+            let error = SegmentManifest::try_new(metadata, ivf(8, 4), vec![entry]).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        // The bound is the size's, not the live count's: a partition of ten
+        // whose four entry points were trained over eight live ones is fine.
+        SegmentManifest::try_new(
+            keeping_entry_points(4),
+            ivf(8, 4),
+            vec![with_entry_points(entry(0, 10), &[0, 3, 6, 9])],
+        )
+        .unwrap();
+    }
+
+    /// The parameters a maintenance pass would train under are checked on the
+    /// way in, so that none off disk reaches the sampler.
+    #[test]
+    fn entry_point_parameters_no_build_would_record_are_rejected() {
+        for (metadata, expected) in [
+            (
+                IndexMetadata {
+                    entry_point_params: Some(EntryPointParams::default().with_sample_rate(0)),
+                    ..keeping_entry_points(4)
+                },
+                "sample_rate 0",
+            ),
+            (
+                IndexMetadata {
+                    entry_point_params: Some(EntryPointParams::new(4).with_small_partitions(8, 5)),
+                    ..keeping_entry_points(4)
+                },
+                "small_partition_entries 5 is more than num_entries 4",
+            ),
+            (
+                IndexMetadata {
+                    codes: None,
+                    ..keeping_entry_points(4)
+                },
+                "keeps entry points but carries no codes",
+            ),
+        ] {
+            let error =
+                SegmentManifest::try_new(metadata, ivf(8, 4), vec![entry(0, 4)]).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
@@ -476,16 +761,21 @@ mod tests {
     fn table_with_a_null_in(column: &str) -> RecordBatch {
         let value = |name: &str, valid: u32| (name != column).then_some(valid);
         let nullable = |name: &str, data_type: DataType| Field::new(name, data_type, true);
+        let nullable_ids = DataType::List(Arc::new(Field::new("item", DataType::UInt32, true)));
         RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![
                 nullable(PARTITION_ID_COLUMN, DataType::UInt32),
                 nullable(MEDOID_COLUMN, DataType::UInt32),
+                nullable(ENTRY_POINTS_COLUMN, nullable_ids),
                 nullable(NUM_ROWS_COLUMN, DataType::UInt32),
                 nullable(FILE_COLUMN, DataType::Utf8),
             ])),
             vec![
                 Arc::new(UInt32Array::from(vec![value(PARTITION_ID_COLUMN, 0)])) as ArrayRef,
                 Arc::new(UInt32Array::from(vec![value(MEDOID_COLUMN, 0)])),
+                Arc::new(ListArray::from_iter_primitive::<UInt32Type, _, _>(vec![
+                    (column != ENTRY_POINTS_COLUMN).then(Vec::<Option<u32>>::new),
+                ])),
                 Arc::new(UInt32Array::from(vec![value(NUM_ROWS_COLUMN, 4)])),
                 Arc::new(StringArray::from(vec![
                     (column != FILE_COLUMN).then(|| partition_file_name(0)),
@@ -502,6 +792,7 @@ mod tests {
         for column in [
             PARTITION_ID_COLUMN,
             MEDOID_COLUMN,
+            ENTRY_POINTS_COLUMN,
             NUM_ROWS_COLUMN,
             FILE_COLUMN,
         ] {
@@ -516,6 +807,26 @@ mod tests {
                 "{column}: {error}"
             );
         }
+    }
+
+    /// A null id inside a list would read back as vertex 0, which is inside the
+    /// partition and so a valid entry point: the list would hold a vertex it
+    /// never held. First in the list, so that what it reads back as is a list
+    /// of the shape training produces, and nothing but the null refuses it.
+    #[test]
+    fn a_null_entry_point_inside_a_list_is_rejected() {
+        let mut columns = table_with_a_null_in("none").columns().to_vec();
+        columns[2] = Arc::new(ListArray::from_iter_primitive::<UInt32Type, _, _>(vec![
+            Some(vec![None, Some(1)]),
+        ]));
+        let batch = RecordBatch::try_new(table_with_a_null_in("none").schema(), columns).unwrap();
+        let error = SegmentManifest::try_from_batch(keeping_entry_points(4), ivf(8, 4), &batch)
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(
+            error.to_string().contains("holds null entry points"),
+            "{error}"
+        );
     }
 
     /// The metadata is the other half of what a segment says about itself, and

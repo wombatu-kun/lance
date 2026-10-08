@@ -37,6 +37,7 @@ use prost::Message;
 
 use crate::cache::FileKey;
 use crate::codes::encode;
+use crate::entry_points::describe_entry_point_params;
 use crate::format::{
     INDEX_FILE_NAME, INDEX_METADATA_KEY, IVF_POSITION_KEY, IndexMetadata, ROW_ID_COLUMN,
     VECTOR_COLUMN, VectorSource, index_schema, partition_file_name, partition_schema,
@@ -44,7 +45,9 @@ use crate::format::{
 use crate::partition::{Partition, graph_from_batch, row_ids_from_batch};
 use crate::query::RescoreReads;
 use crate::raw::{self, VectorLayout};
-use crate::segment::{PartitionEntry, SegmentManifest};
+use crate::segment::{
+    PartitionEntry, SegmentManifest, check_entry_point_params, check_entry_points,
+};
 
 /// The file format every file in a segment is written in.
 ///
@@ -1217,15 +1220,26 @@ impl SegmentWriter {
         }
     }
 
+    /// The metadata the segment is written under.
+    pub(crate) fn metadata(&self) -> &IndexMetadata {
+        &self.metadata
+    }
+
     /// Write one partition and return the size of its file in bytes.
     ///
     /// Partition ids must arrive in ascending order, and `partition` must not be
     /// empty: an empty partition gets no file and no row in `index.idx`, so
     /// calling this for one would write a file nothing points at.
+    ///
+    /// `entry_points` are the partition's own, trained over `partition` under
+    /// this segment's [`IndexMetadata::entry_point_params`], and empty in a
+    /// segment that keeps none; a list training under them could not have
+    /// produced is refused here rather than when the table is written.
     pub async fn write_partition(
         &mut self,
         partition_id: u32,
         medoid: u32,
+        entry_points: Arc<[u32]>,
         partition: &Partition,
     ) -> Result<u64> {
         if partition.is_empty() {
@@ -1247,7 +1261,7 @@ impl SegmentWriter {
                 self.metadata.dimension
             )));
         }
-        self.check_entry(partition_id, medoid, partition.len() as u32)?;
+        self.check_entry(partition_id, medoid, &entry_points, partition.len() as u32)?;
 
         // Encoded here rather than by the caller, so that no pass that produces a
         // partition can forget to, and none of them has to keep a code in step
@@ -1286,6 +1300,7 @@ impl SegmentWriter {
         self.partitions.push(PartitionEntry {
             partition_id,
             medoid,
+            entry_points,
             num_rows: partition.len() as u32,
             file,
         });
@@ -1307,6 +1322,12 @@ impl SegmentWriter {
     /// file's schema back against `partition_schema`, so a copy from a segment
     /// built with another degree would leave `index.idx` describing a file it
     /// does not describe.
+    ///
+    /// The partition's medoid and entry points come along unchanged, being
+    /// local ids, which a copy does not move. A source that trained its entry
+    /// points under other parameters than this segment's is refused: this
+    /// segment's metadata says what every list of it was trained under, and a
+    /// maintenance pass retrains them under that.
     ///
     /// No size comes back, unlike [`Self::write_partition`]: on a blob store the
     /// answer would be a `HEAD` the copy itself does not need, and Lance fills
@@ -1335,6 +1356,7 @@ impl SegmentWriter {
         self.partitions.push(PartitionEntry {
             partition_id,
             medoid: entry.medoid,
+            entry_points: entry.entry_points.clone(),
             num_rows: entry.num_rows,
             file,
         });
@@ -1435,6 +1457,7 @@ impl SegmentWriter {
         self.partitions.push(PartitionEntry {
             partition_id,
             medoid: entry.medoid,
+            entry_points: entry.entry_points.clone(),
             num_rows: entry.num_rows,
             file: written,
         });
@@ -1494,12 +1517,43 @@ impl SegmentWriter {
                 self.metadata.vector_source
             )));
         }
-        self.check_entry(partition_id, entry.medoid, entry.num_rows)?;
+        // A carried list was trained under the source's parameters, and this
+        // segment's metadata says every list of it was trained under its own.
+        // Any list of local ids would still do as a start, so this is stricter
+        // than a walk needs; it keeps what the metadata records true, which is
+        // what a maintenance pass retraining under it relies on.
+        if from.metadata().entry_point_params != self.metadata.entry_point_params {
+            return Err(Error::invalid_input(format!(
+                "Vamana cannot carry partition {partition_id} between segments whose entry points \
+                 were trained under different parameters: {} and {}",
+                describe_entry_point_params(from.metadata().entry_point_params.as_ref()),
+                describe_entry_point_params(self.metadata.entry_point_params.as_ref())
+            )));
+        }
+        self.check_entry(
+            partition_id,
+            entry.medoid,
+            &entry.entry_points,
+            entry.num_rows,
+        )?;
         Ok(entry)
     }
 
     /// What both ways into the table have to agree on before a row is added.
-    fn check_entry(&self, partition_id: u32, medoid: u32, num_rows: u32) -> Result<()> {
+    fn check_entry(
+        &self,
+        partition_id: u32,
+        medoid: u32,
+        entry_points: &[u32],
+        num_rows: u32,
+    ) -> Result<()> {
+        check_entry_point_params(&self.metadata)?;
+        check_entry_points(
+            self.metadata.entry_point_params.as_ref(),
+            partition_id,
+            entry_points,
+            num_rows,
+        )?;
         if medoid >= num_rows {
             return Err(Error::invalid_input(format!(
                 "Vamana partition {partition_id} has medoid {medoid} but holds only {num_rows} \
@@ -2323,6 +2377,7 @@ mod tests {
             row_id_mode: crate::format::RowIdMode::Address,
             fragments: vec![0],
             codes: None,
+            entry_point_params: None,
             vector_source: VectorSource::Index,
         }
     }
@@ -2352,7 +2407,7 @@ mod tests {
         );
         for partition_id in [0, 1] {
             writer
-                .write_partition(partition_id, 1, &sample_partition())
+                .write_partition(partition_id, 1, Arc::from([]), &sample_partition())
                 .await
                 .unwrap();
         }

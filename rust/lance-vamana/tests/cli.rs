@@ -25,7 +25,7 @@ use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::version::LanceFileVersion;
-use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode};
+use lance_vamana::query::{SearchParams, VamanaIndex, WalkMode, WalkStart};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -428,7 +428,9 @@ async fn a_search_answers_what_the_library_answers() {
         .clone()
         .with_mode(WalkMode::Lazy)
         .with_stop_margin(0.25);
+    let from_medoid = ruled.clone().with_start(WalkStart::Medoid);
 
+    let mut costs = Vec::new();
     for (flags, params, margin) in [
         (
             vec!["--mode", "flat", "--rescore-budget", "12", "--json"],
@@ -446,6 +448,21 @@ async fn a_search_answers_what_the_library_answers() {
                 "--json",
             ],
             ruled,
+            Value::from(0.25),
+        ),
+        (
+            vec![
+                "--mode",
+                "lazy",
+                "--start",
+                "medoid",
+                "--rescore-budget",
+                "12",
+                "--stop-margin",
+                "0.25",
+                "--json",
+            ],
+            from_medoid,
             Value::from(0.25),
         ),
     ] {
@@ -480,7 +497,13 @@ async fn a_search_answers_what_the_library_answers() {
             comparisons as f64 / QUERIES as f64,
             "the command line measured other distances than the call it wraps, given {flags:?}"
         );
+        costs.push(comparisons);
     }
+    assert_ne!(
+        costs[1], costs[2],
+        "a walk from the medoid costs what the default start costs here, so the two cannot be \
+         told apart"
+    );
 
     let table = fixture.search(&[
         "--mode",
@@ -832,6 +855,22 @@ async fn what_the_index_cannot_do_is_refused() {
         "lazy",
     ]);
     assert!(error.contains("built without codes"), "{error}");
+    // Asked to start at entry points as well, it is still the codes that are
+    // missing first: entry points are chosen among by code.
+    let error = refused(&[
+        "search",
+        "--dataset",
+        &fixture.dataset,
+        "--index-name",
+        "idx",
+        "--vector",
+        &zeroes,
+        "--mode",
+        "lazy",
+        "--start",
+        "entry",
+    ]);
+    assert!(error.contains("built without codes"), "{error}");
 
     // `-k 1` so that the budget cannot be refused for being smaller than `k`
     // instead of for the mode it was given to.
@@ -1049,4 +1088,90 @@ fn the_parser_refuses_what_it_can_refuse_alone() {
         "truth.ivecs",
     ]);
     assert!(error.contains("cannot be used with"), "{error}");
+}
+
+/// A build stores entry points whenever there are codes and says what training
+/// them cost, `info` names the parameters they were trained under,
+/// `--entry-points` asks for a count in every partition or for none, and
+/// `search --start` says where a walk starts. What cannot be had is refused:
+/// a seed for entry points that are not stored, a count without codes, and a
+/// walk asked by name to start at entry points on an index storing none.
+#[tokio::test]
+async fn entry_points_are_stored_named_and_started_from_as_asked() {
+    let fixture = Fixture::ingest();
+    let entry_points = |fixture: &Fixture| {
+        run(&["info", "--dataset", &fixture.dataset, "--index-name", "idx"])
+            .lines()
+            .find(|line| line.trim_start().starts_with("entry points"))
+            .map(|line| line.trim().to_string())
+            .expect("info names the entry points")
+    };
+
+    let built = fixture.build(&[]);
+    assert!(built.contains("entry points trained in"), "{built}");
+    assert_eq!(
+        entry_points(&fixture),
+        "entry points   16 up to 23170 rows, else 64; 256 per entry; seed 42"
+    );
+    for start in ["medoid", "entry", "prefer-entry"] {
+        let answered: Value =
+            serde_json::from_str(&fixture.search(&["--start", start, "--json"])).unwrap();
+        assert_eq!(answered["settings"]["start"], start, "{answered}");
+        let printed = fixture.search(&["--start", start]);
+        assert!(printed.contains(&format!(", start {start},")), "{printed}");
+    }
+
+    fixture.build(&[
+        "--entry-points",
+        "8",
+        "--entry-seed",
+        "3",
+        "--entry-sample-rate",
+        "64",
+    ]);
+    assert_eq!(
+        entry_points(&fixture),
+        "entry points   8; 64 per entry; seed 3"
+    );
+
+    fixture.build(&["--entry-points", "none"]);
+    assert_eq!(entry_points(&fixture), "entry points   none");
+    let probes = PARTITIONS.to_string();
+    let error = refused(&[
+        "search",
+        "--dataset",
+        &fixture.dataset,
+        "--index-name",
+        "idx",
+        "--fvecs",
+        fixture.queries.to_str().unwrap(),
+        "--nprobes",
+        &probes,
+        "--start",
+        "entry",
+    ]);
+    assert!(error.contains("stores no entry points"), "{error}");
+
+    let build = |extra: &[&str]| {
+        let mut args = vec![
+            "build",
+            "--dataset",
+            &fixture.dataset,
+            "--index-name",
+            "idx",
+            "--rows-per-partition",
+            ROWS_PER_PARTITION,
+        ];
+        args.extend_from_slice(extra);
+        refused(&args)
+    };
+    let error = build(&["--entry-points", "none", "--entry-seed", "3"]);
+    assert!(error.contains("--entry-points none stores none"), "{error}");
+    let error = build(&["--codes", "none", "--entry-points", "8"]);
+    assert!(error.contains("without codes"), "{error}");
+    let error = build(&["--codes", "none", "--entry-seed", "3"]);
+    assert!(
+        error.contains("an index built with --codes none stores none"),
+        "{error}"
+    );
 }

@@ -9,13 +9,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, FieldRef, Schema};
 use lance_core::{Error, Result};
 use lance_encoding::constants::{STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY};
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
 use crate::codes::{CODE_COLUMN, CodeParams};
+use crate::entry_points::EntryPointParams;
 
 /// Name of the file describing a segment.
 ///
@@ -28,6 +29,11 @@ pub const PARTITION_ID_COLUMN: &str = "__partition_id";
 
 /// Local id of the vertex a search of that partition starts from.
 pub const MEDOID_COLUMN: &str = "__medoid";
+
+/// Local ids of that partition's entry points, ascending: where a walk may
+/// start instead, at the one nearest its query ([`crate::entry_points`]).
+/// Empty for a partition that trained none.
+pub const ENTRY_POINTS_COLUMN: &str = "__entry_points";
 
 /// Number of vertices in that partition.
 pub const NUM_ROWS_COLUMN: &str = "__num_rows";
@@ -94,7 +100,7 @@ pub const MAX_DEGREE: u32 = 1024;
 /// manifest's `index_version` and the segment's own [`IndexMetadata`] - and
 /// checked against both on open. Two *different* numbers is what this replaced,
 /// and the one recorded in the manifest was checked nowhere at all.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// Narrowest vectors a segment may leave to the dataset.
 ///
@@ -212,6 +218,17 @@ pub struct IndexMetadata {
     /// Inherited wholesale by every maintenance pass, which is what makes the
     /// rotation inside it one per index rather than one per segment.
     pub codes: Option<CodeParams>,
+    /// What every partition's [`ENTRY_POINTS_COLUMN`] was trained under, when
+    /// the segment keeps entry points.
+    ///
+    /// `None` says no partition has any, and every walk of the segment starts
+    /// at the partition's medoid. Never set without [`Self::codes`]: a walk
+    /// chooses among entry points by code.
+    ///
+    /// Inherited by every maintenance pass like [`Self::codes`], which trains a
+    /// partition it rewrites under these, so that every list of a segment was
+    /// trained under the one set of parameters recorded here.
+    pub entry_point_params: Option<EntryPointParams>,
     /// Whether the partitions hold the vectors or leave them to the dataset.
     ///
     /// Inherited by every maintenance pass like [`Self::codes`], and for the
@@ -364,14 +381,25 @@ fn addressable_list(name: &str, item_type: DataType, width: u32, what: &str) -> 
 ///
 /// No column is nullable because an empty partition is not listed at all. It has
 /// no vertices, so it has no entry point and no file, and leaving the row out is
-/// the only encoding of that which cannot disagree with itself.
+/// the only encoding of that which cannot disagree with itself. A partition
+/// with no entry points of its own lists none, an empty list.
 pub fn index_schema() -> Schema {
     Schema::new(vec![
         Field::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
         Field::new(MEDOID_COLUMN, DataType::UInt32, false),
+        Field::new(
+            ENTRY_POINTS_COLUMN,
+            DataType::List(entry_point_item()),
+            false,
+        ),
         Field::new(NUM_ROWS_COLUMN, DataType::UInt32, false),
         Field::new(FILE_COLUMN, DataType::Utf8, false),
     ])
+}
+
+/// Item of an [`ENTRY_POINTS_COLUMN`] list: a local id, never null.
+pub fn entry_point_item() -> FieldRef {
+    Arc::new(Field::new("item", DataType::UInt32, false))
 }
 
 /// Canonical file name of a partition within its segment directory.
@@ -385,25 +413,36 @@ mod tests {
 
     #[test]
     fn metadata_round_trips_through_json() {
+        let scalar = CodeParams::Scalar {
+            num_bits: 8,
+            bounds: -1.0..1.0,
+        };
         for (vector_source, spelling) in [
             (VectorSource::Index, "\"vector_source\":\"index\""),
             (VectorSource::Dataset, "\"vector_source\":\"dataset\""),
         ] {
-            let metadata = IndexMetadata {
-                format_version: FORMAT_VERSION,
-                max_degree: 64,
-                search_list_size: 100,
-                alpha: 1.2,
-                dimension: 128,
-                distance_type: DistanceType::Cosine,
-                row_id_mode: RowIdMode::Address,
-                fragments: vec![0, 3, 7],
-                codes: None,
-                vector_source,
-            };
-            let json = metadata.to_json().unwrap();
-            assert!(json.contains(spelling), "{json}");
-            assert_eq!(IndexMetadata::from_json(&json).unwrap(), metadata);
+            for (codes, entry_point_params) in [
+                (None, None),
+                (Some(scalar.clone()), None),
+                (Some(scalar.clone()), Some(EntryPointParams::default())),
+            ] {
+                let metadata = IndexMetadata {
+                    format_version: FORMAT_VERSION,
+                    max_degree: 64,
+                    search_list_size: 100,
+                    alpha: 1.2,
+                    dimension: 128,
+                    distance_type: DistanceType::Cosine,
+                    row_id_mode: RowIdMode::Address,
+                    fragments: vec![0, 3, 7],
+                    codes,
+                    entry_point_params,
+                    vector_source,
+                };
+                let json = metadata.to_json().unwrap();
+                assert!(json.contains(spelling), "{json}");
+                assert_eq!(IndexMetadata::from_json(&json).unwrap(), metadata);
+            }
         }
     }
 
@@ -443,6 +482,7 @@ mod tests {
             row_id_mode: RowIdMode::Stable,
             fragments: vec![0],
             codes: None,
+            entry_point_params: None,
             vector_source: VectorSource::Index,
         };
         let json = metadata.to_json().unwrap();
@@ -467,6 +507,7 @@ mod tests {
             row_id_mode: RowIdMode::Address,
             fragments: vec![0],
             codes: None,
+            entry_point_params: None,
             vector_source: VectorSource::Index,
         };
         let json = metadata.to_json().unwrap();
@@ -493,14 +534,16 @@ mod tests {
         assert!(error.to_string().contains("manhattan"), "{error}");
     }
 
-    /// Another format is refused for its version, including an earlier one
-    /// missing a field this one requires: format 5 wrote no `vector_source`, and
-    /// its reader is told which format it has rather than that its file is
+    /// Another format is refused for its version, including the one before it,
+    /// whose metadata would otherwise read: format 6 wrote no
+    /// `entry_point_params`, so its segments would pass for ones keeping no
+    /// entry points, and its partition table has no [`ENTRY_POINTS_COLUMN`].
+    /// Its reader is told which format it has rather than that its file is
     /// corrupt.
     #[test]
     fn metadata_rejects_another_format_version() {
-        let future = serde_json::json!({
-            "format_version": FORMAT_VERSION + 1,
+        let earlier = serde_json::json!({
+            "format_version": 6,
             "max_degree": 64,
             "search_list_size": 100,
             "alpha": 1.2,
@@ -508,12 +551,17 @@ mod tests {
             "distance_type": "l2",
             "row_id_mode": "address",
             "fragments": [0],
+            "codes": null,
             "vector_source": "index",
         });
-        let mut earlier = future.clone();
-        earlier["format_version"] = serde_json::json!(FORMAT_VERSION - 1);
-        earlier.as_object_mut().unwrap().remove("vector_source");
-        for (version, json) in [(FORMAT_VERSION + 1, future), (FORMAT_VERSION - 1, earlier)] {
+        let mut future = earlier.clone();
+        future["format_version"] = serde_json::json!(FORMAT_VERSION + 1);
+        future["entry_point_params"] = serde_json::to_value(EntryPointParams::default()).unwrap();
+        assert_eq!(
+            FORMAT_VERSION, 7,
+            "the earlier format here is the one before this"
+        );
+        for (version, json) in [(FORMAT_VERSION + 1, future), (6, earlier)] {
             let error = IndexMetadata::from_json(&json.to_string()).unwrap_err();
             assert!(
                 matches!(error, Error::NotSupported { .. }),

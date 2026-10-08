@@ -53,6 +53,7 @@ use uuid::Uuid;
 
 use crate::build::BuildParams;
 use crate::builder::{INDEX_DETAILS_TYPE_URL, index_column};
+use crate::entry_points::train_stored;
 use crate::format::{FORMAT_VERSION, IndexMetadata, ROW_ID_COLUMN};
 use crate::io::{
     SegmentWriter, check_partition_shape, open_file, partitions_in_flight, read_row_ids,
@@ -296,6 +297,10 @@ async fn repair_partition(
         partition = spawn_cpu(move || rows.readdress(segment, partition)).await?;
     }
 
+    // Read before `metadata` is shadowed by the clone the closure takes.
+    let (distance_type, entry_point_params) =
+        (metadata.distance_type, metadata.entry_point_params.clone());
+
     // Minutes of arithmetic over a whole segment, and not one await in it, so it
     // runs on the CPU pool rather than on the runtime the scheduler reads
     // through. Nothing inside waits on anything, which is what `spawn_cpu`
@@ -319,8 +324,19 @@ async fn repair_partition(
         Ok::<_, Error>((repaired, comparisons.get()))
     })
     .await?;
+    // Retrained rather than carried: the dead are gone and the survivors are
+    // renumbered, so no old local id keeps its meaning, and every survivor is
+    // live.
+    let entry_points = train_stored(
+        &repaired.partition,
+        distance_type,
+        entry_point_params.as_ref(),
+        (0..repaired.partition.len() as u32).collect(),
+    )
+    .await?;
     Ok(Rewritten::Repaired {
         repaired,
+        entry_points,
         comparisons,
     })
 }
@@ -342,6 +358,7 @@ enum Rewritten {
     Dropped,
     Repaired {
         repaired: Merged,
+        entry_points: Arc<[u32]>,
         comparisons: u64,
     },
 }
@@ -387,10 +404,16 @@ async fn rewrite_segment(
             Rewritten::Dropped => stats.partitions_dropped += 1,
             Rewritten::Repaired {
                 repaired,
+                entry_points,
                 comparisons,
             } => {
                 writer
-                    .write_partition(entry.partition_id, repaired.medoid, &repaired.partition)
+                    .write_partition(
+                        entry.partition_id,
+                        repaired.medoid,
+                        entry_points,
+                        &repaired.partition,
+                    )
                     .await?;
                 stats.comparisons = stats.comparisons.saturating_add(comparisons);
                 if repaired.rebuilt {

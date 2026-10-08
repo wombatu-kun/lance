@@ -30,13 +30,14 @@ use lance_core::cache::{CacheStats, LanceCache};
 use lance_core::{Error, ROW_ID, Result};
 use lance_linalg::distance::DistanceType;
 use lance_vamana::build::BuildParams;
-use lance_vamana::builder::{IndexParams, create_index};
+use lance_vamana::builder::{EntryPointRequest, IndexParams, create_index};
 use lance_vamana::codes::CodeSpec;
 use lance_vamana::consolidator::consolidate_index;
+use lance_vamana::entry_points::EntryPointParams;
 use lance_vamana::format::VectorSource;
 use lance_vamana::inserter::{insert_as_segment, insert_in_place};
 use lance_vamana::merger::merge_index;
-use lance_vamana::query::{QueryResult, SearchParams, VamanaIndex, WalkMode};
+use lance_vamana::query::{QueryResult, SearchParams, VamanaIndex, WalkMode, WalkStart};
 use serde::Serialize;
 
 use fvecs::{Fvecs, read_ivecs};
@@ -132,6 +133,21 @@ struct BuildArgs {
     /// and 8, the only width there is, for `scalar`.
     #[arg(long, value_name = "BITS", requires = "codes")]
     code_bits: Option<u8>,
+    /// Entry points each partition stores, which a lazy walk starts at instead
+    /// of the medoid. Omitted, the library's rule whenever the index has codes:
+    /// up to 16 in a partition of at most 23170 rows and up to 64 in a larger
+    /// one. A number stores up to that many in every partition, none in one of
+    /// no more rows than that, and needs codes; `none` stores none.
+    #[arg(long, value_name = "K|none", value_parser = parse_entry_points)]
+    entry_points: Option<EntryPointsArg>,
+    /// Seed of the entry points' k-means: its sample and starting centroids.
+    /// Needs codes, as entry points do.
+    #[arg(long, value_name = "N")]
+    entry_seed: Option<u64>,
+    /// Vectors the entry points' k-means samples per entry point, 1 to 512.
+    /// Needs codes, as entry points do.
+    #[arg(long, value_name = "N")]
+    entry_sample_rate: Option<usize>,
     /// Where the full vectors a re-score measures against are read from: a
     /// copy in the index, or the dataset's own data files. `dataset` makes the
     /// index smaller, needs codes (any `--codes` but `none`) and at least 64
@@ -189,6 +205,12 @@ struct SearchArgs {
     /// are refused for an index built with `--vectors dataset`.
     #[arg(long, value_enum, default_value_t = ModeArg::from(WalkMode::default()))]
     mode: ModeArg,
+    /// Where a lazy walk starts: `prefer-entry` at the partition's stored entry
+    /// point nearest the query where it has any and at its medoid otherwise;
+    /// `entry` the same, but refused for an index with a segment that stores
+    /// none, and outside `--mode lazy`; `medoid` at the medoid.
+    #[arg(long, value_enum, default_value_t = StartArg::from(WalkStart::default()))]
+    start: StartArg,
     /// `W`: vertices one hop of a lazy walk expands at a time.
     #[arg(short = 'W', long, default_value_t = 4, value_name = "N")]
     beam_width: usize,
@@ -277,6 +299,97 @@ impl From<VectorsArg> for VectorSource {
             VectorsArg::Index => Self::Index,
             VectorsArg::Dataset => Self::Dataset,
         }
+    }
+}
+
+/// Mirrors [`WalkStart`], for the reason [`ModeArg`] mirrors [`WalkMode`].
+#[derive(Clone, Copy, ValueEnum)]
+enum StartArg {
+    Medoid,
+    Entry,
+    PreferEntry,
+}
+
+impl From<StartArg> for WalkStart {
+    fn from(start: StartArg) -> Self {
+        match start {
+            StartArg::Medoid => Self::Medoid,
+            StartArg::Entry => Self::NearestEntry,
+            StartArg::PreferEntry => Self::PreferNearestEntry,
+        }
+    }
+}
+
+/// The way back, so that `--start` defaults to whatever the library starts at.
+impl From<WalkStart> for StartArg {
+    fn from(start: WalkStart) -> Self {
+        match start {
+            WalkStart::Medoid => Self::Medoid,
+            WalkStart::NearestEntry => Self::Entry,
+            WalkStart::PreferNearestEntry => Self::PreferEntry,
+        }
+    }
+}
+
+/// `--entry-points`: a count for every partition, or `none`.
+#[derive(Clone, Copy)]
+enum EntryPointsArg {
+    None,
+    Fixed(usize),
+}
+
+fn parse_entry_points(value: &str) -> std::result::Result<EntryPointsArg, String> {
+    if value == "none" {
+        return Ok(EntryPointsArg::None);
+    }
+    value
+        .parse()
+        .map(EntryPointsArg::Fixed)
+        .map_err(|_| format!("expected a number of entry points or `none`, not {value:?}"))
+}
+
+/// The entry points `--entry-points`, `--entry-seed` and
+/// `--entry-sample-rate` ask for, or the library's own when none is given.
+/// Settled before the dataset is opened, as the codes are; parameters the
+/// library cannot train under are the library's to refuse.
+fn requested_entry_points(
+    entry_points: Option<EntryPointsArg>,
+    seed: Option<u64>,
+    sample_rate: Option<usize>,
+    has_codes: bool,
+) -> Result<EntryPointRequest> {
+    // Told apart from the library's refusal of a count without codes, whose
+    // advice - `--entry-points none` - would be refused next to these.
+    if !has_codes && (seed.is_some() || sample_rate.is_some()) {
+        return Err(Error::invalid_input(
+            "--entry-seed and --entry-sample-rate say how entry points are trained, and an \
+             index built with --codes none stores none"
+                .to_string(),
+        ));
+    }
+    let tuned = |mut params: EntryPointParams| {
+        if let Some(seed) = seed {
+            params = params.with_seed(seed);
+        }
+        if let Some(sample_rate) = sample_rate {
+            params = params.with_sample_rate(sample_rate);
+        }
+        params
+    };
+    match entry_points {
+        None if seed.is_none() && sample_rate.is_none() => Ok(EntryPointRequest::Default),
+        None => Ok(EntryPointRequest::With(tuned(EntryPointParams::default()))),
+        Some(EntryPointsArg::None) if seed.is_none() && sample_rate.is_none() => {
+            Ok(EntryPointRequest::Without)
+        }
+        Some(EntryPointsArg::None) => Err(Error::invalid_input(
+            "--entry-seed and --entry-sample-rate say how entry points are trained, and \
+             --entry-points none stores none"
+                .to_string(),
+        )),
+        Some(EntryPointsArg::Fixed(num_entries)) => Ok(EntryPointRequest::With(tuned(
+            EntryPointParams::new(num_entries),
+        ))),
     }
 }
 
@@ -429,6 +542,12 @@ async fn build(args: BuildArgs) -> Result<()> {
         ));
     }
     let codes = requested_codes(args.codes, args.code_bits)?;
+    let entry_points = requested_entry_points(
+        args.entry_points,
+        args.entry_seed,
+        args.entry_sample_rate,
+        codes.is_some(),
+    )?;
     let mut dataset = Dataset::open(&args.target.dataset).await?;
     let partitions = match (args.partitions, args.rows_per_partition) {
         (Some(partitions), None) => partitions,
@@ -463,6 +582,7 @@ async fn build(args: BuildArgs) -> Result<()> {
         Some(codes) => params.with_codes(codes),
         None => params.without_codes(),
     };
+    params.entry_points = entry_points;
 
     let started = Instant::now();
     let stats = create_index(&mut dataset, &args.target.index_name, &params).await?;
@@ -473,6 +593,12 @@ async fn build(args: BuildArgs) -> Result<()> {
         started.elapsed().as_secs_f64(),
         stats.comparisons
     );
+    if !stats.entry_point_training.is_zero() {
+        println!(
+            "entry points trained in {:.2}s, summed over the partitions",
+            stats.entry_point_training.as_secs_f64()
+        );
+    }
     // The library says this through `log`, which this binary installs nothing
     // to print.
     if stats.fragments_through_lance > 0 {
@@ -519,6 +645,7 @@ async fn search(args: SearchArgs) -> Result<()> {
     let mut params = SearchParams::new(args.k)
         .with_nprobes(args.nprobes)
         .with_mode(args.mode.into())
+        .with_start(args.start.into())
         .with_beam_width(args.beam_width)
         .with_prefetch_ahead(args.prefetch_ahead);
     if let Some(search_list_size) = args.search_list_size {
@@ -561,6 +688,11 @@ async fn search(args: SearchArgs) -> Result<()> {
         settings: Settings {
             k: params.k,
             mode: format!("{:?}", params.mode).to_lowercase(),
+            start: args
+                .start
+                .to_possible_value()
+                .map(|value| value.get_name().to_string())
+                .unwrap_or_default(),
             nprobes: params.nprobes,
             search_list_size: params.search_list_size,
             beam_width: params.beam_width,
@@ -714,6 +846,10 @@ async fn info(args: InfoArgs) -> Result<()> {
     match &metadata.codes {
         Some(codes) => println!("  codes          {}", codes.spec()),
         None => println!("  codes          none"),
+    }
+    match &metadata.entry_point_params {
+        Some(params) => println!("  entry points   {params}"),
+        None => println!("  entry points   none"),
     }
     println!("  vectors        {}", metadata.vector_source);
     println!("  format version {}", metadata.format_version);
@@ -950,6 +1086,7 @@ struct SearchReport {
 struct Settings {
     k: usize,
     mode: String,
+    start: String,
     nprobes: usize,
     search_list_size: usize,
     beam_width: usize,
@@ -992,9 +1129,10 @@ impl SearchReport {
         }
         let settings = &self.settings;
         print!(
-            "{} probes, mode {}, L = {}, W = {}, look-ahead {}",
+            "{} probes, mode {}, start {}, L = {}, W = {}, look-ahead {}",
             settings.nprobes,
             settings.mode,
+            settings.start,
             settings.search_list_size,
             settings.beam_width,
             settings.prefetch_ahead

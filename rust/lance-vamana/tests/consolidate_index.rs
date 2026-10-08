@@ -15,7 +15,7 @@
 //! counter that over-filtered or a table row that was written twice would show
 //! up rather than being masked by a partition of one.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
@@ -25,6 +25,7 @@ use lance::dataset::index::frag_reuse::cleanup_frag_reuse_index;
 use lance::index::DatasetIndexExt;
 use lance_core::utils::address::RowAddress;
 use lance_linalg::distance::DistanceType;
+use lance_vamana::SegmentManifest;
 use lance_vamana::build::BuildParams;
 use lance_vamana::builder::{IndexParams, build_index_segment, create_index};
 use lance_vamana::codes::CodeSpec;
@@ -38,20 +39,23 @@ use uuid::Uuid;
 mod common;
 use common::{
     DatasetFixture, VECTOR_COLUMN, assert_twins_hold_the_same, brute_force, compact_indexed,
-    live_row_ids, random_vectors, read_committed_batches, read_committed_segment, recall,
-    twin_params, twins, wide_fixture,
+    live_row_ids, maintained_entry_point_params, random_vectors, read_committed_batches,
+    read_committed_segment, recall, retrained_entry_points, stored_entry_points, twin_params,
+    twins, wide_fixture,
 };
 
 const INDEX_NAME: &str = "vamana_idx";
 const PARTITIONS: u32 = 8;
 const K: usize = 10;
 
+/// Without entry points: the tests of entry points build them on purpose, and
+/// training them in every pass would cost a debug build several times its graph.
 async fn indexed_dataset(uri: &str) -> Dataset {
     let mut dataset = DatasetFixture::default().write(uri).await;
     create_index(
         &mut dataset,
         INDEX_NAME,
-        &IndexParams::new(VECTOR_COLUMN, PARTITIONS),
+        &IndexParams::new(VECTOR_COLUMN, PARTITIONS).without_entry_points(),
     )
     .await
     .unwrap();
@@ -199,7 +203,7 @@ async fn moved_index(
     vector_source: VectorSource,
     codes: Option<CodeSpec>,
     distance_type: DistanceType,
-) -> (Dataset, Vec<RecordBatch>) {
+) -> (Dataset, SegmentManifest, Vec<RecordBatch>) {
     let mut dataset = wide_fixture().write(uri).await;
     let mut params = IndexParams::new(VECTOR_COLUMN, PARTITIONS)
         .with_graph_params(BuildParams {
@@ -213,13 +217,13 @@ async fn moved_index(
     create_index(&mut dataset, INDEX_NAME, &params)
         .await
         .unwrap();
-    let [(_, before)] = read_committed_batches(&dataset, INDEX_NAME)
+    let [(manifest, before)] = read_committed_batches(&dataset, INDEX_NAME)
         .await
         .try_into()
         .unwrap();
     let metrics = compact_indexed(&mut dataset).await;
     assert!(metrics.fragments_removed > 0, "{metrics:?}");
-    (dataset, before)
+    (dataset, manifest, before)
 }
 
 /// A partition whose rows a deferred compaction only moved is written out again
@@ -230,7 +234,7 @@ async fn moved_index(
 async fn readdressing_reads_no_data_file(pass: Pass) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let (mut dataset, before) = moved_index(
+    let (mut dataset, _, before) = moved_index(
         uri,
         VectorSource::Dataset,
         Some(CodeSpec::Scalar { num_bits: 8 }),
@@ -257,7 +261,10 @@ async fn merging_readdresses_without_reading_a_data_file() {
 
 /// A readdressed partition is the partition as it was written - its graph, its
 /// codes, and its vectors where the index keeps them, in the same schema - with
-/// each row address the one Lance's record of the move gives.
+/// each row address the one Lance's record of the move gives. Its row of the
+/// partition table is as it was too but for the file it names: the medoid, and
+/// the entry points an index with codes trains, are local ids, and no local id
+/// moved.
 async fn readdressing_changes_nothing_but_the_row_addresses(
     pass: Pass,
     vector_source: VectorSource,
@@ -267,7 +274,16 @@ async fn readdressing_changes_nothing_but_the_row_addresses(
     let what = format!("{pass:?}, {vector_source}, {codes:?}, {distance_type:?}");
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let (mut dataset, before) = moved_index(uri, vector_source, codes, distance_type).await;
+    let (mut dataset, manifest, before) =
+        moved_index(uri, vector_source, codes, distance_type).await;
+    assert_eq!(
+        manifest
+            .partitions()
+            .iter()
+            .any(|entry| !entry.entry_points.is_empty()),
+        codes.is_some(),
+        "{what}: entry points are trained with codes and only with codes"
+    );
     let remap = dataset
         .frag_reuse_index()
         .await
@@ -279,10 +295,25 @@ async fn readdressing_changes_nothing_but_the_row_addresses(
         before.len(),
         "{what}"
     );
-    let [(_, after)] = read_committed_batches(&dataset, INDEX_NAME)
+    let [(readdressed, after)] = read_committed_batches(&dataset, INDEX_NAME)
         .await
         .try_into()
         .unwrap();
+    let table = |manifest: &SegmentManifest| {
+        manifest
+            .partitions()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.partition_id,
+                    entry.medoid,
+                    entry.entry_points.clone(),
+                    entry.num_rows,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(table(&readdressed), table(&manifest), "{what}");
     assert_eq!(after.len(), before.len(), "{what}");
     for (partition, (before, after)) in before.iter().zip(&after).enumerate() {
         assert_eq!(
@@ -836,5 +867,56 @@ async fn measure(
     Measured {
         recall: total / queries.len() as f64,
         bytes_read: index.io_stats().bytes_read,
+    }
+}
+
+/// A consolidation trains the entry points of the partition it rewrites over
+/// the survivors, renumbered, and carries the lists of the ones it copies, so
+/// that afterwards every list is what training at open trains. The row deleted
+/// is an entry point of the partition it is taken out of: a list carried over
+/// that partition would name a vertex that is gone, or another one, once the
+/// survivors are renumbered.
+#[tokio::test]
+async fn consolidation_retrains_what_it_rewrites_and_carries_what_it_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = DatasetFixture::default().write(uri).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &IndexParams::new(VECTOR_COLUMN, PARTITIONS)
+            .with_entry_point_params(maintained_entry_point_params()),
+    )
+    .await
+    .unwrap();
+    let (manifest, partitions) = read_committed_segment(&dataset, INDEX_NAME).await;
+    let rewritten = &manifest.partitions()[0];
+    let deleted =
+        partitions[&rewritten.partition_id].graph().row_ids()[rewritten.entry_points[0] as usize];
+    dataset
+        .delete(&format!("_rowid = {deleted}"))
+        .await
+        .unwrap();
+    let by_partition = |stored: BTreeMap<(Uuid, u32), Vec<u32>>| {
+        stored
+            .into_iter()
+            .map(|((_, partition_id), entries)| (partition_id, entries))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before = by_partition(stored_entry_points(&dataset, INDEX_NAME).await);
+
+    let stats = consolidate_index(&mut dataset, INDEX_NAME).await.unwrap();
+    assert_eq!(
+        stats.partitions_consolidated + stats.partitions_rebuilt,
+        1,
+        "{stats:?}"
+    );
+    assert!(stats.partitions_copied > 0, "{stats:?}");
+    let stored = stored_entry_points(&dataset, INDEX_NAME).await;
+    assert_eq!(stored, retrained_entry_points(&dataset, INDEX_NAME).await);
+    for (partition_id, entries) in by_partition(stored) {
+        if partition_id != rewritten.partition_id {
+            assert_eq!(entries, before[&partition_id], "partition {partition_id}");
+        }
     }
 }

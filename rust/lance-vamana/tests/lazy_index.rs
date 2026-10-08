@@ -83,6 +83,10 @@ fn params(codes: CodeSpec) -> IndexParams {
     params_on(VECTOR_COLUMN, codes)
 }
 
+/// Without entry points, so that every walk here that does not ask for them
+/// starts at the medoid, as it did before an index stored any: the tests of
+/// entry points build them on purpose, and training them would cost a debug
+/// build several times its graph.
 fn params_on(column: &str, codes: CodeSpec) -> IndexParams {
     IndexParams::new(column, PARTITIONS)
         .with_graph_params(BuildParams {
@@ -91,6 +95,7 @@ fn params_on(column: &str, codes: CodeSpec) -> IndexParams {
             ..Default::default()
         })
         .with_codes(codes)
+        .without_entry_points()
 }
 
 async fn coded_dataset(uri: &str, codes: CodeSpec) -> Dataset {
@@ -170,7 +175,9 @@ async fn a_hop_of_one_vertex_is_the_coded_walk_exactly(codes: CodeSpec) {
     let dataset = coded_dataset(uri, codes).await;
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
-    let narrow = search(WalkMode::Lazy).with_beam_width(1);
+    let narrow = search(WalkMode::Lazy)
+        .with_beam_width(1)
+        .with_start(WalkStart::Medoid);
     for query in random_vectors(8, 4242) {
         let coded = index
             .search(&query, &search(WalkMode::Coded))
@@ -671,9 +678,12 @@ async fn a_walk_that_reaches_everything_still_answers() {
     .unwrap();
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
 
+    // From the medoid, which the coded walk always starts at: everything is
+    // reachable from it, and the build promises that from no other vertex.
     let params = SearchParams::new(K)
         .with_search_list_size(64)
-        .with_nprobes(1);
+        .with_nprobes(1)
+        .with_start(WalkStart::Medoid);
     let query = &random_vectors(1, 3)[0];
     let mut answers = Vec::new();
     for mode in [WalkMode::Coded, WalkMode::Lazy] {
@@ -2598,10 +2608,12 @@ async fn walked(
     answers
 }
 
-/// The walk with a list and the walk with a stop margin, each answering its
-/// coded neighbours too.
+/// The walk with a list and the walk with a stop margin, each from the medoid
+/// and each answering its coded neighbours too.
 fn both_walks() -> [SearchParams; 2] {
-    let walk = search(WalkMode::Lazy).with_report_coded(true);
+    let walk = search(WalkMode::Lazy)
+        .with_start(WalkStart::Medoid)
+        .with_report_coded(true);
     let margin = walk
         .clone()
         .with_rescore_budget(2 * K)
@@ -2655,7 +2667,13 @@ async fn a_walk_from_the_nearest_entry_point_finds_the_neighbours(codes: CodeSpe
     let queries = random_vectors(QUERIES, 4242);
     let truth = ground_truth(&dataset, &queries).await;
 
-    let medoid = measure(&index, &queries, &truth, &search(WalkMode::Lazy)).await;
+    let medoid = measure(
+        &index,
+        &queries,
+        &truth,
+        &search(WalkMode::Lazy).with_start(WalkStart::Medoid),
+    )
+    .await;
     let entry = measure(
         &index,
         &queries,
@@ -2720,6 +2738,7 @@ async fn a_walk_charges_the_entry_points_it_did_not_choose_and_leaves_them_unmar
                 search_list_size: 64,
                 ..Default::default()
             })
+            .without_entry_points()
             .with_codes(SCALAR),
     )
     .await
@@ -2856,12 +2875,35 @@ async fn entry_points_train_the_same_every_time() {
 }
 
 /// A partition with no more live vertices than entry points asked for trains
-/// none, and its walks are the medoid's.
+/// none, and its walks are the medoid's - on an index that stores entry
+/// points of its own, so that the empty lists handed over are seen to take
+/// their place rather than fall back to them.
 #[tokio::test]
 async fn a_partition_no_larger_than_its_entry_points_starts_at_its_medoid() {
     let dir = tempfile::tempdir().unwrap();
-    let dataset = coded_dataset(dir.path().to_str().unwrap(), SCALAR).await;
+    let mut dataset = fixture().write(dir.path().to_str().unwrap()).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &params(SCALAR).with_entry_point_params(EntryPointParams::new(ENTRIES)),
+    )
+    .await
+    .unwrap();
     let index = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let queries = random_vectors(QUERIES, 4242);
+    for params in both_walks() {
+        assert_ne!(
+            walked(
+                &index,
+                &params.clone().with_start(WalkStart::NearestEntry),
+                &queries
+            )
+            .await,
+            walked(&index, &params, &queries).await,
+            "the stored entry points start every walk at the medoid, margin {:?}",
+            params.stop_margin
+        );
+    }
     let rows = fixture().fragments * fixture().rows_per_fragment;
     let trained = index
         .train_entry_points(&EntryPointParams::new(rows))
@@ -2875,7 +2917,6 @@ async fn a_partition_no_larger_than_its_entry_points_starts_at_its_medoid() {
         "{trained:?}"
     );
     let index = index.with_entry_points(Arc::new(trained)).unwrap();
-    let queries = random_vectors(QUERIES, 4242);
     for params in both_walks() {
         assert_eq!(
             walked(
@@ -3306,10 +3347,14 @@ fn entry_points_out_of_shape_are_refused() {
     for (partitions, expected) in [
         (vec![partition(0, vec![5, 3])], "ascending and distinct"),
         (vec![partition(0, vec![3, 3])], "ascending and distinct"),
-        (vec![partition(0, vec![3, 100])], "outside partition 0"),
+        (vec![partition(0, vec![3, 100])], "partition 0 of segment"),
+        (
+            vec![partition(0, vec![3, 100])],
+            "lists entry point 100 but holds only 100 vertices",
+        ),
         (
             vec![partition(0, vec![1, 2, 3, 4, 5])],
-            "more than num_entries 4",
+            "more than the 4 its parameters train in a partition of 100 vertices",
         ),
         (
             vec![partition(0, vec![1]), partition(0, vec![2])],
@@ -3327,36 +3372,46 @@ fn entry_points_out_of_shape_are_refused() {
         .is_ok()
     );
 
+    // The bound is the partition's: under a rule of two up to a hundred rows,
+    // a partition of a hundred takes two and refuses a third.
+    let rule = || EntryPointParams::new(4).with_small_partitions(100, 2);
+    let message = refused(rule(), vec![partition(0, vec![1, 2, 3])]);
+    assert!(
+        message.contains("more than the 2 its parameters train in a partition of 100 vertices"),
+        "{message}"
+    );
+    assert!(EntryPoints::from_partitions(rule(), vec![partition(0, vec![1, 2])]).is_ok());
+
     for (params, expected) in [
-        (EntryPointParams::new(0), "num_entries must be at least 1"),
+        (EntryPointParams::new(0), "must both be at least 1"),
         (
-            EntryPointParams::new(4).with_sample_size(3),
-            "smaller than num_entries 4",
+            EntryPointParams::new(4).with_sample_rate(0),
+            "sample_rate 0 is outside 1..=512",
         ),
         (
-            EntryPointParams::new(4).with_sample_size(4 * 512 + 1),
-            "over 512 vectors per entry point",
+            EntryPointParams::new(4).with_sample_rate(513),
+            "sample_rate 513 is outside 1..=512",
         ),
     ] {
         let message = refused(params, Vec::new());
         assert!(message.contains(expected), "{message}");
     }
-    // Both ends of the sample's range are inside it.
-    for sample_size in [4, 4 * 512] {
+    // Both ends of the rate's range are inside it.
+    for sample_rate in [1, 512] {
         assert!(
             EntryPoints::from_partitions(
-                EntryPointParams::new(4).with_sample_size(sample_size),
+                EntryPointParams::new(4).with_sample_rate(sample_rate),
                 Vec::new()
             )
             .is_ok(),
-            "sample_size {sample_size}"
+            "sample_rate {sample_rate}"
         );
     }
 }
 
-/// A walk asked to start at entry points is refused by an index given none,
-/// and by every mode but the lazy walk, rather than quietly started at the
-/// medoid.
+/// A walk asked to start at entry points is refused by an index that stores
+/// none and was given none, and by every mode but the lazy walk, rather than
+/// quietly started at the medoid.
 #[tokio::test]
 async fn a_start_at_entry_points_is_refused_where_there_is_none_to_take() {
     let dir = tempfile::tempdir().unwrap();
@@ -3374,7 +3429,7 @@ async fn a_start_at_entry_points_is_refused_where_there_is_none_to_take() {
         "{error}"
     );
     assert!(
-        error.to_string().contains("given no entry points"),
+        error.to_string().contains("stores no entry points"),
         "{error}"
     );
     let error = plain
@@ -3382,7 +3437,7 @@ async fn a_start_at_entry_points_is_refused_where_there_is_none_to_take() {
         .await
         .unwrap_err();
     assert!(
-        error.to_string().contains("num_entries must be at least 1"),
+        error.to_string().contains("must both be at least 1"),
         "{error}"
     );
 
@@ -3443,4 +3498,119 @@ async fn a_start_at_entry_points_is_refused_where_there_is_none_to_take() {
         );
     }
     assert!(given.search(&query, &entry(WalkMode::Lazy)).await.is_ok());
+}
+
+/// The default start is the nearest entry point wherever a lazy walk can have
+/// one: on an index storing them it walks as an explicit `NearestEntry` does,
+/// to the last bit, and differently from the medoid; on an index storing none,
+/// and in every other mode, it walks as the medoid does.
+#[tokio::test]
+async fn the_default_start_is_the_stored_entry_point_where_there_is_one() {
+    assert_eq!(
+        SearchParams::new(K).start,
+        WalkStart::PreferNearestEntry,
+        "the default start"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut dataset = fixture()
+        .write(dir.path().join("stored").to_str().unwrap())
+        .await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &params(SCALAR).with_entry_point_params(EntryPointParams::new(ENTRIES)),
+    )
+    .await
+    .unwrap();
+    let stored = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let plain = coded_dataset(dir.path().join("plain").to_str().unwrap(), SCALAR).await;
+    let plain = VamanaIndex::open(&plain, INDEX_NAME).await.unwrap();
+    let queries = random_vectors(QUERIES, 4242);
+    for medoid in both_walks() {
+        let what = format!("margin {:?}", medoid.stop_margin);
+        let default = medoid.clone().with_start(WalkStart::PreferNearestEntry);
+        let strict = medoid.clone().with_start(WalkStart::NearestEntry);
+        let from_entries = walked(&stored, &default, &queries).await;
+        assert_eq!(
+            from_entries,
+            walked(&stored, &strict, &queries).await,
+            "{what}"
+        );
+        assert_ne!(
+            from_entries,
+            walked(&stored, &medoid, &queries).await,
+            "{what}: the stored entry points walked the medoid's walk, so nothing here tells \
+             the two starts apart"
+        );
+        assert_eq!(
+            walked(&plain, &default, &queries).await,
+            walked(&plain, &medoid, &queries).await,
+            "{what}"
+        );
+    }
+    for mode in [WalkMode::Exact, WalkMode::Coded, WalkMode::Flat] {
+        let default = search(mode).with_report_coded(true);
+        assert_eq!(
+            walked(&stored, &default, &queries).await,
+            walked(
+                &stored,
+                &default.clone().with_start(WalkStart::Medoid),
+                &queries
+            )
+            .await,
+            "{mode:?}"
+        );
+    }
+}
+
+/// Entry points handed over at open take the place of the stored ones: given
+/// each partition's medoid as its only entry point, the default start and the
+/// strict one walk the medoid's walk on an index whose stored entry points
+/// walk another.
+#[tokio::test]
+async fn entry_points_handed_over_take_the_place_of_the_stored_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut dataset = fixture().write(dir.path().to_str().unwrap()).await;
+    create_index(
+        &mut dataset,
+        INDEX_NAME,
+        &params(SCALAR).with_entry_point_params(EntryPointParams::new(ENTRIES)),
+    )
+    .await
+    .unwrap();
+    let stored = VamanaIndex::open(&dataset, INDEX_NAME).await.unwrap();
+    let as_medoids = VamanaIndex::open(&dataset, INDEX_NAME)
+        .await
+        .unwrap()
+        .with_entry_points(Arc::new(
+            EntryPoints::from_partitions(EntryPointParams::new(1), medoids(&dataset).await)
+                .unwrap(),
+        ))
+        .unwrap();
+    let queries = random_vectors(QUERIES, 4242);
+    for medoid in both_walks() {
+        let what = format!("margin {:?}", medoid.stop_margin);
+        let default = medoid.clone().with_start(WalkStart::PreferNearestEntry);
+        let from_medoid = walked(&stored, &medoid, &queries).await;
+        assert_ne!(
+            walked(&stored, &default, &queries).await,
+            from_medoid,
+            "{what}"
+        );
+        assert_eq!(
+            walked(&as_medoids, &default, &queries).await,
+            from_medoid,
+            "{what}"
+        );
+        assert_eq!(
+            walked(
+                &as_medoids,
+                &medoid.clone().with_start(WalkStart::NearestEntry),
+                &queries
+            )
+            .await,
+            from_medoid,
+            "{what}"
+        );
+    }
 }
