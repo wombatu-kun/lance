@@ -669,7 +669,9 @@ mod tests {
             .centroids
             .as_primitive::<Float32Type>()
             .values()
-            .chunks_exact(WIDTH as usize)
+            .as_chunks::<{ WIDTH as usize }>()
+            .0
+            .iter()
             .map(|centroid| {
                 let target = Arc::new(Float32Array::from(centroid.to_vec())) as ArrayRef;
                 let calculator = store.dist_calculator(target, 0.0);
@@ -918,7 +920,9 @@ mod tests {
             .values()
             .as_primitive::<Float32Type>()
             .values()
-            .chunks_exact(WIDTH as usize)
+            .as_chunks::<{ WIDTH as usize }>()
+            .0
+            .iter()
             .enumerate()
             .flat_map(|(row, vector)| {
                 vector

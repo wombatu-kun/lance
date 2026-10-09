@@ -148,6 +148,16 @@ async fn manifest_indices(dataset: &Dataset, index_name: &str) -> Vec<IndexMetad
         .collect()
 }
 
+/// The uuids of [`manifest_indices`], from a fresh open of `uri`.
+async fn manifest_uuids(uri: &str, index_name: &str) -> Vec<Uuid> {
+    let reopened = Dataset::open(uri).await.unwrap();
+    manifest_indices(&reopened, index_name)
+        .await
+        .iter()
+        .map(|idx| idx.uuid)
+        .collect()
+}
+
 /// Commit one hand-written segment covering every fragment of the dataset.
 async fn commit_spike_segment(
     dataset: &mut Dataset,
@@ -477,7 +487,10 @@ async fn q0_2_same_coverage_replaces_the_segment() {
 /// Q0.2 - a disjoint segment survives while its sibling is rewritten.
 ///
 /// This is the commit shape consolidation (S5) needs: rewrite one segment, say
-/// nothing about the others, and they are left exactly as they were.
+/// nothing about the others, and they are left exactly as they were. Committed
+/// under this crate's own details, as the crate commits them: Lance opens
+/// coexisting segments that carry its vector details, which hand-written files
+/// cannot survive (see `q0_2_lance_opens_coexisting_vector_segments_at_commit`).
 #[tokio::test]
 async fn q0_2_disjoint_segment_survives_sibling_rewrite() {
     let dir = tempfile::tempdir().unwrap();
@@ -491,14 +504,16 @@ async fn q0_2_disjoint_segment_survives_sibling_rewrite() {
     let seg_right = Uuid::new_v4();
     write_handwritten_index_file(&dataset, seg_left, INDEX_FILE_NAME, 2).await;
     write_handwritten_index_file(&dataset, seg_right, INDEX_FILE_NAME, 2).await;
-    commit_spike_segments(
+    commit_spike_segments_versioned(
         &mut dataset,
         "vamana_sibling",
         vec![(seg_left, left.clone()), (seg_right, right)],
+        unknown_details(),
+        1,
     )
     .await
     .unwrap();
-    let mut before = committed_uuids(uri, "vamana_sibling").await;
+    let mut before = manifest_uuids(uri, "vamana_sibling").await;
     before.sort();
     let mut expected = vec![seg_left, seg_right];
     expected.sort();
@@ -507,11 +522,17 @@ async fn q0_2_disjoint_segment_survives_sibling_rewrite() {
     // Rewrite only the left segment.
     let seg_left_v2 = Uuid::new_v4();
     write_handwritten_index_file(&dataset, seg_left_v2, INDEX_FILE_NAME, 2).await;
-    commit_spike_segments(&mut dataset, "vamana_sibling", vec![(seg_left_v2, left)])
-        .await
-        .unwrap();
+    commit_spike_segments_versioned(
+        &mut dataset,
+        "vamana_sibling",
+        vec![(seg_left_v2, left)],
+        unknown_details(),
+        1,
+    )
+    .await
+    .unwrap();
 
-    let mut after = committed_uuids(uri, "vamana_sibling").await;
+    let mut after = manifest_uuids(uri, "vamana_sibling").await;
     after.sort();
     let mut want = vec![seg_left_v2, seg_right];
     want.sort();
@@ -583,7 +604,9 @@ async fn q0_2_overlap_within_one_commit_is_rejected() {
 }
 
 /// Q0.2 - a segment covering only newly appended fragments can be added without
-/// touching the existing ones. This is the append path (S6 mode (a)).
+/// touching the existing ones. This is the append path (S6 mode (a)), under this
+/// crate's own details for the reason `q0_2_disjoint_segment_survives_sibling_rewrite`
+/// gives.
 #[tokio::test]
 async fn q0_2_new_fragments_get_their_own_segment() {
     let dir = tempfile::tempdir().unwrap();
@@ -593,10 +616,12 @@ async fn q0_2_new_fragments_get_their_own_segment() {
 
     let base = Uuid::new_v4();
     write_handwritten_index_file(&dataset, base, INDEX_FILE_NAME, 2).await;
-    commit_spike_segments(
+    commit_spike_segments_versioned(
         &mut dataset,
         "vamana_append",
         vec![(base, base_fragments.clone())],
+        unknown_details(),
+        1,
     )
     .await
     .unwrap();
@@ -611,17 +636,56 @@ async fn q0_2_new_fragments_get_their_own_segment() {
 
     let delta = Uuid::new_v4();
     write_handwritten_index_file(&dataset, delta, INDEX_FILE_NAME, 1).await;
-    commit_spike_segments(&mut dataset, "vamana_append", vec![(delta, fresh)])
-        .await
-        .unwrap();
+    commit_spike_segments_versioned(
+        &mut dataset,
+        "vamana_append",
+        vec![(delta, fresh)],
+        unknown_details(),
+        1,
+    )
+    .await
+    .unwrap();
 
-    let mut after = committed_uuids(uri, "vamana_append").await;
+    let mut after = manifest_uuids(uri, "vamana_append").await;
     after.sort();
     let mut want = vec![base, delta];
     want.sort();
     assert_eq!(
         after, want,
         "the base segment must survive a delta commit that never mentions it"
+    );
+}
+
+/// Q0.2 - Lance opens every segment with its own vector details that would
+/// coexist under one name, to check they answer queries alike, and refuses the
+/// commit when it cannot read one. This crate commits its own details and never
+/// meets the check; the day Lance drops or widens it, this says so.
+#[tokio::test]
+async fn q0_2_lance_opens_coexisting_vector_segments_at_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut dataset = write_vector_dataset(uri, 2, 8).await;
+    let all = fragment_ids(&dataset);
+
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    write_handwritten_index_file(&dataset, a, INDEX_FILE_NAME, 1).await;
+    write_handwritten_index_file(&dataset, b, INDEX_FILE_NAME, 1).await;
+    let err = commit_spike_segments(
+        &mut dataset,
+        "vamana_coexist",
+        vec![(a, vec![all[0]]), (b, vec![all[1]])],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, lance::Error::Index { .. })
+            && err.to_string().contains("Index Metadata not found"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        manifest_uuids(uri, "vamana_coexist").await.is_empty(),
+        "a refused commit must leave no segment behind"
     );
 }
 

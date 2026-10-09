@@ -328,8 +328,10 @@ fn ivf_difference(left: &pb::Ivf, right: &pb::Ivf) -> Option<String> {
         match &ivf.centroids_tensor {
             Some(tensor) => tensor
                 .data
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect(),
             None => ivf.centroids.clone(),
         }

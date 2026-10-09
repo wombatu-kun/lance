@@ -1287,7 +1287,9 @@ mod tests {
 
         let values = vectors.values().as_primitive::<Float32Type>().values();
         let mut errors = values
-            .chunks_exact(DIMENSION as usize)
+            .as_chunks::<{ DIMENSION as usize }>()
+            .0
+            .iter()
             .enumerate()
             .map(|(id, vector)| {
                 let exact = query

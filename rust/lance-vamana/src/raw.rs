@@ -449,8 +449,10 @@ pub(crate) fn vectors<'a>(
         }
         values.extend(
             chunk
-                .chunks_exact(4)
-                .map(|value| f32::from_le_bytes([value[0], value[1], value[2], value[3]])),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|value| f32::from_le_bytes(*value)),
         );
     }
     Ok(FixedSizeListArray::try_new_from_values(
@@ -698,11 +700,12 @@ mod tests {
     /// That is what keeps a run comparable with the runs taken before this
     /// existed - those two columns are how one is checked against another.
     ///
-    /// `requests` counts calls to the scheduler rather than reads, and it is
-    /// *supposed* to fall: the decoder asks once per page it has scheduled,
-    /// while a re-score knows all of its rows at once and asks once. The
-    /// assertion below is on the direction, so the day it stops falling is the
-    /// day something started asking twice.
+    /// `requests` counts calls to the scheduler rather than reads. A re-score
+    /// knows all of its rows at once and asks once; the decoder asked once per
+    /// page it had scheduled until Lance began handing a scheduling step's reads
+    /// over as one request (#9473), and now asks once here too. So the raw read
+    /// is pinned at one request and at no more than the decoder's: the day it
+    /// asks twice, something started asking twice.
     #[tokio::test]
     async fn a_raw_read_costs_what_the_decoder_costs() {
         let dir = tempfile::tempdir().unwrap();
@@ -740,8 +743,13 @@ mod tests {
             (decoded.bytes_read, decoded.iops),
             "raw read {raw:?} where the decoder read {decoded:?}"
         );
+        assert_eq!(
+            raw.requests, 1,
+            "a re-score knows all of its rows at once, and asked the scheduler {} times",
+            raw.requests
+        );
         assert!(
-            raw.requests < decoded.requests,
+            raw.requests <= decoded.requests,
             "raw asked the scheduler {} times where the decoder asked {}",
             raw.requests,
             decoded.requests
@@ -1067,7 +1075,9 @@ mod tests {
             .values()
             .as_primitive::<Float32Type>()
             .values()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| f64::from(pair[0]) + f64::from(pair[1]))
             .collect::<Vec<_>>();
         let doubles =
