@@ -3899,6 +3899,7 @@ dependencies = [
  "lance-select",
  "lance-table",
  "lance-tokenizer",
+ "libc",
  "log",
  "moka",
  "num-traits",
