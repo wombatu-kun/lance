@@ -328,7 +328,7 @@ public class Query {
 
     /**
      * Sets the number of candidates to reserve while searching. This is an optional parameter for
-     * HNSW related index types.
+     * HNSW related index types, and the candidates the walk of an IVF_VAMANA_* index keeps.
      *
      * @param ef The number of candidates to reserve.
      * @return The Builder instance for method chaining.

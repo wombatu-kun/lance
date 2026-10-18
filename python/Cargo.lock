@@ -4041,6 +4041,7 @@ dependencies = [
  "lance-select",
  "lance-table",
  "lance-tokenizer",
+ "libc",
  "log",
  "moka",
  "object_store 0.14.1",
