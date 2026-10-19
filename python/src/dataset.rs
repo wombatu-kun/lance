@@ -1606,6 +1606,11 @@ impl Dataset {
                 } else {
                     None
                 };
+            // fork(vamana)
+            let stop_margin: Option<f32> = match nearest.get_item("stop_margin")? {
+                Some(margin) if !margin.is_none() => Some(margin.extract()?),
+                _ => None,
+            };
 
             scanner
                 .and_then(|s| {
@@ -1621,6 +1626,10 @@ impl Dataset {
                     }
                     if let Some(ef) = ef {
                         s = s.ef(ef);
+                    }
+                    // fork(vamana)
+                    if let Some(margin) = stop_margin {
+                        s = s.stop_margin(margin)?;
                     }
                     s = s.query_parallelism(query_parallelism);
                     s = s.approx_mode(approx_mode);
@@ -5969,6 +5978,7 @@ impl PySearchFilter {
             dist_q_c: 0.0,
             approx_mode,
             search_effort,
+            adaptive_stop: None, // fork(vamana): vector query filters take no stop margin
         };
         vector_query
             .validate_search_effort()
