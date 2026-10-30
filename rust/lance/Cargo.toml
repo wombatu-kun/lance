@@ -151,6 +151,14 @@ reqwest = { workspace = true, features = ["rustls"] }
 name = "arrow_ordering"
 test = false
 
+# Seeded stress scenarios (storage faults, cancellation), one child process per
+# seed. Not part of the default test run. Run by hand with
+# `cargo test -p lance --test stress`.
+[[test]]
+name = "stress"
+path = "tests/stress/main.rs"
+test = false
+
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
 backtrace = ["lance-core/backtrace"]
