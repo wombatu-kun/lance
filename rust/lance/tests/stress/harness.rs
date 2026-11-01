@@ -7,16 +7,20 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::os::unix::process::CommandExt;
+use std::io::Write as _;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::incidents::CRASH_FIRED;
+use crate::limits::{ENV_CGROUP, RunScope, SeedCgroup};
 use crate::scenario;
 
 pub const ENV_CHILD: &str = "LANCE_STRESS_CHILD";
 pub const ENV_SEED: &str = "LANCE_STRESS_SEED";
 pub const ENV_DIR: &str = "LANCE_STRESS_DIR";
+pub const ENV_GENERATION: &str = "LANCE_STRESS_GENERATION";
 pub const ENV_PARENT_PID: &str = "LANCE_STRESS_PARENT_PID";
 pub const ENV_STEPS: &str = "LANCE_STRESS_STEPS";
 pub const ENV_QUIET_SECS: &str = "LANCE_STRESS_QUIET_SECS";
@@ -25,34 +29,60 @@ pub const ENV_PLAN: &str = "LANCE_STRESS_PLAN";
 pub const ENV_STANDALONE: &str = "LANCE_STRESS_STANDALONE";
 const ENV_STALL_SECS: &str = "LANCE_STRESS_STALL_SECS";
 const ENV_DEADLINE_SECS: &str = "LANCE_STRESS_DEADLINE_SECS";
+pub const ENV_CALIBRATE: &str = "LANCE_STRESS_CALIBRATE";
 
 pub const PLAN_LOG: &str = "plan.log";
 pub const STEPS_LOG: &str = "steps.log";
 pub const CALLS_LOG: &str = "calls.log";
+pub const MEMORY_LOG: &str = "memory.log";
 
 const POLL: Duration = Duration::from_millis(200);
 const GDB_TIMEOUT: Duration = Duration::from_secs(60);
 const REAP_TIMEOUT: Duration = Duration::from_secs(30);
 const STDERR_LIMIT: usize = 8 << 20;
+/// Well short of the 20 seconds `systemd-oomd` waits, so that nothing else is at
+/// risk from a thrashing child.
+const THRASH_PATIENCE: Duration = Duration::from_secs(10);
+/// A silent child that used this share of the stall on the CPU is busy, not
+/// hung. A loop that never ends meets the deadline.
+const BUSY_SHARE: f64 = 0.05;
+const DEAD_LIMIT_PLANNED: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScenarioKind {
     StorageFaults,
     Cancellation,
+    ProcessKill,
+    MemoryLimits,
+    HeapGrowth,
 }
 
 impl ScenarioKind {
+    /// Whether Lance reports its memory in this scenario, and the checks read it.
+    pub fn observes_memory(self) -> bool {
+        matches!(self, Self::ProcessKill | Self::MemoryLimits)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::StorageFaults => "storage_faults",
             Self::Cancellation => "cancellation",
+            Self::ProcessKill => "process_kill",
+            Self::MemoryLimits => "memory_limits",
+            Self::HeapGrowth => "heap_growth",
         }
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
-        [Self::StorageFaults, Self::Cancellation]
-            .into_iter()
-            .find(|kind| kind.name() == name)
+        [
+            Self::StorageFaults,
+            Self::Cancellation,
+            Self::ProcessKill,
+            Self::MemoryLimits,
+            Self::HeapGrowth,
+        ]
+        .into_iter()
+        .find(|kind| kind.name() == name)
     }
 }
 
@@ -66,10 +96,22 @@ pub enum SelfTest {
     ModelMismatch,
     ColumnMismatch,
     Orphan,
+    /// A SIGKILL nobody planned: the seed must end there.
+    ForeignKill,
+    /// A file a manifest references goes away while the process is dead.
+    KillThenMissingFile,
+    /// A step goes over its limit: the seed goes on and ends well.
+    OomRecovery,
+    /// A step hangs under a limit.
+    HangUnderLimit,
+    /// An index build reports no memory events, though it must.
+    MemoryEvents,
+    /// Heap goes missing on every cycle of a repeated workload.
+    HeapLeak,
 }
 
 impl SelfTest {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 13] = [
         Self::Hang,
         Self::Panic,
         Self::TaskLeak,
@@ -77,6 +119,12 @@ impl SelfTest {
         Self::ModelMismatch,
         Self::ColumnMismatch,
         Self::Orphan,
+        Self::ForeignKill,
+        Self::KillThenMissingFile,
+        Self::OomRecovery,
+        Self::HangUnderLimit,
+        Self::MemoryEvents,
+        Self::HeapLeak,
     ];
 
     pub fn name(self) -> &'static str {
@@ -88,6 +136,12 @@ impl SelfTest {
             Self::ModelMismatch => "model_mismatch",
             Self::ColumnMismatch => "column_mismatch",
             Self::Orphan => "orphan",
+            Self::ForeignKill => "foreign_kill",
+            Self::KillThenMissingFile => "kill_then_missing_file",
+            Self::OomRecovery => "oom_recovery",
+            Self::HangUnderLimit => "hang_under_limit",
+            Self::MemoryEvents => "memory_events",
+            Self::HeapLeak => "heap_leak",
         }
     }
 
@@ -95,15 +149,33 @@ impl SelfTest {
         Self::ALL.into_iter().find(|test| test.name() == name)
     }
 
-    /// The failure class the parent must report for this defect.
-    fn expected_class(self) -> &'static str {
+    fn scenario(self) -> ScenarioKind {
         match self {
-            Self::Hang => "hang",
-            Self::Panic => "panic",
-            Self::TaskLeak => "task_leak",
-            Self::TmpLeak => "tmp_leak",
-            Self::ModelMismatch | Self::ColumnMismatch => "content",
-            Self::Orphan => "orphans",
+            Self::ForeignKill | Self::KillThenMissingFile | Self::MemoryEvents => {
+                ScenarioKind::ProcessKill
+            }
+            Self::OomRecovery | Self::HangUnderLimit => ScenarioKind::MemoryLimits,
+            Self::HeapLeak => ScenarioKind::HeapGrowth,
+            _ => ScenarioKind::StorageFaults,
+        }
+    }
+
+    /// The failure classes the parent may report for this defect; none means
+    /// the seed must pass.
+    fn expected_classes(self) -> &'static [&'static str] {
+        match self {
+            Self::Hang | Self::HangUnderLimit => &["hang"],
+            Self::Panic => &["panic"],
+            Self::TaskLeak => &["task_leak"],
+            Self::TmpLeak => &["tmp_leak"],
+            Self::ModelMismatch | Self::ColumnMismatch => &["content"],
+            Self::Orphan => &["orphans"],
+            Self::ForeignKill => &["crash"],
+            // Which check meets the missing file first depends on the file.
+            Self::KillThenMissingFile => &["validate", "missing_files", "unreadable"],
+            Self::OomRecovery => &[],
+            Self::MemoryEvents => &["memory_events"],
+            Self::HeapLeak => &["heap_growth"],
         }
     }
 }
@@ -117,9 +189,20 @@ struct RunConfig {
     stall: Duration,
     deadline: Duration,
     quiet_secs: u64,
-    keep: bool,
+    keep: Keep,
     repeat: u64,
     self_test: Option<SelfTest>,
+    /// Where the children of a run under memory limits live.
+    scope: Option<RunScope>,
+}
+
+/// What stays of a seed that passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Keep {
+    Nothing,
+    /// The logs, without the dataset and the temporary files.
+    Logs,
+    Everything,
 }
 
 impl RunConfig {
@@ -129,6 +212,11 @@ impl RunConfig {
         let (steps, quiet_secs, stall_secs) = match self_test {
             Some(_) => (3, 2, 15),
             None => (env_u64(ENV_STEPS, 8), 20, env_u64(ENV_STALL_SECS, 60)),
+        };
+        // Repeated cycles are the point of this scenario: it has a size of its own.
+        let steps = match kind {
+            ScenarioKind::HeapGrowth => scenario::heap_growth_steps(),
+            _ => steps,
         };
         assert!(
             stall_secs >= quiet_secs + 10,
@@ -144,6 +232,20 @@ impl RunConfig {
             std::process::id()
         ));
         let replaying = std::env::var(ENV_SEED).is_ok();
+        let keep = if self_test.is_some() || replaying {
+            Keep::Everything
+        } else {
+            match std::env::var("LANCE_STRESS_KEEP").as_deref() {
+                Ok("1") => Keep::Everything,
+                Ok("logs") => Keep::Logs,
+                _ => Keep::Nothing,
+            }
+        };
+        let scope = (kind == ScenarioKind::MemoryLimits).then(|| {
+            RunScope::create(&name).unwrap_or_else(|error| {
+                panic!("the memory limit scenarios cannot run here: {error}")
+            })
+        });
         Self {
             kind,
             run_dir,
@@ -151,11 +253,10 @@ impl RunConfig {
             stall: Duration::from_secs(stall_secs),
             deadline: Duration::from_secs(env_u64(ENV_DEADLINE_SECS, 120 + 60 * steps)),
             quiet_secs,
-            keep: self_test.is_some()
-                || replaying
-                || std::env::var("LANCE_STRESS_KEEP").is_ok_and(|keep| keep == "1"),
+            keep,
             repeat: env_u64("LANCE_STRESS_REPEAT", 1).max(1),
             self_test,
+            scope,
         }
     }
 }
@@ -210,24 +311,64 @@ pub fn run(kind: ScenarioKind) {
                 .expect("write the summary");
         }
     }
-    assert!(summary.failures.is_empty(), "{}", summary.render());
+    assert!(
+        summary.failures.is_empty() && summary.dead_limits().is_empty(),
+        "{}",
+        summary.render()
+    );
 }
 
 /// Runs one seed with a defect injected and checks that it is reported.
 pub fn check_self_test(test: SelfTest) {
-    let config = RunConfig::new(ScenarioKind::StorageFaults, Some(test));
+    let config = RunConfig::new(test.scenario(), Some(test));
     fs::create_dir_all(&config.run_dir).expect("create the run directory");
     let report = run_seed(&config, 1, 1);
-    assert_eq!(
-        report.class.as_deref(),
-        Some(test.expected_class()),
+    let expected = test.expected_classes();
+    assert!(
+        match report.class.as_deref() {
+            Some(class) => expected.contains(&class),
+            None => expected.is_empty(),
+        },
         "the {} self-test was reported as {:?}: {} (artifacts in {})",
         test.name(),
         report.class,
         report.detail,
         report.dir.display()
     );
-    if test == SelfTest::Hang {
+    let resumed = report.journal.contains("generation=2 ");
+    match test {
+        SelfTest::ForeignKill => assert!(
+            !resumed,
+            "a death nobody planned must end the seed, see {}",
+            report.dir.display()
+        ),
+        SelfTest::KillThenMissingFile => assert!(
+            resumed,
+            "the death was planned, so a later process must look at the dataset, see {}",
+            report.dir.display()
+        ),
+        SelfTest::OomRecovery => assert!(
+            resumed
+                && report.journal.contains("observation=killed:oom_kill")
+                && report.journal.contains("outcome=killed"),
+            "the step must have died of its limit and been concluded later, see {}",
+            report.dir.display()
+        ),
+        SelfTest::HangUnderLimit => {
+            let cgroup = fs::read_to_string(report.dir.join("cgroup.txt")).unwrap_or_default();
+            // Taken before the kill, so the child is still there to see.
+            assert!(
+                cgroup
+                    .split("== cgroup.procs\n")
+                    .nth(1)
+                    .is_some_and(|procs| !procs.trim().is_empty()),
+                "a hang under a limit must leave the cgroup as it was in {}",
+                report.dir.display()
+            );
+        }
+        _ => {}
+    }
+    if matches!(test, SelfTest::Hang | SelfTest::HangUnderLimit) {
         let threads = fs::read_to_string(report.dir.join("threads.txt")).unwrap_or_default();
         assert!(
             !threads.is_empty(),
@@ -310,7 +451,7 @@ fn replay_command(config: &RunConfig, seed: u64) -> String {
         "{ENV_PLAN}={}",
         scenario::plan_fingerprint(config.kind, seed, config.steps as usize)
     ));
-    for name in [ENV_STALL_SECS, ENV_DEADLINE_SECS] {
+    for name in [ENV_STALL_SECS, ENV_DEADLINE_SECS, ENV_CALIBRATE] {
         if let Ok(value) = std::env::var(name) {
             vars.push(format!("{name}={}", shell_quote(&value)));
         }
@@ -353,8 +494,15 @@ fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
         );
     }
     let replay = replay_command(config, seed);
+    let mut standalone_vars = String::new();
+    if config.kind.observes_memory() {
+        standalone_vars.push_str("LANCE_MEMORY_OBSERVE=1 ");
+    }
+    if std::env::var(ENV_CALIBRATE).is_ok_and(|value| value == "1") {
+        write!(standalone_vars, "{ENV_CALIBRATE}=1 ").unwrap();
+    }
     let standalone = format!(
-        "# Or in one process, for gdb or rr, into a fresh directory:\n# {ENV_STANDALONE}=1 {ENV_CHILD}={} {ENV_SEED}={seed} {ENV_STEPS}={} {ENV_QUIET_SECS}={} {ENV_DIR}=<dir> TMPDIR=<dir>/tmp {} --exact child --nocapture\n",
+        "# Or in one process, for gdb or rr, into a fresh directory, where no cgroup limit applies. After a death, go on with {ENV_GENERATION}=2 in the same directory:\n# {standalone_vars}{ENV_STANDALONE}=1 {ENV_CHILD}={} {ENV_SEED}={seed} {ENV_GENERATION}=1 {ENV_STEPS}={} {ENV_QUIET_SECS}={} {ENV_DIR}=<dir> TMPDIR=<dir>/tmp {} --exact child --nocapture\n",
         config.kind.name(),
         config.steps,
         config.quiet_secs,
@@ -364,19 +512,79 @@ fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
     if let Err(error) = fs::write(dir.join("replay.sh"), format!("{replay}\n{standalone}")) {
         return report("harness", format!("cannot write replay.sh: {error}"));
     }
-    let (stdout, stderr) = match (
-        File::create(dir.join("stdout.log")),
-        File::create(dir.join("stderr.log")),
-    ) {
-        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
-        (Err(error), _) | (_, Err(error)) => {
+    let cgroup = match &config.scope {
+        Some(scope) => match scope.seed_cgroup(&format!("seed-{seed}-{attempt}")) {
+            Ok(cgroup) => Some(cgroup),
+            Err(error) => return report("harness", error),
+        },
+        None => None,
+    };
+    // A seed whose process dies goes on in a new process, up to one death per
+    // step and a little more for a delayed death between steps.
+    let max_generations = config.steps + 2;
+    let mut generation = 1;
+    let end = loop {
+        let journal_start = fs::metadata(dir.join(STEPS_LOG)).map_or(0, |meta| meta.len());
+        let oom_kills = cgroup.as_ref().map_or(0, SeedCgroup::oom_kills);
+        if let Some(Err(error)) = cgroup.as_ref().map(SeedCgroup::lift_limit) {
+            return report("harness", error);
+        }
+        let mut child = match start_child(config, seed, &dir, generation, cgroup.as_ref()) {
+            Ok(child) => child,
+            Err(error) => return report("harness", format!("cannot start the child: {error}")),
+        };
+        let end = watch(&mut child, &dir, config, generation, cgroup.as_ref());
+        let Some(cause) = planned_death(&end, &dir, journal_start, oom_kills, cgroup.as_ref())
+        else {
+            break end;
+        };
+        if generation == max_generations {
             return report(
                 "harness",
-                format!("cannot create the child's logs: {error}"),
+                format!("the seed still dies after {max_generations} processes: {cause}"),
             );
         }
+        generation += 1;
+        if let Err(error) = note_the_death(&dir, generation, cause) {
+            return report("harness", format!("cannot note a death: {error}"));
+        }
     };
+    drop(cgroup);
+    let mut report = judge(seed, attempt, dir, end);
+    if report.class.is_some() {
+        write!(report.detail, " | replay: {replay}").unwrap();
+    } else {
+        match config.keep {
+            Keep::Everything => {}
+            Keep::Nothing => {
+                fs::remove_dir_all(&report.dir).ok();
+            }
+            Keep::Logs => {
+                fs::remove_dir_all(report.dir.join("dataset")).ok();
+                fs::remove_dir_all(report.dir.join("tmp")).ok();
+            }
+        }
+    }
+    report
+}
 
+fn start_child(
+    config: &RunConfig,
+    seed: u64,
+    dir: &Path,
+    generation: u64,
+    cgroup: Option<&SeedCgroup>,
+) -> Result<Child, String> {
+    // On append: the logs hold all the processes of a seed, so the check for
+    // panics below sees the ones of a process that died later too.
+    let log = |name: &str| {
+        File::options()
+            .create(true)
+            .append(true)
+            .open(dir.join(name))
+            .map_err(|error| format!("cannot open {name}: {error}"))
+    };
+    let tmp = dir.join("tmp");
     // /proc/self/exe runs this very binary even if a build has replaced the
     // file since the run started.
     let mut command = Command::new("/proc/self/exe");
@@ -384,7 +592,8 @@ fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
         .args(["--exact", "child", "--nocapture", "--test-threads=1"])
         .env(ENV_CHILD, config.kind.name())
         .env(ENV_SEED, seed.to_string())
-        .env(ENV_DIR, &dir)
+        .env(ENV_DIR, dir)
+        .env(ENV_GENERATION, generation.to_string())
         .env(ENV_PARENT_PID, std::process::id().to_string())
         .env(ENV_STEPS, config.steps.to_string())
         .env(ENV_QUIET_SECS, config.quiet_secs.to_string())
@@ -399,8 +608,8 @@ fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
         .env("RAYON_NUM_THREADS", "2")
         .env("RUST_BACKTRACE", "1")
         .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
+        .stdout(log("stdout.log")?)
+        .stderr(log("stderr.log")?)
         // A process group of its own, so that a kill reaches all of it.
         .process_group(0);
     match config.self_test {
@@ -415,32 +624,127 @@ fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
     {
         command.env(ENV_PLAN, plan);
     }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => return report("harness", format!("cannot start the child: {error}")),
+    // Read once, when a process first needs it, so it is set from the start.
+    if config.kind.observes_memory() && config.self_test != Some(SelfTest::MemoryEvents) {
+        command.env("LANCE_MEMORY_OBSERVE", "1");
+    } else {
+        command.env_remove("LANCE_MEMORY_OBSERVE");
+    }
+    // The steps of this scenario set the pool, and the switch would turn it off.
+    if config.kind == ScenarioKind::MemoryLimits {
+        command
+            .env_remove("LANCE_MEM_POOL_SIZE")
+            .env_remove("LANCE_BYPASS_SPILLING");
+    }
+    match cgroup {
+        Some(cgroup) => {
+            command.env(ENV_CGROUP, cgroup.dir());
+            cgroup.add_to(&mut command)?;
+        }
+        None => {
+            command.env_remove(ENV_CGROUP);
+        }
+    }
+    command.spawn().map_err(|error| error.to_string())
+}
+
+/// Why a child that was killed may simply go on in a new process: the OOM
+/// killer of its cgroup, a death the scenario planned, or the parent's own
+/// patience with a thrashing child. Any other end falls to `judge`.
+fn planned_death(
+    end: &ChildEnd,
+    dir: &Path,
+    journal_start: u64,
+    oom_kills: u64,
+    cgroup: Option<&SeedCgroup>,
+) -> Option<&'static str> {
+    let status = match end {
+        ChildEnd::Exited(status) => status,
+        ChildEnd::Thrashed => return Some("thrash"),
+        ChildEnd::Hung { .. } => return None,
     };
-    let end = watch(&mut child, &dir, config);
-    let mut report = judge(seed, attempt, dir, end);
-    if report.class.is_none() && !config.keep {
-        fs::remove_dir_all(&report.dir).ok();
+    if status.signal() != Some(libc::SIGKILL) {
+        return None;
     }
-    if report.class.is_some() {
-        write!(report.detail, " | replay: {replay}").unwrap();
+    // The limit of a step is still set when its process dies. A kill without one
+    // comes from another OOM killer, and a check or a retry has no budget to
+    // blow: that is no planned death.
+    if cgroup.is_some_and(|cgroup| cgroup.is_limited() && cgroup.oom_kills() > oom_kills) {
+        return Some("oom_kill");
     }
-    report
+    let journal = fs::read(dir.join(STEPS_LOG)).ok()?;
+    let this_process = journal.get(journal_start as usize..)?;
+    String::from_utf8_lossy(this_process)
+        .contains(CRASH_FIRED)
+        .then_some(CRASH_FIRED)
+}
+
+/// A SIGKILL can tear a write at a page boundary, so whatever comes next to a
+/// log of a dead process starts a line of its own.
+fn note_the_death(dir: &Path, generation: u64, cause: &str) -> std::io::Result<()> {
+    for name in [STEPS_LOG, CALLS_LOG, MEMORY_LOG] {
+        let path = dir.join(name);
+        if fs::read(&path).is_ok_and(|log| !log.is_empty() && !log.ends_with(b"\n")) {
+            File::options().append(true).open(&path)?.write_all(b"\n")?;
+        }
+    }
+    File::options()
+        .append(true)
+        .open(dir.join(STEPS_LOG))?
+        .write_all(format!("generation={generation} observation=killed:{cause}\n").as_bytes())
 }
 
 enum ChildEnd {
     Exited(ExitStatus),
-    Hung { reason: String, reaped: bool },
+    Hung {
+        reason: String,
+        reaped: bool,
+    },
+    /// The parent killed a child that was thrashing under its limit.
+    Thrashed,
+}
+
+/// The CPU time a process used so far, in seconds.
+fn cpu_seconds(pid: u32) -> f64 {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    // The fields go on after the parenthesized name, which may contain spaces;
+    // the first one there is number 3, and utime and stime are 14 and 15.
+    let ticks: u64 = stat
+        .rsplit_once(") ")
+        .map(|(_, rest)| {
+            rest.split(' ')
+                .skip(11)
+                .take(2)
+                .filter_map(|ticks| ticks.parse::<u64>().ok())
+                .sum()
+        })
+        .unwrap_or(0);
+    // SAFETY: `sysconf` only reads a system setting.
+    let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    ticks as f64 / per_second.max(1) as f64
 }
 
 /// Waits for the child, which appends to its step log at every phase; a log
 /// that stops growing means a hang.
-fn watch(child: &mut Child, dir: &Path, config: &RunConfig) -> ChildEnd {
+fn watch(
+    child: &mut Child,
+    dir: &Path,
+    config: &RunConfig,
+    generation: u64,
+    cgroup: Option<&SeedCgroup>,
+) -> ChildEnd {
     let started = Instant::now();
     let mut log_len = 0;
     let mut last_progress = Instant::now();
+    let mut cpu_at_progress = cpu_seconds(child.id());
+    let mut timeline = cgroup.and_then(|_| {
+        File::options()
+            .create(true)
+            .append(true)
+            .open(dir.join("cgroup.log"))
+            .ok()
+    });
+    let mut thrashing_since: Option<Instant> = None;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return ChildEnd::Exited(status),
@@ -452,10 +756,50 @@ fn watch(child: &mut Child, dir: &Path, config: &RunConfig) -> ChildEnd {
                 };
             }
         }
+        if let Some(cgroup) = cgroup {
+            if let Some(timeline) = timeline.as_mut() {
+                writeln!(timeline, "generation={generation} {}", cgroup.sample()).ok();
+            }
+            thrashing_since = cgroup
+                .is_thrashing()
+                .then(|| thrashing_since.unwrap_or_else(Instant::now));
+            if thrashing_since.is_some_and(|since| since.elapsed() >= THRASH_PATIENCE) {
+                fs::write(
+                    dir.join(format!("thrash-{generation}-threads.txt")),
+                    thread_states(child.id()),
+                )
+                .ok();
+                fs::write(
+                    dir.join(format!("thrash-{generation}-cgroup.txt")),
+                    cgroup.dump(),
+                )
+                .ok();
+                if gdb_available() {
+                    gdb_stacks(child.id(), dir, &format!("thrash-{generation}-stacks"));
+                }
+                // A child that outlives the kill would run beside the next one.
+                if !kill_and_reap(child) {
+                    return ChildEnd::Hung {
+                        reason: "thrashing".to_string(),
+                        reaped: false,
+                    };
+                }
+                return ChildEnd::Thrashed;
+            }
+        }
         let len = fs::metadata(dir.join(STEPS_LOG)).map_or(0, |meta| meta.len());
         if len != log_len {
             log_len = len;
             last_progress = Instant::now();
+            cpu_at_progress = cpu_seconds(child.id());
+        }
+        // Under a limit a slow operation can stay silent while it works.
+        if cgroup.is_some() && last_progress.elapsed() >= config.stall {
+            let cpu = cpu_seconds(child.id());
+            if cpu - cpu_at_progress >= config.stall.as_secs_f64() * BUSY_SHARE {
+                last_progress = Instant::now();
+                cpu_at_progress = cpu;
+            }
         }
         let hang = if last_progress.elapsed() >= config.stall {
             Some(format!("no progress for {}s", config.stall.as_secs()))
@@ -469,8 +813,11 @@ fn watch(child: &mut Child, dir: &Path, config: &RunConfig) -> ChildEnd {
         };
         if let Some(reason) = hang {
             fs::write(dir.join("threads.txt"), thread_states(child.id())).ok();
+            if let Some(cgroup) = cgroup {
+                fs::write(dir.join("cgroup.txt"), cgroup.dump()).ok();
+            }
             if gdb_available() {
-                gdb_stacks(child.id(), dir);
+                gdb_stacks(child.id(), dir, "stacks");
             }
             return ChildEnd::Hung {
                 reason,
@@ -539,10 +886,10 @@ fn gdb_available() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-fn gdb_stacks(pid: u32, dir: &Path) {
+fn gdb_stacks(pid: u32, dir: &Path, name: &str) {
     let (Ok(stdout), Ok(stderr)) = (
-        File::create(dir.join("stacks.txt")),
-        File::create(dir.join("stacks.err")),
+        File::create(dir.join(format!("{name}.txt"))),
+        File::create(dir.join(format!("{name}.err"))),
     ) else {
         return;
     };
@@ -605,7 +952,7 @@ fn judge(seed: u64, attempt: u64, dir: PathBuf, end: ChildEnd) -> SeedReport {
             "hung: {reason}{}",
             if *reaped { "" } else { "; it survived SIGKILL" }
         )),
-        ChildEnd::Exited(_) => None,
+        ChildEnd::Exited(_) | ChildEnd::Thrashed => None,
     };
     let mut notes: Vec<String> = Vec::new();
     let class = if let Some(panic) = &panic {
@@ -635,6 +982,9 @@ fn judge(seed: u64, attempt: u64, dir: PathBuf, end: ChildEnd) -> SeedReport {
             }
             (ChildEnd::Exited(status), _) => {
                 notes.push(format!("exited with {status}; last: {last_line}"));
+            }
+            (ChildEnd::Thrashed, _) => {
+                notes.push(format!("killed for thrashing; last: {last_line}"));
             }
             (ChildEnd::Hung { .. }, _) => unreachable!("a hang is handled above"),
         }
@@ -699,9 +1049,40 @@ impl Summary {
         }
     }
 
+    /// Limits of Lance's own that a run planned often enough and that never bit:
+    /// a limit that has stopped working would otherwise stay green. Per seed
+    /// this could be chance, as a watcher can miss a short spill.
+    fn dead_limits(&self) -> Vec<String> {
+        let mut limits: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for (kind, coverage) in &self.coverage {
+            let mut parts = kind.split(':');
+            if let (Some("memory"), Some(op), Some(limit @ ("pool" | "fts_memory"))) =
+                (parts.next(), parts.next(), parts.next())
+            {
+                let entry = limits.entry(format!("{op}:{limit}")).or_default();
+                entry.0 += coverage.planned;
+                entry.1 += coverage.fired;
+            }
+        }
+        limits
+            .into_iter()
+            .filter(|(_, (planned, fired))| *planned >= DEAD_LIMIT_PLANNED && *fired == 0)
+            .map(|(limit, (planned, _))| format!("{limit} planned={planned} fired=0"))
+            .collect()
+    }
+
     fn add(&mut self, report: SeedReport) {
         self.runs += 1;
-        for line in report.journal.lines() {
+        let mut concluded_last = BTreeMap::new();
+        for (index, line) in report.journal.lines().enumerate() {
+            let head = line.split(" detail=").next().unwrap_or(line);
+            if head.split(' ').any(|token| token == "verdict")
+                && let Some(step) = field(line, "step")
+            {
+                concluded_last.insert(step, index);
+            }
+        }
+        for (index, line) in report.journal.lines().enumerate() {
             if let Some(observation) = field(line, "observation") {
                 *self
                     .observations
@@ -710,6 +1091,14 @@ impl Summary {
             }
             let head = line.split(" detail=").next().unwrap_or(line);
             if !head.split(' ').any(|token| token == "verdict") {
+                continue;
+            }
+            // A death before the end of a step gets it concluded a second time,
+            // and the later verdict knows more.
+            if field(line, "step")
+                .and_then(|step| concluded_last.get(step))
+                .is_some_and(|last| *last != index)
+            {
                 continue;
             }
             let outcome = format!(
@@ -768,6 +1157,9 @@ impl Summary {
                 outcomes.join(" ")
             )
             .unwrap();
+        }
+        for limit in self.dead_limits() {
+            writeln!(text, "dead limit: {limit}").unwrap();
         }
         if !self.failures.is_empty() {
             writeln!(text, "failed:").unwrap();

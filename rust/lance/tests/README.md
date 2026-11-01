@@ -20,11 +20,11 @@ bytehound server memory-profiling_*.dat
 
 ## Stress tests
 
-The `stress` target runs seeded scenarios, one child process per seed: `storage_faults` injects object store errors into writes, index builds and commits, and `cancellation` drops those operations at named points. After every step it checks the data, the indices and the leftover resources against a model. The target has `test = false`, so a plain `cargo test` skips it; start it by name.
+The `stress` target runs seeded scenarios, one child process per seed: `storage_faults` injects object store errors into writes, index builds and commits, `cancellation` drops those operations at named points, `process_kill` sends the process a SIGKILL at those points and goes on in a new one, `memory_limits` runs them under a cgroup limit that ends in the OOM killer or under Lance's own limits, and `heap_growth` looks for heap that a repeated workload does not give back. After every step it checks the data, the indices and the leftover resources against a model. `memory_limits` needs cgroup v2 and `systemd-run --user`. The target has `test = false`, so a plain `cargo test` skips it; start it by name.
 
 ```shell
 cargo test -p lance --test stress -- --test-threads=2
 LANCE_STRESS_SEEDS=200 LANCE_STRESS_SEED_BASE=33 cargo test -p lance --test stress -- --exact cancellation
 ```
 
-Artifacts go to `$CARGO_TARGET_TMPDIR/stress` unless `LANCE_STRESS_ARTIFACTS` says otherwise. The failure message lists every failing seed with its class, the command that replays it and its directory, which holds the plan, the step log, the storage calls, the child's output and, for a hang, its thread states and stacks. What a run checks, its blind spots and all the environment variables are described at the top of `stress/main.rs`.
+Artifacts go to `$CARGO_TARGET_TMPDIR/stress` unless `LANCE_STRESS_ARTIFACTS` says otherwise. The failure message lists every failing seed with its class, the command that replays it and its directory, which holds the plan, the step log, the storage calls, the child's output and, for a hang, its thread states and stacks; under limits also the memory of the cgroup over time and Lance's memory events. What a run checks, its blind spots and all the environment variables are described at the top of `stress/main.rs`.

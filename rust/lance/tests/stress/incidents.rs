@@ -8,13 +8,14 @@
 //! writes. Both ask the shared [`IncidentState`] what to do with each call.
 
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::Write as _;
 use std::ops::Range;
 use std::path::Path as FsPath;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -31,6 +32,8 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
 };
 use tokio::sync::{Notify, watch};
+
+use crate::scenario::Journal;
 
 /// The kind of a storage call. Reads of whole objects and of ranges are both
 /// `Get`, a metadata-only read is `Head`.
@@ -162,6 +165,14 @@ impl Incident {
                 if *sticky { "sticky" } else { "once" },
                 if *blind { ":blind" } else { "" }
             ),
+            // Which call matters beyond the first: the second manifest of a
+            // compaction comes after its reservation has landed.
+            Self::CancelCall {
+                method,
+                area,
+                when,
+                nth,
+            } if *nth > 1 => format!("cancel:{method}:{area}:{when}:call{nth}"),
             Self::CancelCall {
                 method, area, when, ..
             } => format!("cancel:{method}:{area}:{when}"),
@@ -207,19 +218,112 @@ impl fmt::Display for Action {
     }
 }
 
+/// The line that tells the parent a SIGKILL was planned.
+pub const CRASH_FIRED: &str = "crash_fired";
+
+/// Sends this process the SIGKILL that nothing can catch or clean up after.
+pub fn kill_this_process() -> ! {
+    // SAFETY: `kill` only sends a signal, here to this very process.
+    unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+    loop {
+        std::thread::park();
+    }
+}
+
+const KILLER_WAITS: u8 = 0;
+const KILLER_GOES: u8 = 1;
+const KILLER_STANDS_DOWN: u8 = 2;
+
+/// Turns a cancellation point into the death of the process.
+#[derive(Clone)]
+pub struct Death {
+    journal: Arc<Journal>,
+    /// What the thread that kills during a request is told, if there is one.
+    killer: Arc<AtomicU8>,
+}
+
+impl Death {
+    /// With `in_flight`, a thread stands ready to kill that long after a request
+    /// starts. It is running already and spins, because a small write is over in
+    /// a time shorter than a thread takes to start or to wake up.
+    pub fn new(journal: Arc<Journal>, in_flight: Option<Duration>) -> Self {
+        let death = Self {
+            journal,
+            killer: Arc::new(AtomicU8::new(KILLER_WAITS)),
+        };
+        if let Some(in_flight) = in_flight {
+            let killer = death.clone();
+            std::thread::spawn(move || killer.wait_and_kill(in_flight));
+        }
+        death
+    }
+
+    fn wait_and_kill(&self, in_flight: Duration) {
+        loop {
+            match self.killer.load(Ordering::Acquire) {
+                KILLER_GOES => break,
+                KILLER_STANDS_DOWN => return,
+                _ => std::thread::yield_now(),
+            }
+        }
+        let started = Instant::now();
+        while started.elapsed() < in_flight {
+            std::hint::spin_loop();
+        }
+        self.now();
+    }
+
+    fn now(&self) -> ! {
+        self.journal.line(CRASH_FIRED);
+        kill_this_process()
+    }
+
+    fn while_the_request_runs(&self) {
+        self.killer.store(KILLER_GOES, Ordering::Release);
+    }
+
+    /// The step is over. A killer that was told to go has a kill to deliver.
+    fn stand_down(&self) {
+        self.killer
+            .compare_exchange(
+                KILLER_WAITS,
+                KILLER_STANDS_DOWN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok();
+    }
+}
+
 /// The signals of one armed step: `cancel` tells the step to drop its
 /// operation, `released` lets a call that was held back go on once the step
 /// is over. A held call can sit in a task the operation detached, which a
-/// drop does not reach, so holding it forever would leak that task.
+/// drop does not reach, so holding it forever would leak that task. With
+/// `death`, the point kills the process instead of cancelling the operation.
 #[derive(Clone)]
 struct Cancellation {
     cancel: Arc<Notify>,
     released: watch::Receiver<bool>,
+    death: Option<Death>,
 }
 
 impl Cancellation {
+    fn fire(&self) {
+        match &self.death {
+            Some(death) => death.now(),
+            None => self.cancel.notify_one(),
+        }
+    }
+
+    fn fire_during_the_request(&self) {
+        match &self.death {
+            Some(death) => death.while_the_request_runs(),
+            None => self.cancel.notify_one(),
+        }
+    }
+
     async fn hold(mut self) {
-        self.cancel.notify_one();
+        self.fire();
         // An error only means the step is over, which releases the call too.
         let _ = self.released.wait_for(|released| *released).await;
     }
@@ -336,7 +440,14 @@ impl IncidentState {
     pub fn new(root: String, calls_log: &FsPath, started: Instant) -> Self {
         Self {
             root,
-            calls: Mutex::new(File::create(calls_log).expect("create the call log")),
+            // A seed's processes share the log, one after the other.
+            calls: Mutex::new(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(calls_log)
+                    .expect("open the call log"),
+            ),
             started,
             phase: Mutex::new("setup".to_string()),
             armed: Mutex::new(None),
@@ -348,9 +459,14 @@ impl IncidentState {
         *self.phase.lock().unwrap() = phase.into();
     }
 
+    pub fn phase(&self) -> String {
+        self.phase.lock().unwrap().clone()
+    }
+
     /// Arms `incident` and returns the signal that cancels the operation it
-    /// is armed for. Without an incident the signal never fires.
-    pub fn arm(&self, incident: Option<Incident>) -> Arc<Notify> {
+    /// is armed for. Without an incident the signal never fires. With `death`,
+    /// the incident kills the process rather than cancelling the operation.
+    pub fn arm(&self, incident: Option<Incident>, death: Option<Death>) -> Arc<Notify> {
         let cancel = Arc::new(Notify::new());
         let (release, released) = watch::channel(false);
         *self.release.lock().unwrap() = Some(release);
@@ -359,6 +475,7 @@ impl IncidentState {
             cancellation: Cancellation {
                 cancel: cancel.clone(),
                 released,
+                death,
             },
             matched: 0,
             fired: 0,
@@ -370,12 +487,14 @@ impl IncidentState {
     /// Disarms the incident, releases every call it held back, and returns
     /// how many times it fired.
     pub fn disarm(&self) -> u64 {
-        let fired = self
-            .armed
-            .lock()
-            .unwrap()
-            .take()
-            .map_or(0, |armed| armed.fired);
+        let armed = self.armed.lock().unwrap().take();
+        if let Some(death) = armed
+            .as_ref()
+            .and_then(|armed| armed.cancellation.death.as_ref())
+        {
+            death.stand_down();
+        }
+        let fired = armed.map_or(0, |armed| armed.fired);
         if let Some(release) = self.release.lock().unwrap().take() {
             release.send_replace(true);
         }
@@ -565,14 +684,14 @@ async fn apply<T>(
         // yields once after the call, as a real store's response would,
         // and the step drops the operation before it sees the result.
         Action::Cancel(CancelWhen::During, cancellation) => {
-            cancellation.cancel.notify_one();
+            cancellation.fire_during_the_request();
             let result = call.await;
             tokio::task::yield_now().await;
             result
         }
         Action::Cancel(CancelWhen::After, cancellation) => {
             let result = call.await;
-            cancellation.cancel.notify_one();
+            cancellation.fire();
             tokio::task::yield_now().await;
             result
         }
@@ -595,7 +714,7 @@ impl ObjectStore for StressStore {
             let inner = self.inner.clone();
             let target = location.clone();
             let request = tokio::spawn(async move { inner.put_opts(&target, payload, opts).await });
-            cancellation.cancel.notify_one();
+            cancellation.fire_during_the_request();
             tokio::task::yield_now().await;
             return request
                 .await

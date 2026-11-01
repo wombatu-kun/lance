@@ -23,8 +23,11 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, TryStreamExt};
 use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
-use lance::dataset::{WriteMode, WriteParams};
+use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
+use lance::dataset::{MergeInsertBuilder, WriteMode, WriteParams};
 use lance::index::vector::VectorIndexParams;
 use lance::index::{DatasetIndexExt, IndexBuildProgress};
 use lance_index::IndexType;
@@ -37,21 +40,81 @@ use object_store::{PutOptions, PutPayload};
 use tokio::sync::Notify;
 
 use crate::harness::{
-    CALLS_LOG, ENV_CHILD, ENV_DIR, ENV_PARENT_PID, ENV_PLAN, ENV_QUIET_SECS, ENV_SEED,
-    ENV_SELF_TEST, ENV_STANDALONE, ENV_STEPS, PLAN_LOG, STEPS_LOG, ScenarioKind, SelfTest,
+    CALLS_LOG, ENV_CALIBRATE, ENV_CHILD, ENV_DIR, ENV_GENERATION, ENV_PARENT_PID, ENV_PLAN,
+    ENV_QUIET_SECS, ENV_SEED, ENV_SELF_TEST, ENV_STANDALONE, ENV_STEPS, MEMORY_LOG, PLAN_LOG,
+    STEPS_LOG, ScenarioKind, SelfTest, field,
 };
 use crate::incidents::{
-    Area, CancelWhen, Incident, IncidentState, Method, StressHooks, StressWrapper,
+    Area, CRASH_FIRED, CancelWhen, Death, Incident, IncidentState, Method, StressHooks,
+    StressWrapper, kill_this_process,
 };
-use crate::leaks::{Snapshot, quiesce};
+use crate::leaks::{
+    Snapshot, TmpWatch, files_below, heap_peak_bytes, live_heap_bytes, quiesce, start_heap_peak,
+};
+use crate::limits::{OwnCgroup, log_memory_events};
 
-const ROWS_PER_FILE: usize = 200;
-const MIN_LIVE_ROWS: usize = 300;
-const VECTOR_DIM: i32 = 8;
+const POOL_VARIABLE: &str = "LANCE_MEM_POOL_SIZE";
+/// One cycle of `heap_growth`, repeated until a leak has had time to show. The
+/// first cycles fill global caches and pools: the heap grows by about 7 KiB per
+/// cycle, then stops by the eighth and stays within 1 KiB.
+const HEAP_CYCLE_OPS: usize = 9;
+const HEAP_CYCLES: usize = 16;
+const HEAP_EARLY_CYCLES: Range<usize> = 8..11;
+const HEAP_LATE_CYCLES: Range<usize> = 13..16;
+/// The heap of a healthy run varies by about 1 KiB between these cycles.
+const HEAP_GROWTH_LIMIT: i64 = 16 << 10;
+const VECTOR_DIM: i32 = 32;
 const IVF_PARTITIONS: usize = 2;
 const NEIGHBORS: usize = 10;
-const VOCABULARY: u64 = 16;
 const CATEGORIES: i32 = 7;
+/// The rows of one generated batch: the reader builds them only when asked, so
+/// the source of a write holds almost no memory of its own.
+const CHUNK_ROWS: i64 = 1024;
+
+/// How much data a scenario works on.
+#[derive(Clone, Copy, Debug)]
+struct Scale {
+    rows_per_file: usize,
+    initial_rows: (u64, u64),
+    added_rows: (u64, u64),
+    min_live_rows: usize,
+    doc_tokens: u64,
+    vocabulary: u64,
+}
+
+const SMALL: Scale = Scale {
+    rows_per_file: 200,
+    initial_rows: (600, 1200),
+    added_rows: (100, 400),
+    min_live_rows: 300,
+    doc_tokens: 3,
+    vocabulary: 16,
+};
+
+/// Enough data for what a build retains to show, in cycles short enough to repeat.
+const MEDIUM: Scale = Scale {
+    rows_per_file: 500,
+    initial_rows: (5000, 8000),
+    added_rows: (500, 1000),
+    min_live_rows: 1000,
+    doc_tokens: 8,
+    vocabulary: 256,
+};
+
+/// Enough data for the memory of an operation to stand out from the process.
+const LARGE: Scale = Scale {
+    rows_per_file: 2000,
+    initial_rows: (20_000, 40_000),
+    added_rows: (2000, 8000),
+    min_live_rows: 10_000,
+    doc_tokens: 16,
+    vocabulary: 4096,
+};
+
+/// A calibration run plans no limit, and reports what each operation uses.
+fn calibrating() -> bool {
+    std::env::var(ENV_CALIBRATE).is_ok_and(|value| value == "1")
+}
 
 /// Runs the seed this process was started for, if any, and exits non-zero
 /// when it fails. The verdict is the last line of the step log.
@@ -70,13 +133,25 @@ pub fn run_child_if_requested() {
     let dir = PathBuf::from(env::<String>(ENV_DIR));
     let steps: usize = env(ENV_STEPS);
     let quiet = Duration::from_secs(env(ENV_QUIET_SECS));
+    let generation: u64 = env(ENV_GENERATION);
     let self_test = std::env::var(ENV_SELF_TEST).ok().map(|name| {
         SelfTest::from_name(&name).unwrap_or_else(|| panic!("unknown self-test {name:?}"))
     });
 
+    let setting = ChildSetting {
+        kind,
+        quiet,
+        generation,
+        self_test,
+        started,
+    };
     let journal = Arc::new(Journal::open(&dir.join(STEPS_LOG), started));
     // A self-test arms no incident, so that only the injected defect can fail it.
-    let plan = Plan::generate(kind, seed, steps, self_test.is_none());
+    let mut plan = Plan::generate(kind, seed, steps, self_test.is_none() && !calibrating());
+    // The ids of later steps stay free, so this cannot clash with them.
+    if self_test == Some(SelfTest::MemoryEvents) {
+        plan.steps[0].op = Op::CreateIndex(IndexKind::BTree);
+    }
     let rendered = plan.render(kind, seed, steps);
     fs::write(dir.join(PLAN_LOG), &rendered).expect("write the plan");
     let print = fingerprint(&rendered);
@@ -88,7 +163,7 @@ pub fn run_child_if_requested() {
                 "this build generates plan {print} for seed {seed}, while the run being replayed had {expected}"
             ),
         )),
-        _ => run_on_runtime(kind, plan, &dir, journal.clone(), quiet, self_test, started),
+        _ => run_on_runtime(setting, plan, &dir, journal.clone()),
     };
     if let Err(failure) = result {
         journal.line(format_args!(
@@ -100,14 +175,22 @@ pub fn run_child_if_requested() {
     journal.line("result=pass");
 }
 
-fn run_on_runtime(
+/// What a child process knows about itself beyond its plan.
+#[derive(Clone, Copy)]
+struct ChildSetting {
     kind: ScenarioKind,
+    quiet: Duration,
+    /// Which process of the seed this is, the first one being 1.
+    generation: u64,
+    self_test: Option<SelfTest>,
+    started: Instant,
+}
+
+fn run_on_runtime(
+    setting: ChildSetting,
     plan: Plan,
     dir: &Path,
     journal: Arc<Journal>,
-    quiet: Duration,
-    self_test: Option<SelfTest>,
-    started: Instant,
 ) -> Result<(), Failure> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -119,10 +202,8 @@ fn run_on_runtime(
     // limit, for any thread that panic has wedged.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         runtime.block_on(async {
-            let mut run = Box::pin(Run::setup(
-                kind, plan, dir, journal, quiet, self_test, started,
-            ))
-            .await?;
+            let mut run = Box::pin(Run::setup(setting, plan, dir, journal)).await?;
+            Box::pin(run.resume()).await?;
             Box::pin(run.run_steps()).await?;
             Box::pin(run.finish()).await
         })
@@ -172,7 +253,7 @@ fn tie_to_parent() -> bool {
 
 /// The step log. Every line goes out in a single write, so the parent sees
 /// progress at once and a killed child leaves no half line.
-struct Journal {
+pub struct Journal {
     file: Mutex<File>,
     started: Instant,
 }
@@ -190,7 +271,7 @@ impl Journal {
         }
     }
 
-    fn line(&self, line: impl fmt::Display) {
+    pub fn line(&self, line: impl fmt::Display) {
         let text = format!("t={} {line}\n", self.started.elapsed().as_millis());
         self.file
             .lock()
@@ -238,12 +319,16 @@ fn category(id: i64) -> i32 {
     (splitmix64(id as u64 ^ 0xCA7E_9087) % CATEGORIES as u64) as i32
 }
 
-fn tokens(id: i64) -> [u64; 3] {
-    std::array::from_fn(|slot| splitmix64(((id as u64) << 2) | slot as u64) % VOCABULARY)
+fn tokens(id: i64, scale: &Scale) -> impl Iterator<Item = u64> {
+    let (doc_tokens, vocabulary) = (scale.doc_tokens, scale.vocabulary);
+    (0..doc_tokens).map(move |slot| splitmix64(((id as u64) << 8) | slot) % vocabulary)
 }
 
-fn text(id: i64) -> String {
-    tokens(id).map(|token| format!("tok{token:02}")).join(" ")
+fn text(id: i64, scale: &Scale) -> String {
+    tokens(id, scale)
+        .map(|token| format!("tok{token:04}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn vector(data_seed: u64, id: i64) -> [f32; VECTOR_DIM as usize] {
@@ -268,7 +353,19 @@ fn schema() -> SchemaRef {
     ]))
 }
 
-fn rows(data_seed: u64, ids: Range<i64>) -> impl RecordBatchReader + Send + 'static {
+fn rows(data_seed: u64, ids: Range<i64>, scale: Scale) -> impl RecordBatchReader + Send + 'static {
+    let end = ids.end;
+    let chunks = ids.step_by(CHUNK_ROWS as usize).map(move |start| {
+        Ok(batch_of_rows(
+            data_seed,
+            start..(start + CHUNK_ROWS).min(end),
+            &scale,
+        ))
+    });
+    RecordBatchIterator::new(chunks, schema())
+}
+
+fn batch_of_rows(data_seed: u64, ids: Range<i64>, scale: &Scale) -> RecordBatch {
     let ids: Vec<i64> = ids.collect();
     let vectors = Float32Array::from_iter_values(ids.iter().flat_map(|id| vector(data_seed, *id)));
     let item = Arc::new(Field::new("item", DataType::Float32, true));
@@ -282,16 +379,17 @@ fn rows(data_seed: u64, ids: Range<i64>) -> impl RecordBatchReader + Send + 'sta
                 .expect("build the vectors"),
         ),
         Arc::new(StringArray::from_iter_values(
-            ids.iter().map(|id| text(*id)),
+            ids.iter().map(|id| text(*id, scale)),
         )),
     ];
-    let batch = RecordBatch::try_new(schema(), columns).expect("build a batch");
-    RecordBatchIterator::new(vec![Ok(batch)], schema())
+    RecordBatch::try_new(schema(), columns).expect("build a batch")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum IndexKind {
     BTree,
+    /// On the join key of a merge insert, which then takes its indexed path.
+    BTreeId,
     IvfFlat,
     Inverted,
 }
@@ -300,6 +398,7 @@ impl IndexKind {
     fn name(self) -> &'static str {
         match self {
             Self::BTree => "idx_category",
+            Self::BTreeId => "idx_id",
             Self::IvfFlat => "idx_vec",
             Self::Inverted => "idx_text",
         }
@@ -308,6 +407,7 @@ impl IndexKind {
     fn column(self) -> &'static str {
         match self {
             Self::BTree => "category",
+            Self::BTreeId => "id",
             Self::IvfFlat => "vec",
             Self::Inverted => "text",
         }
@@ -316,7 +416,7 @@ impl IndexKind {
     /// The stages the build reports to its progress hooks.
     fn stages(self) -> &'static [&'static str] {
         match self {
-            Self::BTree => &["load_data"],
+            Self::BTree | Self::BTreeId => &["load_data"],
             Self::IvfFlat => &[
                 "train_ivf",
                 "train_quantizer",
@@ -335,9 +435,215 @@ impl IndexKind {
 
 #[derive(Clone, Copy, Debug)]
 enum Op {
-    Append { first_id: i64, rows: i64 },
-    Delete { lo: i64, hi: i64 },
+    Append {
+        first_id: i64,
+        rows: i64,
+    },
+    Delete {
+        lo: i64,
+        hi: i64,
+    },
     CreateIndex(IndexKind),
+    /// Updates the rows with these ids that exist and inserts the others.
+    /// Columns are functions of the id, so a lost update stays invisible,
+    /// while a lost or doubled row does not.
+    MergeInsert {
+        first_id: i64,
+        rows: i64,
+    },
+    Compact,
+    Scan,
+}
+
+/// How an operation moves the latest version when it succeeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitShape {
+    Exactly1,
+    /// A compaction commits a reservation of fragment ids before its rewrite,
+    /// and may find nothing to do.
+    UpTo2,
+    Never,
+}
+
+impl CommitShape {
+    fn max_delta(self) -> u64 {
+        match self {
+            Self::Exactly1 => 1,
+            Self::UpTo2 => 2,
+            Self::Never => 0,
+        }
+    }
+}
+
+impl Op {
+    fn shape(&self) -> CommitShape {
+        match self {
+            Self::Compact => CommitShape::UpTo2,
+            Self::Scan => CommitShape::Never,
+            _ => CommitShape::Exactly1,
+        }
+    }
+
+    /// The operation without its arguments, for coverage counts.
+    fn kind(&self) -> String {
+        match self {
+            Self::Append { .. } => "append".to_string(),
+            Self::Delete { .. } => "delete".to_string(),
+            Self::CreateIndex(kind) => format!("create_index_{}", kind.name()),
+            Self::MergeInsert { .. } => "merge_insert".to_string(),
+            Self::Compact => "compact".to_string(),
+            Self::Scan => "scan".to_string(),
+        }
+    }
+}
+
+/// The memory limit on a step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Limit {
+    /// `memory.max` at what the cgroup holds plus this many KiB. Going over it
+    /// ends with the OOM killer.
+    Cgroup { budget_kib: u64 },
+    /// `LANCE_MEM_POOL_SIZE`: going over it means spilling to disk or a clean
+    /// error. Sorts for BTree training and the indexed path of a merge insert
+    /// honor it.
+    Pool { kib: u64 },
+    /// `InvertedIndexParams::memory_limit_mb`: going over it means more
+    /// partitions in the index.
+    FtsMemory { mib: u64 },
+    /// `Scanner::io_buffer_size`: the read budget of a scan.
+    IoBuffer { kib: u64 },
+}
+
+impl fmt::Display for Limit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cgroup { budget_kib } => write!(f, "cgroup:{budget_kib}"),
+            Self::Pool { kib } => write!(f, "pool:{kib}"),
+            Self::FtsMemory { mib } => write!(f, "fts_memory:{mib}"),
+            Self::IoBuffer { kib } => write!(f, "io_buffer:{kib}"),
+        }
+    }
+}
+
+/// The budgets a seed picks from for an operation: an eighth, a quarter, a half,
+/// one and two times the heap a calibration run saw it take on the data of this
+/// scenario (`LANCE_STRESS_CALIBRATE=1`). The table is fixed, so that a seed
+/// decides its budgets whatever the machine does.
+fn cgroup_budgets_kib(op: &Op) -> &'static [u64] {
+    match op {
+        Op::Compact => &[3072, 6144, 12288, 24576, 49152],
+        Op::CreateIndex(IndexKind::IvfFlat) => &[1792, 3584, 7168, 14336, 28672],
+        Op::MergeInsert { .. } => &[800, 1600, 3200, 6400, 12800],
+        // Most of what these hold is page cache, which the limit evicts, or a
+        // few rows to sort.
+        Op::Delete { .. } | Op::Scan | Op::CreateIndex(IndexKind::BTree | IndexKind::BTreeId) => {
+            &[80, 160, 320, 640, 1280, 2560, 5120]
+        }
+        _ => &[640, 1280, 2560, 5120, 10240],
+    }
+}
+
+fn pick(rng: &mut PlanRng, values: &[u64]) -> u64 {
+    values[rng.range(0..=values.len() as u64 - 1) as usize]
+}
+
+/// The limit on a step. Half of the steps a limit of Lance's own applies to get
+/// that one instead of the kernel's. Pool sizes follow what is sorted, not the
+/// heap of the operation: a BTree sorts 12 bytes per row, around 0.5 MB here.
+fn random_limit(rng: &mut PlanRng, op: &Op, model: &Model) -> Limit {
+    let own = rng.chance(0.5);
+    match op {
+        Op::CreateIndex(IndexKind::BTree | IndexKind::BTreeId) if own => Limit::Pool {
+            kib: pick(rng, &[32, 64, 128, 256, 512, 1024]),
+        },
+        // Without an index on the key, the join does not use the pool at all, and
+        // the kernel's limit gets plenty of merges without one.
+        Op::MergeInsert { .. }
+            if model.indices.contains(&IndexKind::BTreeId) && (own || rng.chance(0.6)) =>
+        {
+            Limit::Pool {
+                kib: pick(rng, &[512, 1024, 2048, 4096, 8192, 16384]),
+            }
+        }
+        Op::CreateIndex(IndexKind::Inverted) if own => Limit::FtsMemory {
+            mib: pick(rng, &[1, 2, 4]),
+        },
+        Op::Scan if own => Limit::IoBuffer {
+            kib: pick(rng, &[4, 64, 1024, 16384]),
+        },
+        _ => Limit::Cgroup {
+            budget_kib: pick(rng, cgroup_budgets_kib(op)),
+        },
+    }
+}
+
+/// The pool an operation of this scenario must make do with: it may spill, but
+/// from this size up, running out of memory is a regression. A sort needs room
+/// for a batch, and with less a clean error is all it can do.
+fn pool_floor_kib(op: &Op) -> u64 {
+    match op {
+        // The merge of a spilled source held 949 KiB under a pool of 1 and of 2 MiB,
+        // too much for the sort of the target to fit its batch beside it.
+        Op::MergeInsert { .. } => 4096,
+        // A sorted batch of `category` takes 192 KiB, and a third of the pool is
+        // reserved for the merge of the spilled runs.
+        _ => 512,
+    }
+}
+
+/// The size of a `heap_growth` run.
+pub fn heap_growth_steps() -> u64 {
+    (HEAP_CYCLES * HEAP_CYCLE_OPS) as u64
+}
+
+/// The same cycle over and over, on a steady number of rows: whatever grows is
+/// not the data.
+fn heap_growth_plan(rng: &mut PlanRng, scale: &Scale, initial_rows: i64) -> Vec<Step> {
+    let added = rng.range(scale.added_rows.0..=scale.added_rows.1) as i64;
+    let mut model = Model::new(initial_rows);
+    let mut oldest = 0;
+    let mut steps = Vec::with_capacity(HEAP_CYCLES * HEAP_CYCLE_OPS);
+    for _ in 0..HEAP_CYCLES {
+        let before = model.live.len();
+        let append = Op::Append {
+            first_id: model.next_id,
+            rows: added,
+        };
+        model.apply(&append);
+        let merge = Op::MergeInsert {
+            first_id: model.next_id - added / 2,
+            rows: added,
+        };
+        model.apply(&merge);
+        let grown = (model.live.len() - before) as i64;
+        let delete = Op::Delete {
+            lo: oldest,
+            hi: oldest + grown,
+        };
+        model.apply(&delete);
+        oldest += grown;
+        for op in [
+            // First, so that the merge takes its indexed path.
+            Op::CreateIndex(IndexKind::BTreeId),
+            append,
+            merge,
+            delete,
+            Op::CreateIndex(IndexKind::BTree),
+            Op::CreateIndex(IndexKind::IvfFlat),
+            Op::CreateIndex(IndexKind::Inverted),
+            Op::Compact,
+            Op::Scan,
+        ] {
+            steps.push(Step {
+                op,
+                incident: None,
+                resync: true,
+                in_flight_us: 0,
+                limit: None,
+            });
+        }
+    }
+    steps
 }
 
 impl fmt::Display for Op {
@@ -348,6 +654,11 @@ impl fmt::Display for Op {
             }
             Self::Delete { lo, hi } => write!(f, "delete:ids={lo}..{hi}"),
             Self::CreateIndex(kind) => write!(f, "create_index:{}", kind.name()),
+            Self::MergeInsert { first_id, rows } => {
+                write!(f, "merge_insert:ids={first_id}..{}", first_id + rows)
+            }
+            Self::Compact => f.write_str("compact"),
+            Self::Scan => f.write_str("scan"),
         }
     }
 }
@@ -379,6 +690,11 @@ impl Model {
             Op::CreateIndex(kind) => {
                 self.indices.insert(kind);
             }
+            Op::MergeInsert { first_id, rows } => {
+                self.live.extend(first_id..first_id + rows);
+                self.next_id = self.next_id.max(first_id + rows);
+            }
+            Op::Compact | Op::Scan => {}
         }
     }
 }
@@ -387,6 +703,9 @@ impl Model {
 enum StoreChoice {
     Local,
     SharedMemory,
+    /// The same files as `Local`, but every request passes the object store,
+    /// so an incident reaches data, index and transaction files too.
+    FileObjectStore,
 }
 
 #[derive(Clone, Debug)]
@@ -400,12 +719,16 @@ struct Step {
     /// it again, but evaluates it again after a conflict with another delete,
     /// so on a stale handle the rows it removes depend on what it raced with.
     resync: bool,
+    /// How long a request in flight runs before a planned death.
+    in_flight_us: u64,
+    limit: Option<Limit>,
 }
 
 /// Everything a seed decides. Every operation ends up committed once, by its
 /// first try or by the retry, so the plan can track the model on its own.
 struct Plan {
     store: StoreChoice,
+    scale: Scale,
     data_seed: u64,
     initial_rows: i64,
     steps: Vec<Step>,
@@ -418,24 +741,63 @@ impl Plan {
             ScenarioKind::StorageFaults => StoreChoice::SharedMemory,
             ScenarioKind::Cancellation if rng.chance(0.5) => StoreChoice::Local,
             ScenarioKind::Cancellation => StoreChoice::SharedMemory,
+            ScenarioKind::ProcessKill if rng.chance(0.5) => StoreChoice::Local,
+            ScenarioKind::ProcessKill => StoreChoice::FileObjectStore,
+            ScenarioKind::MemoryLimits | ScenarioKind::HeapGrowth => StoreChoice::Local,
+        };
+        let scale = match kind {
+            ScenarioKind::MemoryLimits => LARGE,
+            ScenarioKind::HeapGrowth => MEDIUM,
+            _ => SMALL,
         };
         let data_seed = rng.next();
-        let initial_rows = rng.range(600..=1200) as i64;
+        let initial_rows = rng.range(scale.initial_rows.0..=scale.initial_rows.1) as i64;
+        if kind == ScenarioKind::HeapGrowth {
+            return Self {
+                store,
+                scale,
+                data_seed,
+                initial_rows,
+                steps: heap_growth_plan(&mut rng, &scale, initial_rows),
+            };
+        }
         let mut model = Model::new(initial_rows);
         let mut planned = Vec::with_capacity(steps);
-        for _ in 0..steps {
-            let op = random_op(&mut rng, &model);
+        for index in 0..steps {
+            // A merge insert honors the pool only with an index on its key.
+            let op = if kind == ScenarioKind::MemoryLimits && index == 0 && rng.chance(0.5) {
+                Op::CreateIndex(IndexKind::BTreeId)
+            } else {
+                random_op(&mut rng, kind, &scale, &model)
+            };
             model.apply(&op);
-            let incident = random_incident(&mut rng, kind, store, &op);
-            let resync = rng.chance(0.7) || matches!(op, Op::Delete { .. });
+            let incident = random_incident(&mut rng, kind, store, &scale, &op);
+            // A stale handle is covered by the scenarios of its own; a read
+            // or a merge on one would only report what it was left with.
+            let resync = rng.chance(0.7)
+                || matches!(op, Op::Delete { .. })
+                || matches!(kind, ScenarioKind::ProcessKill | ScenarioKind::MemoryLimits);
+            let in_flight_us = match kind {
+                ScenarioKind::ProcessKill => rng.range(0..=300),
+                _ => 0,
+            };
+            let limit = match kind {
+                ScenarioKind::MemoryLimits if rng.chance(0.85) => {
+                    Some(random_limit(&mut rng, &op, &model))
+                }
+                _ => None,
+            };
             planned.push(Step {
                 op,
                 incident: incident.filter(|_| with_incidents),
                 resync,
+                in_flight_us,
+                limit: limit.filter(|_| with_incidents),
             });
         }
         Self {
             store,
+            scale,
             data_seed,
             initial_rows,
             steps: planned,
@@ -444,9 +806,10 @@ impl Plan {
 
     fn render(&self, kind: ScenarioKind, seed: u64, steps: usize) -> String {
         let mut text = format!(
-            "scenario={} seed={seed} steps={steps} store={:?} data_seed={} initial_rows={}\n",
+            "scenario={} seed={seed} steps={steps} store={:?} scale={:?} data_seed={} initial_rows={}\n",
             kind.name(),
             self.store,
+            self.scale,
             self.data_seed,
             self.initial_rows
         );
@@ -455,12 +818,17 @@ impl Plan {
                 .incident
                 .as_ref()
                 .map_or_else(|| "none".to_string(), Incident::to_string);
+            let limit = step
+                .limit
+                .as_ref()
+                .map_or_else(|| "none".to_string(), Limit::to_string);
             writeln!(
                 text,
-                "step={} op={} incident={incident} resync={}",
+                "step={} op={} incident={incident} limit={limit} resync={} in_flight_us={}",
                 index + 1,
                 step.op,
-                step.resync
+                step.resync,
+                step.in_flight_us
             )
             .unwrap();
         }
@@ -480,14 +848,20 @@ fn fingerprint(rendered: &str) -> String {
 
 /// The fingerprint of the plan a seed generates, for a replay command.
 pub fn plan_fingerprint(kind: ScenarioKind, seed: u64, steps: usize) -> String {
-    fingerprint(&Plan::generate(kind, seed, steps, true).render(kind, seed, steps))
+    fingerprint(&Plan::generate(kind, seed, steps, !calibrating()).render(kind, seed, steps))
 }
 
-fn random_op(rng: &mut PlanRng, model: &Model) -> Op {
+fn random_op(rng: &mut PlanRng, kind: ScenarioKind, scale: &Scale, model: &Model) -> Op {
     let roll = rng.range(0..=99);
-    if (35..55).contains(&roll) && model.live.len() > MIN_LIVE_ROWS + 1 {
+    let deletes = match kind {
+        ScenarioKind::MemoryLimits => 35..45,
+        _ => 35..55,
+    };
+    if deletes.contains(&roll) && model.live.len() > scale.min_live_rows + 1 {
         let live: Vec<i64> = model.live.iter().copied().collect();
-        let max_len = (live.len() / 10).min(live.len() - MIN_LIVE_ROWS).max(1);
+        let max_len = (live.len() / 10)
+            .min(live.len() - scale.min_live_rows)
+            .max(1);
         let len = rng.range(1..=max_len as u64) as usize;
         let start = rng.range(0..=(live.len() - len) as u64) as usize;
         return Op::Delete {
@@ -495,13 +869,27 @@ fn random_op(rng: &mut PlanRng, model: &Model) -> Op {
             hi: live[start + len - 1] + 1,
         };
     }
-    match roll {
-        55..70 => Op::CreateIndex(IndexKind::BTree),
-        70..85 => Op::CreateIndex(IndexKind::IvfFlat),
-        85..100 => Op::CreateIndex(IndexKind::Inverted),
+    let added = |rng: &mut PlanRng| rng.range(scale.added_rows.0..=scale.added_rows.1) as i64;
+    match (kind, roll) {
+        (_, 55..70) => Op::CreateIndex(IndexKind::BTree),
+        (_, 70..85) => Op::CreateIndex(IndexKind::IvfFlat),
+        (_, 85..100) => Op::CreateIndex(IndexKind::Inverted),
+        (ScenarioKind::ProcessKill | ScenarioKind::MemoryLimits, 0..6) => Op::Compact,
+        (ScenarioKind::ProcessKill | ScenarioKind::MemoryLimits, 6..10) => {
+            Op::CreateIndex(IndexKind::BTreeId)
+        }
+        (ScenarioKind::MemoryLimits, 25..35) => Op::Scan,
+        // Half of its ids exist, the other half are new.
+        (ScenarioKind::ProcessKill | ScenarioKind::MemoryLimits, 10..20) => {
+            let rows = added(rng);
+            Op::MergeInsert {
+                first_id: model.next_id - rows / 2,
+                rows,
+            }
+        }
         _ => Op::Append {
             first_id: model.next_id,
-            rows: rng.range(100..=400) as i64,
+            rows: added(rng),
         },
     }
 }
@@ -519,9 +907,11 @@ fn random_incident(
     rng: &mut PlanRng,
     kind: ScenarioKind,
     store: StoreChoice,
+    scale: &Scale,
     op: &Op,
 ) -> Option<Incident> {
     match kind {
+        ScenarioKind::MemoryLimits | ScenarioKind::HeapGrowth => None,
         ScenarioKind::StorageFaults => {
             if !rng.chance(0.75) {
                 return None;
@@ -533,7 +923,7 @@ fn random_incident(
                     (
                         Method::Put,
                         Area::Data,
-                        (rows as u64).div_ceil(ROWS_PER_FILE as u64),
+                        (rows as u64).div_ceil(scale.rows_per_file as u64),
                     ),
                     (Method::Put, Area::Transactions, 1),
                     (Method::Put, Area::Manifests, 1),
@@ -553,6 +943,9 @@ fn random_incident(
                     (Method::Put, Area::Manifests, 1),
                     (Method::List, Area::Manifests, 1),
                 ],
+                Op::MergeInsert { .. } | Op::Compact | Op::Scan => {
+                    unreachable!("{op} is not part of this scenario")
+                }
             };
             let (method, area, max_nth) = targets[rng.range(0..=targets.len() as u64 - 1) as usize];
             let nth = rng.range(1..=max_nth);
@@ -569,14 +962,16 @@ fn random_incident(
                 blind,
             })
         }
-        ScenarioKind::Cancellation => {
+        ScenarioKind::Cancellation | ScenarioKind::ProcessKill => {
             if !rng.chance(0.85) {
                 return None;
             }
             // The manifest write passes the wrapper on every store. Only a local
             // store keeps a request in flight, in its blocking pool.
             let flights: &[CancelWhen] = match store {
-                StoreChoice::Local => &[CancelWhen::Before, CancelWhen::During, CancelWhen::After],
+                StoreChoice::Local | StoreChoice::FileObjectStore => {
+                    &[CancelWhen::Before, CancelWhen::During, CancelWhen::After]
+                }
                 StoreChoice::SharedMemory => &[CancelWhen::Before, CancelWhen::After],
             };
             let mut points: Vec<Incident> = flights
@@ -585,19 +980,10 @@ fn random_incident(
                 .collect();
             match *op {
                 Op::Append { rows, .. } => {
-                    let fragments = (rows as u64).div_ceil(ROWS_PER_FILE as u64);
+                    let fragments = (rows as u64).div_ceil(scale.rows_per_file as u64);
                     for nth in 1..=fragments {
-                        points.push(Incident::CancelFragment {
-                            nth,
-                            at_begin: true,
-                        });
-                        // A write reports `complete` only for files closed at the
-                        // row limit, never for its last one.
-                        if nth < fragments || (rows as u64).is_multiple_of(ROWS_PER_FILE as u64) {
-                            points.push(Incident::CancelFragment {
-                                nth,
-                                at_begin: false,
-                            });
+                        for at_begin in [true, false] {
+                            points.push(Incident::CancelFragment { nth, at_begin });
                         }
                     }
                 }
@@ -608,19 +994,28 @@ fn random_incident(
                         }
                     }
                 }
-                Op::Delete { .. } => {}
+                // Its second manifest: between the reservation of fragment ids
+                // and the rewrite.
+                Op::Compact => {
+                    for when in flights {
+                        points.push(cancel_call(Method::Put, Area::Manifests, 2, *when));
+                    }
+                }
+                Op::Delete { .. } | Op::MergeInsert { .. } | Op::Scan => {}
             }
             // A local store writes data, index, transaction and deletion files
-            // around the wrapper, so only a shared-memory store sees those.
-            if store == StoreChoice::SharedMemory {
+            // around the wrapper, so only the other stores see those.
+            if store != StoreChoice::Local {
                 let written = match op {
-                    Op::Append { .. } => Area::Data,
+                    Op::Append { .. } | Op::MergeInsert { .. } | Op::Compact | Op::Scan => {
+                        Area::Data
+                    }
                     Op::Delete { .. } => Area::Deletions,
                     Op::CreateIndex(_) => Area::Indices,
                 };
                 for area in [written, Area::Transactions] {
-                    for when in [CancelWhen::Before, CancelWhen::After] {
-                        points.push(cancel_call(Method::Put, area, 1, when));
+                    for when in flights {
+                        points.push(cancel_call(Method::Put, area, 1, *when));
                     }
                 }
                 if !matches!(op, Op::Append { .. }) {
@@ -632,22 +1027,33 @@ fn random_incident(
     }
 }
 
+/// What a finished operation reports beyond success.
+#[derive(Clone, Copy, Debug, Default)]
+struct OpOutput {
+    fragments_removed: usize,
+    /// The rows a scan returned, and the wrapping sum of their ids.
+    scanned: Option<(usize, i64)>,
+}
+
 enum Outcome {
-    Ok,
+    Ok(OpOutput),
     Failed {
         message: String,
         status_unknown: bool,
     },
     Cancelled,
+    /// The process died during the operation; a later process tells.
+    Killed,
     Panicked(String),
 }
 
 impl Outcome {
     fn name(&self) -> &'static str {
         match self {
-            Self::Ok => "ok",
+            Self::Ok(_) => "ok",
             Self::Failed { .. } => "err",
             Self::Cancelled => "cancelled",
+            Self::Killed => "killed",
             Self::Panicked(_) => "panic",
         }
     }
@@ -655,8 +1061,12 @@ impl Outcome {
     fn detail(&self) -> &str {
         match self {
             Self::Failed { message, .. } | Self::Panicked(message) => message,
-            Self::Ok | Self::Cancelled => "",
+            Self::Ok(_) | Self::Cancelled | Self::Killed => "",
         }
+    }
+
+    fn is_ok(&self) -> bool {
+        matches!(self, Self::Ok(_))
     }
 }
 
@@ -777,13 +1187,37 @@ async fn file_times<E: fmt::Display>(
     Ok(times)
 }
 
+/// The files `Dataset::all_files` lists, with their sizes in bytes.
+async fn file_sizes<E: fmt::Display>(
+    stream: impl Stream<Item = Result<RecordBatch, E>>,
+) -> Result<BTreeMap<String, i64>, E> {
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    let mut sizes = BTreeMap::new();
+    for batch in &batches {
+        let paths = batch
+            .column_by_name("path")
+            .expect("a path column")
+            .as_string::<i32>();
+        let bytes = batch
+            .column_by_name("size_bytes")
+            .expect("a size_bytes column")
+            .as_primitive::<Int64Type>();
+        for row in 0..batch.num_rows() {
+            sizes.insert(paths.value(row).to_string(), bytes.value(row));
+        }
+    }
+    Ok(sizes)
+}
+
 /// The operation of a step on the handle that meets the incidents.
 fn op_future<'a>(
     ds: &'a mut Dataset,
     hooks: &Arc<StressHooks>,
     data_seed: u64,
+    scale: Scale,
     op: Op,
-) -> BoxFuture<'a, lance::Result<()>> {
+    limit: Option<Limit>,
+) -> BoxFuture<'a, lance::Result<OpOutput>> {
     let hooks = hooks.clone();
     match op {
         Op::Append {
@@ -792,22 +1226,65 @@ fn op_future<'a>(
         } => Box::pin(async move {
             let params = WriteParams {
                 mode: WriteMode::Append,
-                max_rows_per_file: ROWS_PER_FILE,
+                max_rows_per_file: scale.rows_per_file,
                 progress: hooks,
                 ..Default::default()
             };
-            Box::pin(ds.append(rows(data_seed, first_id..first_id + count), Some(params))).await
+            let source = rows(data_seed, first_id..first_id + count, scale);
+            Box::pin(ds.append(source, Some(params))).await?;
+            Ok(OpOutput::default())
         }),
         Op::Delete { lo, hi } => Box::pin(async move {
             let predicate = format!("id >= {lo} AND id < {hi}");
-            Box::pin(ds.delete(&predicate)).await.map(|_| ())
+            Box::pin(ds.delete(&predicate)).await?;
+            Ok(OpOutput::default())
+        }),
+        Op::MergeInsert {
+            first_id,
+            rows: count,
+        } => Box::pin(async move {
+            let source: Box<dyn RecordBatchReader + Send> =
+                Box::new(rows(data_seed, first_id..first_id + count, scale));
+            let job = MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["id".to_string()])?
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()?;
+            let (merged, _) = Box::pin(job.execute_reader(source)).await?;
+            *ds = merged.as_ref().clone();
+            Ok(OpOutput::default())
+        }),
+        Op::Compact => Box::pin(async move {
+            let metrics = Box::pin(compact_files(ds, CompactionOptions::default(), None)).await?;
+            Ok(OpOutput {
+                fragments_removed: metrics.fragments_removed,
+                ..Default::default()
+            })
+        }),
+        Op::Scan => Box::pin(async move {
+            let mut scan = ds.scan();
+            if let Some(Limit::IoBuffer { kib }) = limit {
+                scan.io_buffer_size(kib << 10);
+            }
+            let mut stream = scan.try_into_stream().await?;
+            let mut count = 0;
+            let mut sum = 0i64;
+            while let Some(batch) = stream.try_next().await? {
+                count += batch.num_rows();
+                for id in int64_column(&batch, "id") {
+                    sum = sum.wrapping_add(id);
+                }
+            }
+            Ok(OpOutput {
+                scanned: Some((count, sum)),
+                ..Default::default()
+            })
         }),
         Op::CreateIndex(kind) => Box::pin(async move {
             let columns = [kind.column()];
             let progress: Arc<dyn IndexBuildProgress> = hooks;
             let name = kind.name().to_string();
             match kind {
-                IndexKind::BTree => {
+                IndexKind::BTree | IndexKind::BTreeId => {
                     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
                     ds.create_index_builder(&columns, IndexType::BTree, &params)
                         .name(name)
@@ -824,7 +1301,12 @@ fn op_future<'a>(
                         .await
                 }
                 IndexKind::Inverted => {
-                    let params = InvertedIndexParams::default();
+                    let params = match limit {
+                        Some(Limit::FtsMemory { mib }) => {
+                            InvertedIndexParams::default().memory_limit_mb(mib)
+                        }
+                        _ => InvertedIndexParams::default(),
+                    };
                     ds.create_index_builder(&columns, IndexType::Inverted, &params)
                         .name(name)
                         .replace(true)
@@ -832,14 +1314,145 @@ fn op_future<'a>(
                         .await
                 }
             }
-            .map(|_| ())
+            .map(|_| OpOutput::default())
         }),
+    }
+}
+
+/// A limit in force on a step.
+enum ArmedLimit {
+    /// Its value after the kernel's rounding, and the count of hits when set.
+    Cgroup {
+        hits: u64,
+        bytes: u64,
+    },
+    Pool(TmpWatch),
+}
+
+fn is_resources_exhausted(message: &str) -> bool {
+    message.contains("Resources exhausted")
+}
+
+/// A defect of Lance, not a pool too small for the work. The scan of the fragments
+/// an index does not cover reaches the sort of an indexed merge insert through a
+/// `RepartitionExec`, which counts as a spilling consumer of the fair pool. The sort
+/// is then left with less than the two batches of an eighth of the pool each that
+/// `HardCapBatchSizeExec` lets through, at any pool size.
+fn is_merge_insert_pool_share_defect(op: &Op, message: &str) -> bool {
+    matches!(op, Op::MergeInsert { .. })
+        && message.contains("RepartitionExec[")
+        && message.contains("for ExternalSorter[")
+}
+
+/// The last progress hook a step reached, from the call log.
+fn last_progress_mark(calls_log: &Path, n: usize) -> String {
+    let phase = format!("phase={n}");
+    let calls = fs::read_to_string(calls_log).unwrap_or_default();
+    calls
+        .lines()
+        .rev()
+        .filter(|line| line.split(' ').any(|token| token == phase))
+        .find_map(|line| {
+            let mut tokens = line.split(' ').skip(2);
+            let (event, name) = (tokens.next()?, tokens.next()?);
+            match event {
+                "stage_start" | "stage_complete" => Some(format!("{event}:{name}")),
+                "fragment_begin" | "fragment_complete" => Some(event.to_string()),
+                _ => None,
+            }
+        })
+        .unwrap_or_else(|| "before_any_mark".to_string())
+}
+
+/// Where the journal of the earlier processes of a seed says it stopped.
+#[derive(Debug, PartialEq, Eq)]
+struct ResumePoint {
+    /// Steps that ran to their end; they stand at the head of the plan.
+    finished: usize,
+    /// The step whose operation started and did not end, and the latest
+    /// version before it. Nothing commits before the operation starts, so a
+    /// step that got no further than its start counts as not started.
+    interrupted: Option<(usize, u64)>,
+    /// What the operation of that step reported, if it got that far.
+    ended: Option<OpEnd>,
+}
+
+/// The `op_end` line of a step.
+#[derive(Debug, PartialEq, Eq)]
+struct OpEnd {
+    outcome: String,
+    fired: u64,
+    status_unknown: bool,
+    fragments_removed: usize,
+    message: String,
+}
+
+impl OpEnd {
+    fn from_line(line: &str) -> Self {
+        let number = |name: &str| field(line, name).and_then(|value| value.parse().ok());
+        Self {
+            outcome: field(line, "outcome").unwrap_or_default().to_string(),
+            fired: number("fired").unwrap_or(0),
+            status_unknown: field(line, "status_unknown") == Some("true"),
+            fragments_removed: number("fragments_removed").unwrap_or(0) as usize,
+            message: line
+                .split_once(" detail=")
+                .map_or_else(String::new, |(_, detail)| detail.to_string()),
+        }
+    }
+
+    fn outcome(&self) -> Outcome {
+        match self.outcome.as_str() {
+            "ok" => Outcome::Ok(OpOutput {
+                fragments_removed: self.fragments_removed,
+                scanned: None,
+            }),
+            "err" => Outcome::Failed {
+                message: self.message.clone(),
+                status_unknown: self.status_unknown,
+            },
+            _ => Outcome::Killed,
+        }
+    }
+}
+
+impl ResumePoint {
+    fn from_journal(journal: &str) -> Self {
+        let mut point = Self {
+            finished: 0,
+            interrupted: None,
+            ended: None,
+        };
+        for line in journal.lines() {
+            let Some(n) = field(line, "step").and_then(|n| n.parse().ok()) else {
+                continue;
+            };
+            // A detail is free text.
+            let head = line.split(" detail=").next().unwrap_or(line);
+            let word = |word: &str| head.split(' ').any(|token| token == word);
+            if word("done") {
+                point.finished = n;
+                point.interrupted = None;
+                point.ended = None;
+            } else if word("armed")
+                && let Some(before) = field(line, "before").and_then(|v| v.parse().ok())
+            {
+                point.interrupted = Some((n, before));
+                point.ended = None;
+            } else if word("op_end") {
+                point.ended = Some(OpEnd::from_line(line));
+            }
+        }
+        point
     }
 }
 
 struct Run {
     kind: ScenarioKind,
     plan: Plan,
+    generation: u64,
+    /// The first step this process has to run; `resume` moves it.
+    next_step: usize,
     /// The seed the checks recompute vectors from; a self-test changes it.
     oracle_seed: u64,
     uri: String,
@@ -849,6 +1462,11 @@ struct Run {
     journal: Arc<Journal>,
     state: Arc<IncidentState>,
     hooks: Arc<StressHooks>,
+    wrapper: Arc<StressWrapper>,
+    /// Where this process lives, under a scenario with memory limits.
+    cgroup: Option<OwnCgroup>,
+    /// The heap held after each cycle of `heap_growth`.
+    heap_after_cycle: Vec<i64>,
     /// The handle every operation runs on; reads that check it go through a
     /// fresh handle without the wrapper.
     ds: Dataset,
@@ -864,23 +1482,30 @@ struct Run {
 
 impl Run {
     async fn setup(
-        kind: ScenarioKind,
+        setting: ChildSetting,
         plan: Plan,
         dir: &Path,
         journal: Arc<Journal>,
-        quiet: Duration,
-        self_test: Option<SelfTest>,
-        started: Instant,
     ) -> Result<Self, Failure> {
+        let ChildSetting {
+            kind,
+            quiet,
+            generation,
+            self_test,
+            started,
+        } = setting;
         let (uri, root) = match plan.store {
-            StoreChoice::Local => {
-                let uri = dir
+            StoreChoice::Local | StoreChoice::FileObjectStore => {
+                let path = dir
                     .join("dataset")
                     .to_str()
                     .expect("a UTF-8 artifacts path")
                     .to_string();
-                let root = uri.trim_start_matches('/').to_string();
-                (uri, root)
+                let root = path.trim_start_matches('/').to_string();
+                match plan.store {
+                    StoreChoice::Local => (path, root),
+                    _ => (format!("file-object-store://{path}"), root),
+                }
             }
             StoreChoice::SharedMemory => (
                 format!("shared-memory://stress-{}/ds", std::process::id()),
@@ -893,26 +1518,50 @@ impl Run {
             started,
         ));
         let hooks = Arc::new(StressHooks::new(state.clone()));
+        if kind.observes_memory() {
+            log_memory_events(&dir.join(MEMORY_LOG), started, generation, state.clone())
+                .map_err(|error| fail("harness", 0, error))?;
+        }
         journal.line(format_args!(
-            "setup store={:?} uri={uri} rows={}",
+            "setup store={:?} uri={uri} rows={} generation={generation}",
             plan.store, plan.initial_rows
         ));
-        let params = WriteParams {
-            mode: WriteMode::Create,
-            max_rows_per_file: ROWS_PER_FILE,
-            store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(Arc::new(StressWrapper::new(state.clone()))),
-                ..Default::default()
-            }),
-            progress: hooks.clone(),
+        let wrapper = Arc::new(StressWrapper::new(state.clone()));
+        let store_params = ObjectStoreParams {
+            object_store_wrapper: Some(wrapper.clone()),
             ..Default::default()
         };
-        let initial = rows(plan.data_seed, 0..plan.initial_rows);
-        let ds = Box::pin(Dataset::write(initial, uri.as_str(), Some(params)))
+        let ds = if generation == 1 {
+            let params = WriteParams {
+                mode: WriteMode::Create,
+                max_rows_per_file: plan.scale.rows_per_file,
+                store_params: Some(store_params),
+                progress: hooks.clone(),
+                ..Default::default()
+            };
+            let initial = rows(plan.data_seed, 0..plan.initial_rows, plan.scale);
+            Box::pin(Dataset::write(initial, uri.as_str(), Some(params))).await
+        } else {
+            Box::pin(
+                DatasetBuilder::from_uri(&uri)
+                    .with_store_params(store_params)
+                    .load(),
+            )
             .await
-            .map_err(|error| fail("setup", 0, error))?;
+        }
+        // A dead process must not take the dataset with it.
+        .map_err(|error| {
+            let class = if generation == 1 {
+                "setup"
+            } else {
+                "unreadable"
+            };
+            fail(class, 0, error)
+        })?;
         let mut run = Self {
             kind,
+            generation,
+            next_step: 0,
             oracle_seed: plan.data_seed,
             model: Model::new(plan.initial_rows),
             plan,
@@ -922,6 +1571,9 @@ impl Run {
             journal,
             state,
             hooks,
+            wrapper,
+            cgroup: OwnCgroup::from_env().map_err(|error| fail("harness", 0, error))?,
+            heap_after_cycle: Vec::with_capacity(HEAP_CYCLES),
             ds,
             handle_stale: false,
             baseline_tasks: 0,
@@ -929,33 +1581,258 @@ impl Run {
             quiet,
             self_test,
         };
-        Box::pin(run.check_content(0)).await?;
-        // What the runtime and the process keep between operations.
-        let (snapshot, waited) = quiesce(0, &run.tmp, run.quiet).await;
-        run.baseline_tasks = snapshot.tasks;
-        run.baseline_fds = snapshot.fds;
-        run.journal.line(format_args!(
+        if generation == 1 {
+            Box::pin(run.measure_baseline(0)).await?;
+        }
+        Ok(run)
+    }
+
+    /// What the runtime and the process keep between operations, measured
+    /// after a first read, which starts the pools that stay.
+    async fn measure_baseline(&mut self, n: usize) -> Result<(), Failure> {
+        Box::pin(self.check_content(n)).await?;
+        let (snapshot, waited) = quiesce(0, &self.tmp, self.quiet).await;
+        self.baseline_tasks = snapshot.tasks;
+        self.baseline_fds = snapshot.fds;
+        self.journal.line(format_args!(
             "setup baseline waited_ms={} {}",
             waited.as_millis(),
             snapshot.line()
         ));
-        run.check_leaks(0, &snapshot)?;
-        Ok(run)
+        self.check_leaks(n, &snapshot)
+    }
+
+    /// Picks up the seed after an earlier process died, and first of all looks
+    /// at what it left: the dataset must read as if the death was a clean end
+    /// of the step it interrupted.
+    async fn resume(&mut self) -> Result<(), Failure> {
+        if self.generation == 1 {
+            return Ok(());
+        }
+        let log = fs::read_to_string(self.seed_dir().join(STEPS_LOG))
+            .map_err(|error| fail("harness", 0, format_args!("read the step log: {error}")))?;
+        let point = ResumePoint::from_journal(&log);
+        for step in &self.plan.steps[..point.finished] {
+            self.model.apply(&step.op);
+        }
+        self.next_step = point.finished;
+        let Some((n, before)) = point.interrupted else {
+            self.journal.line(format_args!(
+                "resume after={} interrupted=none",
+                point.finished
+            ));
+            self.observe_what_the_death_left(point.finished).await?;
+            return Box::pin(self.measure_baseline(point.finished)).await;
+        };
+        let step = self.plan.steps[n - 1].clone();
+        self.state.set_phase(format!("{n}.resume"));
+        self.journal.line(format_args!(
+            "resume after={} interrupted={n} before={before}",
+            point.finished
+        ));
+        self.observe(
+            n,
+            &format!(
+                "killed_at:{}:{}",
+                step.op.kind(),
+                last_progress_mark(&self.seed_dir().join(CALLS_LOG), n)
+            ),
+        );
+        self.observe_what_the_death_left(n).await?;
+        if self.self_test == Some(SelfTest::KillThenMissingFile) {
+            self.remove_a_data_file(n).await?;
+        }
+        // The read that starts the pools needs the model of this very moment.
+        let finished_model = self.model.clone();
+        let latest = self.latest_version(n).await?;
+        if latest > before {
+            self.model.apply(&step.op);
+        }
+        Box::pin(self.measure_baseline(n)).await?;
+        self.model = finished_model;
+        self.state.set_phase(n.to_string());
+        // A death can come after the operation ended, and what the operation
+        // reported still has to hold.
+        let (outcome, fired) = match &point.ended {
+            Some(ended) => (ended.outcome(), ended.fired),
+            None => (Outcome::Killed, 1),
+        };
+        Box::pin(self.conclude(n, &step, outcome, before, fired, None)).await?;
+        // Steps count from 1, their places in the plan from 0.
+        self.next_step = n;
+        Ok(())
+    }
+
+    /// Temporary files stay behind a death, since nothing runs to remove them;
+    /// that is recorded and cleared, so that the leak checks start anew. Files
+    /// of the dataset stay until a cleanup, which the end of the seed checks.
+    async fn observe_what_the_death_left(&self, n: usize) -> Result<(), Failure> {
+        let snapshot = Snapshot::take(&self.tmp);
+        if !snapshot.tmp_files.is_empty() {
+            let bytes: u64 = snapshot
+                .tmp_files
+                .iter()
+                .filter_map(|path| fs::metadata(path).ok())
+                .map(|meta| meta.len())
+                .sum();
+            self.journal.line(format_args!(
+                "step={n} observation=tmp_after_kill files={} bytes={bytes}",
+                snapshot.tmp_files.len()
+            ));
+        }
+        for entry in fs::read_dir(&self.tmp)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+        {
+            let path = entry.path();
+            let removed = if path.is_dir() {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            removed.map_err(|error| {
+                fail(
+                    "harness",
+                    n,
+                    format_args!("clear {}: {error}", path.display()),
+                )
+            })?;
+        }
+        let verifier = self.open_verifier(n).await?;
+        let all = file_sizes(verifier.all_files().await)
+            .await
+            .map_err(|error| fail("unreadable", n, error))?;
+        let tracked = paths(verifier.tracked_files().await)
+            .await
+            .map_err(|error| fail("unreadable", n, error))?;
+        let (mut orphans, mut bytes) = (0, 0);
+        for (path, size) in &all {
+            if !tracked.contains(path) && !path.ends_with("latest_version_hint.json") {
+                orphans += 1;
+                bytes += size;
+            }
+        }
+        if orphans > 0 {
+            self.journal.line(format_args!(
+                "step={n} observation=orphans_after_kill files={orphans} bytes={bytes}"
+            ));
+        }
+        self.observe_hidden_files(n, "hidden_after_kill", &all);
+        Ok(())
+    }
+
+    /// A local object store writes `name` by way of a file `name#digits`, and
+    /// its listings hide those. So a death inside a write can leave a file that
+    /// neither a listing nor a cleanup through the store ever sees: only the
+    /// file system tells.
+    fn observe_hidden_files(&self, n: usize, observation: &str, listed: &BTreeMap<String, i64>) {
+        let dataset = self.seed_dir().join("dataset");
+        let hidden: Vec<PathBuf> = files_below(&dataset)
+            .into_iter()
+            .filter(|file| {
+                file.strip_prefix(&dataset)
+                    .ok()
+                    .and_then(Path::to_str)
+                    .is_some_and(|path| !listed.contains_key(path))
+            })
+            .collect();
+        if hidden.is_empty() {
+            return;
+        }
+        let bytes: u64 = hidden
+            .iter()
+            .filter_map(|file| fs::metadata(file).ok())
+            .map(|meta| meta.len())
+            .sum();
+        self.journal.line(format_args!(
+            "step={n} observation={observation} files={} bytes={bytes} detail={hidden:?}",
+            hidden.len()
+        ));
+    }
+
+    fn seed_dir(&self) -> &Path {
+        self.tmp.parent().expect("the seed's directory")
+    }
+
+    async fn remove_a_data_file(&self, n: usize) -> Result<(), Failure> {
+        let tracked = paths(self.open_verifier(n).await?.tracked_files().await)
+            .await
+            .map_err(|error| fail("unreadable", n, error))?;
+        let file = tracked
+            .iter()
+            .find(|path| path.starts_with("data/"))
+            .expect("a dataset has data files");
+        let path = self.seed_dir().join("dataset").join(file);
+        fs::remove_file(&path).expect("remove a data file");
+        self.journal
+            .line(format_args!("self_test removed {}", path.display()));
+        Ok(())
     }
 
     async fn run_steps(&mut self) -> Result<(), Failure> {
-        for index in 0..self.plan.steps.len() {
+        for index in self.next_step..self.plan.steps.len() {
             let step = self.plan.steps[index].clone();
             Box::pin(self.run_step(index + 1, &step)).await?;
+            if self.kind == ScenarioKind::HeapGrowth && (index + 1) % HEAP_CYCLE_OPS == 0 {
+                self.end_heap_cycle(index + 1).await;
+            }
+        }
+        if self.kind == ScenarioKind::HeapGrowth {
+            self.check_heap_growth()?;
         }
         Ok(())
     }
 
-    async fn run_step(&mut self, n: usize, step: &Step) -> Result<(), Failure> {
-        let incident = step
+    /// The handle is new by now, so its session holds nothing of the cycle.
+    async fn end_heap_cycle(&mut self, n: usize) {
+        if self.self_test == Some(SelfTest::HeapLeak) {
+            Box::leak(vec![1u8; 8 << 10].into_boxed_slice());
+        }
+        quiesce(self.baseline_tasks, &self.tmp, self.quiet).await;
+        let live = live_heap_bytes();
+        self.heap_after_cycle.push(live);
+        self.journal
+            .line(format_args!("step={n} heap_cycle live_kib={}", live >> 10));
+    }
+
+    fn check_heap_growth(&self) -> Result<(), Failure> {
+        let median = |cycles: Range<usize>| {
+            let mut values = self.heap_after_cycle[cycles].to_vec();
+            values.sort_unstable();
+            values[values.len() / 2]
+        };
+        let early = median(HEAP_EARLY_CYCLES);
+        let late = median(HEAP_LATE_CYCLES);
+        if late - early > HEAP_GROWTH_LIMIT {
+            return Err(fail(
+                "heap_growth",
+                self.plan.steps.len(),
+                format_args!(
+                    "the heap grew from {early} to {late} bytes over cycles of the same work: {:?}",
+                    self.heap_after_cycle
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The incident a step's verdict counts under.
+    fn incident_label(&self, step: &Step) -> String {
+        if let Some(limit) = &step.limit {
+            return format!("memory:{}:{limit}", step.op.kind());
+        }
+        let kind = step
             .incident
             .as_ref()
             .map_or_else(|| "none".to_string(), Incident::kind);
+        match self.kind {
+            ScenarioKind::ProcessKill => kind.replacen("cancel", "kill", 1),
+            _ => kind,
+        }
+    }
+
+    async fn run_step(&mut self, n: usize, step: &Step) -> Result<(), Failure> {
         self.state.set_phase(n.to_string());
         self.journal.line(format_args!(
             "step={n} start op={} incident={} resync={}",
@@ -969,11 +1846,39 @@ impl Run {
             self.catch_up(n).await?;
         }
         let before = self.latest_version(n).await?;
-        let cancel = self.state.arm(step.incident.clone());
-        let outcome = self.execute(step.op, Some(cancel)).await;
-        let fired = self.state.disarm();
+        let armed = self.arm_limit(n, step, before)?;
+        let death = (self.kind == ScenarioKind::ProcessKill).then(|| {
+            let in_flight = matches!(
+                step.incident,
+                Some(Incident::CancelCall {
+                    when: CancelWhen::During,
+                    ..
+                })
+            );
+            Death::new(
+                self.journal.clone(),
+                in_flight.then(|| Duration::from_micros(step.in_flight_us)),
+            )
+        });
+        let cancel = self.state.arm(step.incident.clone(), death);
+        if n == 2 && self.generation == 1 {
+            self.die_if_a_self_test_says_so().await?;
+        }
+        let heap_start = start_heap_peak();
+        let outcome = self.execute(step.op, step.limit, Some(cancel)).await;
+        let heap_growth_kib = (heap_peak_bytes() - heap_start) >> 10;
+        let mut fired = self.state.disarm();
+        // Lifted before the line that says the operation ended: a death before
+        // that line counts as a death during the operation, and no check runs
+        // under the limit.
+        fired += Box::pin(self.lift_limit(n, step, armed, &outcome)).await?;
+        let (status_unknown, removed) = match &outcome {
+            Outcome::Failed { status_unknown, .. } => (*status_unknown, 0),
+            Outcome::Ok(output) => (false, output.fragments_removed),
+            _ => (false, 0),
+        };
         self.journal.line(format_args!(
-            "step={n} op_end outcome={} fired={fired} detail={}",
+            "step={n} op_end outcome={} fired={fired} status_unknown={status_unknown} fragments_removed={removed} heap_growth_kib={heap_growth_kib} detail={}",
             outcome.name(),
             outcome.detail()
         ));
@@ -991,47 +1896,82 @@ impl Run {
         } else {
             None
         };
+        Box::pin(self.conclude(n, step, outcome, before, fired, right_after)).await
+    }
+
+    /// Everything after the operation of step `n`, whichever process runs it:
+    /// what the outcome says about the dataset, the model, the checks, the
+    /// retry and the leaks.
+    async fn conclude(
+        &mut self,
+        n: usize,
+        step: &Step,
+        outcome: Outcome,
+        before: u64,
+        fired: u64,
+        right_after: Option<u64>,
+    ) -> Result<(), Failure> {
+        let incident = self.incident_label(step);
+        let shape = step.op.shape();
+        let handle = self.ds.version().version;
+        self.let_go_of_the_session(n).await?;
         self.quiet_down(n).await;
         let after = self.latest_version(n).await?;
-        if after < before || after > before + 1 {
+        if after < before || after > before + shape.max_delta() {
             return Err(fail(
                 "version_jump",
                 n,
-                format_args!("one operation moved the version from {before} to {after}"),
+                format_args!(
+                    "{} moved the version from {before} to {after}, by at most {} it should",
+                    step.op,
+                    shape.max_delta()
+                ),
             ));
         }
-        let committed = after == before + 1;
+        let committed = after > before;
         self.journal.line(format_args!(
             "step={n} verdict incident={incident} fired={fired} outcome={} committed={committed} before={before} after={after}",
             outcome.name()
         ));
-        match (&outcome, committed) {
-            (Outcome::Ok, false) => {
-                return Err(fail(
-                    "lost_commit",
-                    n,
-                    format_args!(
-                        "{} returned Ok, but the latest version is still {before}",
-                        step.op
-                    ),
-                ));
+        self.check_memory_events(n, step, &outcome, committed)?;
+        let lost = match (&outcome, shape) {
+            (Outcome::Ok(_), CommitShape::Exactly1) => !committed,
+            // The reservation and the rewrite, or nothing at all.
+            (Outcome::Ok(output), CommitShape::UpTo2) => {
+                (output.fragments_removed > 0) != (after == before + 2)
             }
-            (Outcome::Ok, true) if fired > 0 => self.observe(
+            _ => false,
+        };
+        if lost {
+            return Err(fail(
+                "lost_commit",
+                n,
+                format_args!(
+                    "{} returned Ok, but the latest version moved from {before} to {after}",
+                    step.op
+                ),
+            ));
+        }
+        // A limit that only changes how a read goes has nothing to absorb.
+        let says_nothing = matches!(step.limit, Some(Limit::IoBuffer { .. }));
+        if outcome.is_ok() && fired > 0 && !says_nothing {
+            self.observe(
                 n,
                 match self.kind {
                     ScenarioKind::StorageFaults => "fault_absorbed",
                     ScenarioKind::Cancellation => "cancel_missed",
+                    ScenarioKind::ProcessKill => "kill_missed",
+                    ScenarioKind::MemoryLimits | ScenarioKind::HeapGrowth => "limit_absorbed",
                 },
-            ),
+            );
+        }
+        match &outcome {
             // A caller that sees an error retries, and a retried append
             // duplicates its rows. Only an honest "status unknown" may land.
-            (
-                Outcome::Failed {
-                    message,
-                    status_unknown: false,
-                },
-                true,
-            ) => {
+            Outcome::Failed {
+                message,
+                status_unknown: false,
+            } if committed && after == before + shape.max_delta() => {
                 return Err(fail(
                     "error_after_commit",
                     n,
@@ -1041,62 +1981,94 @@ impl Run {
                     ),
                 ));
             }
-            (
-                Outcome::Failed {
-                    status_unknown: true,
-                    ..
-                },
-                true,
-            ) => {
-                self.observe(n, "status_unknown_landed");
+            Outcome::Failed {
+                status_unknown: true,
+                ..
+            } => {
+                self.observe(
+                    n,
+                    if committed {
+                        "status_unknown_landed"
+                    } else {
+                        "status_unknown_lost"
+                    },
+                );
             }
-            (
-                Outcome::Failed {
-                    status_unknown: true,
-                    ..
-                },
-                false,
-            ) => {
-                self.observe(n, "status_unknown_lost");
-            }
-            (Outcome::Cancelled, true) => {
+            Outcome::Cancelled if committed => {
                 self.observe(n, "cancel_after_commit");
                 if right_after == Some(before) {
                     self.observe(n, "late_commit");
                 }
             }
+            Outcome::Killed if committed => self.observe(n, "killed_after_commit"),
             _ => {}
         }
-        if let (Outcome::Failed { message, .. }, 0) = (&outcome, fired) {
-            // A stale handle may legitimately lose a conflict.
-            if !self.handle_stale {
-                return Err(fail(
-                    "error_without_fault",
-                    n,
-                    format_args!("{} failed with no incident firing: {message}", step.op),
-                ));
+        if let Outcome::Failed { message, .. } = &outcome {
+            let explained = match step.limit {
+                // The counter of hits also grows when reclaim succeeds, so the
+                // error itself has to say that memory ran out.
+                Some(Limit::Cgroup { .. }) => {
+                    fired > 0
+                        && (message.contains("(os error 12)")
+                            || message.contains("Cannot allocate memory"))
+                }
+                // Enough for the work to spill, so an error here is a regression.
+                Some(Limit::Pool { kib }) => {
+                    let defect = is_merge_insert_pool_share_defect(&step.op, message);
+                    if defect {
+                        self.observe(n, "known_defect:merge_insert_pool_share");
+                    }
+                    defect || (kib < pool_floor_kib(&step.op) && is_resources_exhausted(message))
+                }
+                // Neither promises an error: both only change how the work is done.
+                Some(Limit::FtsMemory { .. } | Limit::IoBuffer { .. }) => false,
+                // A death injects no error.
+                None => fired > 0 && self.kind != ScenarioKind::ProcessKill,
+            };
+            if !explained {
+                // A stale handle may legitimately lose a conflict.
+                if !self.handle_stale {
+                    return Err(fail(
+                        "error_without_fault",
+                        n,
+                        format_args!("{} failed with nothing to explain it: {message}", step.op),
+                    ));
+                }
+                self.observe(n, "error_on_stale_handle");
             }
-            self.observe(n, "error_on_stale_handle");
         }
-        if step.incident.is_some() && fired == 0 {
+        if (step.incident.is_some() || step.limit.is_some()) && fired == 0 {
             self.observe(n, "not_reached");
         }
-        if matches!(outcome, Outcome::Ok) {
-            self.check_handle(n, &step.op, after)?;
+        if let Outcome::Ok(output) = &outcome {
+            self.check_handle(n, &step.op, handle, after)?;
+            self.check_scan(n, output)?;
             self.handle_stale = false;
-        } else if committed {
+        } else if committed && !matches!(outcome, Outcome::Killed) {
             self.handle_stale = true;
         }
         if committed {
             self.model.apply(&step.op);
         }
         Box::pin(self.check_content(n)).await?;
-        if !committed {
+        let retries = match shape {
+            CommitShape::Exactly1 => !committed,
+            CommitShape::UpTo2 | CommitShape::Never => !outcome.is_ok(),
+        };
+        if retries {
             self.state.set_phase(format!("{n}.retry"));
             self.catch_up(n).await?;
-            let retry = self.execute(step.op, None).await;
+            let retry = self.execute(step.op, None, None).await;
+            let handle = self.ds.version().version;
             let retried = self.latest_version(n).await?;
-            if !matches!(retry, Outcome::Ok) || retried != after + 1 {
+            let right_move = match (shape, &retry) {
+                (CommitShape::Exactly1, _) => retried == after + 1,
+                (CommitShape::UpTo2, Outcome::Ok(output)) if output.fragments_removed > 0 => {
+                    retried == after + 2
+                }
+                (CommitShape::UpTo2 | CommitShape::Never, _) => retried == after,
+            };
+            if !retry.is_ok() || !right_move {
                 return Err(fail(
                     "retry_failed",
                     n,
@@ -1108,25 +2080,356 @@ impl Run {
                     ),
                 ));
             }
-            self.check_handle(n, &step.op, retried)?;
+            self.check_handle(n, &step.op, handle, retried)?;
             self.journal
                 .line(format_args!("step={n} retry outcome=ok version={retried}"));
             self.model.apply(&step.op);
+            if let Outcome::Ok(output) = &retry {
+                self.check_scan(n, output)?;
+            }
             Box::pin(self.check_content(n)).await?;
         }
+        self.let_go_of_the_session(n).await?;
         let snapshot = self.quiet_down(n).await;
-        self.check_leaks(n, &snapshot)
+        self.check_leaks(n, &snapshot)?;
+        // From here on a later process does not touch this step again.
+        self.journal.line(format_args!("step={n} done"));
+        Ok(())
+    }
+
+    /// What Lance logged about the memory of an index build must agree with
+    /// what happened: the build, its stages, the limit it ran under, and that
+    /// the end of a build is only ever logged after its commit.
+    fn check_memory_events(
+        &self,
+        n: usize,
+        step: &Step,
+        outcome: &Outcome,
+        committed: bool,
+    ) -> Result<(), Failure> {
+        if !self.kind.observes_memory() || !matches!(step.op, Op::CreateIndex(_)) {
+            return Ok(());
+        }
+        let wrong = |detail: String| Err(fail("memory_events", n, detail));
+        let in_this_step = |line: &&str| field(line, "phase") == Some(n.to_string().as_str());
+        let log = fs::read_to_string(self.seed_dir().join(MEMORY_LOG)).unwrap_or_default();
+        // The last line of a dead process can be torn.
+        let events: Vec<&str> = log
+            .lines()
+            .filter(|line| line.ends_with(" end=1"))
+            .filter(in_this_step)
+            .collect();
+        if let Some(limit) = self.limit_of_step(n) {
+            for line in &events {
+                let bytes = |name: &str| field(line, name).and_then(|v| v.parse::<u64>().ok());
+                if bytes("cgroup_limit_bytes") != Some(limit) {
+                    return wrong(format!("the limit of the step is {limit}, but: {line}"));
+                }
+                // A kernel can charge past the limit, but not by much.
+                if bytes("cgroup_bytes").is_none_or(|current| current > limit + (1 << 20)) {
+                    return wrong(format!("the limit of the step is {limit}, but: {line}"));
+                }
+            }
+        }
+        let of_kind = |name: &'static str| {
+            events
+                .iter()
+                .filter(move |line| field(line, "event") == Some(name))
+        };
+        if !committed
+            && matches!(outcome, Outcome::Killed | Outcome::Failed { .. })
+            && let Some(line) = of_kind("operation_complete").next()
+        {
+            return wrong(format!("an uncommitted build logged its end: {line}"));
+        }
+        let calls = fs::read_to_string(self.seed_dir().join(CALLS_LOG)).unwrap_or_default();
+        let hooks_saw = |name: &str| -> Vec<String> {
+            calls
+                .lines()
+                .filter(in_this_step)
+                .filter_map(|line| {
+                    let mut tokens = line.split(' ').skip(2);
+                    (tokens.next() == Some(name))
+                        .then(|| tokens.next().map(str::to_string))
+                        .flatten()
+                })
+                .collect()
+        };
+        if !outcome.is_ok() {
+            // An event goes out right before its hook, so a build that did not
+            // end can only have logged one stage more than the hooks saw.
+            for name in ["stage_start", "stage_complete"] {
+                let logged: Vec<&str> = of_kind(name)
+                    .filter_map(|line| field(line, "stage"))
+                    .collect();
+                let seen = hooks_saw(name);
+                if logged.len() < seen.len()
+                    || logged.len() > seen.len() + 1
+                    || !logged.iter().zip(&seen).all(|(a, b)| a == b)
+                {
+                    return wrong(format!(
+                        "{name}: the events name {logged:?}, the progress hooks saw {seen:?}"
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        let starts: Vec<&&str> = of_kind("operation_start").collect();
+        let ends: Vec<&&str> = of_kind("operation_complete").collect();
+        let ([start], [end]) = (starts.as_slice(), ends.as_slice()) else {
+            return wrong(format!(
+                "a finished build logged {} starts and {} ends",
+                starts.len(),
+                ends.len()
+            ));
+        };
+        if field(start, "operation_id") != field(end, "operation_id") {
+            return wrong(format!("the ends of a build differ: {start} and {end}"));
+        }
+        let peak = |line: &str| field(line, "peak_bytes").and_then(|peak| peak.parse::<u64>().ok());
+        let Some(whole_peak) = peak(end).filter(|peak| *peak > 0) else {
+            return wrong(format!("a finished build logged no peak: {end}"));
+        };
+        // The window of the build holds the window of each stage.
+        for line in of_kind("stage_complete") {
+            if peak(line).is_none_or(|stage_peak| stage_peak == 0 || stage_peak > whole_peak) {
+                return wrong(format!(
+                    "the build logged a peak of {whole_peak}, but: {line}"
+                ));
+            }
+        }
+        for name in ["stage_start", "stage_complete"] {
+            let logged: Vec<&str> = of_kind(name)
+                .filter_map(|line| field(line, "stage"))
+                .collect();
+            let seen = hooks_saw(name);
+            if logged != seen {
+                return wrong(format!(
+                    "{name}: the events name {logged:?}, the progress hooks saw {seen:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The limit a step was armed with, from the journal, which a death leaves
+    /// behind too.
+    fn limit_of_step(&self, n: usize) -> Option<u64> {
+        let journal = fs::read_to_string(self.seed_dir().join(STEPS_LOG)).ok()?;
+        journal
+            .lines()
+            .filter(|line| field(line, "step") == Some(n.to_string().as_str()))
+            .find(|line| line.split(' ').any(|token| token == "armed"))
+            .and_then(|line| field(line, "limit")?.parse().ok())
+    }
+
+    /// Replaces the operations' handle with a fresh one, in a session of its
+    /// own. An operation that reads through an index leaves it in the cache of
+    /// its session, and with it the task of the index store's I/O scheduler
+    /// (`ScanScheduler`) until the session goes. Only what outlives the handle
+    /// is a leak. The older scenarios keep one session, so that its caches see
+    /// everything that follows.
+    async fn let_go_of_the_session(&mut self, n: usize) -> Result<(), Failure> {
+        if matches!(
+            self.kind,
+            ScenarioKind::StorageFaults | ScenarioKind::Cancellation
+        ) {
+            return Ok(());
+        }
+        self.ds = Box::pin(
+            DatasetBuilder::from_uri(&self.uri)
+                .with_store_params(ObjectStoreParams {
+                    object_store_wrapper: Some(self.wrapper.clone()),
+                    ..Default::default()
+                })
+                .load(),
+        )
+        .await
+        .map_err(|error| fail("unreadable", n, error))?;
+        self.handle_stale = false;
+        Ok(())
+    }
+
+    /// A scan must have returned every live row once.
+    fn check_scan(&self, n: usize, output: &OpOutput) -> Result<(), Failure> {
+        let Some((count, sum)) = output.scanned else {
+            return Ok(());
+        };
+        let expected = self
+            .model
+            .live
+            .iter()
+            .fold(0i64, |sum, id| sum.wrapping_add(*id));
+        if count != self.model.live.len() || sum != expected {
+            return Err(fail(
+                "content",
+                n,
+                format_args!(
+                    "a scan returned {count} rows with ids summing to {sum}, where the model has {} rows summing to {expected}",
+                    self.model.live.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Writes the line a later process resumes from, then, on a step with a
+    /// limit, what the budget comes down to.
+    fn arm_limit(&self, n: usize, step: &Step, before: u64) -> Result<Option<ArmedLimit>, Failure> {
+        let harness = |error: String| fail("harness", n, error);
+        if let Some(Limit::Pool { kib }) = step.limit {
+            self.journal
+                .line(format_args!("step={n} armed before={before}"));
+            // SAFETY: the step starts from quiet, with no task left and the
+            // pools idle, so no other thread reads the environment now.
+            unsafe { std::env::set_var(POOL_VARIABLE, (kib << 10).to_string()) };
+            return Ok(Some(ArmedLimit::Pool(TmpWatch::start(&self.tmp))));
+        }
+        let (Some(Limit::Cgroup { budget_kib }), Some(cgroup)) = (step.limit, &self.cgroup) else {
+            // Only a run in one process, for a debugger, has no cgroup.
+            let skipped = matches!(step.limit, Some(Limit::Cgroup { .. }));
+            self.journal.line(format_args!(
+                "step={n} armed before={before} limit_skipped={skipped}"
+            ));
+            return Ok(None);
+        };
+        cgroup.shrink(&self.seed_dir().join("dataset"));
+        let usage = cgroup.usage();
+        // SAFETY: `sysconf` only reads a system setting.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let limit = (usage.current + budget_kib * 1024) & !(page - 1);
+        let hits = cgroup.limit_hits();
+        self.journal.line(format_args!(
+            "step={n} armed before={before} limit={limit} current={} anon={} file={}",
+            usage.current, usage.anon, usage.file
+        ));
+        let bytes = cgroup.set_limit(limit).map_err(harness)?;
+        if bytes != limit {
+            return Err(harness(format!(
+                "memory.max reads {bytes} after writing {limit}"
+            )));
+        }
+        Ok(Some(ArmedLimit::Cgroup { hits, bytes }))
+    }
+
+    /// Lifts the limit of a step, and returns how many times the step hit it.
+    async fn lift_limit(
+        &self,
+        n: usize,
+        step: &Step,
+        armed: Option<ArmedLimit>,
+        outcome: &Outcome,
+    ) -> Result<u64, Failure> {
+        match armed {
+            Some(ArmedLimit::Cgroup { hits, bytes }) => {
+                let cgroup = self
+                    .cgroup
+                    .as_ref()
+                    .ok_or_else(|| fail("harness", n, "a limit without a cgroup"))?;
+                cgroup
+                    .lift_limit()
+                    .map_err(|error| fail("harness", n, error))?;
+                let hits = cgroup.limit_hits() - hits;
+                self.journal
+                    .line(format_args!("step={n} limit_end bytes={bytes} hits={hits}"));
+                return Ok(hits);
+            }
+            Some(ArmedLimit::Pool(watch)) => {
+                let spilled = watch.stop();
+                // SAFETY: the operation is over, and what it left behind reads
+                // no variable of the pool, which only a new operation looks up.
+                unsafe { std::env::remove_var(POOL_VARIABLE) };
+                self.journal
+                    .line(format_args!("step={n} limit_end tmp_peak_bytes={spilled}"));
+                if spilled > 0 {
+                    self.observe(n, &format!("spill:{}", step.op.kind()));
+                }
+                let exhausted = matches!(
+                    outcome,
+                    Outcome::Failed { message, .. } if is_resources_exhausted(message)
+                );
+                return Ok(u64::from(spilled > 0 || exhausted));
+            }
+            None => {}
+        }
+        match (step.limit, outcome) {
+            (Some(Limit::IoBuffer { .. }), _) => Ok(1),
+            (Some(Limit::FtsMemory { .. }), Outcome::Ok(_)) => {
+                let partitions = self.text_index_partitions(n).await?;
+                self.journal
+                    .line(format_args!("step={n} limit_end partitions={partitions}"));
+                Ok(u64::from(partitions > 1))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// The partitions of the inverted index: a builder that goes over its memory
+    /// limit writes one and starts the next.
+    async fn text_index_partitions(&self, n: usize) -> Result<usize, Failure> {
+        let indices = self
+            .ds
+            .load_indices()
+            .await
+            .map_err(|error| fail("unreadable", n, error))?;
+        let parts: BTreeSet<&str> = indices
+            .iter()
+            .filter(|index| index.name == IndexKind::Inverted.name())
+            .filter_map(|index| index.files.as_ref())
+            .flatten()
+            .filter_map(|file| file.path.strip_suffix("_tokens.lance"))
+            .collect();
+        Ok(parts.len())
+    }
+
+    async fn die_if_a_self_test_says_so(&self) -> Result<(), Failure> {
+        let limited = |room: u64| -> Result<&OwnCgroup, Failure> {
+            let cgroup = self
+                .cgroup
+                .as_ref()
+                .ok_or_else(|| fail("harness", 2, "this self-test needs a cgroup"))?;
+            cgroup
+                .set_limit(cgroup.usage().current + room)
+                .map_err(|error| fail("harness", 2, error))?;
+            Ok(cgroup)
+        };
+        match self.self_test {
+            Some(SelfTest::ForeignKill) => kill_this_process(),
+            Some(SelfTest::KillThenMissingFile) => {
+                self.journal.line(CRASH_FIRED);
+                kill_this_process()
+            }
+            Some(SelfTest::OomRecovery) => {
+                limited(16 << 20)?;
+                // Writing every page of it is what goes over the limit.
+                std::hint::black_box(vec![1u8; 1 << 30]);
+                Err(fail("harness", 2, "1 GiB fit into a budget of 16 MiB"))
+            }
+            Some(SelfTest::HangUnderLimit) => {
+                limited(16 << 20)?;
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Runs `op` on the handle that meets the incidents. When `cancel` fires,
     /// the operation is dropped at whatever await it has reached.
-    async fn execute(&mut self, op: Op, cancel: Option<Arc<Notify>>) -> Outcome {
+    async fn execute(
+        &mut self,
+        op: Op,
+        limit: Option<Limit>,
+        cancel: Option<Arc<Notify>>,
+    ) -> Outcome {
         let cancel = cancel.unwrap_or_default();
         let operation = AssertUnwindSafe(op_future(
             &mut self.ds,
             &self.hooks,
             self.plan.data_seed,
+            self.plan.scale,
             op,
+            limit,
         ))
         .catch_unwind();
         let result = tokio::select! {
@@ -1135,7 +2438,7 @@ impl Run {
             result = operation => result,
         };
         match result {
-            Ok(Ok(())) => Outcome::Ok,
+            Ok(Ok(output)) => Outcome::Ok(output),
             Ok(Err(error)) => Outcome::Failed {
                 status_unknown: error.is_commit_status_unknown(),
                 message: one_line(&error.to_string()),
@@ -1161,8 +2464,15 @@ impl Run {
                 self.model.live.pop_first();
             }
             SelfTest::ColumnMismatch => self.oracle_seed ^= 1,
-            // Planted after the cleanup, which would remove it.
-            SelfTest::Orphan => {}
+            // Planted after the cleanup, which would remove it. The others act
+            // before the operation or in a later process.
+            SelfTest::Orphan
+            | SelfTest::ForeignKill
+            | SelfTest::KillThenMissingFile
+            | SelfTest::OomRecovery
+            | SelfTest::HangUnderLimit
+            | SelfTest::MemoryEvents
+            | SelfTest::HeapLeak => {}
         }
     }
 
@@ -1180,8 +2490,7 @@ impl Run {
     }
 
     /// An operation that returned Ok must leave its handle on its own commit.
-    fn check_handle(&self, n: usize, op: &Op, version: u64) -> Result<(), Failure> {
-        let handle = self.ds.version().version;
+    fn check_handle(&self, n: usize, op: &Op, handle: u64, version: u64) -> Result<(), Failure> {
         if handle != version {
             return Err(fail(
                 "stale_handle",
@@ -1316,7 +2625,7 @@ impl Run {
         for (row, id) in ids.iter().enumerate() {
             let wrong = if categories.value(row) != category(*id) {
                 Some("category")
-            } else if texts.value(row) != text(*id) {
+            } else if texts.value(row) != text(*id, &self.plan.scale) {
                 Some("text")
             } else if vectors
                 .value(row)
@@ -1346,6 +2655,30 @@ impl Run {
     async fn check_index(&self, ds: &Dataset, n: usize, kind: IndexKind) -> Result<(), Failure> {
         let unreadable = |error: lance::Error| fail("unreadable", n, error);
         match kind {
+            IndexKind::BTreeId => {
+                let last = self.model.next_id.max(1);
+                for slot in 0..3 {
+                    let lo = last * slot / 3;
+                    let hi = last * (slot + 1) / 3;
+                    let filter = format!("id >= {lo} AND id < {hi}");
+                    let mut scan = ds.scan();
+                    scan.filter(&filter).map_err(unreadable)?;
+                    scan.project(&["id"]).map_err(unreadable)?;
+                    if slot == 0 {
+                        let plan = scan.explain_plan(true).await.map_err(unreadable)?;
+                        if !plan.contains("@idx_id(BTree)") {
+                            return Err(fail(
+                                "index_not_used",
+                                n,
+                                format_args!("{filter} does not use idx_id: {plan}"),
+                            ));
+                        }
+                    }
+                    let batch = scan.try_into_batch().await.map_err(unreadable)?;
+                    let expected: BTreeSet<i64> = self.model.live.range(lo..hi).copied().collect();
+                    compare_ids(n, &filter, &int64_column(&batch, "id"), &expected)?;
+                }
+            }
             IndexKind::BTree => {
                 for value in 0..CATEGORIES {
                     let filter = format!("category = {value}");
@@ -1418,8 +2751,8 @@ impl Run {
             }
             IndexKind::Inverted => {
                 for slot in 0..4 {
-                    let token = (n as u64 * 4 + slot) % VOCABULARY;
-                    let term = format!("tok{token:02}");
+                    let token = (n as u64 * 4 + slot) % self.plan.scale.vocabulary;
+                    let term = format!("tok{token:04}");
                     let query = FullTextSearchQuery::new(term.clone())
                         .with_column("text".to_string())
                         .map_err(unreadable)?
@@ -1446,7 +2779,7 @@ impl Run {
                         .live
                         .iter()
                         .copied()
-                        .filter(|id| tokens(*id).contains(&token))
+                        .filter(|id| tokens(*id, &self.plan.scale).any(|found| found == token))
                         .collect();
                     compare_ids(
                         n,
@@ -1530,11 +2863,14 @@ impl Run {
                 ),
             ));
         }
-        if !snapshot.tmp_files.is_empty() {
+        if !snapshot.tmp_files.is_empty() || snapshot.tmp_dirs > 0 {
             return Err(fail(
                 "tmp_leak",
                 n,
-                format_args!("temporary files left behind: {:?}", snapshot.tmp_files),
+                format_args!(
+                    "temporary files left behind: {:?}, and {} directories",
+                    snapshot.tmp_files, snapshot.tmp_dirs
+                ),
             ));
         }
         if snapshot.fds > self.baseline_fds {
@@ -1595,6 +2931,10 @@ impl Run {
                 .expect("plant an orphan");
         }
         let verifier = self.open_verifier(n).await?;
+        let listed = file_sizes(verifier.all_files().await)
+            .await
+            .map_err(|error| fail("unreadable", n, error))?;
+        self.observe_hidden_files(n, "hidden_after_cleanup", &listed);
         let cutoff = verifier.version().timestamp.timestamp_micros();
         let all = file_times(verifier.all_files().await)
             .await
