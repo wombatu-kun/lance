@@ -655,21 +655,15 @@ const HOLE_ROUND: usize = 1;
 /// a commit checked before a cleanup and written after it can take the number of
 /// a version the cleanup removed, <https://github.com/lance-format/lance/issues/3718>.
 /// Seeds take the pairs in turn.
-///
-/// Two pairs stay out while Lance lets them through a hole, as neither changes a
-/// fragment: `("contended_upsert", "hole_keys")`, an upsert that only inserts new
-/// declared keys and duplicates them, since no filter of keys is compared with the
-/// hidden insert (<https://github.com/lance-format/lance/issues/10659>), and
-/// `("stamp_index", "hole_stamp")`, an index on `gen` that keeps the values a
-/// hidden rewrite in place replaced
-/// (<https://github.com/lance-format/lance/issues/10660>).
-const HOLES: [(&str, &str); 6] = [
+const HOLES: [(&str, &str); 8] = [
     ("delete", "hole_rows"),
     ("merge_insert", "hole_rows"),
     ("merge_insert_columns", "hole_rows"),
     ("compact", "hole_rows"),
     ("delete", "hole_compact"),
     ("merge_insert", "hole_compact"),
+    ("contended_upsert", "hole_keys"),
+    ("stamp_index", "hole_stamp"),
 ];
 
 /// The operation a name of `PAIRS` or `HOLES` runs, as `LANCE_STRESS_ONLY` names it.
@@ -678,6 +672,8 @@ fn focus_name(name: &'static str) -> &'static str {
         "stamp_index" => "create_index",
         "hole_rows" => "update",
         "hole_compact" => "compact",
+        "hole_keys" => "contended_upsert",
+        "hole_stamp" => "merge_insert_columns",
         other => other,
     }
 }
@@ -706,8 +702,10 @@ pub(super) fn focusable_ops() -> Vec<&'static str> {
 }
 
 /// The pairs a seed forces: one per pair round, which seeds take in turn from
-/// `PAIRS`, and the one over the hole from `HOLES`. A focus keeps the pairs that
-/// run one of its operations; a round left without one is a random round.
+/// `PAIRS`, and the one over the hole from `HOLES`, which moves one further every
+/// `HOLES.len()` seeds: with as many holes as turns of the pairs, a hole would
+/// otherwise meet the same pairs on every seed. A focus keeps the pairs that run
+/// one of its operations; a round left without one is a random round.
 fn forced_pairs(
     seed: u64,
     rounds: usize,
@@ -730,7 +728,10 @@ fn forced_pairs(
             pair_rounds.insert(n, pairs[(turn + slot) % pairs.len()]);
         }
     }
-    let hole = (!holes.is_empty()).then(|| holes[(seed % holes.len() as u64) as usize]);
+    let hole = (!holes.is_empty()).then(|| {
+        let len = holes.len() as u64;
+        holes[((seed + seed / len) % len) as usize]
+    });
     (pair_rounds, hole)
 }
 
@@ -866,6 +867,9 @@ pub(super) fn plan_rounds(
     let mut rows = RowsModel::new(initial_rows, workers);
     let mut indices = BTreeSet::new();
     let (pair_rounds, hole) = forced_pairs(seed, rounds, focus);
+    // An insert of new keys over the hole is what its pair is for, and without a
+    // declared key the round upserts existing keys instead.
+    let declared_key = declared_key || hole.is_some_and(|(_, hidden)| hidden == "hole_keys");
     let free_rounds: Vec<usize> = (1..=rounds)
         .filter(|n| !pair_rounds.contains_key(n) && (hole.is_none() || *n != HOLE_ROUND))
         .collect();
@@ -2429,9 +2433,12 @@ impl RoundContext {
     }
 
     /// What became of a staged commit over the hole: `refused` is the fix of
-    /// <https://github.com/lance-format/lance/issues/10603>, `landed` only right for
-    /// what changes no fragment, `masked` a missing file that came first, and
-    /// `conflict` any other conflict.
+    /// <https://github.com/lance-format/lance/issues/10603>, and for an insert of
+    /// declared keys of <https://github.com/lance-format/lance/issues/10659>;
+    /// `landed` only right for what changes no fragment and inserts no declared
+    /// key, an index build withdrawing the coverage the hidden rewrite made stale
+    /// (<https://github.com/lance-format/lance/issues/10660>); `masked` a missing
+    /// file that came first, and `conflict` any other conflict.
     fn observe_hole(&self, op: &PlannedOp, result: &lance::Result<Attempted>) {
         let hidden = self.round.hole.unwrap_or("none");
         let outcome = match result {
@@ -4063,8 +4070,12 @@ impl Run {
     /// Upserts of the same keys by two workers raced when one committed while the
     /// other was under way. Over only new keys nothing but the filter of keys stops
     /// the duplicate, and with the index on the key there before the racers began,
-    /// every racer took the indexed path of merge insert.
+    /// every racer took the indexed path of merge insert. Over a hole the refusal
+    /// stops it before any filter is compared, so such a round counts no race.
     fn observe_key_race(&self, n: usize, context: &RoundContext) {
+        if context.round.hole.is_some() {
+            return;
+        }
         let spans = &context.clocks.spans;
         let tick = |value: &AtomicU64| value.load(Ordering::SeqCst);
         let upserts: Vec<&PlannedOp> = context
@@ -4108,7 +4119,9 @@ impl Run {
 #[test]
 fn selection_forces_only_the_pairs_of_the_focus() {
     let everything = BTreeSet::new();
-    for seed in 1..=48 {
+    let mut holes_of_a_gate = BTreeSet::new();
+    let mut met: BTreeSet<(Pair, Pair)> = BTreeSet::new();
+    for seed in 1..=64 {
         // Without a focus, seeds take every pair in turn, as they always have.
         let (pair_rounds, hole) = forced_pairs(seed, 8, &everything);
         let turn = (seed % PAIRS.len() as u64) as usize * PAIR_ROUNDS;
@@ -4118,8 +4131,19 @@ fn selection_forces_only_the_pairs_of_the_focus() {
             .map(|(slot, n)| (n, PAIRS[(turn + slot) % PAIRS.len()]))
             .collect();
         assert_eq!(pair_rounds, expected);
-        assert_eq!(hole, Some(HOLES[(seed % HOLES.len() as u64) as usize]));
+        let hole = hole.expect("a seed without a focus has a hole");
+        if seed <= 16 {
+            holes_of_a_gate.insert(hole);
+        }
+        met.insert((hole, expected[&3]));
     }
+    assert_eq!(
+        holes_of_a_gate.len(),
+        HOLES.len(),
+        "16 seeds meet every hole"
+    );
+    // Every hole meets every turn of the pairs, not the same pairs on every seed.
+    assert_eq!(met.len(), HOLES.len() * PAIRS.len() / PAIR_ROUNDS);
     for op in focusable_ops() {
         let focus = BTreeSet::from([op]);
         let mut forced = 0;

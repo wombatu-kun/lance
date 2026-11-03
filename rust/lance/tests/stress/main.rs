@@ -82,15 +82,12 @@
 //! reads the same each time, and a cleanup takes what it should and nothing else. The
 //! failure classes of its own are `torn_snapshot`, `lost_write`, `stale_read`,
 //! `snapshot_changed`, `duplicate_key` and `lineage`.
-//! It stays clear of three known defects and of one thing Lance allows. Outside
+//! It stays clear of one known defect and of one thing Lance allows. Outside
 //! round 1 a cleanup keeps every version of its round and the one before, so that a
 //! write held between its check for conflicts and its manifest never takes the
 //! number of a version the cleanup removed
 //! (<https://github.com/lance-format/lance/issues/3718>); round 1 commits its staged
-//! writes only after its cleanup, and without holds. Round 1 leaves out an
-//! upsert of new declared keys and an index build over the hole, which Lance lets
-//! through (<https://github.com/lance-format/lance/issues/10659>,
-//! <https://github.com/lance-format/lance/issues/10660>). Workers only race for a
+//! writes only after its cleanup, and without holds. Workers only race for a
 //! new key on a seed with a declared primary key: without one a duplicate is legal,
 //! see #5633.
 //!
