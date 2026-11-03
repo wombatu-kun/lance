@@ -3652,7 +3652,7 @@ impl Run {
             }
         }
         Box::pin(self.check_content(n)).await?;
-        self.let_go_of_the_session(n).await?;
+        self.let_go_of_the_session(n, None).await?;
         let snapshot = self.quiet_down(n).await;
         self.check_leaks(n, &snapshot)?;
         self.journal.line(format_args!("step={n} done"));

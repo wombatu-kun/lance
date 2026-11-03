@@ -1006,21 +1006,57 @@ impl ObjectStore for StressStore {
         locations: BoxStream<'static, OSResult<Path>>,
     ) -> BoxStream<'static, OSResult<Path>> {
         let state = self.state.clone();
+        // `delete` passes one location at a time, so a cancellation after a
+        // deletion fires with the next result of the inner store.
+        let after_deletion: Arc<Mutex<Vec<Cancellation>>> = Arc::default();
+        let pending = after_deletion.clone();
         let checked = locations
             .and_then(move |location| {
-                let result = match state.on_call(Method::Delete, &location) {
-                    Action::FailBefore(fault) | Action::FailAfter(fault) => Err(injected(
-                        fault,
-                        Method::Delete,
-                        &location,
-                        "before the request",
-                    )),
-                    _ => Ok(location),
-                };
-                future::ready(result)
+                let action = state.on_call(Method::Delete, &location);
+                let pending = pending.clone();
+                async move {
+                    match action {
+                        Action::FailBefore(fault) | Action::FailAfter(fault) => Err(injected(
+                            fault,
+                            Method::Delete,
+                            &location,
+                            "before the request",
+                        )),
+                        Action::Cancel(CancelWhen::Before, cancellation) => {
+                            cancellation.hold().await;
+                            Err(injected(
+                                0,
+                                Method::Delete,
+                                &location,
+                                "after a cancellation released it",
+                            ))
+                        }
+                        Action::Cancel(CancelWhen::During, cancellation) => {
+                            cancellation.fire_during_the_request();
+                            Ok(location)
+                        }
+                        Action::Cancel(CancelWhen::After, cancellation) => {
+                            pending.lock().unwrap().push(cancellation);
+                            Ok(location)
+                        }
+                        Action::Proceed | Action::Hold { .. } => Ok(location),
+                    }
+                }
             })
             .boxed();
-        self.inner.delete_stream(checked)
+        self.inner
+            .delete_stream(checked)
+            .then(move |result| {
+                let due: Vec<Cancellation> = after_deletion.lock().unwrap().drain(..).collect();
+                async move {
+                    if !due.is_empty() {
+                        due.iter().for_each(Cancellation::fire);
+                        tokio::task::yield_now().await;
+                    }
+                    result
+                }
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
@@ -1045,7 +1081,29 @@ impl ObjectStore for StressStore {
                 .flatten()
                 .boxed()
             }
-            _ => self.inner.list(prefix),
+            Action::Cancel(CancelWhen::Before, cancellation) => futures::stream::once(async move {
+                cancellation.hold().await;
+                Err(injected(
+                    0,
+                    Method::List,
+                    &location,
+                    "after a cancellation released it",
+                ))
+            })
+            .boxed(),
+            Action::Cancel(CancelWhen::During, cancellation) => {
+                cancellation.fire_during_the_request();
+                self.inner.list(prefix)
+            }
+            Action::Cancel(CancelWhen::After, cancellation) => {
+                let end = futures::stream::once(async move {
+                    cancellation.fire();
+                    tokio::task::yield_now().await;
+                })
+                .filter_map(|()| future::ready(None));
+                self.inner.list(prefix).chain(end).boxed()
+            }
+            Action::Proceed => self.inner.list(prefix),
         }
     }
 

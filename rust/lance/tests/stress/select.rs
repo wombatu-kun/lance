@@ -166,6 +166,31 @@ fn selection_reads_kinds_scenarios_and_operations() {
             .all(|kind| selection.runs_self_test(*kind))
     );
 
+    // These two run in every scenario but the one with a fixed cycle.
+    for value in [
+        "op:cleanup",
+        "op:optimize_indices",
+        "storage_faults,op:cleanup",
+    ] {
+        let selection = Selection::parse(value).unwrap();
+        let running: Vec<&str> = ScenarioKind::ALL
+            .iter()
+            .filter(|kind| selection.runs(**kind))
+            .map(|kind| kind.name())
+            .collect();
+        let expected: &[&str] = match value {
+            "storage_faults,op:cleanup" => &["storage_faults"],
+            _ => &[
+                "storage_faults",
+                "cancellation",
+                "process_kill",
+                "memory_limits",
+                "concurrency",
+            ],
+        };
+        assert_eq!(running, expected, "{value}");
+    }
+
     let everything = Selection::default();
     assert!(ScenarioKind::ALL.iter().all(|kind| everything.runs(*kind)));
     assert!(everything.focus().is_empty());

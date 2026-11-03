@@ -380,9 +380,16 @@ pub fn run(kind: ScenarioKind) {
     }
     let config = RunConfig::new(kind, None);
     // A focus takes every other step, and in `concurrency` the forced pairs, from
-    // the third round on: with fewer, it would fall on nothing.
+    // the third round on: with fewer, it would fall on nothing. An index
+    // optimization has work from the fourth step on, after an index build and an
+    // append.
+    let focused: Vec<&str> = scenario::focusable_ops(kind)
+        .into_iter()
+        .filter(|op| selection.focus().contains(op))
+        .collect();
     let least = match kind {
         ScenarioKind::Concurrency => 3,
+        _ if focused == ["optimize_indices"] => 4,
         _ => 2,
     };
     assert!(

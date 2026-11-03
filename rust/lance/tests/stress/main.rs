@@ -13,11 +13,11 @@
 //! IVF build, so a failure replays only with some probability.
 //!
 //! `storage_faults` injects object store errors into appends, deletes, index
-//! builds and their commits, either before a request or after it (a lost
-//! response), on a `shared-memory://` dataset that a separate session reads
-//! back without faults. `cancellation` drops the same operations at a named
-//! point: a storage call, an index build stage or a written fragment, on a
-//! local or a `shared-memory://` dataset.
+//! builds and optimizations, cleanups and the commits of all of them, either
+//! before a request or after it (a lost response), on a `shared-memory://`
+//! dataset that a separate session reads back without faults. `cancellation`
+//! drops the same operations at a named point: a storage call, an index build
+//! stage or a written fragment, on a local or a `shared-memory://` dataset.
 //!
 //! `process_kill` plans the same points, but there the process sends itself a
 //! SIGKILL. Its dataset is on disk, through the plain local path or through
@@ -95,12 +95,26 @@
 //! see #5633.
 //!
 //! After every step the dataset must hold exactly the expected rows in every
-//! column, and the expected indices, whose answers must match the model. Files
-//! that manifests reference must exist. An operation that returned an error
-//! must not have committed unless it reported its status as unknown, one that
-//! did not commit must succeed when retried, and no tokio task, temporary file
-//! or descriptor may be left behind. The run ends with a cleanup that must
-//! leave no unreferenced file.
+//! column, and the expected indices, whose answers must match the model. A
+//! version stays listed, with every file it references, until a cleanup may
+//! remove it, and the versions a cleanup keeps must read as they did, also
+//! after an index build or optimization. A cleanup that returned Ok must have
+//! removed every version below its boundary but those whose manifest it failed
+//! to delete, and when no deletion failed and no incident fired, every file only
+//! those versions referenced. One that may not delete unverified files, whether
+//! it returned or was cancelled, must leave every file no version referenced,
+//! which a write in progress may own. Only an injected error or a cgroup limit
+//! may fail a deletion, and Lance must count each one. A cleanup deletes files
+//! before manifests, so one that stopped half way can leave a version it expired
+//! listed without some of its files, which shows as the `expired_version_broken`
+//! observation. An index optimization that returned Ok must leave no fragment
+//! out of an index, on a stale handle none that its version held. Lance skips an
+//! index it fails to open and still returns Ok, so after an injected error
+//! reading index files that shows as the `optimize_left_unindexed` observation.
+//! An operation that returned an error must not have committed unless it
+//! reported its status as unknown, one that did not commit must succeed when
+//! retried, and no tokio task, temporary file or descriptor may be left behind.
+//! The run ends with a cleanup that must leave no unreferenced file.
 //!
 //! Known blind spots: work in the blocking pool and in the CPU and rayon pools
 //! is visible only through what it leaves behind; a local store writes data,
@@ -145,13 +159,15 @@
 //! - `LANCE_STRESS_ONLY`: what a run takes, a comma-separated list. A kind of
 //!   trouble (`faults`, `cancel`, `kill`, `memory`, `concurrency`) or the name of a
 //!   scenario picks scenarios, and the self-tests of those. `op:<operation>` makes
-//!   every other step of a seed one of the operations it names and puts the
-//!   incidents and limits on those steps alone, which takes at least 2 steps; in
-//!   `concurrency` it keeps the forced pairs that run one of them, which takes at
-//!   least 3 rounds, and a round left without its pair, the first one included, is
-//!   an ordinary one. A scenario a kind picks drops out if it has none of the
-//!   operations, and one picked by name fails the run, as does a name it does not
-//!   know or a list that leaves nothing to run.
+//!   every other step of a seed one of the operations it names that has work
+//!   there and puts the incidents and limits on those steps alone, which takes at
+//!   least 2 steps. An index optimization has work once an index misses fragments,
+//!   so the steps between build an index and append when it has none, and it
+//!   alone takes 4 steps. In `concurrency` it keeps the forced pairs that run one
+//!   of them, which takes at least 3 rounds, and a round left without its pair,
+//!   the first one included, is an ordinary one. A scenario a kind picks drops out
+//!   if it has none of the operations, and one picked by name fails the run, as
+//!   does a name it does not know or a list that leaves nothing to run.
 #![cfg(target_os = "linux")]
 
 mod harness;

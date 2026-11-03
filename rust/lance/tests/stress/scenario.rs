@@ -31,12 +31,14 @@ use lance::dataset::{MergeInsertBuilder, WriteMode, WriteParams};
 use lance::index::vector::VectorIndexParams;
 use lance::index::{DatasetIndexExt, IndexBuildProgress};
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery, ScalarIndexParams};
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use object_store::path::Path as ObjectPath;
 use object_store::{PutOptions, PutPayload};
+use roaring::RoaringBitmap;
 use tokio::sync::Notify;
 
 use crate::harness::{
@@ -282,7 +284,7 @@ fn tie_to_parent() -> bool {
 }
 
 /// The step log. Every line goes out in a single write, so the parent sees
-/// progress at once and a killed child leaves no half line.
+/// progress at once, though a SIGKILL can still tear one at a page boundary.
 pub struct Journal {
     file: Mutex<File>,
     started: Instant,
@@ -495,12 +497,21 @@ enum Op {
     },
     Compact,
     Scan,
+    /// Removes the versions before the last `retain` and the files only they use.
+    Cleanup {
+        retain: usize,
+        delete_unverified: bool,
+    },
+    /// Indexes the fragments the indices do not cover yet.
+    OptimizeIndices,
 }
 
 /// How an operation moves the latest version when it succeeds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommitShape {
     Exactly1,
+    /// An index optimization may find nothing to do.
+    UpTo1,
     /// A compaction commits a reservation of fragment ids before its rewrite,
     /// and may find nothing to do.
     UpTo2,
@@ -510,7 +521,7 @@ enum CommitShape {
 impl CommitShape {
     fn max_delta(self) -> u64 {
         match self {
-            Self::Exactly1 => 1,
+            Self::Exactly1 | Self::UpTo1 => 1,
             Self::UpTo2 => 2,
             Self::Never => 0,
         }
@@ -520,8 +531,9 @@ impl CommitShape {
 impl Op {
     fn shape(&self) -> CommitShape {
         match self {
+            Self::OptimizeIndices => CommitShape::UpTo1,
             Self::Compact => CommitShape::UpTo2,
-            Self::Scan => CommitShape::Never,
+            Self::Scan | Self::Cleanup { .. } => CommitShape::Never,
             _ => CommitShape::Exactly1,
         }
     }
@@ -529,12 +541,8 @@ impl Op {
     /// The operation without its arguments, for coverage counts.
     fn kind(&self) -> String {
         match self {
-            Self::Append { .. } => "append".to_string(),
-            Self::Delete { .. } => "delete".to_string(),
             Self::CreateIndex(kind) => format!("create_index_{}", kind.name()),
-            Self::MergeInsert { .. } => "merge_insert".to_string(),
-            Self::Compact => "compact".to_string(),
-            Self::Scan => "scan".to_string(),
+            _ => self.focus_name().to_string(),
         }
     }
 
@@ -547,6 +555,8 @@ impl Op {
             Self::MergeInsert { .. } => "merge_insert",
             Self::Compact => "compact",
             Self::Scan => "scan",
+            Self::Cleanup { .. } => "cleanup",
+            Self::OptimizeIndices => "optimize_indices",
         }
     }
 }
@@ -555,25 +565,31 @@ impl Op {
 /// them: what its plans draw, and in `concurrency` what its forced pairs run.
 pub fn focusable_ops(kind: ScenarioKind) -> Vec<&'static str> {
     match kind {
-        ScenarioKind::StorageFaults | ScenarioKind::Cancellation => {
-            vec!["append", "delete", "create_index"]
-        }
-        ScenarioKind::ProcessKill => {
-            vec![
-                "append",
-                "delete",
-                "create_index",
-                "merge_insert",
-                "compact",
-            ]
-        }
+        ScenarioKind::StorageFaults | ScenarioKind::Cancellation => vec![
+            "append",
+            "delete",
+            "create_index",
+            "optimize_indices",
+            "cleanup",
+        ],
+        ScenarioKind::ProcessKill => vec![
+            "append",
+            "delete",
+            "create_index",
+            "optimize_indices",
+            "merge_insert",
+            "compact",
+            "cleanup",
+        ],
         ScenarioKind::MemoryLimits => vec![
             "append",
             "delete",
             "create_index",
+            "optimize_indices",
             "merge_insert",
             "compact",
             "scan",
+            "cleanup",
         ],
         // Its cycle is fixed.
         ScenarioKind::HeapGrowth => Vec::new(),
@@ -630,6 +646,10 @@ fn cgroup_budgets_kib(op: &Op) -> &'static [u64] {
     match op {
         Op::Compact => &[3072, 6144, 12288, 24576, 49152],
         Op::CreateIndex(IndexKind::IvfFlat) => &[1792, 3584, 7168, 14336, 28672],
+        Op::OptimizeIndices => &[768, 1536, 3072, 6144, 12288],
+        // Its heap comes back from the allocator, and the cgroup sees little
+        // more than the manifests it reads: one cleanup in 60 reached even these.
+        Op::Cleanup { .. } => &[16, 32, 64, 128, 256],
         Op::MergeInsert { .. } => &[800, 1600, 3200, 6400, 12800],
         // Most of what these hold is page cache, which the limit evicts, or a
         // few rows to sort.
@@ -756,6 +776,14 @@ impl fmt::Display for Op {
             }
             Self::Compact => f.write_str("compact"),
             Self::Scan => f.write_str("scan"),
+            Self::Cleanup {
+                retain,
+                delete_unverified,
+            } => write!(
+                f,
+                "cleanup:retain={retain},delete_unverified={delete_unverified}"
+            ),
+            Self::OptimizeIndices => f.write_str("optimize_indices"),
         }
     }
 }
@@ -766,6 +794,9 @@ struct Model {
     live: BTreeSet<i64>,
     next_id: i64,
     indices: BTreeSet<IndexKind>,
+    /// An index misses fragments that rows were written to since it was built,
+    /// which gives an index optimization work.
+    unindexed: bool,
 }
 
 impl Model {
@@ -774,6 +805,7 @@ impl Model {
             live: (0..rows).collect(),
             next_id: rows,
             indices: BTreeSet::new(),
+            unindexed: false,
         }
     }
 
@@ -782,16 +814,23 @@ impl Model {
             Op::Append { first_id, rows } => {
                 self.live.extend(first_id..first_id + rows);
                 self.next_id = first_id + rows;
+                self.unindexed = !self.indices.is_empty();
             }
             Op::Delete { lo, hi } => self.live.retain(|id| !(lo..hi).contains(id)),
             Op::CreateIndex(kind) => {
                 self.indices.insert(kind);
+                // The other indices may still miss fragments.
+                if self.indices.len() == 1 {
+                    self.unindexed = false;
+                }
             }
             Op::MergeInsert { first_id, rows } => {
                 self.live.extend(first_id..first_id + rows);
                 self.next_id = self.next_id.max(first_id + rows);
+                self.unindexed = !self.indices.is_empty();
             }
-            Op::Compact | Op::Scan => {}
+            Op::OptimizeIndices => self.unindexed = false,
+            Op::Compact | Op::Scan | Op::Cleanup { .. } => {}
         }
     }
 }
@@ -919,6 +958,20 @@ impl Plan {
                 None if kind == ScenarioKind::MemoryLimits && index == 0 && rng.chance(0.5) => {
                     Op::CreateIndex(IndexKind::BTreeId)
                 }
+                // An optimization of the focus needs work: an index, and fragments
+                // it does not cover. Other steps go on as they would.
+                None if focus.contains("optimize_indices")
+                    && index % 2 == 0
+                    && !model.unindexed =>
+                {
+                    match model.indices.is_empty() {
+                        true => Op::CreateIndex(*pick_from(&mut rng, index_kinds(kind))),
+                        false => Op::Append {
+                            first_id: model.next_id,
+                            rows: added_rows(&mut rng, &scale),
+                        },
+                    }
+                }
                 None => random_op(&mut rng, kind, &scale, &model),
             };
             model.apply(&op);
@@ -1027,6 +1080,18 @@ fn random_op(rng: &mut PlanRng, kind: ScenarioKind, scale: &Scale, model: &Model
     if deletes.contains(&roll) && can_delete(scale, model) {
         return delete_op(rng, scale, model);
     }
+    // Taken from the appends, and in `memory_limits` from the scans.
+    let (cleanups, optimizations) = match kind {
+        ScenarioKind::ProcessKill => (20..25, 25..30),
+        ScenarioKind::MemoryLimits => (25..28, 28..32),
+        _ => (20..26, 26..32),
+    };
+    if cleanups.contains(&roll) {
+        return cleanup_op(rng);
+    }
+    if optimizations.contains(&roll) && !model.indices.is_empty() {
+        return Op::OptimizeIndices;
+    }
     match (kind, roll) {
         (_, 55..70) => Op::CreateIndex(IndexKind::BTree),
         (_, 70..85) => Op::CreateIndex(IndexKind::IvfFlat),
@@ -1056,7 +1121,15 @@ fn focused_op(
 ) -> Option<Op> {
     let candidates: Vec<&str> = focusable_ops(kind)
         .into_iter()
-        .filter(|op| focus.contains(op) && (*op != "delete" || can_delete(scale, model)))
+        .filter(|op| {
+            focus.contains(op)
+                && match *op {
+                    "delete" => can_delete(scale, model),
+                    // An optimization with nothing to do meets no trouble.
+                    "optimize_indices" => model.unindexed,
+                    _ => true,
+                }
+        })
         .collect();
     if candidates.is_empty() {
         return None;
@@ -1068,9 +1141,11 @@ fn focused_op(
         },
         "delete" => delete_op(rng, scale, model),
         "create_index" => Op::CreateIndex(*pick_from(rng, index_kinds(kind))),
+        "optimize_indices" => Op::OptimizeIndices,
         "merge_insert" => merge_insert_op(rng, scale, model),
         "compact" => Op::Compact,
         "scan" => Op::Scan,
+        "cleanup" => cleanup_op(rng),
         other => unreachable!("{} plans no {other}", kind.name()),
     })
 }
@@ -1099,6 +1174,13 @@ fn delete_op(rng: &mut PlanRng, scale: &Scale, model: &Model) -> Op {
     Op::Delete {
         lo: live[start],
         hi: live[start + len - 1] + 1,
+    }
+}
+
+fn cleanup_op(rng: &mut PlanRng) -> Op {
+    Op::Cleanup {
+        retain: rng.range(1..=3) as usize,
+        delete_unverified: rng.chance(0.5),
     }
 }
 
@@ -1160,6 +1242,29 @@ fn random_incident(
                     (Method::Put, Area::Manifests, 1),
                     (Method::List, Area::Manifests, 1),
                 ],
+                // It reads the segments it merges with.
+                Op::OptimizeIndices => &[
+                    (Method::Get, Area::Data, 3),
+                    (Method::Get, Area::Indices, 2),
+                    (Method::Put, Area::Indices, 2),
+                    (Method::Put, Area::Transactions, 1),
+                    (Method::Put, Area::Manifests, 1),
+                    (Method::List, Area::Manifests, 1),
+                ],
+                // It lists the manifests for its policy, for itself and with the
+                // rest of the dataset, reads what it keeps, and goes on past a
+                // failed deletion.
+                Op::Cleanup { .. } => &[
+                    (Method::List, Area::Manifests, 3),
+                    (Method::Get, Area::Manifests, 2),
+                    (Method::List, Area::Data, 1),
+                    (Method::List, Area::Indices, 1),
+                    (Method::Delete, Area::Data, 1),
+                    (Method::Delete, Area::Deletions, 1),
+                    (Method::Delete, Area::Indices, 1),
+                    (Method::Delete, Area::Transactions, 2),
+                    (Method::Delete, Area::Manifests, 2),
+                ],
                 Op::MergeInsert { .. } | Op::Compact | Op::Scan => {
                     unreachable!("{op} is not part of this scenario")
                 }
@@ -1191,6 +1296,9 @@ fn random_incident(
                 }
                 StoreChoice::SharedMemory => &[CancelWhen::Before, CancelWhen::After],
             };
+            if let Op::Cleanup { .. } = op {
+                return Some(cleanup_point(rng, store, flights));
+            }
             let mut points: Vec<Incident> = flights
                 .iter()
                 .map(|when| cancel_call(Method::Put, Area::Manifests, 1, *when))
@@ -1218,7 +1326,8 @@ fn random_incident(
                         points.push(cancel_call(Method::Put, Area::Manifests, 2, *when));
                     }
                 }
-                Op::Delete { .. } | Op::MergeInsert { .. } | Op::Scan => {}
+                Op::Delete { .. } | Op::MergeInsert { .. } | Op::Scan | Op::OptimizeIndices => {}
+                Op::Cleanup { .. } => unreachable!("a cleanup has points of its own"),
             }
             // A local store writes data, index, transaction and deletion files
             // around the wrapper, so only the other stores see those.
@@ -1228,7 +1337,8 @@ fn random_incident(
                         Area::Data
                     }
                     Op::Delete { .. } => Area::Deletions,
-                    Op::CreateIndex(_) => Area::Indices,
+                    Op::CreateIndex(_) | Op::OptimizeIndices => Area::Indices,
+                    Op::Cleanup { .. } => unreachable!("a cleanup writes nothing"),
                 };
                 for area in [written, Area::Transactions] {
                     for when in flights {
@@ -1244,12 +1354,51 @@ fn random_incident(
     }
 }
 
+/// Where a cancellation or a death meets a cleanup: at a listing of manifests,
+/// the one for its policy or its own, at its first read of one, or at a
+/// deletion, which can leave a version it expires without some of its files.
+/// All of these pass the wrapper on every store. A shared-memory store deletes
+/// within the call, and a cleanup runs its deletions side by side, so a
+/// cancellation there would land only once the others ran: on that store a
+/// cancellation meets a cleanup before its deletions.
+fn cleanup_point(rng: &mut PlanRng, store: StoreChoice, flights: &[CancelWhen]) -> Incident {
+    let mut points = vec![
+        cancel_call(Method::List, Area::Manifests, 1, CancelWhen::Before),
+        cancel_call(Method::List, Area::Manifests, 2, CancelWhen::Before),
+        cancel_call(Method::Get, Area::Manifests, 1, CancelWhen::Before),
+    ];
+    if store != StoreChoice::SharedMemory {
+        for (area, deletions) in CLEANUP_DELETIONS {
+            for nth in 1..=deletions {
+                for when in flights {
+                    points.push(cancel_call(Method::Delete, area, nth, *when));
+                }
+            }
+        }
+    }
+    points.swap_remove(rng.range(0..=points.len() as u64 - 1) as usize)
+}
+
+/// What a cleanup deletes, and how far into its deletions of each kind an
+/// incident may go. Every version has a manifest and a transaction file, while
+/// a data, deletion or index file goes only once nothing kept refers to it, or
+/// when an operation that failed left it behind.
+const CLEANUP_DELETIONS: [(Area, u64); 5] = [
+    (Area::Data, 1),
+    (Area::Deletions, 1),
+    (Area::Indices, 1),
+    (Area::Transactions, 2),
+    (Area::Manifests, 2),
+];
+
 /// What a finished operation reports beyond success.
 #[derive(Clone, Copy, Debug, Default)]
 struct OpOutput {
     fragments_removed: usize,
     /// The rows a scan returned, and the wrapping sum of their ids.
     scanned: Option<(usize, i64)>,
+    /// The files a cleanup failed to delete, and went on without.
+    failed_deletes: u64,
 }
 
 enum Outcome {
@@ -1381,6 +1530,123 @@ async fn paths<E: fmt::Display>(
         .collect())
 }
 
+/// The files `Dataset::tracked_files` lists, with the versions that reference
+/// each of them.
+async fn files_by_version<E: fmt::Display>(
+    stream: impl Stream<Item = Result<RecordBatch, E>>,
+) -> Result<BTreeMap<String, BTreeSet<u64>>, E> {
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    let mut files: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    for batch in &batches {
+        let paths = batch
+            .column_by_name("path")
+            .expect("a path column")
+            .as_string::<i32>();
+        for (row, version) in int64_column(batch, "version").into_iter().enumerate() {
+            files
+                .entry(paths.value(row).to_string())
+                .or_default()
+                .insert(version as u64);
+        }
+    }
+    Ok(files)
+}
+
+/// The versions whose manifests a listing finds, without reading them, as
+/// `retain_n_versions` does.
+async fn listed_versions(ds: &Dataset, n: usize) -> Result<BTreeSet<u64>, Failure> {
+    Ok(ds
+        .version_refs()
+        .await
+        .map_err(|error| fail("unreadable", n, error))?
+        .iter()
+        .map(|version| version.version)
+        .collect())
+}
+
+/// What a cleanup must remove and what it must leave, from the files the
+/// dataset holds before it starts.
+struct CleanupFiles {
+    /// Files that only versions below its boundary reference.
+    expired: BTreeSet<String>,
+    /// Files that no listed version references. A write in progress may own
+    /// one, so only a cleanup allowed to delete unverified files takes it.
+    unreferenced: BTreeSet<String>,
+}
+
+impl CleanupFiles {
+    async fn before(verifier: &Dataset, n: usize, boundary: u64) -> Result<Self, Failure> {
+        let tracked = files_by_version(verifier.tracked_files().await)
+            .await
+            .map_err(|error| fail("unreadable", n, error))?;
+        let all = file_times(verifier.all_files().await)
+            .await
+            .map_err(|error| fail("unreadable", n, error))?;
+        Ok(Self {
+            expired: tracked
+                .iter()
+                .filter(|(_, versions)| versions.iter().all(|version| *version < boundary))
+                .map(|(path, _)| path.clone())
+                .collect(),
+            unreferenced: all
+                .into_keys()
+                .filter(|path| {
+                    !tracked.contains_key(path) && !path.ends_with("latest_version_hint.json")
+                })
+                .collect(),
+        })
+    }
+}
+
+/// The area of the deletions that an error the wrapper injected failed. Lance
+/// counts each failed deletion and goes on.
+fn failed_deletions(incident: Option<&Incident>, fired: u64) -> Option<Area> {
+    match incident? {
+        Incident::Fail {
+            method: Method::Delete,
+            area,
+            ..
+        }
+        | Incident::CancelCall {
+            method: Method::Delete,
+            area,
+            when: CancelWhen::Before,
+            ..
+        } if fired > 0 => Some(*area),
+        _ => None,
+    }
+}
+
+/// Whether an error the wrapper injected failed a read of index files: Lance
+/// skips an index it fails to open and still returns Ok.
+fn failed_an_index_read(incident: Option<&Incident>, fired: u64) -> bool {
+    fired > 0
+        && matches!(
+            incident,
+            Some(
+                Incident::Fail {
+                    method: Method::Get,
+                    area: Area::Indices,
+                    ..
+                } | Incident::CancelCall {
+                    method: Method::Get,
+                    area: Area::Indices,
+                    when: CancelWhen::Before,
+                    ..
+                }
+            )
+        )
+}
+
+/// The rows of a version by their ids: how many, and a sum that does not
+/// depend on their order.
+fn ids_digest(ids: impl IntoIterator<Item = i64>) -> String {
+    let (count, sum) = ids.into_iter().fold((0usize, 0u64), |(count, sum), id| {
+        (count + 1, sum.wrapping_add(mix(id as u64)))
+    });
+    format!("{count}:{sum:016x}")
+}
+
 /// The files `Dataset::all_files` lists, with their modification times in
 /// microseconds since the epoch.
 async fn file_times<E: fmt::Display>(
@@ -1476,6 +1742,26 @@ fn op_future<'a>(
                 fragments_removed: metrics.fragments_removed,
                 ..Default::default()
             })
+        }),
+        Op::Cleanup {
+            retain,
+            delete_unverified,
+        } => Box::pin(async move {
+            let policy = CleanupPolicyBuilder::default()
+                .retain_n_versions(ds, retain)
+                .await?
+                .delete_unverified(delete_unverified)
+                .error_if_tagged_old_versions(false)
+                .build();
+            let removed = Box::pin(ds.cleanup_with_policy(policy)).await?;
+            Ok(OpOutput {
+                failed_deletes: removed.failed_deletes,
+                ..Default::default()
+            })
+        }),
+        Op::OptimizeIndices => Box::pin(async move {
+            Box::pin(ds.optimize_indices(&OptimizeOptions::new().progress(hooks))).await?;
+            Ok(OpOutput::default())
         }),
         Op::Scan => Box::pin(async move {
             let mut scan = ds.scan();
@@ -1856,6 +2142,7 @@ struct OpEnd {
     fired: u64,
     status_unknown: bool,
     fragments_removed: usize,
+    failed_deletes: u64,
     message: String,
 }
 
@@ -1867,6 +2154,7 @@ impl OpEnd {
             fired: number("fired").unwrap_or(0),
             status_unknown: field(line, "status_unknown") == Some("true"),
             fragments_removed: number("fragments_removed").unwrap_or(0) as usize,
+            failed_deletes: number("failed_deletes").unwrap_or(0),
             message: line
                 .split_once(" detail=")
                 .map_or_else(String::new, |(_, detail)| detail.to_string()),
@@ -1878,6 +2166,7 @@ impl OpEnd {
             "ok" => Outcome::Ok(OpOutput {
                 fragments_removed: self.fragments_removed,
                 scanned: None,
+                failed_deletes: self.failed_deletes,
             }),
             "err" => Outcome::Failed {
                 message: self.message.clone(),
@@ -1911,7 +2200,9 @@ impl ResumePoint {
             {
                 point.interrupted = Some((n, before));
                 point.ended = None;
-            } else if word("op_end") {
+            } else if word("op_end") && line.contains(" detail=") {
+                // A line the death tore lacks its last field, and then the
+                // step ended with the death.
                 point.ended = Some(OpEnd::from_line(line));
             }
         }
@@ -1946,6 +2237,19 @@ struct Run {
     /// did not return Ok.
     handle_stale: bool,
     model: Model,
+    /// A cleanup was allowed to remove every version before this one, so such a
+    /// version may be gone, or listed without some of its files when a cleanup
+    /// stopped half way.
+    expired_below: u64,
+    /// What each version held when it was the latest, as `ids_digest` puts it.
+    digests: BTreeMap<u64, String>,
+    /// The expired versions already reported without some of their files.
+    broken_reported: BTreeSet<u64>,
+    /// What the cleanup about to run must remove and must leave.
+    cleanup_files: Option<CleanupFiles>,
+    /// The fragments of a stale handle that an index optimization starts on:
+    /// those are what it covers.
+    read_fragments: Option<RoaringBitmap>,
     /// What `concurrency` knows between its rounds.
     rounds: Option<concurrency::RoundsState>,
     baseline_tasks: usize,
@@ -2065,6 +2369,11 @@ impl Run {
             heap_after_cycle: Vec::with_capacity(HEAP_CYCLES),
             ds,
             handle_stale: false,
+            expired_below: 0,
+            digests: BTreeMap::new(),
+            broken_reported: BTreeSet::new(),
+            cleanup_files: None,
+            read_fragments: None,
             rounds,
             baseline_tasks: 0,
             baseline_fds: 0,
@@ -2104,6 +2413,30 @@ impl Run {
         let point = ResumePoint::from_journal(&log);
         for step in &self.plan.steps[..point.finished] {
             self.model.apply(&step.op);
+        }
+        for line in log.lines() {
+            if let Some(boundary) = field(line, "cleanup_boundary").and_then(|b| b.parse().ok()) {
+                self.expired_below = self.expired_below.max(boundary);
+            }
+            // The last line of a dead process can be torn.
+            if let (Some(version), Some(ids)) = (
+                field(line, "digest_of").and_then(|version| version.parse().ok()),
+                field(line, "ids").filter(|ids| {
+                    ids.split_once(':')
+                        .is_some_and(|(_, hash)| hash.len() == 16)
+                }),
+            ) {
+                self.digests.insert(version, ids.to_string());
+            }
+            if field(line, "observation") == Some("expired_version_broken")
+                && let Some(versions) = field(line, "versions")
+            {
+                self.broken_reported.extend(
+                    versions
+                        .split(',')
+                        .filter_map(|version| version.parse::<u64>().ok()),
+                );
+            }
         }
         self.next_step = point.finished;
         let Some((n, before)) = point.interrupted else {
@@ -2246,12 +2579,18 @@ impl Run {
     }
 
     async fn remove_a_data_file(&self, n: usize) -> Result<(), Failure> {
-        let tracked = paths(self.open_verifier(n).await?.tracked_files().await)
+        let tracked = files_by_version(self.open_verifier(n).await?.tracked_files().await)
             .await
             .map_err(|error| fail("unreadable", n, error))?;
-        let file = tracked
+        // One that a kept version needs: an expired one may lack files already.
+        let (file, _) = tracked
             .iter()
-            .find(|path| path.starts_with("data/"))
+            .find(|(path, versions)| {
+                path.starts_with("data/")
+                    && versions
+                        .last()
+                        .is_some_and(|newest| *newest >= self.expired_below)
+            })
             .expect("a dataset has data files");
         let path = self.seed_dir().join("dataset").join(file);
         fs::remove_file(&path).expect("remove a data file");
@@ -2339,6 +2678,17 @@ impl Run {
             self.catch_up(n).await?;
         }
         let before = self.latest_version(n).await?;
+        if let Op::Cleanup { retain, .. } = step.op {
+            self.note_cleanup_boundary(n, retain).await?;
+        }
+        self.read_fragments =
+            (self.handle_stale && matches!(step.op, Op::OptimizeIndices)).then(|| {
+                self.ds
+                    .fragments()
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect()
+            });
         let armed = self.arm_limit(n, step, before)?;
         let death = (self.kind == ScenarioKind::ProcessKill).then(|| {
             let in_flight = matches!(
@@ -2365,14 +2715,16 @@ impl Run {
         // that line counts as a death during the operation, and no check runs
         // under the limit.
         fired += Box::pin(self.lift_limit(n, step, armed, &outcome)).await?;
-        let (status_unknown, removed) = match &outcome {
-            Outcome::Failed { status_unknown, .. } => (*status_unknown, 0),
-            Outcome::Ok(output) => (false, output.fragments_removed),
-            _ => (false, 0),
+        let (status_unknown, output) = match &outcome {
+            Outcome::Failed { status_unknown, .. } => (*status_unknown, OpOutput::default()),
+            Outcome::Ok(output) => (false, *output),
+            _ => (false, OpOutput::default()),
         };
         self.journal.line(format_args!(
-            "step={n} op_end outcome={} fired={fired} status_unknown={status_unknown} fragments_removed={removed} heap_growth_kib={heap_growth_kib} detail={}",
+            "step={n} op_end outcome={} fired={fired} status_unknown={status_unknown} fragments_removed={} failed_deletes={} heap_growth_kib={heap_growth_kib} detail={}",
             outcome.name(),
+            output.fragments_removed,
+            output.failed_deletes,
             outcome.detail()
         ));
         if n == 2
@@ -2407,8 +2759,12 @@ impl Run {
         let incident = self.incident_label(step);
         let shape = step.op.shape();
         let handle = self.ds.version().version;
-        self.let_go_of_the_session(n).await?;
+        let ran_stale = self.handle_stale;
+        self.let_go_of_the_session(n, Some(&step.op)).await?;
         self.quiet_down(n).await;
+        if let (Op::Cleanup { .. }, Outcome::Cancelled) = (step.op, &outcome) {
+            self.settle_files().await;
+        }
         let after = self.latest_version(n).await?;
         if after < before || after > before + shape.max_delta() {
             return Err(fail(
@@ -2521,7 +2877,7 @@ impl Run {
             };
             if !explained {
                 // A stale handle may legitimately lose a conflict.
-                if !self.handle_stale {
+                if !ran_stale {
                     return Err(fail(
                         "error_without_fault",
                         n,
@@ -2535,9 +2891,12 @@ impl Run {
             self.observe(n, "not_reached");
         }
         if let Outcome::Ok(output) = &outcome {
-            self.check_handle(n, &step.op, handle, after)?;
+            // One that commits nothing leaves its handle where it was, stale or not.
+            if committed {
+                self.check_handle(n, &step.op, handle, after)?;
+                self.handle_stale = false;
+            }
             self.check_scan(n, output)?;
-            self.handle_stale = false;
         } else if committed && !matches!(outcome, Outcome::Killed) {
             self.handle_stale = true;
         }
@@ -2545,18 +2904,33 @@ impl Run {
             self.model.apply(&step.op);
         }
         Box::pin(self.check_content(n)).await?;
+        if let Op::Cleanup { .. } = step.op {
+            let boundary = self.boundary_of_step(n)?;
+            Box::pin(self.check_cleanup(n, step, false, &outcome, fired, boundary)).await?;
+        }
+        if let (Op::OptimizeIndices, Outcome::Ok(_)) = (step.op, &outcome) {
+            let read_failed = failed_an_index_read(step.incident.as_ref(), fired);
+            let read_fragments = self.read_fragments.take();
+            Box::pin(self.check_optimized(n, read_failed, read_fragments.as_ref())).await?;
+        }
         let retries = match shape {
             CommitShape::Exactly1 => !committed,
-            CommitShape::UpTo2 | CommitShape::Never => !outcome.is_ok(),
+            CommitShape::UpTo1 | CommitShape::UpTo2 | CommitShape::Never => !outcome.is_ok(),
         };
         if retries {
             self.state.set_phase(format!("{n}.retry"));
             self.catch_up(n).await?;
+            let boundary = match step.op {
+                Op::Cleanup { retain, .. } => self.note_cleanup_boundary(n, retain).await?,
+                _ => 0,
+            };
             let retry = self.execute(step.op, None, None).await;
             let handle = self.ds.version().version;
             let retried = self.latest_version(n).await?;
             let right_move = match (shape, &retry) {
                 (CommitShape::Exactly1, _) => retried == after + 1,
+                // Whether the first try committed or not, there may be nothing left.
+                (CommitShape::UpTo1, _) => (after..=after + 1).contains(&retried),
                 (CommitShape::UpTo2, Outcome::Ok(output)) if output.fragments_removed > 0 => {
                     retried == after + 2
                 }
@@ -2582,8 +2956,25 @@ impl Run {
                 self.check_scan(n, output)?;
             }
             Box::pin(self.check_content(n)).await?;
+            if let Op::Cleanup { .. } = step.op {
+                Box::pin(self.check_cleanup(n, step, true, &retry, 0, boundary)).await?;
+            }
+            if let Op::OptimizeIndices = step.op {
+                Box::pin(self.check_optimized(n, false, None)).await?;
+            }
         }
-        self.let_go_of_the_session(n).await?;
+        // A new index or segment must leave the files of the ones the versions
+        // before it hold, which a cleanup may not look at before they expire.
+        if matches!(step.op, Op::OptimizeIndices | Op::CreateIndex(_))
+            && !matches!(
+                self.kind,
+                ScenarioKind::HeapGrowth | ScenarioKind::Concurrency
+            )
+            && self.latest_version(n).await? > before
+        {
+            Box::pin(self.check_kept_versions(n)).await?;
+        }
+        self.let_go_of_the_session(n, Some(&step.op)).await?;
         let snapshot = self.quiet_down(n).await;
         self.check_leaks(n, &snapshot)?;
         // From here on a later process does not touch this step again.
@@ -2722,12 +3113,14 @@ impl Run {
     /// its session, and with it the task of the index store's I/O scheduler
     /// (`ScanScheduler`) until the session goes. Only what outlives the handle
     /// is a leak. The older scenarios keep one session, so that its caches see
-    /// everything that follows.
-    async fn let_go_of_the_session(&mut self, n: usize) -> Result<(), Failure> {
+    /// everything that follows, but for an index optimization, which reads the
+    /// segments it merges through it.
+    async fn let_go_of_the_session(&mut self, n: usize, op: Option<&Op>) -> Result<(), Failure> {
         if matches!(
             self.kind,
             ScenarioKind::StorageFaults | ScenarioKind::Cancellation
-        ) {
+        ) && !matches!(op, Some(Op::OptimizeIndices))
+        {
             return Ok(());
         }
         self.ds = Box::pin(
@@ -3044,29 +3437,67 @@ impl Run {
         Ok(latest)
     }
 
-    async fn check_content(&self, n: usize) -> Result<(), Failure> {
+    async fn check_content(&mut self, n: usize) -> Result<(), Failure> {
         let unreadable = |error: lance::Error| fail("unreadable", n, error);
         let ds = self.open_verifier(n).await?;
         Box::pin(ds.validate())
             .await
             .map_err(|error| fail("validate", n, error))?;
         self.check_rows(&ds, n).await?;
+        let latest = ds.version().version;
+        // The rounds of `concurrency` check their history themselves.
+        if self.plan.rounds.is_none() {
+            let listed = listed_versions(&ds, n).await?;
+            let gone: Vec<u64> = (self.expired_below.max(1)..=latest)
+                .filter(|version| !listed.contains(version))
+                .collect();
+            if !gone.is_empty() {
+                return Err(fail(
+                    "version_jump",
+                    n,
+                    format_args!(
+                        "versions {gone:?} are gone, though cleanups could only remove the versions before {}",
+                        self.expired_below
+                    ),
+                ));
+            }
+        }
         let all = file_times(ds.all_files().await)
             .await
             .map_err(|error| fail("unreadable", n, error))?;
-        let tracked = paths(ds.tracked_files().await)
+        let tracked = files_by_version(ds.tracked_files().await)
             .await
             .map_err(|error| fail("unreadable", n, error))?;
-        let missing: Vec<&String> = tracked
-            .iter()
-            .filter(|path| !all.contains_key(*path))
-            .collect();
+        let mut missing = Vec::new();
+        let mut broken = BTreeSet::new();
+        for (path, versions) in tracked.iter().filter(|(path, _)| !all.contains_key(*path)) {
+            // A cleanup deletes the files of the versions it expires before
+            // their manifests, so one that stopped half way leaves such a version
+            // listed without some of them.
+            match versions.last() {
+                Some(newest) if *newest >= self.expired_below => {
+                    missing.push(format!("{path} of versions {versions:?}"));
+                }
+                _ => broken.extend(versions),
+            }
+        }
         if !missing.is_empty() {
             return Err(fail(
                 "missing_files",
                 n,
                 format_args!("manifests reference files that are not there: {missing:?}"),
             ));
+        }
+        let newly_broken: Vec<String> = broken
+            .difference(&self.broken_reported)
+            .map(u64::to_string)
+            .collect();
+        if !newly_broken.is_empty() {
+            self.journal.line(format_args!(
+                "step={n} observation=expired_version_broken versions={}",
+                newly_broken.join(",")
+            ));
+            self.broken_reported.extend(broken);
         }
         let indices = ds.load_indices().await.map_err(unreadable)?;
         let names: BTreeSet<String> = indices.iter().map(|index| index.name.clone()).collect();
@@ -3099,6 +3530,321 @@ impl Run {
                 salt: n,
             };
             Box::pin(check_index(&ds, n, *kind, &answers)).await?;
+        }
+        // Only for the versions a cleanup keeps: in `heap_growth` the map would
+        // count as growth of the heap.
+        if !matches!(
+            self.kind,
+            ScenarioKind::HeapGrowth | ScenarioKind::Concurrency
+        ) {
+            // The rows of the latest version are the model's by now.
+            let digest = ids_digest(self.model.live.iter().copied());
+            match self.digests.get(&latest) {
+                Some(known) if *known != digest => {
+                    return Err(fail(
+                        "snapshot_changed",
+                        n,
+                        format_args!(
+                            "version {latest} reads as {digest}, and read as {known} before"
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    self.journal
+                        .line(format_args!("step={n} digest_of={latest} ids={digest}"));
+                    self.digests.insert(latest, digest);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A cleanup dropped half way leaves the deletions it started running in the
+    /// blocking pool of a local store, which tokio does not count. The checks
+    /// wait until the files of the dataset stop changing: they read every
+    /// manifest they list, and one could go in between.
+    async fn settle_files(&self) {
+        let dataset = self.seed_dir().join("dataset");
+        let files = || {
+            let mut files = files_below(&dataset);
+            files.sort();
+            files
+        };
+        let mut last = files();
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let now = files();
+            if now == last {
+                return;
+            }
+            last = now;
+        }
+    }
+
+    /// The boundary of the cleanup of step `n`, from the journal, which a death
+    /// leaves behind too.
+    fn boundary_of_step(&self, n: usize) -> Result<u64, Failure> {
+        let journal = fs::read_to_string(self.seed_dir().join(STEPS_LOG)).unwrap_or_default();
+        journal
+            .lines()
+            .filter(|line| field(line, "step") == Some(n.to_string().as_str()))
+            .filter_map(|line| field(line, "cleanup_boundary")?.parse().ok())
+            .next_back()
+            .ok_or_else(|| fail("harness", n, "a cleanup without its boundary"))
+    }
+
+    /// The first version a cleanup keeping `retain` versions leaves, as
+    /// `retain_n_versions` documents it, though never above the version its
+    /// handle reads, from which on Lance keeps every version. Written down before
+    /// the cleanup starts, so that a later process knows it too; the files it
+    /// must remove and leave only this process knows.
+    async fn note_cleanup_boundary(&mut self, n: usize, retain: usize) -> Result<u64, Failure> {
+        let verifier = self.open_verifier(n).await?;
+        let listed: Vec<u64> = listed_versions(&verifier, n).await?.into_iter().collect();
+        let boundary = listed[listed.len().saturating_sub(retain)].min(self.ds.version().version);
+        self.journal
+            .line(format_args!("step={n} cleanup_boundary={boundary}"));
+        self.expired_below = self.expired_below.max(boundary);
+        self.cleanup_files = Some(CleanupFiles::before(&verifier, n, boundary).await?);
+        Ok(boundary)
+    }
+
+    /// What a cleanup leaves, however it ended: the versions it keeps open and
+    /// read as they did, with all their files, and unless it may delete
+    /// unverified files, the files no version referenced stay. One that returned
+    /// Ok leaves no version below its boundary but those whose manifest it
+    /// failed to delete, and with no deletion failed and no incident fired, none
+    /// of the files only those versions referenced. Only an injected error or a
+    /// cgroup limit fails a deletion.
+    async fn check_cleanup(
+        &mut self,
+        n: usize,
+        step: &Step,
+        // The retry runs without the incident and the limit of the step.
+        retry: bool,
+        outcome: &Outcome,
+        fired: u64,
+        boundary: u64,
+    ) -> Result<(), Failure> {
+        let Op::Cleanup {
+            delete_unverified, ..
+        } = step.op
+        else {
+            unreachable!("a cleanup check after {}", step.op);
+        };
+        let incident = step.incident.as_ref().filter(|_| !retry);
+        let mut swept = false;
+        if let Outcome::Ok(output) = outcome {
+            let may_stay = match failed_deletions(incident, fired) {
+                Some(area) => {
+                    if output.failed_deletes != fired {
+                        return Err(fail(
+                            "cleanup",
+                            n,
+                            format_args!(
+                                "the cleanup counted {} failed deletions where {fired} were made to fail",
+                                output.failed_deletes
+                            ),
+                        ));
+                    }
+                    // A manifest it failed to delete keeps its version listed.
+                    if area == Area::Manifests { fired } else { 0 }
+                }
+                // The kernel may refuse an unlink for lack of memory.
+                None if !retry && step.limit.is_some() && fired > 0 => {
+                    if output.failed_deletes > 0 {
+                        self.observe(n, "failed_deletes_under_limit");
+                    }
+                    output.failed_deletes
+                }
+                None if output.failed_deletes > 0 => {
+                    return Err(fail(
+                        "cleanup",
+                        n,
+                        format_args!(
+                            "the cleanup failed {} deletions with nothing to explain them",
+                            output.failed_deletes
+                        ),
+                    ));
+                }
+                None => 0,
+            };
+            self.check_expired_gone(n, boundary, may_stay).await?;
+            // An expired manifest it failed to read leaves its files unverified.
+            swept = output.failed_deletes == 0 && (incident.is_none() || fired == 0);
+        }
+        // A process that died during the cleanup took what it knew with it.
+        if let Some(files) = self.cleanup_files.take() {
+            let left = file_times(self.open_verifier(n).await?.all_files().await)
+                .await
+                .map_err(|error| fail("unreadable", n, error))?;
+            let taken: Vec<&String> = files
+                .unreferenced
+                .iter()
+                .filter(|path| !left.contains_key(*path))
+                .collect();
+            if !delete_unverified && !taken.is_empty() {
+                return Err(fail(
+                    "cleanup",
+                    n,
+                    format_args!(
+                        "the cleanup deleted files no version referenced, which a write in progress may own: {taken:?}"
+                    ),
+                ));
+            }
+            let kept: Vec<&String> = files
+                .expired
+                .iter()
+                .filter(|path| left.contains_key(*path))
+                .collect();
+            if swept && !kept.is_empty() {
+                return Err(fail(
+                    "cleanup",
+                    n,
+                    format_args!(
+                        "the cleanup returned Ok, but kept files that only versions below its boundary {boundary} referenced: {kept:?}"
+                    ),
+                ));
+            }
+        }
+        Box::pin(self.check_kept_versions(n)).await
+    }
+
+    /// Only a failed deletion of its manifest leaves an expired version behind.
+    async fn check_expired_gone(
+        &self,
+        n: usize,
+        boundary: u64,
+        may_stay: u64,
+    ) -> Result<(), Failure> {
+        let left: Vec<u64> = listed_versions(&self.open_verifier(n).await?, n)
+            .await?
+            .into_iter()
+            .filter(|version| *version < boundary)
+            .collect();
+        if left.len() as u64 > may_stay {
+            return Err(fail(
+                "cleanup",
+                n,
+                format_args!(
+                    "the cleanup returned Ok, but versions {left:?} are still there, below its boundary {boundary}, where its failed deletions allow {may_stay}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// An index optimization that returned Ok leaves no fragment out of an index,
+    /// and on a stale handle none of those its version held that are still
+    /// there. Lance skips an index it fails to open and still returns Ok, so
+    /// after an injected error reading index files, one left out is only
+    /// reported.
+    async fn check_optimized(
+        &self,
+        n: usize,
+        read_failed: bool,
+        read_fragments: Option<&RoaringBitmap>,
+    ) -> Result<(), Failure> {
+        let ds = self.open_verifier(n).await?;
+        let indices = ds
+            .load_indices()
+            .await
+            .map_err(|error| fail("unreadable", n, error))?;
+        let live: RoaringBitmap = ds
+            .fragments()
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect();
+        let due = match read_fragments {
+            Some(read) => &live & read,
+            None => live,
+        };
+        let mut left_out = Vec::new();
+        for kind in &self.model.indices {
+            let covered = indices
+                .iter()
+                .filter(|index| index.name == kind.name())
+                .filter_map(|index| index.fragment_bitmap.as_ref())
+                .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap);
+            let missed = &due - &covered;
+            if !missed.is_empty() {
+                let missed: Vec<u32> = missed.iter().collect();
+                left_out.push(format!("{} misses fragments {missed:?}", kind.name()));
+            }
+        }
+        if left_out.is_empty() {
+            return Ok(());
+        }
+        if read_failed {
+            self.journal.line(format_args!(
+                "step={n} observation=optimize_left_unindexed detail={}",
+                left_out.join("; ")
+            ));
+            return Ok(());
+        }
+        Err(fail(
+            "lost_commit",
+            n,
+            format_args!("optimize_indices returned Ok, but {}", left_out.join("; ")),
+        ))
+    }
+
+    /// Every version the cleanups keep opens, reads as it did when it was the
+    /// latest, and has the files of its indices, which `check_content` sees
+    /// only by listing their directories.
+    async fn check_kept_versions(&self, n: usize) -> Result<(), Failure> {
+        let verifier = self.open_verifier(n).await?;
+        let all = file_times(verifier.all_files().await)
+            .await
+            .map_err(|error| fail("unreadable", n, error))?;
+        let kept = listed_versions(&verifier, n)
+            .await?
+            .into_iter()
+            .filter(|version| *version >= self.expired_below);
+        for version in kept {
+            let unreadable = |error: lance::Error| {
+                fail("unreadable", n, format_args!("version {version}: {error}"))
+            };
+            let ds = verifier
+                .checkout_version(version)
+                .await
+                .map_err(unreadable)?;
+            let mut scan = ds.scan();
+            scan.project(&["id"]).map_err(unreadable)?;
+            let batch = scan.try_into_batch().await.map_err(unreadable)?;
+            let digest = ids_digest(int64_column(&batch, "id"));
+            if let Some(known) = self.digests.get(&version)
+                && *known != digest
+            {
+                return Err(fail(
+                    "snapshot_changed",
+                    n,
+                    format_args!(
+                        "version {version} reads as {digest}, and read as {known} when it was the latest"
+                    ),
+                ));
+            }
+            for index in ds.load_indices().await.map_err(unreadable)?.iter() {
+                let Some(files) = &index.files else {
+                    continue;
+                };
+                let missing: Vec<String> = files
+                    .iter()
+                    .map(|file| format!("_indices/{}/{}", index.uuid, file.path))
+                    .filter(|path| !all.contains_key(path))
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(fail(
+                        "missing_files",
+                        n,
+                        format_args!(
+                            "version {version} keeps the index {} without its files {missing:?}",
+                            index.name
+                        ),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -3218,6 +3964,8 @@ impl Run {
         self.state.set_phase("final");
         self.journal.line(format_args!("step={n} final"));
         self.catch_up(n).await?;
+        // Every version but the latest may go now.
+        self.expired_below = self.ds.version().version;
         let policy = CleanupPolicyBuilder::default()
             .retain_n_versions(&self.ds, 1)
             .await
@@ -3231,13 +3979,26 @@ impl Run {
             .await
             .map_err(|error| fail("cleanup", n, error))?;
         self.journal.line(format_args!(
-            "step={n} cleanup old_versions={} data_files={} index_files={} transaction_files={} deletion_files={}",
+            "step={n} cleanup old_versions={} data_files={} index_files={} transaction_files={} deletion_files={} failed_deletes={}",
             removed.old_versions,
             removed.data_files_removed,
             removed.index_files_removed,
             removed.transaction_files_removed,
-            removed.deletion_files_removed
+            removed.deletion_files_removed,
+            removed.failed_deletes
         ));
+        // It runs without an incident or a limit, so nothing explains a failure.
+        if removed.failed_deletes > 0 {
+            return Err(fail(
+                "cleanup",
+                n,
+                format_args!(
+                    "the final cleanup failed {} deletions",
+                    removed.failed_deletes
+                ),
+            ));
+        }
+        self.check_expired_gone(n, self.expired_below, 0).await?;
         if self.self_test == Some(SelfTest::Orphan) {
             let store = self
                 .ds
@@ -3314,6 +4075,8 @@ impl Run {
             }
         }
         Box::pin(self.check_content(n)).await?;
+        // The queries of an index need not touch every file of it.
+        Box::pin(self.check_kept_versions(n)).await?;
         let snapshot = self.quiet_down(n).await;
         self.check_leaks(n, &snapshot)
     }
@@ -3328,10 +4091,20 @@ fn selection_focusable_operations_are_the_ones_plans_draw() {
         ScenarioKind::ProcessKill,
         ScenarioKind::MemoryLimits,
     ] {
-        let drawn: BTreeSet<&str> = (1..=48)
-            .flat_map(|seed| Plan::generate(kind, seed, 8, true, &everything).steps)
-            .map(|step| step.op.focus_name())
-            .collect();
+        let mut drawn = BTreeSet::new();
+        for seed in 1..=48 {
+            // No step drops an index.
+            let mut indexed = false;
+            for step in Plan::generate(kind, seed, 8, true, &everything).steps {
+                assert!(
+                    indexed || !matches!(step.op, Op::OptimizeIndices),
+                    "{} seed {seed}: an optimization without an index",
+                    kind.name()
+                );
+                indexed |= matches!(step.op, Op::CreateIndex(_));
+                drawn.insert(step.op.focus_name());
+            }
+        }
         let focusable: BTreeSet<&str> = focusable_ops(kind).into_iter().collect();
         assert_eq!(drawn, focusable, "{}", kind.name());
     }
@@ -3368,7 +4141,9 @@ fn check_focus(kind: ScenarioKind, seeds: u64) {
                 focused += usize::from(on_focus);
             }
         }
-        // Four steps of eight are the focus's, unless a delete has no rows to spare.
+        // Four steps of eight are the focus's, unless a delete has no rows to spare,
+        // or an optimization has nothing to do yet: at step 2, an index has just
+        // been built.
         assert!(
             focused as u64 >= seeds * 3,
             "{}: {focused} steps of {op} in {seeds} seeds",
