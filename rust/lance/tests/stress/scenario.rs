@@ -52,6 +52,7 @@ use crate::leaks::{
     Snapshot, TmpWatch, files_below, heap_peak_bytes, live_heap_bytes, quiesce, start_heap_peak,
 };
 use crate::limits::{OwnCgroup, log_memory_events};
+use crate::select::Selection;
 
 mod concurrency;
 
@@ -148,8 +149,19 @@ pub fn run_child_if_requested() {
         started,
     };
     let journal = Arc::new(Journal::open(&dir.join(STEPS_LOG), started));
-    // A self-test arms no incident, so that only the injected defect can fail it.
-    let mut plan = Plan::generate(kind, seed, steps, self_test.is_none() && !calibrating());
+    // A self-test arms no incident, so that only the injected defect can fail it,
+    // and plans as if nothing were selected.
+    let focus = match self_test {
+        Some(_) => BTreeSet::new(),
+        None => Selection::from_env().focus().clone(),
+    };
+    let mut plan = Plan::generate(
+        kind,
+        seed,
+        steps,
+        self_test.is_none() && !calibrating(),
+        &focus,
+    );
     // The ids of later steps stay free, so this cannot clash with them.
     if self_test == Some(SelfTest::MemoryEvents) {
         plan.steps[0].op = Op::CreateIndex(IndexKind::BTree);
@@ -525,6 +537,61 @@ impl Op {
             Self::Scan => "scan".to_string(),
         }
     }
+
+    /// The operation as `LANCE_STRESS_ONLY` names it: one name for every index.
+    fn focus_name(&self) -> &'static str {
+        match self {
+            Self::Append { .. } => "append",
+            Self::Delete { .. } => "delete",
+            Self::CreateIndex(_) => "create_index",
+            Self::MergeInsert { .. } => "merge_insert",
+            Self::Compact => "compact",
+            Self::Scan => "scan",
+        }
+    }
+}
+
+/// The operations a scenario can put its trouble on, as `LANCE_STRESS_ONLY` names
+/// them: what its plans draw, and in `concurrency` what its forced pairs run.
+pub fn focusable_ops(kind: ScenarioKind) -> Vec<&'static str> {
+    match kind {
+        ScenarioKind::StorageFaults | ScenarioKind::Cancellation => {
+            vec!["append", "delete", "create_index"]
+        }
+        ScenarioKind::ProcessKill => {
+            vec![
+                "append",
+                "delete",
+                "create_index",
+                "merge_insert",
+                "compact",
+            ]
+        }
+        ScenarioKind::MemoryLimits => vec![
+            "append",
+            "delete",
+            "create_index",
+            "merge_insert",
+            "compact",
+            "scan",
+        ],
+        // Its cycle is fixed.
+        ScenarioKind::HeapGrowth => Vec::new(),
+        ScenarioKind::Concurrency => concurrency::focusable_ops(),
+    }
+}
+
+/// The indices a scenario builds.
+fn index_kinds(kind: ScenarioKind) -> &'static [IndexKind] {
+    match kind {
+        ScenarioKind::ProcessKill | ScenarioKind::MemoryLimits => &[
+            IndexKind::BTree,
+            IndexKind::BTreeId,
+            IndexKind::IvfFlat,
+            IndexKind::Inverted,
+        ],
+        _ => &[IndexKind::BTree, IndexKind::IvfFlat, IndexKind::Inverted],
+    }
 }
 
 /// The memory limit on a step.
@@ -764,10 +831,28 @@ struct Plan {
     steps: Vec<Step>,
     /// What `concurrency` runs instead of `steps`.
     rounds: Option<concurrency::RoundsPlan>,
+    /// The operations that `LANCE_STRESS_ONLY` puts the trouble on.
+    focus: BTreeSet<&'static str>,
 }
 
 impl Plan {
-    fn generate(kind: ScenarioKind, seed: u64, steps: usize, with_incidents: bool) -> Self {
+    /// A focus makes every other step one of its operations and leaves the trouble
+    /// to those steps alone, while the steps between build the history they need;
+    /// in `concurrency` it picks the forced pairs instead.
+    fn generate(
+        kind: ScenarioKind,
+        seed: u64,
+        steps: usize,
+        with_incidents: bool,
+        focus: &BTreeSet<&'static str>,
+    ) -> Self {
+        // Only what the scenario can run: a list for several scenarios plans each
+        // of them as a list of its own operations would.
+        let focus: BTreeSet<&'static str> = focusable_ops(kind)
+            .into_iter()
+            .filter(|op| focus.contains(op))
+            .collect();
+        let focus = &focus;
         let mut rng = PlanRng(seed);
         let store = match kind {
             ScenarioKind::StorageFaults => StoreChoice::SharedMemory,
@@ -797,6 +882,7 @@ impl Plan {
                 initial_rows,
                 steps: heap_growth_plan(&mut rng, &scale, initial_rows),
                 rounds: None,
+                focus: BTreeSet::new(),
             };
         }
         if kind == ScenarioKind::Concurrency {
@@ -808,6 +894,7 @@ impl Plan {
                 initial_rows,
                 steps,
                 with_incidents,
+                focus,
             );
             return Self {
                 store,
@@ -816,16 +903,23 @@ impl Plan {
                 initial_rows,
                 steps: Vec::new(),
                 rounds: Some(rounds),
+                focus: focus.clone(),
             };
         }
         let mut model = Model::new(initial_rows);
         let mut planned = Vec::with_capacity(steps);
         for index in 0..steps {
-            // A merge insert honors the pool only with an index on its key.
-            let op = if kind == ScenarioKind::MemoryLimits && index == 0 && rng.chance(0.5) {
-                Op::CreateIndex(IndexKind::BTreeId)
-            } else {
-                random_op(&mut rng, kind, &scale, &model)
+            let focused = (!focus.is_empty() && index % 2 == 1)
+                .then(|| focused_op(&mut rng, kind, &scale, &model, focus))
+                .flatten();
+            let troubled = focus.is_empty() || focused.is_some();
+            let op = match focused {
+                Some(op) => op,
+                // A merge insert honors the pool only with an index on its key.
+                None if kind == ScenarioKind::MemoryLimits && index == 0 && rng.chance(0.5) => {
+                    Op::CreateIndex(IndexKind::BTreeId)
+                }
+                None => random_op(&mut rng, kind, &scale, &model),
             };
             model.apply(&op);
             let incident = random_incident(&mut rng, kind, store, &scale, &op);
@@ -846,10 +940,10 @@ impl Plan {
             };
             planned.push(Step {
                 op,
-                incident: incident.filter(|_| with_incidents),
+                incident: incident.filter(|_| with_incidents && troubled),
                 resync,
                 in_flight_us,
-                limit: limit.filter(|_| with_incidents),
+                limit: limit.filter(|_| with_incidents && troubled),
             });
         }
         Self {
@@ -859,6 +953,7 @@ impl Plan {
             initial_rows,
             steps: planned,
             rounds: None,
+            focus: focus.clone(),
         }
     }
 
@@ -871,6 +966,10 @@ impl Plan {
             self.data_seed,
             self.initial_rows
         );
+        if !self.focus.is_empty() {
+            let focus: Vec<&str> = self.focus.iter().copied().collect();
+            text.insert_str(text.len() - 1, &format!(" focus={}", focus.join(",")));
+        }
         for (index, step) in self.steps.iter().enumerate() {
             let incident = step
                 .incident
@@ -909,7 +1008,14 @@ fn fingerprint(rendered: &str) -> String {
 
 /// The fingerprint of the plan a seed generates, for a replay command.
 pub fn plan_fingerprint(kind: ScenarioKind, seed: u64, steps: usize) -> String {
-    fingerprint(&Plan::generate(kind, seed, steps, !calibrating()).render(kind, seed, steps))
+    let plan = Plan::generate(
+        kind,
+        seed,
+        steps,
+        !calibrating(),
+        Selection::from_env().focus(),
+    );
+    fingerprint(&plan.render(kind, seed, steps))
 }
 
 fn random_op(rng: &mut PlanRng, kind: ScenarioKind, scale: &Scale, model: &Model) -> Op {
@@ -918,19 +1024,9 @@ fn random_op(rng: &mut PlanRng, kind: ScenarioKind, scale: &Scale, model: &Model
         ScenarioKind::MemoryLimits => 35..45,
         _ => 35..55,
     };
-    if deletes.contains(&roll) && model.live.len() > scale.min_live_rows + 1 {
-        let live: Vec<i64> = model.live.iter().copied().collect();
-        let max_len = (live.len() / 10)
-            .min(live.len() - scale.min_live_rows)
-            .max(1);
-        let len = rng.range(1..=max_len as u64) as usize;
-        let start = rng.range(0..=(live.len() - len) as u64) as usize;
-        return Op::Delete {
-            lo: live[start],
-            hi: live[start + len - 1] + 1,
-        };
+    if deletes.contains(&roll) && can_delete(scale, model) {
+        return delete_op(rng, scale, model);
     }
-    let added = |rng: &mut PlanRng| rng.range(scale.added_rows.0..=scale.added_rows.1) as i64;
     match (kind, roll) {
         (_, 55..70) => Op::CreateIndex(IndexKind::BTree),
         (_, 70..85) => Op::CreateIndex(IndexKind::IvfFlat),
@@ -940,18 +1036,78 @@ fn random_op(rng: &mut PlanRng, kind: ScenarioKind, scale: &Scale, model: &Model
             Op::CreateIndex(IndexKind::BTreeId)
         }
         (ScenarioKind::MemoryLimits, 25..35) => Op::Scan,
-        // Half of its ids exist, the other half are new.
         (ScenarioKind::ProcessKill | ScenarioKind::MemoryLimits, 10..20) => {
-            let rows = added(rng);
-            Op::MergeInsert {
-                first_id: model.next_id - rows / 2,
-                rows,
-            }
+            merge_insert_op(rng, scale, model)
         }
         _ => Op::Append {
             first_id: model.next_id,
-            rows: added(rng),
+            rows: added_rows(rng, scale),
         },
+    }
+}
+
+/// One of the operations of a focus that this step can run, if any.
+fn focused_op(
+    rng: &mut PlanRng,
+    kind: ScenarioKind,
+    scale: &Scale,
+    model: &Model,
+    focus: &BTreeSet<&'static str>,
+) -> Option<Op> {
+    let candidates: Vec<&str> = focusable_ops(kind)
+        .into_iter()
+        .filter(|op| focus.contains(op) && (*op != "delete" || can_delete(scale, model)))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(match *pick_from(rng, &candidates) {
+        "append" => Op::Append {
+            first_id: model.next_id,
+            rows: added_rows(rng, scale),
+        },
+        "delete" => delete_op(rng, scale, model),
+        "create_index" => Op::CreateIndex(*pick_from(rng, index_kinds(kind))),
+        "merge_insert" => merge_insert_op(rng, scale, model),
+        "compact" => Op::Compact,
+        "scan" => Op::Scan,
+        other => unreachable!("{} plans no {other}", kind.name()),
+    })
+}
+
+fn pick_from<'a, T>(rng: &mut PlanRng, values: &'a [T]) -> &'a T {
+    &values[rng.range(0..=values.len() as u64 - 1) as usize]
+}
+
+fn added_rows(rng: &mut PlanRng, scale: &Scale) -> i64 {
+    rng.range(scale.added_rows.0..=scale.added_rows.1) as i64
+}
+
+/// Whether a delete leaves the rows the checks need.
+fn can_delete(scale: &Scale, model: &Model) -> bool {
+    model.live.len() > scale.min_live_rows + 1
+}
+
+/// A run of up to a tenth of the live rows.
+fn delete_op(rng: &mut PlanRng, scale: &Scale, model: &Model) -> Op {
+    let live: Vec<i64> = model.live.iter().copied().collect();
+    let max_len = (live.len() / 10)
+        .min(live.len() - scale.min_live_rows)
+        .max(1);
+    let len = rng.range(1..=max_len as u64) as usize;
+    let start = rng.range(0..=(live.len() - len) as u64) as usize;
+    Op::Delete {
+        lo: live[start],
+        hi: live[start + len - 1] + 1,
+    }
+}
+
+/// Half of its ids exist, the other half are new.
+fn merge_insert_op(rng: &mut PlanRng, scale: &Scale, model: &Model) -> Op {
+    let rows = added_rows(rng, scale);
+    Op::MergeInsert {
+        first_id: model.next_id - rows / 2,
+        rows,
     }
 }
 
@@ -3161,4 +3317,84 @@ impl Run {
         let snapshot = self.quiet_down(n).await;
         self.check_leaks(n, &snapshot)
     }
+}
+
+#[test]
+fn selection_focusable_operations_are_the_ones_plans_draw() {
+    let everything = BTreeSet::new();
+    for kind in [
+        ScenarioKind::StorageFaults,
+        ScenarioKind::Cancellation,
+        ScenarioKind::ProcessKill,
+        ScenarioKind::MemoryLimits,
+    ] {
+        let drawn: BTreeSet<&str> = (1..=48)
+            .flat_map(|seed| Plan::generate(kind, seed, 8, true, &everything).steps)
+            .map(|step| step.op.focus_name())
+            .collect();
+        let focusable: BTreeSet<&str> = focusable_ops(kind).into_iter().collect();
+        assert_eq!(drawn, focusable, "{}", kind.name());
+    }
+}
+
+/// Every other step of a focused plan runs an operation of the focus, and only
+/// those steps meet trouble.
+fn check_focus(kind: ScenarioKind, seeds: u64) {
+    for op in focusable_ops(kind) {
+        let focus = BTreeSet::from([op]);
+        let mut focused = 0;
+        let mut troubled = 0;
+        for seed in 1..=seeds {
+            let plan = Plan::generate(kind, seed, 8, true, &focus);
+            assert!(
+                plan.render(kind, seed, 8)
+                    .lines()
+                    .next()
+                    .is_some_and(|header| header.ends_with(&format!(" focus={op}"))),
+                "the focus must be part of the plan and its fingerprint"
+            );
+            for (index, step) in plan.steps.iter().enumerate() {
+                let on_focus = index % 2 == 1 && step.op.focus_name() == op;
+                if step.incident.is_some() || step.limit.is_some() {
+                    assert!(
+                        on_focus,
+                        "{} seed {seed} step {}: trouble on {} with a focus on {op}",
+                        kind.name(),
+                        index + 1,
+                        step.op
+                    );
+                    troubled += 1;
+                }
+                focused += usize::from(on_focus);
+            }
+        }
+        // Four steps of eight are the focus's, unless a delete has no rows to spare.
+        assert!(
+            focused as u64 >= seeds * 3,
+            "{}: {focused} steps of {op} in {seeds} seeds",
+            kind.name()
+        );
+        assert!(troubled > 0, "{}: no trouble on {op}", kind.name());
+    }
+}
+
+#[test]
+fn selection_focus_on_storage_faults() {
+    check_focus(ScenarioKind::StorageFaults, 16);
+}
+
+#[test]
+fn selection_focus_on_cancellation() {
+    check_focus(ScenarioKind::Cancellation, 16);
+}
+
+#[test]
+fn selection_focus_on_process_kill() {
+    check_focus(ScenarioKind::ProcessKill, 16);
+}
+
+#[test]
+fn selection_focus_on_memory_limits() {
+    // Its plans hold tens of thousands of rows.
+    check_focus(ScenarioKind::MemoryLimits, 8);
 }

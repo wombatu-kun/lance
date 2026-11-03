@@ -68,7 +68,8 @@ use tokio::task::JoinHandle;
 
 use super::{
     Answers, Failure, IndexKind, Journal, Op, OpOutput, PlanRng, Run, Scale, StoreChoice,
-    VECTOR_DIM, category, check_index, fail, int64_column, one_line, op_future, text, vector,
+    VECTOR_DIM, category, check_index, fail, int64_column, one_line, op_future, pick_from, text,
+    vector,
 };
 use crate::harness::{ENV_SERIAL, SelfTest};
 use crate::incidents::{Area, Gate, Incident, IncidentState, Method, StressHooks, StressWrapper};
@@ -671,6 +672,68 @@ const HOLES: [(&str, &str); 6] = [
     ("merge_insert", "hole_compact"),
 ];
 
+/// The operation a name of `PAIRS` or `HOLES` runs, as `LANCE_STRESS_ONLY` names it.
+fn focus_name(name: &'static str) -> &'static str {
+    match name {
+        "stamp_index" => "create_index",
+        "hole_rows" => "update",
+        "hole_compact" => "compact",
+        other => other,
+    }
+}
+
+/// Two operations a round makes meet: in `PAIRS` the one in flight and the one
+/// that lands under it, in `HOLES` the one in flight and the hidden write.
+type Pair = (&'static str, &'static str);
+
+/// Whether a forced pair runs an operation of the focus. The first worker of a
+/// round over a hole cleans up as well.
+fn in_focus(pair: Pair, hole: bool, focus: &BTreeSet<&'static str>) -> bool {
+    focus.contains(focus_name(pair.0))
+        || focus.contains(focus_name(pair.1))
+        || (hole && focus.contains("cleanup"))
+}
+
+/// What a focus can keep of this scenario: the operations of its forced pairs.
+pub(super) fn focusable_ops() -> Vec<&'static str> {
+    let mut ops: BTreeSet<&'static str> = PAIRS
+        .iter()
+        .chain(&HOLES)
+        .flat_map(|&(first, second)| [focus_name(first), focus_name(second)])
+        .collect();
+    ops.insert("cleanup");
+    ops.into_iter().collect()
+}
+
+/// The pairs a seed forces: one per pair round, which seeds take in turn from
+/// `PAIRS`, and the one over the hole from `HOLES`. A focus keeps the pairs that
+/// run one of its operations; a round left without one is a random round.
+fn forced_pairs(
+    seed: u64,
+    rounds: usize,
+    focus: &BTreeSet<&'static str>,
+) -> (BTreeMap<usize, Pair>, Option<Pair>) {
+    let kept = |pairs: &[Pair], hole: bool| -> Vec<Pair> {
+        pairs
+            .iter()
+            .copied()
+            .filter(|pair| focus.is_empty() || in_focus(*pair, hole, focus))
+            .collect()
+    };
+    let pairs = kept(&PAIRS, false);
+    let holes = kept(&HOLES, true);
+    let mut pair_rounds = BTreeMap::new();
+    if !pairs.is_empty() {
+        // From the third round on: a cleanup needs some versions behind it.
+        let turn = (seed % pairs.len() as u64) as usize * PAIR_ROUNDS;
+        for (slot, n) in (3..=rounds).step_by(2).take(PAIR_ROUNDS).enumerate() {
+            pair_rounds.insert(n, pairs[(turn + slot) % pairs.len()]);
+        }
+    }
+    let hole = (!holes.is_empty()).then(|| holes[(seed % holes.len() as u64) as usize]);
+    (pair_rounds, hole)
+}
+
 /// What decides the operations of a round.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RoundKind {
@@ -714,10 +777,6 @@ fn random_kind(rng: &mut PlanRng) -> &'static str {
         roll -= weight;
     }
     unreachable!("the roll is below the total of the weights")
-}
-
-fn pick_from<'a, T>(rng: &mut PlanRng, values: &'a [T]) -> &'a T {
-    &values[rng.range(0..=values.len() as u64 - 1) as usize]
 }
 
 /// The points an operation passes on this store. Hold points are the places
@@ -788,6 +847,7 @@ fn hold_points(op: &RoundOp, store: StoreChoice, scale: &Scale) -> Vec<Incident>
     points
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plan_rounds(
     rng: &mut PlanRng,
     seed: u64,
@@ -796,6 +856,7 @@ pub(super) fn plan_rounds(
     initial_rows: i64,
     rounds: usize,
     with_holds: bool,
+    focus: &BTreeSet<&'static str>,
 ) -> RoundsPlan {
     let workers = rng.range(2..=4) as usize;
     let stable_row_ids = rng.chance(0.5);
@@ -804,33 +865,24 @@ pub(super) fn plan_rounds(
     let declared_key = rng.range(0..=3) != 3;
     let mut rows = RowsModel::new(initial_rows, workers);
     let mut indices = BTreeSet::new();
-    // From the third round on: a cleanup needs some versions behind it.
-    let turn = (seed % PAIRS.len() as u64) as usize * PAIR_ROUNDS;
-    let pair_rounds: BTreeMap<usize, (&'static str, &'static str)> = (3..=rounds)
-        .step_by(2)
-        .take(PAIR_ROUNDS)
-        .enumerate()
-        .map(|(slot, n)| (n, PAIRS[(turn + slot) % PAIRS.len()]))
-        .collect();
-    let (hole_in_flight, hidden) = HOLES[(seed % HOLES.len() as u64) as usize];
+    let (pair_rounds, hole) = forced_pairs(seed, rounds, focus);
     let free_rounds: Vec<usize> = (1..=rounds)
-        .filter(|n| !pair_rounds.contains_key(n) && *n != HOLE_ROUND)
+        .filter(|n| !pair_rounds.contains_key(n) && (hole.is_none() || *n != HOLE_ROUND))
         .collect();
     let new_keys_round =
         (declared_key && !free_rounds.is_empty()).then(|| *pick_from(rng, &free_rounds));
     let indexed_new_keys = declared_key && rng.chance(0.5);
     let planned = (1..=rounds)
         .map(|n| {
-            let kind = match pair_rounds.get(&n) {
-                Some(&(in_flight, landed)) => RoundKind::Pair { in_flight, landed },
-                None if n == HOLE_ROUND => RoundKind::Hole {
-                    in_flight: hole_in_flight,
-                    hidden,
-                },
-                None if new_keys_round == Some(n) => RoundKind::OnlyNewKeys {
+            let kind = match (pair_rounds.get(&n), hole) {
+                (Some(&(in_flight, landed)), _) => RoundKind::Pair { in_flight, landed },
+                (None, Some((in_flight, hidden))) if n == HOLE_ROUND => {
+                    RoundKind::Hole { in_flight, hidden }
+                }
+                _ if new_keys_round == Some(n) => RoundKind::OnlyNewKeys {
                     indexed: indexed_new_keys,
                 },
-                None => RoundKind::Random,
+                _ => RoundKind::Random,
             };
             // Something for it to optimize: an index, and rows that it lacks.
             let index_ahead = matches!(pair_rounds.get(&(n + 1)), Some(("optimize_indices", _)));
@@ -4051,4 +4103,42 @@ impl Run {
             self.observe(n, "only_new_keys_race_indexed");
         }
     }
+}
+
+#[test]
+fn selection_forces_only_the_pairs_of_the_focus() {
+    let everything = BTreeSet::new();
+    for seed in 1..=48 {
+        // Without a focus, seeds take every pair in turn, as they always have.
+        let (pair_rounds, hole) = forced_pairs(seed, 8, &everything);
+        let turn = (seed % PAIRS.len() as u64) as usize * PAIR_ROUNDS;
+        let expected: BTreeMap<usize, (&str, &str)> = [3, 5, 7]
+            .into_iter()
+            .enumerate()
+            .map(|(slot, n)| (n, PAIRS[(turn + slot) % PAIRS.len()]))
+            .collect();
+        assert_eq!(pair_rounds, expected);
+        assert_eq!(hole, Some(HOLES[(seed % HOLES.len() as u64) as usize]));
+    }
+    for op in focusable_ops() {
+        let focus = BTreeSet::from([op]);
+        let mut forced = 0;
+        for seed in 1..=48 {
+            let (pair_rounds, hole) = forced_pairs(seed, 8, &focus);
+            for pair in pair_rounds.values() {
+                assert!(in_focus(*pair, false, &focus), "{pair:?} for {op}");
+            }
+            if let Some(pair) = hole {
+                assert!(
+                    in_focus(pair, true, &focus),
+                    "{pair:?} over a hole for {op}"
+                );
+            }
+            forced += pair_rounds.len() + usize::from(hole.is_some());
+        }
+        assert!(forced > 0, "a focus on {op} forced no pair");
+    }
+    let (pair_rounds, hole) = forced_pairs(1, 8, &BTreeSet::from(["append"]));
+    assert_eq!(pair_rounds.values().next(), Some(&("append", "cleanup")));
+    assert_eq!(hole, None, "no pair over a hole appends");
 }

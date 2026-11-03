@@ -142,6 +142,16 @@
 //! - `LANCE_STRESS_STANDALONE=1`: run a seed in this process, for gdb or rr.
 //! - `LANCE_STRESS_SERIAL=1`: run the operations of a round one at a time; a failure
 //!   of `concurrency` that goes away with this needs a race.
+//! - `LANCE_STRESS_ONLY`: what a run takes, a comma-separated list. A kind of
+//!   trouble (`faults`, `cancel`, `kill`, `memory`, `concurrency`) or the name of a
+//!   scenario picks scenarios, and the self-tests of those. `op:<operation>` makes
+//!   every other step of a seed one of the operations it names and puts the
+//!   incidents and limits on those steps alone, which takes at least 2 steps; in
+//!   `concurrency` it keeps the forced pairs that run one of them, which takes at
+//!   least 3 rounds, and a round left without its pair, the first one included, is
+//!   an ordinary one. A scenario a kind picks drops out if it has none of the
+//!   operations, and one picked by name fails the run, as does a name it does not
+//!   know or a list that leaves nothing to run.
 #![cfg(target_os = "linux")]
 
 mod harness;
@@ -149,6 +159,7 @@ mod incidents;
 mod leaks;
 mod limits;
 mod scenario;
+mod select;
 
 use harness::{ScenarioKind, SelfTest};
 

@@ -4,7 +4,7 @@
 //! The parent side: runs each seed in a child process, watches it for
 //! progress, and turns what the child left behind into a verdict.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Write as _;
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use crate::incidents::CRASH_FIRED;
 use crate::limits::{ENV_CGROUP, RunScope, SeedCgroup};
 use crate::scenario;
+use crate::select::{ENV_ONLY, Selection};
 
 pub const ENV_CHILD: &str = "LANCE_STRESS_CHILD";
 pub const ENV_SEED: &str = "LANCE_STRESS_SEED";
@@ -54,14 +55,14 @@ const THRASH_PATIENCE: Duration = Duration::from_secs(10);
 const BUSY_SHARE: f64 = 0.05;
 const DEAD_LIMIT_PLANNED: usize = 3;
 const DEAD_HOLD_PLANNED: usize = 3;
-/// A round that forces a pair counts once: 16 seeds force each pair twice, and a
-/// replay of one seed never judges a pair.
-const DEAD_PAIR_PLANNED: usize = 2;
+/// Seeds, not rounds: 16 seeds force each pair twice, and one seed never judges
+/// a pair, whether it is repeated or a focus forces the pair in several rounds.
+const DEAD_PAIR_SEEDS: usize = 2;
 /// How long a commit may keep retrying: a hold point can eat the default 30 s.
 const COMMIT_RETRY_TIMEOUT_VARIABLE: &str = "LANCE_COMMIT_RETRY_TIMEOUT_SECS";
 const COMMIT_RETRY_TIMEOUT_SECS: &str = "120";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ScenarioKind {
     StorageFaults,
     Cancellation,
@@ -72,6 +73,15 @@ pub enum ScenarioKind {
 }
 
 impl ScenarioKind {
+    pub const ALL: [Self; 6] = [
+        Self::StorageFaults,
+        Self::Cancellation,
+        Self::ProcessKill,
+        Self::MemoryLimits,
+        Self::HeapGrowth,
+        Self::Concurrency,
+    ];
+
     /// Whether Lance reports its memory in this scenario, and the checks read it.
     pub fn observes_memory(self) -> bool {
         matches!(self, Self::ProcessKill | Self::MemoryLimits)
@@ -89,16 +99,7 @@ impl ScenarioKind {
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
-        [
-            Self::StorageFaults,
-            Self::Cancellation,
-            Self::ProcessKill,
-            Self::MemoryLimits,
-            Self::HeapGrowth,
-            Self::Concurrency,
-        ]
-        .into_iter()
-        .find(|kind| kind.name() == name)
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
     }
 }
 
@@ -365,7 +366,30 @@ fn artifacts_root() -> PathBuf {
 
 /// Runs every requested seed of a scenario and fails if any seed failed.
 pub fn run(kind: ScenarioKind) {
+    // libtest has no verdict for a test that did not run: it passes. A replay
+    // names its scenario, so there it would pass for a seed it never ran.
+    let selection = Selection::from_env();
+    if !selection.runs(kind) {
+        let replay = std::env::var_os(ENV_SEED).is_some() && std::env::var_os(ENV_PLAN).is_some();
+        assert!(
+            !replay,
+            "{ENV_PLAN} replays a seed of {}, which {ENV_ONLY} leaves out",
+            kind.name()
+        );
+        return;
+    }
     let config = RunConfig::new(kind, None);
+    // A focus takes every other step, and in `concurrency` the forced pairs, from
+    // the third round on: with fewer, it would fall on nothing.
+    let least = match kind {
+        ScenarioKind::Concurrency => 3,
+        _ => 2,
+    };
+    assert!(
+        selection.focus().is_empty() || config.steps >= least,
+        "the operations of {ENV_ONLY} need {ENV_STEPS} of at least {least} in {}",
+        kind.name()
+    );
     fs::create_dir_all(&config.run_dir).expect("create the run directory");
     record_environment(&config.run_dir);
     let seeds: Vec<u64> = if std::env::var(ENV_SEED).is_ok() {
@@ -395,6 +419,9 @@ pub fn run(kind: ScenarioKind) {
 
 /// Runs one seed with a defect injected and checks that it is reported.
 pub fn check_self_test(test: SelfTest) {
+    if !Selection::from_env().runs_self_test(test.scenario()) {
+        return;
+    }
     let config = RunConfig::new(test.scenario(), Some(test));
     fs::create_dir_all(&config.run_dir).expect("create the run directory");
     let report = run_seed(&config, 1, 1);
@@ -557,7 +584,13 @@ fn replay_command(config: &RunConfig, seed: u64) -> String {
         "{ENV_PLAN}={}",
         scenario::plan_fingerprint(config.kind, seed, config.steps as usize)
     ));
-    for name in [ENV_STALL_SECS, ENV_DEADLINE_SECS, ENV_CALIBRATE, ENV_SERIAL] {
+    for name in [
+        ENV_STALL_SECS,
+        ENV_DEADLINE_SECS,
+        ENV_CALIBRATE,
+        ENV_SERIAL,
+        ENV_ONLY,
+    ] {
         if let Ok(value) = std::env::var(name) {
             vars.push(format!("{name}={}", shell_quote(&value)));
         }
@@ -616,6 +649,9 @@ fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
     }
     if std::env::var(ENV_SERIAL).is_ok_and(|value| value == "1") {
         write!(standalone_vars, "{ENV_SERIAL}=1 ").unwrap();
+    }
+    if let Ok(only) = std::env::var(ENV_ONLY) {
+        write!(standalone_vars, "{ENV_ONLY}={} ", shell_quote(&only)).unwrap();
     }
     let standalone = format!(
         "# Or in one process, for gdb or rr, into a fresh directory, where no cgroup limit applies. After a death, go on with {ENV_GENERATION}=2 in the same directory:\n# {standalone_vars}{ENV_STANDALONE}=1 {ENV_CHILD}={} {ENV_SEED}={seed} {ENV_GENERATION}=1 {ENV_STEPS}={} {ENV_QUIET_SECS}={} {ENV_DIR}=<dir> TMPDIR=<dir>/tmp {} --exact child --nocapture\n",
@@ -728,8 +764,10 @@ fn start_child(
         .stderr(log("stderr.log")?)
         // A process group of its own, so that a kill reaches all of it.
         .process_group(0);
+    // A self-test plans as if nothing were selected: its defect lands on the
+    // steps it expects.
     match config.self_test {
-        Some(test) => command.env(ENV_SELF_TEST, test.name()),
+        Some(test) => command.env(ENV_SELF_TEST, test.name()).env_remove(ENV_ONLY),
         None => command.env_remove(ENV_SELF_TEST),
     };
     // A replay pins the plan it expects, so a changed generator cannot pass
@@ -1144,6 +1182,8 @@ struct Summary {
     runs: usize,
     outcomes: BTreeMap<String, usize>,
     observations: BTreeMap<String, usize>,
+    /// The seeds that forced each pair.
+    pair_seeds: BTreeMap<String, BTreeSet<u64>>,
     coverage: BTreeMap<String, Coverage>,
     holds: BTreeMap<String, Coverage>,
     failures: Vec<SeedReport>,
@@ -1151,7 +1191,7 @@ struct Summary {
 
 impl Summary {
     fn new(config: &RunConfig, seeds: &[u64]) -> Self {
-        let header = format!(
+        let mut header = format!(
             "scenario={} run_dir={} steps={} repeat={} seeds={}..={}",
             config.kind.name(),
             config.run_dir.display(),
@@ -1160,12 +1200,16 @@ impl Summary {
             seeds.first().copied().unwrap_or_default(),
             seeds.last().copied().unwrap_or_default()
         );
+        if let Ok(only) = std::env::var(ENV_ONLY) {
+            write!(header, " only={only}").unwrap();
+        }
         Self {
             header,
             kind: config.kind,
             runs: 0,
             outcomes: BTreeMap::new(),
             observations: BTreeMap::new(),
+            pair_seeds: BTreeMap::new(),
             coverage: BTreeMap::new(),
             holds: BTreeMap::new(),
             failures: Vec::new(),
@@ -1216,12 +1260,15 @@ impl Summary {
                 .copied()
                 .unwrap_or_default()
         };
-        self.observations
+        self.pair_seeds
             .iter()
-            .filter_map(|(observation, planned)| {
-                let pair = observation.strip_prefix("pair_planned:")?;
-                (*planned >= DEAD_PAIR_PLANNED && count("pair_met", pair) == 0)
-                    .then(|| format!("{pair} planned={planned} met=0"))
+            .filter(|(pair, seeds)| seeds.len() >= DEAD_PAIR_SEEDS && count("pair_met", pair) == 0)
+            .map(|(pair, seeds)| {
+                format!(
+                    "{pair} planned={} seeds={} met=0",
+                    count("pair_planned", pair),
+                    seeds.len()
+                )
             })
             .collect()
     }
@@ -1243,6 +1290,12 @@ impl Summary {
                     .observations
                     .entry(observation.to_string())
                     .or_default() += 1;
+                if let Some(pair) = observation.strip_prefix("pair_planned:") {
+                    self.pair_seeds
+                        .entry(pair.to_string())
+                        .or_default()
+                        .insert(report.seed);
+                }
             }
             if let Some(hold) = field(line, "hold") {
                 let coverage = self.holds.entry(hold.to_string()).or_default();
@@ -1360,4 +1413,38 @@ impl Summary {
         }
         text
     }
+}
+
+#[test]
+fn selection_dead_pairs_count_seeds_not_rounds() {
+    let report = |seed: u64| SeedReport {
+        seed,
+        attempt: 1,
+        class: None,
+        detail: String::new(),
+        dir: PathBuf::new(),
+        // A focus forces the same pair in several rounds of a seed.
+        journal: "t=1 step=3 observation=pair_planned:append:cleanup\n\
+                  t=2 step=5 observation=pair_planned:append:cleanup\n"
+            .to_string(),
+    };
+    let mut summary = Summary {
+        header: String::new(),
+        kind: ScenarioKind::Concurrency,
+        runs: 0,
+        outcomes: BTreeMap::new(),
+        observations: BTreeMap::new(),
+        pair_seeds: BTreeMap::new(),
+        coverage: BTreeMap::new(),
+        holds: BTreeMap::new(),
+        failures: Vec::new(),
+    };
+    summary.add(report(5));
+    summary.add(report(5));
+    assert!(summary.dead_pairs().is_empty(), "one seed, even repeated");
+    summary.add(report(6));
+    assert_eq!(
+        summary.dead_pairs(),
+        ["append:cleanup planned=6 seeds=2 met=0"]
+    );
 }
