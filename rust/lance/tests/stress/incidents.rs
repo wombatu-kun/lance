@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Incidents: storage faults and cancellation points, armed for one step.
+//! Incidents: storage faults, cancellation points and hold points, armed for
+//! one step.
 //!
 //! [`StressWrapper`] puts [`StressStore`] in front of the dataset's object
 //! store, and [`StressHooks`] receives the progress of index builds and
@@ -13,7 +14,7 @@ use std::future::Future;
 use std::io::Write as _;
 use std::ops::Range;
 use std::path::Path as FsPath;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -142,6 +143,19 @@ pub enum Incident {
     /// The operation is cancelled when the `nth` fragment write begins or
     /// completes.
     CancelFragment { nth: u64, at_begin: bool },
+    /// The operation waits for its gate at the `nth` matching storage call,
+    /// before the request or, with `after`, once the request has completed.
+    HoldCall {
+        method: Method,
+        area: Area,
+        nth: u64,
+        after: bool,
+    },
+    /// The operation waits for its gate when an index build stage starts or ends.
+    HoldStage { stage: &'static str, at_start: bool },
+    /// The operation waits for its gate when the `nth` fragment write begins or
+    /// completes.
+    HoldFragment { nth: u64, at_begin: bool },
 }
 
 impl Incident {
@@ -184,6 +198,28 @@ impl Incident {
                 "cancel_fragment:{}",
                 if *at_begin { "begin" } else { "complete" }
             ),
+            Self::HoldCall {
+                method,
+                area,
+                nth,
+                after,
+            } => format!(
+                "hold:{method}:{area}:{}{}",
+                if *after { "after" } else { "before" },
+                if *nth > 1 {
+                    format!(":call{nth}")
+                } else {
+                    String::new()
+                }
+            ),
+            Self::HoldStage { stage, at_start } => format!(
+                "hold_stage:{stage}:{}",
+                if *at_start { "start" } else { "complete" }
+            ),
+            Self::HoldFragment { at_begin, .. } => format!(
+                "hold_fragment:{}",
+                if *at_begin { "begin" } else { "complete" }
+            ),
         }
     }
 }
@@ -193,8 +229,10 @@ impl fmt::Display for Incident {
         match self {
             Self::Fail { nth, .. }
             | Self::CancelCall { nth, .. }
-            | Self::CancelFragment { nth, .. } => write!(f, "{}:n={nth}", self.kind()),
-            Self::CancelStage { .. } => f.write_str(&self.kind()),
+            | Self::CancelFragment { nth, .. }
+            | Self::HoldCall { nth, .. }
+            | Self::HoldFragment { nth, .. } => write!(f, "{}:n={nth}", self.kind()),
+            Self::CancelStage { .. } | Self::HoldStage { .. } => f.write_str(&self.kind()),
         }
     }
 }
@@ -205,6 +243,7 @@ enum Action {
     FailBefore(u64),
     FailAfter(u64),
     Cancel(CancelWhen, Cancellation),
+    Hold { gate: Gate, after: bool },
 }
 
 impl fmt::Display for Action {
@@ -214,6 +253,8 @@ impl fmt::Display for Action {
             Self::FailBefore(fault) => write!(f, "fail_before#{fault}"),
             Self::FailAfter(fault) => write!(f, "fail_after#{fault}"),
             Self::Cancel(when, _) => write!(f, "cancel_{when}"),
+            Self::Hold { after: false, .. } => f.write_str("hold_before"),
+            Self::Hold { after: true, .. } => f.write_str("hold_after"),
         }
     }
 }
@@ -329,9 +370,71 @@ impl Cancellation {
     }
 }
 
+/// What a hold point waits for: the end of another operation, or its arrival at
+/// a point of its own. A limit makes the plan's order a wish rather than a
+/// promise, so that a planned wait that cannot end costs time and shows in the
+/// count of timeouts, while only a gate without a limit can hang a run.
+#[derive(Clone)]
+pub struct Gate {
+    opened: watch::Receiver<bool>,
+    limit: Option<Duration>,
+    timeouts: Arc<AtomicU64>,
+    /// How many times the state that armed it found it still closed: a point can
+    /// fire after the gate has opened, when nothing is held up.
+    waits: Arc<AtomicU64>,
+    /// Told that the holder got to its point, before it waits.
+    arrival: Option<Arc<watch::Sender<bool>>>,
+}
+
+impl Gate {
+    pub fn new(limit: Option<Duration>, timeouts: Arc<AtomicU64>) -> (watch::Sender<bool>, Self) {
+        let (open, opened) = watch::channel(false);
+        (
+            open,
+            Self {
+                opened,
+                limit,
+                timeouts,
+                waits: Arc::default(),
+                arrival: None,
+            },
+        )
+    }
+
+    /// The same gate, which tells `arrival` when its holder gets to the point.
+    pub fn announcing(mut self, arrival: Arc<watch::Sender<bool>>) -> Self {
+        self.arrival = Some(arrival);
+        self
+    }
+
+    /// Waits until the gate opens or its limit passes.
+    pub async fn pass(&self) {
+        if let Some(arrival) = &self.arrival {
+            arrival.send_replace(true);
+        }
+        let mut opened = self.opened.clone();
+        if !*opened.borrow() {
+            self.waits.fetch_add(1, Ordering::SeqCst);
+        }
+        let wait = opened.wait_for(|opened| *opened);
+        // An error only means that the sender is gone, so nothing will come.
+        match self.limit {
+            Some(limit) => {
+                if tokio::time::timeout(limit, wait).await.is_err() {
+                    self.timeouts.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            None => {
+                let _ = wait.await;
+            }
+        }
+    }
+}
+
 struct Armed {
     incident: Incident,
     cancellation: Cancellation,
+    gate: Option<Gate>,
     matched: u64,
     fired: u64,
     /// A `blind` incident has fired: reads of manifests fail.
@@ -384,7 +487,54 @@ impl Armed {
                 };
                 (action, Some(self.matched))
             }
+            Incident::HoldCall {
+                method: target_method,
+                area: target_area,
+                nth,
+                after,
+            } if target_method == method && target_area == area => {
+                self.matched += 1;
+                let action = match &self.gate {
+                    Some(gate) if self.matched == nth => {
+                        self.fired += 1;
+                        Action::Hold {
+                            gate: gate.clone(),
+                            after,
+                        }
+                    }
+                    _ => Action::Proceed,
+                };
+                (action, Some(self.matched))
+            }
             _ => (Action::Proceed, None),
+        }
+    }
+
+    fn gate_at_stage(&mut self, stage: &str, start: bool) -> Option<Gate> {
+        match self.incident {
+            Incident::HoldStage {
+                stage: target,
+                at_start,
+            } if target == stage && at_start == start && self.fired == 0 => {
+                self.fired += 1;
+                self.gate.clone()
+            }
+            _ => None,
+        }
+    }
+
+    fn gate_at_fragment(&mut self, begin: bool) -> Option<Gate> {
+        match self.incident {
+            Incident::HoldFragment { nth, at_begin } if at_begin == begin => {
+                self.matched += 1;
+                if self.matched == nth {
+                    self.fired += 1;
+                    self.gate.clone()
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -420,12 +570,19 @@ impl Armed {
 pub struct IncidentState {
     /// The object path of the dataset root, to tell its directories apart.
     root: String,
-    calls: Mutex<File>,
+    calls: Arc<Mutex<File>>,
     started: Instant,
     /// What the run is doing: a step number, its retry, or the final checks.
     phase: Mutex<String>,
     armed: Mutex<Option<Armed>>,
     release: Mutex<Option<watch::Sender<bool>>>,
+    /// The logical clock of a round, and when it last saw this state's manifest
+    /// land. A `concurrency` round compares these between its operations.
+    clock: Arc<AtomicU64>,
+    last_commit: AtomicU64,
+    /// Manifest writes that found the version already taken by another writer.
+    lost_races: AtomicU64,
+    gate_waits: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for IncidentState {
@@ -441,17 +598,65 @@ impl IncidentState {
         Self {
             root,
             // A seed's processes share the log, one after the other.
-            calls: Mutex::new(
+            calls: Arc::new(Mutex::new(
                 OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(calls_log)
                     .expect("open the call log"),
-            ),
+            )),
             started,
             phase: Mutex::new("setup".to_string()),
             armed: Mutex::new(None),
             release: Mutex::new(None),
+            clock: Arc::new(AtomicU64::new(0)),
+            last_commit: AtomicU64::new(0),
+            lost_races: AtomicU64::new(0),
+            gate_waits: Arc::default(),
+        }
+    }
+
+    /// A state of its own for one writer or reader of a round. The call log stays
+    /// the one that was opened before the baseline of open descriptors.
+    pub fn sibling(&self, clock: Arc<AtomicU64>) -> Self {
+        Self {
+            root: self.root.clone(),
+            calls: self.calls.clone(),
+            started: self.started,
+            phase: Mutex::new(self.phase()),
+            armed: Mutex::new(None),
+            release: Mutex::new(None),
+            clock,
+            last_commit: AtomicU64::new(0),
+            lost_races: AtomicU64::new(0),
+            gate_waits: Arc::default(),
+        }
+    }
+
+    /// When this state last saw a manifest land, on the clock of the round.
+    pub fn last_commit(&self) -> u64 {
+        self.last_commit.load(Ordering::SeqCst)
+    }
+
+    pub fn take_gate_waits(&self) -> u64 {
+        self.gate_waits.swap(0, Ordering::SeqCst)
+    }
+
+    pub fn take_lost_races(&self) -> u64 {
+        self.lost_races.swap(0, Ordering::SeqCst)
+    }
+
+    fn note_manifest_put(&self, result: &OSResult<PutResult>, location: &Path) {
+        match result {
+            Ok(_) => {
+                let tick = self.clock.fetch_add(1, Ordering::SeqCst) + 1;
+                self.last_commit.store(tick, Ordering::SeqCst);
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                self.lost_races.fetch_add(1, Ordering::SeqCst);
+                self.log(format_args!("lost_manifest_race {location}"));
+            }
+            Err(_) => {}
         }
     }
 
@@ -477,11 +682,21 @@ impl IncidentState {
                 released,
                 death,
             },
+            gate: None,
             matched: 0,
             fired: 0,
             blinded: false,
         });
         cancel
+    }
+
+    /// Arms a hold point: the operation waits at it until `gate` lets it go.
+    pub fn arm_hold(&self, point: Incident, mut gate: Gate) {
+        gate.waits = self.gate_waits.clone();
+        self.arm(Some(point), None);
+        if let Some(armed) = self.armed.lock().unwrap().as_mut() {
+            armed.gate = Some(gate);
+        }
     }
 
     /// Disarms the incident, releases every call it held back, and returns
@@ -547,14 +762,21 @@ impl IncidentState {
 
     async fn on_stage(&self, stage: &str, start: bool) -> lance_core::Result<()> {
         let edge = if start { "start" } else { "complete" };
-        let held = match self.armed.lock().unwrap().as_mut() {
-            Some(armed) => armed.on_stage(stage, start),
-            None => None,
+        let (held, gate) = match self.armed.lock().unwrap().as_mut() {
+            Some(armed) => (
+                armed.on_stage(stage, start),
+                armed.gate_at_stage(stage, start),
+            ),
+            None => (None, None),
         };
         self.log(format_args!(
-            "stage_{edge} {stage}{}",
-            if held.is_some() { " cancel" } else { "" }
+            "stage_{edge} {stage}{}{}",
+            if held.is_some() { " cancel" } else { "" },
+            if gate.is_some() { " hold" } else { "" }
         ));
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
         match held {
             Some(cancellation) => {
                 cancellation.hold().await;
@@ -566,15 +788,19 @@ impl IncidentState {
 
     async fn on_fragment(&self, fragment: &Fragment, begin: bool) -> lance_core::Result<()> {
         let edge = if begin { "begin" } else { "complete" };
-        let held = match self.armed.lock().unwrap().as_mut() {
-            Some(armed) => armed.on_fragment(begin),
-            None => None,
+        let (held, gate) = match self.armed.lock().unwrap().as_mut() {
+            Some(armed) => (armed.on_fragment(begin), armed.gate_at_fragment(begin)),
+            None => (None, None),
         };
         self.log(format_args!(
-            "fragment_{edge} {}{}",
+            "fragment_{edge} {}{}{}",
             fragment.id,
-            if held.is_some() { " cancel" } else { "" }
+            if held.is_some() { " cancel" } else { "" },
+            if gate.is_some() { " hold" } else { "" }
         ));
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
         match held {
             Some(cancellation) => {
                 cancellation.hold().await;
@@ -695,6 +921,15 @@ async fn apply<T>(
             tokio::task::yield_now().await;
             result
         }
+        Action::Hold { gate, after: false } => {
+            gate.pass().await;
+            call.await
+        }
+        Action::Hold { gate, after: true } => {
+            let result = call.await;
+            gate.pass().await;
+            result
+        }
     }
 }
 
@@ -723,13 +958,15 @@ impl ObjectStore for StressStore {
                     source: Box::new(error),
                 })?;
         }
-        apply(
-            action,
-            Method::Put,
-            location,
-            self.inner.put_opts(location, payload, opts),
-        )
-        .await
+        let is_manifest = self.state.area(location) == Area::Manifests;
+        let call = async {
+            let result = self.inner.put_opts(location, payload, opts).await;
+            if is_manifest {
+                self.state.note_manifest_put(&result, location);
+            }
+            result
+        };
+        apply(action, Method::Put, location, call).await
     }
 
     async fn put_multipart_opts(
@@ -796,6 +1033,16 @@ impl ObjectStore for StressStore {
                     &location,
                     "before the request",
                 ))))
+                .boxed()
+            }
+            Action::Hold { gate, .. } => {
+                let inner = self.inner.clone();
+                let prefix = prefix.cloned();
+                futures::stream::once(async move {
+                    gate.pass().await;
+                    inner.list(prefix.as_ref())
+                })
+                .flatten()
                 .boxed()
             }
             _ => self.inner.list(prefix),

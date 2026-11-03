@@ -42,7 +42,7 @@ use tokio::sync::Notify;
 use crate::harness::{
     CALLS_LOG, ENV_CALIBRATE, ENV_CHILD, ENV_DIR, ENV_GENERATION, ENV_PARENT_PID, ENV_PLAN,
     ENV_QUIET_SECS, ENV_SEED, ENV_SELF_TEST, ENV_STANDALONE, ENV_STEPS, MEMORY_LOG, PLAN_LOG,
-    STEPS_LOG, ScenarioKind, SelfTest, field,
+    READS_LOG, STEPS_LOG, ScenarioKind, SelfTest, field,
 };
 use crate::incidents::{
     Area, CRASH_FIRED, CancelWhen, Death, Incident, IncidentState, Method, StressHooks,
@@ -52,6 +52,8 @@ use crate::leaks::{
     Snapshot, TmpWatch, files_below, heap_peak_bytes, live_heap_bytes, quiesce, start_heap_peak,
 };
 use crate::limits::{OwnCgroup, log_memory_events};
+
+mod concurrency;
 
 const POOL_VARIABLE: &str = "LANCE_MEM_POOL_SIZE";
 /// One cycle of `heap_growth`, repeated until a leak has had time to show. The
@@ -152,6 +154,9 @@ pub fn run_child_if_requested() {
     if self_test == Some(SelfTest::MemoryEvents) {
         plan.steps[0].op = Op::CreateIndex(IndexKind::BTree);
     }
+    if let (Some(test), Some(rounds)) = (self_test, plan.rounds.as_mut()) {
+        rounds.for_self_test(test, plan.initial_rows);
+    }
     let rendered = plan.render(kind, seed, steps);
     fs::write(dir.join(PLAN_LOG), &rendered).expect("write the plan");
     let print = fingerprint(&rendered);
@@ -192,8 +197,14 @@ fn run_on_runtime(
     dir: &Path,
     journal: Arc<Journal>,
 ) -> Result<(), Failure> {
+    // A round's writers and readers are tasks, which only race with threads to
+    // run on.
+    let threads = match setting.kind {
+        ScenarioKind::Concurrency => 4,
+        _ => 2,
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(threads)
         .enable_all()
         .build()
         .expect("build the runtime");
@@ -208,8 +219,15 @@ fn run_on_runtime(
             Box::pin(run.finish()).await
         })
     }));
-    // A self-test leaves a task behind on purpose; do not wait for it.
-    runtime.shutdown_timeout(Duration::from_secs(5));
+    // A failed round leaves its tasks running, and the process is about to exit.
+    // Shutting the runtime down would cancel their scans, and a scan cancelled
+    // that way panics (`filtered_read.rs`), which would hide the failure.
+    if setting.kind == ScenarioKind::Concurrency && matches!(result, Ok(Err(_))) {
+        std::mem::forget(runtime);
+    } else {
+        // A self-test leaves a task behind on purpose; do not wait for it.
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
     result.unwrap_or_else(|panic| Err(fail("panic", 0, panic_message(panic.as_ref()))))
 }
 
@@ -390,15 +408,26 @@ enum IndexKind {
     BTree,
     /// On the join key of a merge insert, which then takes its indexed path.
     BTreeId,
+    /// On a column that changes, which an update in place takes fragments away from.
+    BTreeStamp,
     IvfFlat,
     Inverted,
 }
 
 impl IndexKind {
+    const ALL: [Self; 5] = [
+        Self::BTree,
+        Self::BTreeId,
+        Self::BTreeStamp,
+        Self::IvfFlat,
+        Self::Inverted,
+    ];
+
     fn name(self) -> &'static str {
         match self {
             Self::BTree => "idx_category",
             Self::BTreeId => "idx_id",
+            Self::BTreeStamp => "idx_gen",
             Self::IvfFlat => "idx_vec",
             Self::Inverted => "idx_text",
         }
@@ -408,6 +437,7 @@ impl IndexKind {
         match self {
             Self::BTree => "category",
             Self::BTreeId => "id",
+            Self::BTreeStamp => "gen",
             Self::IvfFlat => "vec",
             Self::Inverted => "text",
         }
@@ -416,7 +446,7 @@ impl IndexKind {
     /// The stages the build reports to its progress hooks.
     fn stages(self) -> &'static [&'static str] {
         match self {
-            Self::BTree | Self::BTreeId => &["load_data"],
+            Self::BTree | Self::BTreeId | Self::BTreeStamp => &["load_data"],
             Self::IvfFlat => &[
                 "train_ivf",
                 "train_quantizer",
@@ -732,6 +762,8 @@ struct Plan {
     data_seed: u64,
     initial_rows: i64,
     steps: Vec<Step>,
+    /// What `concurrency` runs instead of `steps`.
+    rounds: Option<concurrency::RoundsPlan>,
 }
 
 impl Plan {
@@ -744,6 +776,11 @@ impl Plan {
             ScenarioKind::ProcessKill if rng.chance(0.5) => StoreChoice::Local,
             ScenarioKind::ProcessKill => StoreChoice::FileObjectStore,
             ScenarioKind::MemoryLimits | ScenarioKind::HeapGrowth => StoreChoice::Local,
+            ScenarioKind::Concurrency => match rng.range(0..=2) {
+                0 => StoreChoice::Local,
+                1 => StoreChoice::FileObjectStore,
+                _ => StoreChoice::SharedMemory,
+            },
         };
         let scale = match kind {
             ScenarioKind::MemoryLimits => LARGE,
@@ -759,6 +796,26 @@ impl Plan {
                 data_seed,
                 initial_rows,
                 steps: heap_growth_plan(&mut rng, &scale, initial_rows),
+                rounds: None,
+            };
+        }
+        if kind == ScenarioKind::Concurrency {
+            let rounds = concurrency::plan_rounds(
+                &mut rng,
+                seed,
+                store,
+                &scale,
+                initial_rows,
+                steps,
+                with_incidents,
+            );
+            return Self {
+                store,
+                scale,
+                data_seed,
+                initial_rows,
+                steps: Vec::new(),
+                rounds: Some(rounds),
             };
         }
         let mut model = Model::new(initial_rows);
@@ -801,6 +858,7 @@ impl Plan {
             data_seed,
             initial_rows,
             steps: planned,
+            rounds: None,
         }
     }
 
@@ -831,6 +889,9 @@ impl Plan {
                 step.in_flight_us
             )
             .unwrap();
+        }
+        if let Some(rounds) = &self.rounds {
+            text.push_str(&rounds.render());
         }
         text
     }
@@ -911,7 +972,7 @@ fn random_incident(
     op: &Op,
 ) -> Option<Incident> {
     match kind {
-        ScenarioKind::MemoryLimits | ScenarioKind::HeapGrowth => None,
+        ScenarioKind::MemoryLimits | ScenarioKind::HeapGrowth | ScenarioKind::Concurrency => None,
         ScenarioKind::StorageFaults => {
             if !rng.chance(0.75) {
                 return None;
@@ -1284,7 +1345,7 @@ fn op_future<'a>(
             let progress: Arc<dyn IndexBuildProgress> = hooks;
             let name = kind.name().to_string();
             match kind {
-                IndexKind::BTree | IndexKind::BTreeId => {
+                IndexKind::BTree | IndexKind::BTreeId | IndexKind::BTreeStamp => {
                     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
                     ds.create_index_builder(&columns, IndexType::BTree, &params)
                         .name(name)
@@ -1317,6 +1378,261 @@ fn op_future<'a>(
             .map(|_| OpOutput::default())
         }),
     }
+}
+
+/// What the queries of an index must answer: the rows of one version.
+struct Answers<'a> {
+    live: &'a BTreeSet<i64>,
+    next_id: i64,
+    /// The value of `gen` per row, in a scenario that has the column.
+    stamps: Option<&'a BTreeMap<i64, i64>>,
+    /// Values of `gen` to ask about, besides those the rows hold.
+    stamps_ever: Option<&'a BTreeSet<i64>>,
+    /// Whether to ask about a few of the values that the rows hold, not all.
+    few_stamps: bool,
+    scale: Scale,
+    data_seed: u64,
+    check_plan: bool,
+    /// Varies the queries between checks.
+    salt: usize,
+}
+
+/// Queries an index and compares the answers with what the version holds. The
+/// first query of each index can check its plan, since a query that falls back
+/// to a scan would answer right whatever the index holds.
+async fn check_index(
+    ds: &Dataset,
+    n: usize,
+    kind: IndexKind,
+    answers: &Answers<'_>,
+) -> Result<(), Failure> {
+    let unreadable = |error: lance::Error| fail("unreadable", n, error);
+    match kind {
+        IndexKind::BTreeStamp => {
+            let stamps = answers
+                .stamps
+                .expect("an index on gen only exists in a scenario that has the column");
+            let distinct: BTreeSet<i64> = stamps.values().copied().collect();
+            let held: Vec<i64> = distinct.iter().copied().collect();
+            let mut values: Vec<i64> = if answers.few_stamps && !held.is_empty() {
+                vec![
+                    held[0],
+                    held[answers.salt % held.len()],
+                    held[held.len() - 1],
+                ]
+            } else {
+                held
+            };
+            // A value that no row holds now, which an index that went stale can
+            // still answer, and one that no row ever held.
+            values.extend(
+                answers
+                    .stamps_ever
+                    .into_iter()
+                    .flatten()
+                    .filter(|value| !distinct.contains(value)),
+            );
+            values.push(-1);
+            for (position, value) in values.into_iter().enumerate() {
+                let filter = format!("gen = {value}");
+                let mut scan = ds.scan();
+                scan.filter(&filter).map_err(unreadable)?;
+                scan.project(&["id"]).map_err(unreadable)?;
+                if position == 0 && answers.check_plan {
+                    let plan = scan.explain_plan(true).await.map_err(unreadable)?;
+                    if !plan.contains("@idx_gen(BTree)") {
+                        return Err(fail(
+                            "index_not_used",
+                            n,
+                            format_args!("{filter} does not use idx_gen: {plan}"),
+                        ));
+                    }
+                }
+                let batch = scan.try_into_batch().await.map_err(unreadable)?;
+                let expected: BTreeSet<i64> = stamps
+                    .iter()
+                    .filter(|(_, stamp)| **stamp == value)
+                    .map(|(id, _)| *id)
+                    .collect();
+                compare_ids(n, &filter, &int64_column(&batch, "id"), &expected)?;
+            }
+        }
+        IndexKind::BTreeId => {
+            let last = answers.next_id.max(1);
+            for slot in 0..3 {
+                let lo = last * slot / 3;
+                let hi = last * (slot + 1) / 3;
+                let filter = format!("id >= {lo} AND id < {hi}");
+                let mut scan = ds.scan();
+                scan.filter(&filter).map_err(unreadable)?;
+                scan.project(&["id"]).map_err(unreadable)?;
+                if slot == 0 && answers.check_plan {
+                    let plan = scan.explain_plan(true).await.map_err(unreadable)?;
+                    if !plan.contains("@idx_id(BTree)") {
+                        return Err(fail(
+                            "index_not_used",
+                            n,
+                            format_args!("{filter} does not use idx_id: {plan}"),
+                        ));
+                    }
+                }
+                let batch = scan.try_into_batch().await.map_err(unreadable)?;
+                let expected: BTreeSet<i64> = answers.live.range(lo..hi).copied().collect();
+                compare_ids(n, &filter, &int64_column(&batch, "id"), &expected)?;
+            }
+        }
+        IndexKind::BTree => {
+            for value in 0..CATEGORIES {
+                let filter = format!("category = {value}");
+                let mut scan = ds.scan();
+                scan.filter(&filter).map_err(unreadable)?;
+                scan.project(&["id"]).map_err(unreadable)?;
+                if value == 0 && answers.check_plan {
+                    let plan = scan.explain_plan(true).await.map_err(unreadable)?;
+                    if !plan.contains("@idx_category(BTree)") {
+                        return Err(fail(
+                            "index_not_used",
+                            n,
+                            format_args!("{filter} does not use idx_category: {plan}"),
+                        ));
+                    }
+                }
+                let batch = scan.try_into_batch().await.map_err(unreadable)?;
+                let expected: BTreeSet<i64> = answers
+                    .live
+                    .iter()
+                    .copied()
+                    .filter(|id| category(*id) == value)
+                    .collect();
+                compare_ids(n, &filter, &int64_column(&batch, "id"), &expected)?;
+            }
+        }
+        IndexKind::IvfFlat => {
+            let mut queries: Vec<(String, [f32; VECTOR_DIM as usize])> = (0..3)
+                .map(|slot| {
+                    let id = (answers.salt * 3 + slot) as i64;
+                    (
+                        format!("random query {slot}"),
+                        vector(!answers.data_seed, id),
+                    )
+                })
+                .collect();
+            // A deleted row's own vector: only an index that ignores
+            // deletions would answer with that row.
+            if let Some(deleted) = (0..answers.next_id).find(|id| !answers.live.contains(id)) {
+                queries.push((
+                    format!("deleted row {deleted}"),
+                    vector(answers.data_seed, deleted),
+                ));
+            }
+            for (position, (label, query)) in queries.iter().enumerate() {
+                let mut scan = ds.scan();
+                scan.nearest("vec", &Float32Array::from(query.to_vec()), NEIGHBORS)
+                    .map_err(unreadable)?;
+                // Every partition: IVF_FLAT is then exact.
+                scan.minimum_nprobes(IVF_PARTITIONS);
+                scan.project(&["id"]).map_err(unreadable)?;
+                if position == 0 && answers.check_plan {
+                    let plan = scan.explain_plan(true).await.map_err(unreadable)?;
+                    if !plan.contains("ANNSubIndex: name=idx_vec") {
+                        return Err(fail(
+                            "index_not_used",
+                            n,
+                            format_args!("a nearest neighbor query does not use idx_vec: {plan}"),
+                        ));
+                    }
+                }
+                let batch = scan.try_into_batch().await.map_err(unreadable)?;
+                check_neighbors(n, label, query, &int64_column(&batch, "id"), answers)?;
+            }
+        }
+        IndexKind::Inverted => {
+            for slot in 0..4 {
+                let token = (answers.salt as u64 * 4 + slot) % answers.scale.vocabulary;
+                let term = format!("tok{token:04}");
+                let query = FullTextSearchQuery::new(term.clone())
+                    .with_column("text".to_string())
+                    .map_err(unreadable)?
+                    .limit(None);
+                let mut scan = ds.scan();
+                scan.full_text_search(query).map_err(unreadable)?;
+                scan.project(&["id"]).map_err(unreadable)?;
+                if slot == 0 && answers.check_plan {
+                    let plan = scan.explain_plan(true).await.map_err(unreadable)?;
+                    if !plan
+                        .lines()
+                        .any(|line| line.trim_start().starts_with("MatchQuery: column=text"))
+                    {
+                        return Err(fail(
+                            "index_not_used",
+                            n,
+                            format_args!("a search for {term} does not use idx_text: {plan}"),
+                        ));
+                    }
+                }
+                let batch = scan.try_into_batch().await.map_err(unreadable)?;
+                let expected: BTreeSet<i64> = answers
+                    .live
+                    .iter()
+                    .copied()
+                    .filter(|id| tokens(*id, &answers.scale).any(|found| found == token))
+                    .collect();
+                compare_ids(
+                    n,
+                    &format!("a search for {term}"),
+                    &int64_column(&batch, "id"),
+                    &expected,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The answer must be the brute-force nearest live rows, up to ties within
+/// float rounding at the cut.
+fn check_neighbors(
+    n: usize,
+    label: &str,
+    query: &[f32; VECTOR_DIM as usize],
+    found: &[i64],
+    answers: &Answers<'_>,
+) -> Result<(), Failure> {
+    let mut ranked: Vec<(f32, i64)> = answers
+        .live
+        .iter()
+        .map(|id| (squared_l2(query, &vector(answers.data_seed, *id)), *id))
+        .collect();
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let k = NEIGHBORS.min(ranked.len());
+    let cut = ranked[k - 1].0;
+    let tolerance = cut * 1e-4 + 1e-6;
+    let required: BTreeSet<i64> = ranked
+        .iter()
+        .take_while(|(distance, _)| *distance < cut - tolerance)
+        .map(|(_, id)| *id)
+        .collect();
+    let allowed: BTreeSet<i64> = ranked
+        .iter()
+        .take_while(|(distance, _)| *distance <= cut + tolerance)
+        .map(|(_, id)| *id)
+        .collect();
+    let distinct: BTreeSet<i64> = found.iter().copied().collect();
+    if found.len() != k
+        || distinct.len() != k
+        || !required.is_subset(&distinct)
+        || !distinct.is_subset(&allowed)
+    {
+        let expected: Vec<i64> = ranked.iter().take(k).map(|(_, id)| *id).collect();
+        return Err(fail(
+            "content",
+            n,
+            format_args!(
+                "the nearest neighbors of {label} are {found:?} where brute force finds {expected:?}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// A limit in force on a step.
@@ -1474,6 +1790,8 @@ struct Run {
     /// did not return Ok.
     handle_stale: bool,
     model: Model,
+    /// What `concurrency` knows between its rounds.
+    rounds: Option<concurrency::RoundsState>,
     baseline_tasks: usize,
     baseline_fds: usize,
     quiet: Duration,
@@ -1531,15 +1849,30 @@ impl Run {
             object_store_wrapper: Some(wrapper.clone()),
             ..Default::default()
         };
+        let rounds = plan.rounds.as_ref().map(|rounds| {
+            rounds.start(
+                plan.initial_rows,
+                Journal::open(&dir.join(READS_LOG), started),
+            )
+        });
         let ds = if generation == 1 {
             let params = WriteParams {
                 mode: WriteMode::Create,
                 max_rows_per_file: plan.scale.rows_per_file,
                 store_params: Some(store_params),
                 progress: hooks.clone(),
+                enable_stable_row_ids: plan
+                    .rounds
+                    .as_ref()
+                    .is_some_and(|rounds| rounds.stable_row_ids),
                 ..Default::default()
             };
-            let initial = rows(plan.data_seed, 0..plan.initial_rows, plan.scale);
+            let initial: Box<dyn RecordBatchReader + Send> = match &plan.rounds {
+                Some(rounds) => {
+                    Box::new(rounds.initial_source(plan.data_seed, plan.initial_rows, plan.scale))
+                }
+                None => Box::new(rows(plan.data_seed, 0..plan.initial_rows, plan.scale)),
+            };
             Box::pin(Dataset::write(initial, uri.as_str(), Some(params))).await
         } else {
             Box::pin(
@@ -1576,6 +1909,7 @@ impl Run {
             heap_after_cycle: Vec::with_capacity(HEAP_CYCLES),
             ds,
             handle_stale: false,
+            rounds,
             baseline_tasks: 0,
             baseline_fds: 0,
             quiet,
@@ -1771,6 +2105,9 @@ impl Run {
     }
 
     async fn run_steps(&mut self) -> Result<(), Failure> {
+        if self.plan.rounds.is_some() {
+            return Box::pin(self.run_rounds()).await;
+        }
         for index in self.next_step..self.plan.steps.len() {
             let step = self.plan.steps[index].clone();
             Box::pin(self.run_step(index + 1, &step)).await?;
@@ -1962,6 +2299,7 @@ impl Run {
                     ScenarioKind::Cancellation => "cancel_missed",
                     ScenarioKind::ProcessKill => "kill_missed",
                     ScenarioKind::MemoryLimits | ScenarioKind::HeapGrowth => "limit_absorbed",
+                    ScenarioKind::Concurrency => "hold_absorbed",
                 },
             );
         }
@@ -2473,6 +2811,13 @@ impl Run {
             | SelfTest::HangUnderLimit
             | SelfTest::MemoryEvents
             | SelfTest::HeapLeak => {}
+            SelfTest::TornSnapshot
+            | SelfTest::LostWrite
+            | SelfTest::StaleRead
+            | SelfTest::SnapshotChanged
+            | SelfTest::DuplicateKey
+            | SelfTest::Lineage
+            | SelfTest::GateHang => unreachable!("{} acts in a round", test.name()),
         }
     }
 
@@ -2567,13 +2912,8 @@ impl Run {
                 format_args!("manifests reference files that are not there: {missing:?}"),
             ));
         }
-        let names: BTreeSet<String> = ds
-            .load_indices()
-            .await
-            .map_err(unreadable)?
-            .iter()
-            .map(|index| index.name.clone())
-            .collect();
+        let indices = ds.load_indices().await.map_err(unreadable)?;
+        let names: BTreeSet<String> = indices.iter().map(|index| index.name.clone()).collect();
         let expected: BTreeSet<String> = self
             .model
             .indices
@@ -2588,7 +2928,21 @@ impl Run {
             ));
         }
         for kind in &self.model.indices {
-            Box::pin(self.check_index(&ds, n, *kind)).await?;
+            let answers = Answers {
+                live: &self.model.live,
+                next_id: self.model.next_id,
+                stamps: self.rounds.as_ref().map(|rounds| rounds.stamps()),
+                stamps_ever: self.rounds.as_ref().map(|rounds| rounds.stamps_ever()),
+                few_stamps: false,
+                scale: self.plan.scale,
+                data_seed: self.oracle_seed,
+                // Under concurrency an index can legitimately cover nothing by now:
+                // an update in place takes its fragments away from it.
+                check_plan: self.plan.rounds.is_none()
+                    || concurrency::covers_a_fragment(&ds, &indices, kind.name()),
+                salt: n,
+            };
+            Box::pin(check_index(&ds, n, *kind, &answers)).await?;
         }
         Ok(())
     }
@@ -2649,197 +3003,6 @@ impl Run {
         Ok(())
     }
 
-    /// Queries an index and compares the answers with the model. The first
-    /// query of each index checks its plan, since a query that falls back to a
-    /// scan would answer right whatever the index holds.
-    async fn check_index(&self, ds: &Dataset, n: usize, kind: IndexKind) -> Result<(), Failure> {
-        let unreadable = |error: lance::Error| fail("unreadable", n, error);
-        match kind {
-            IndexKind::BTreeId => {
-                let last = self.model.next_id.max(1);
-                for slot in 0..3 {
-                    let lo = last * slot / 3;
-                    let hi = last * (slot + 1) / 3;
-                    let filter = format!("id >= {lo} AND id < {hi}");
-                    let mut scan = ds.scan();
-                    scan.filter(&filter).map_err(unreadable)?;
-                    scan.project(&["id"]).map_err(unreadable)?;
-                    if slot == 0 {
-                        let plan = scan.explain_plan(true).await.map_err(unreadable)?;
-                        if !plan.contains("@idx_id(BTree)") {
-                            return Err(fail(
-                                "index_not_used",
-                                n,
-                                format_args!("{filter} does not use idx_id: {plan}"),
-                            ));
-                        }
-                    }
-                    let batch = scan.try_into_batch().await.map_err(unreadable)?;
-                    let expected: BTreeSet<i64> = self.model.live.range(lo..hi).copied().collect();
-                    compare_ids(n, &filter, &int64_column(&batch, "id"), &expected)?;
-                }
-            }
-            IndexKind::BTree => {
-                for value in 0..CATEGORIES {
-                    let filter = format!("category = {value}");
-                    let mut scan = ds.scan();
-                    scan.filter(&filter).map_err(unreadable)?;
-                    scan.project(&["id"]).map_err(unreadable)?;
-                    if value == 0 {
-                        let plan = scan.explain_plan(true).await.map_err(unreadable)?;
-                        if !plan.contains("@idx_category(BTree)") {
-                            return Err(fail(
-                                "index_not_used",
-                                n,
-                                format_args!("{filter} does not use idx_category: {plan}"),
-                            ));
-                        }
-                    }
-                    let batch = scan.try_into_batch().await.map_err(unreadable)?;
-                    let expected: BTreeSet<i64> = self
-                        .model
-                        .live
-                        .iter()
-                        .copied()
-                        .filter(|id| category(*id) == value)
-                        .collect();
-                    compare_ids(n, &filter, &int64_column(&batch, "id"), &expected)?;
-                }
-            }
-            IndexKind::IvfFlat => {
-                let mut queries: Vec<(String, [f32; VECTOR_DIM as usize])> = (0..3)
-                    .map(|slot| {
-                        let id = (n * 3 + slot) as i64;
-                        (
-                            format!("random query {slot}"),
-                            vector(!self.oracle_seed, id),
-                        )
-                    })
-                    .collect();
-                // A deleted row's own vector: only an index that ignores
-                // deletions would answer with that row.
-                if let Some(deleted) =
-                    (0..self.model.next_id).find(|id| !self.model.live.contains(id))
-                {
-                    queries.push((
-                        format!("deleted row {deleted}"),
-                        vector(self.oracle_seed, deleted),
-                    ));
-                }
-                for (position, (label, query)) in queries.iter().enumerate() {
-                    let mut scan = ds.scan();
-                    scan.nearest("vec", &Float32Array::from(query.to_vec()), NEIGHBORS)
-                        .map_err(unreadable)?;
-                    // Every partition: IVF_FLAT is then exact.
-                    scan.minimum_nprobes(IVF_PARTITIONS);
-                    scan.project(&["id"]).map_err(unreadable)?;
-                    if position == 0 {
-                        let plan = scan.explain_plan(true).await.map_err(unreadable)?;
-                        if !plan.contains("ANNSubIndex: name=idx_vec") {
-                            return Err(fail(
-                                "index_not_used",
-                                n,
-                                format_args!(
-                                    "a nearest neighbor query does not use idx_vec: {plan}"
-                                ),
-                            ));
-                        }
-                    }
-                    let batch = scan.try_into_batch().await.map_err(unreadable)?;
-                    self.check_neighbors(n, label, query, &int64_column(&batch, "id"))?;
-                }
-            }
-            IndexKind::Inverted => {
-                for slot in 0..4 {
-                    let token = (n as u64 * 4 + slot) % self.plan.scale.vocabulary;
-                    let term = format!("tok{token:04}");
-                    let query = FullTextSearchQuery::new(term.clone())
-                        .with_column("text".to_string())
-                        .map_err(unreadable)?
-                        .limit(None);
-                    let mut scan = ds.scan();
-                    scan.full_text_search(query).map_err(unreadable)?;
-                    scan.project(&["id"]).map_err(unreadable)?;
-                    if slot == 0 {
-                        let plan = scan.explain_plan(true).await.map_err(unreadable)?;
-                        if !plan
-                            .lines()
-                            .any(|line| line.trim_start().starts_with("MatchQuery: column=text"))
-                        {
-                            return Err(fail(
-                                "index_not_used",
-                                n,
-                                format_args!("a search for {term} does not use idx_text: {plan}"),
-                            ));
-                        }
-                    }
-                    let batch = scan.try_into_batch().await.map_err(unreadable)?;
-                    let expected: BTreeSet<i64> = self
-                        .model
-                        .live
-                        .iter()
-                        .copied()
-                        .filter(|id| tokens(*id, &self.plan.scale).any(|found| found == token))
-                        .collect();
-                    compare_ids(
-                        n,
-                        &format!("a search for {term}"),
-                        &int64_column(&batch, "id"),
-                        &expected,
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// The answer must be the brute-force nearest live rows, up to ties within
-    /// float rounding at the cut.
-    fn check_neighbors(
-        &self,
-        n: usize,
-        label: &str,
-        query: &[f32; VECTOR_DIM as usize],
-        found: &[i64],
-    ) -> Result<(), Failure> {
-        let mut ranked: Vec<(f32, i64)> = self
-            .model
-            .live
-            .iter()
-            .map(|id| (squared_l2(query, &vector(self.oracle_seed, *id)), *id))
-            .collect();
-        ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let k = NEIGHBORS.min(ranked.len());
-        let cut = ranked[k - 1].0;
-        let tolerance = cut * 1e-4 + 1e-6;
-        let required: BTreeSet<i64> = ranked
-            .iter()
-            .take_while(|(distance, _)| *distance < cut - tolerance)
-            .map(|(_, id)| *id)
-            .collect();
-        let allowed: BTreeSet<i64> = ranked
-            .iter()
-            .take_while(|(distance, _)| *distance <= cut + tolerance)
-            .map(|(_, id)| *id)
-            .collect();
-        let distinct: BTreeSet<i64> = found.iter().copied().collect();
-        if found.len() != k
-            || distinct.len() != k
-            || !required.is_subset(&distinct)
-            || !distinct.is_subset(&allowed)
-        {
-            let expected: Vec<i64> = ranked.iter().take(k).map(|(_, id)| *id).collect();
-            return Err(fail(
-                "content",
-                n,
-                format_args!(
-                    "the nearest neighbors of {label} are {found:?} where brute force finds {expected:?}"
-                ),
-            ));
-        }
-        Ok(())
-    }
-
     async fn quiet_down(&self, n: usize) -> Snapshot {
         let (snapshot, waited) = quiesce(self.baseline_tasks, &self.tmp, self.quiet).await;
         self.journal.line(format_args!(
@@ -2889,7 +3052,13 @@ impl Run {
     /// Cleans up everything but the latest version, then checks that no
     /// unreferenced file is left and the dataset still reads right.
     async fn finish(&mut self) -> Result<(), Failure> {
-        let n = self.plan.steps.len() + 1;
+        let n = self.plan.steps.len()
+            + self
+                .plan
+                .rounds
+                .as_ref()
+                .map_or(0, |rounds| rounds.rounds.len())
+            + 1;
         self.state.set_phase("final");
         self.journal.line(format_args!("step={n} final"));
         self.catch_up(n).await?;

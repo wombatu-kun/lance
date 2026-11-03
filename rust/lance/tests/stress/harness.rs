@@ -30,11 +30,17 @@ pub const ENV_STANDALONE: &str = "LANCE_STRESS_STANDALONE";
 const ENV_STALL_SECS: &str = "LANCE_STRESS_STALL_SECS";
 const ENV_DEADLINE_SECS: &str = "LANCE_STRESS_DEADLINE_SECS";
 pub const ENV_CALIBRATE: &str = "LANCE_STRESS_CALIBRATE";
+/// Workers run one operation at a time, in the order of their ranks: a failure of
+/// `concurrency` that goes away with this needs a race.
+pub const ENV_SERIAL: &str = "LANCE_STRESS_SERIAL";
 
 pub const PLAN_LOG: &str = "plan.log";
 pub const STEPS_LOG: &str = "steps.log";
 pub const CALLS_LOG: &str = "calls.log";
 pub const MEMORY_LOG: &str = "memory.log";
+/// Reads have a log of their own: the watchdog counts the growth of the step log
+/// as progress, and a busy reader must not hide a hung writer.
+pub const READS_LOG: &str = "reads.log";
 
 const POLL: Duration = Duration::from_millis(200);
 const GDB_TIMEOUT: Duration = Duration::from_secs(60);
@@ -47,6 +53,13 @@ const THRASH_PATIENCE: Duration = Duration::from_secs(10);
 /// hung. A loop that never ends meets the deadline.
 const BUSY_SHARE: f64 = 0.05;
 const DEAD_LIMIT_PLANNED: usize = 3;
+const DEAD_HOLD_PLANNED: usize = 3;
+/// A round that forces a pair counts once: 16 seeds force each pair twice, and a
+/// replay of one seed never judges a pair.
+const DEAD_PAIR_PLANNED: usize = 2;
+/// How long a commit may keep retrying: a hold point can eat the default 30 s.
+const COMMIT_RETRY_TIMEOUT_VARIABLE: &str = "LANCE_COMMIT_RETRY_TIMEOUT_SECS";
+const COMMIT_RETRY_TIMEOUT_SECS: &str = "120";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScenarioKind {
@@ -55,6 +68,7 @@ pub enum ScenarioKind {
     ProcessKill,
     MemoryLimits,
     HeapGrowth,
+    Concurrency,
 }
 
 impl ScenarioKind {
@@ -70,6 +84,7 @@ impl ScenarioKind {
             Self::ProcessKill => "process_kill",
             Self::MemoryLimits => "memory_limits",
             Self::HeapGrowth => "heap_growth",
+            Self::Concurrency => "concurrency",
         }
     }
 
@@ -80,6 +95,7 @@ impl ScenarioKind {
             Self::ProcessKill,
             Self::MemoryLimits,
             Self::HeapGrowth,
+            Self::Concurrency,
         ]
         .into_iter()
         .find(|kind| kind.name() == name)
@@ -108,10 +124,25 @@ pub enum SelfTest {
     MemoryEvents,
     /// Heap goes missing on every cycle of a repeated workload.
     HeapLeak,
+    /// An update lands as two commits, each with half of its rows.
+    TornSnapshot,
+    /// A commit restores the version the round started from.
+    LostWrite,
+    /// A reader that should see the latest version reads the first of the round.
+    StaleRead,
+    /// A reader's pinned version turns into another between two reads.
+    SnapshotChanged,
+    /// A row is appended a second time.
+    DuplicateKey,
+    /// The history of a row's lineage is not what the rows say.
+    Lineage,
+    /// A hold point waits, with no limit, for what cannot happen, while a reader
+    /// keeps reading: its reads must not count as progress.
+    GateHang,
 }
 
 impl SelfTest {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 20] = [
         Self::Hang,
         Self::Panic,
         Self::TaskLeak,
@@ -125,6 +156,13 @@ impl SelfTest {
         Self::HangUnderLimit,
         Self::MemoryEvents,
         Self::HeapLeak,
+        Self::TornSnapshot,
+        Self::LostWrite,
+        Self::StaleRead,
+        Self::SnapshotChanged,
+        Self::DuplicateKey,
+        Self::Lineage,
+        Self::GateHang,
     ];
 
     pub fn name(self) -> &'static str {
@@ -142,6 +180,13 @@ impl SelfTest {
             Self::HangUnderLimit => "hang_under_limit",
             Self::MemoryEvents => "memory_events",
             Self::HeapLeak => "heap_leak",
+            Self::TornSnapshot => "torn_snapshot",
+            Self::LostWrite => "lost_write",
+            Self::StaleRead => "stale_read",
+            Self::SnapshotChanged => "snapshot_changed",
+            Self::DuplicateKey => "duplicate_key",
+            Self::Lineage => "lineage",
+            Self::GateHang => "gate_hang",
         }
     }
 
@@ -156,6 +201,13 @@ impl SelfTest {
             }
             Self::OomRecovery | Self::HangUnderLimit => ScenarioKind::MemoryLimits,
             Self::HeapLeak => ScenarioKind::HeapGrowth,
+            Self::TornSnapshot
+            | Self::LostWrite
+            | Self::StaleRead
+            | Self::SnapshotChanged
+            | Self::DuplicateKey
+            | Self::Lineage
+            | Self::GateHang => ScenarioKind::Concurrency,
             _ => ScenarioKind::StorageFaults,
         }
     }
@@ -164,7 +216,7 @@ impl SelfTest {
     /// the seed must pass.
     fn expected_classes(self) -> &'static [&'static str] {
         match self {
-            Self::Hang | Self::HangUnderLimit => &["hang"],
+            Self::Hang | Self::HangUnderLimit | Self::GateHang => &["hang"],
             Self::Panic => &["panic"],
             Self::TaskLeak => &["task_leak"],
             Self::TmpLeak => &["tmp_leak"],
@@ -176,6 +228,12 @@ impl SelfTest {
             Self::OomRecovery => &[],
             Self::MemoryEvents => &["memory_events"],
             Self::HeapLeak => &["heap_growth"],
+            Self::TornSnapshot => &["torn_snapshot"],
+            Self::LostWrite => &["lost_write"],
+            Self::StaleRead => &["stale_read"],
+            Self::SnapshotChanged => &["snapshot_changed"],
+            Self::DuplicateKey => &["duplicate_key"],
+            Self::Lineage => &["lineage"],
         }
     }
 }
@@ -209,14 +267,28 @@ impl RunConfig {
     fn new(kind: ScenarioKind, self_test: Option<SelfTest>) -> Self {
         // Self-tests ignore the tuning variables: their timing is part of what
         // they check.
+        // A hold's wait goes into the first try of a commit, which sets the unit of
+        // Lance's backoff: 10 s there can become a silent sleep of over a minute.
+        let default_stall = match kind {
+            ScenarioKind::Concurrency => 150,
+            _ => 60,
+        };
         let (steps, quiet_secs, stall_secs) = match self_test {
             Some(_) => (3, 2, 15),
-            None => (env_u64(ENV_STEPS, 8), 20, env_u64(ENV_STALL_SECS, 60)),
+            None => (
+                env_u64(ENV_STEPS, 8),
+                20,
+                env_u64(ENV_STALL_SECS, default_stall),
+            ),
         };
         // Repeated cycles are the point of this scenario: it has a size of its own.
         let steps = match kind {
             ScenarioKind::HeapGrowth => scenario::heap_growth_steps(),
             _ => steps,
+        };
+        let default_deadline = match kind {
+            ScenarioKind::Concurrency => 300 + 120 * steps,
+            _ => 120 + 60 * steps,
         };
         assert!(
             stall_secs >= quiet_secs + 10,
@@ -251,7 +323,7 @@ impl RunConfig {
             run_dir,
             steps,
             stall: Duration::from_secs(stall_secs),
-            deadline: Duration::from_secs(env_u64(ENV_DEADLINE_SECS, 120 + 60 * steps)),
+            deadline: Duration::from_secs(env_u64(ENV_DEADLINE_SECS, default_deadline)),
             quiet_secs,
             keep,
             repeat: env_u64("LANCE_STRESS_REPEAT", 1).max(1),
@@ -312,7 +384,10 @@ pub fn run(kind: ScenarioKind) {
         }
     }
     assert!(
-        summary.failures.is_empty() && summary.dead_limits().is_empty(),
+        summary.failures.is_empty()
+            && summary.dead_limits().is_empty()
+            && summary.dead_holds().is_empty()
+            && summary.dead_pairs().is_empty(),
         "{}",
         summary.render()
     );
@@ -368,7 +443,38 @@ pub fn check_self_test(test: SelfTest) {
         }
         _ => {}
     }
-    if matches!(test, SelfTest::Hang | SelfTest::HangUnderLimit) {
+    if test == SelfTest::GateHang {
+        // The stall, not the deadline, must have ended it, with the reader going
+        // on long after the last line of the step log.
+        assert!(
+            report.detail.contains("no progress for"),
+            "the watchdog must have seen no progress, but: {}",
+            report.detail
+        );
+        let last_tick = |name: &str| {
+            fs::read_to_string(report.dir.join(name))
+                .unwrap_or_default()
+                .lines()
+                .rev()
+                .find_map(|line| field(line, "t").and_then(|tick| tick.parse::<u64>().ok()))
+                .unwrap_or(0)
+        };
+        assert!(
+            last_tick(READS_LOG) >= last_tick(STEPS_LOG) + 10_000,
+            "a reader must have kept reading during the hang, see {}",
+            report.dir.display()
+        );
+        let calls = fs::read_to_string(report.dir.join(CALLS_LOG)).unwrap_or_default();
+        assert!(
+            calls.contains("hold_before"),
+            "the hang must come from the hold point, see {}",
+            report.dir.display()
+        );
+    }
+    if matches!(
+        test,
+        SelfTest::Hang | SelfTest::HangUnderLimit | SelfTest::GateHang
+    ) {
         let threads = fs::read_to_string(report.dir.join("threads.txt")).unwrap_or_default();
         assert!(
             !threads.is_empty(),
@@ -451,7 +557,7 @@ fn replay_command(config: &RunConfig, seed: u64) -> String {
         "{ENV_PLAN}={}",
         scenario::plan_fingerprint(config.kind, seed, config.steps as usize)
     ));
-    for name in [ENV_STALL_SECS, ENV_DEADLINE_SECS, ENV_CALIBRATE] {
+    for name in [ENV_STALL_SECS, ENV_DEADLINE_SECS, ENV_CALIBRATE, ENV_SERIAL] {
         if let Ok(value) = std::env::var(name) {
             vars.push(format!("{name}={}", shell_quote(&value)));
         }
@@ -500,6 +606,16 @@ fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
     }
     if std::env::var(ENV_CALIBRATE).is_ok_and(|value| value == "1") {
         write!(standalone_vars, "{ENV_CALIBRATE}=1 ").unwrap();
+    }
+    if config.kind == ScenarioKind::Concurrency {
+        write!(
+            standalone_vars,
+            "{COMMIT_RETRY_TIMEOUT_VARIABLE}={COMMIT_RETRY_TIMEOUT_SECS} "
+        )
+        .unwrap();
+    }
+    if std::env::var(ENV_SERIAL).is_ok_and(|value| value == "1") {
+        write!(standalone_vars, "{ENV_SERIAL}=1 ").unwrap();
     }
     let standalone = format!(
         "# Or in one process, for gdb or rr, into a fresh directory, where no cgroup limit applies. After a death, go on with {ENV_GENERATION}=2 in the same directory:\n# {standalone_vars}{ENV_STANDALONE}=1 {ENV_CHILD}={} {ENV_SEED}={seed} {ENV_GENERATION}=1 {ENV_STEPS}={} {ENV_QUIET_SECS}={} {ENV_DIR}=<dir> TMPDIR=<dir>/tmp {} --exact child --nocapture\n",
@@ -635,6 +751,9 @@ fn start_child(
         command
             .env_remove("LANCE_MEM_POOL_SIZE")
             .env_remove("LANCE_BYPASS_SPILLING");
+    }
+    if config.kind == ScenarioKind::Concurrency {
+        command.env(COMMIT_RETRY_TIMEOUT_VARIABLE, COMMIT_RETRY_TIMEOUT_SECS);
     }
     match cgroup {
         Some(cgroup) => {
@@ -1013,6 +1132,8 @@ pub fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 struct Coverage {
     planned: usize,
     fired: usize,
+    /// How many of those found their gate closed: a hold point only.
+    waited: usize,
     /// `<outcome>+committed` or `<outcome>+uncommitted`, counted.
     outcomes: BTreeMap<String, usize>,
 }
@@ -1024,6 +1145,7 @@ struct Summary {
     outcomes: BTreeMap<String, usize>,
     observations: BTreeMap<String, usize>,
     coverage: BTreeMap<String, Coverage>,
+    holds: BTreeMap<String, Coverage>,
     failures: Vec<SeedReport>,
 }
 
@@ -1045,6 +1167,7 @@ impl Summary {
             outcomes: BTreeMap::new(),
             observations: BTreeMap::new(),
             coverage: BTreeMap::new(),
+            holds: BTreeMap::new(),
             failures: Vec::new(),
         }
     }
@@ -1071,6 +1194,38 @@ impl Summary {
             .collect()
     }
 
+    /// Hold points a run planned often enough and that never fired: nothing
+    /// waited there, so what the plan meant to race did not race. Per seed this
+    /// could be chance, as an operation may find nothing to do.
+    fn dead_holds(&self) -> Vec<String> {
+        self.holds
+            .iter()
+            .filter(|(_, hold)| hold.planned >= DEAD_HOLD_PLANNED && hold.fired == 0)
+            .map(|(kind, hold)| format!("{kind} planned={} fired=0", hold.planned))
+            .collect()
+    }
+
+    /// Pairs of operations a run forced often enough that never met: the first
+    /// always committed before the second landed, so the rebase it is there for
+    /// never ran. Per seed this could be chance, as an operation may find nothing
+    /// to do.
+    fn dead_pairs(&self) -> Vec<String> {
+        let count = |prefix: &str, pair: &str| {
+            self.observations
+                .get(&format!("{prefix}:{pair}"))
+                .copied()
+                .unwrap_or_default()
+        };
+        self.observations
+            .iter()
+            .filter_map(|(observation, planned)| {
+                let pair = observation.strip_prefix("pair_planned:")?;
+                (*planned >= DEAD_PAIR_PLANNED && count("pair_met", pair) == 0)
+                    .then(|| format!("{pair} planned={planned} met=0"))
+            })
+            .collect()
+    }
+
     fn add(&mut self, report: SeedReport) {
         self.runs += 1;
         let mut concluded_last = BTreeMap::new();
@@ -1088,6 +1243,12 @@ impl Summary {
                     .observations
                     .entry(observation.to_string())
                     .or_default() += 1;
+            }
+            if let Some(hold) = field(line, "hold") {
+                let coverage = self.holds.entry(hold.to_string()).or_default();
+                coverage.planned += 1;
+                coverage.fired += usize::from(field(line, "fired").is_some_and(|f| f != "0"));
+                coverage.waited += usize::from(field(line, "waited").is_some_and(|w| w != "0"));
             }
             let head = line.split(" detail=").next().unwrap_or(line);
             if !head.split(' ').any(|token| token == "verdict") {
@@ -1160,6 +1321,21 @@ impl Summary {
         }
         for limit in self.dead_limits() {
             writeln!(text, "dead limit: {limit}").unwrap();
+        }
+        writeln!(text, "holds:").unwrap();
+        for (kind, hold) in &self.holds {
+            writeln!(
+                text,
+                "  {kind} planned={} fired={} waited={}",
+                hold.planned, hold.fired, hold.waited
+            )
+            .unwrap();
+        }
+        for hold in self.dead_holds() {
+            writeln!(text, "dead hold: {hold}").unwrap();
+        }
+        for pair in self.dead_pairs() {
+            writeln!(text, "dead pair: {pair}").unwrap();
         }
         if !self.failures.is_empty() {
             writeln!(text, "failed:").unwrap();
