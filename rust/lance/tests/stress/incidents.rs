@@ -14,7 +14,7 @@ use std::future::Future;
 use std::io::Write as _;
 use std::ops::Range;
 use std::path::Path as FsPath;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -117,6 +117,30 @@ impl fmt::Display for CancelWhen {
     }
 }
 
+/// A slow call: the `nth` matching call waits `millis` before its request or,
+/// with `after`, once the request has completed and before its caller sees the
+/// response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Delay {
+    pub method: Method,
+    pub area: Area,
+    pub nth: u64,
+    pub millis: u64,
+    pub after: bool,
+}
+
+/// A call that never answers: the `nth` matching call, before its request or,
+/// with `after`, once the request has completed. The operation gives up on it
+/// `grace_ms` later, as an application whose deadline has passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HangPoint {
+    pub method: Method,
+    pub area: Area,
+    pub nth: u64,
+    pub after: bool,
+    pub grace_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Incident {
     /// The `nth` matching call fails, and with `sticky` every later one too.
@@ -156,6 +180,13 @@ pub enum Incident {
     /// The operation waits for its gate when the `nth` fragment write begins or
     /// completes.
     HoldFragment { nth: u64, at_begin: bool },
+    /// A slow store: every one of `delays` slows a call, and `hang` stops one
+    /// for good, so that the operation is given up on. It fires when the hang
+    /// does, or without one when a delay does.
+    Slow {
+        delays: Vec<Delay>,
+        hang: Option<HangPoint>,
+    },
 }
 
 impl Incident {
@@ -220,6 +251,16 @@ impl Incident {
                 "hold_fragment:{}",
                 if *at_begin { "begin" } else { "complete" }
             ),
+            // The delays only slow an operation down; a hang decides its end.
+            Self::Slow {
+                hang: Some(hang), ..
+            } => format!(
+                "slow:hang:{}:{}:{}",
+                hang.method,
+                hang.area,
+                if hang.after { "after" } else { "before" }
+            ),
+            Self::Slow { hang: None, .. } => "slow:delays".to_string(),
         }
     }
 }
@@ -233,6 +274,33 @@ impl fmt::Display for Incident {
             | Self::HoldCall { nth, .. }
             | Self::HoldFragment { nth, .. } => write!(f, "{}:n={nth}", self.kind()),
             Self::CancelStage { .. } | Self::HoldStage { .. } => f.write_str(&self.kind()),
+            Self::Slow { delays, hang } => {
+                let side = |after: bool| if after { "after" } else { "before" };
+                let mut calls: Vec<String> = delays
+                    .iter()
+                    .map(|delay| {
+                        format!(
+                            "delay:{}:{}:n={}:{}ms:{}",
+                            delay.method,
+                            delay.area,
+                            delay.nth,
+                            delay.millis,
+                            side(delay.after)
+                        )
+                    })
+                    .collect();
+                if let Some(hang) = hang {
+                    calls.push(format!(
+                        "hang:{}:{}:n={}:{}:grace={}ms",
+                        hang.method,
+                        hang.area,
+                        hang.nth,
+                        side(hang.after),
+                        hang.grace_ms
+                    ));
+                }
+                write!(f, "slow({})", calls.join(","))
+            }
         }
     }
 }
@@ -243,7 +311,16 @@ enum Action {
     FailBefore(u64),
     FailAfter(u64),
     Cancel(CancelWhen, Cancellation),
-    Hold { gate: Gate, after: bool },
+    Hold {
+        gate: Gate,
+        after: bool,
+    },
+    Delay {
+        millis: u64,
+        after: bool,
+        watch: Option<Watch>,
+    },
+    Hang(Hang),
 }
 
 impl fmt::Display for Action {
@@ -255,7 +332,100 @@ impl fmt::Display for Action {
             Self::Cancel(when, _) => write!(f, "cancel_{when}"),
             Self::Hold { after: false, .. } => f.write_str("hold_before"),
             Self::Hold { after: true, .. } => f.write_str("hold_after"),
+            Self::Delay {
+                millis,
+                after: false,
+                ..
+            } => write!(f, "delay_before#{millis}ms"),
+            Self::Delay {
+                millis,
+                after: true,
+                ..
+            } => write!(f, "delay_after#{millis}ms"),
+            Self::Hang(hang) if hang.after => f.write_str("hang_after"),
+            Self::Hang(_) => f.write_str("hang_before"),
         }
+    }
+}
+
+/// A call that never answers. It fires the cancellation once its grace has
+/// passed, which drops the operation; the call itself ends only when its future
+/// is dropped or the step lets it go, so one in a task the operation detached
+/// outlives the operation. It counts from the moment it meets the store wrapper,
+/// its own request included.
+struct Hang {
+    cancellation: Cancellation,
+    grace: Duration,
+    after: bool,
+    _live: Live,
+    released: watch::Receiver<bool>,
+}
+
+impl Hang {
+    async fn wait(mut self) {
+        tokio::time::sleep(self.grace).await;
+        self.cancellation.fire();
+        // An error only means that the step dropped its sender, which lets it go too.
+        let _ = self.released.wait_for(|released| *released).await;
+    }
+}
+
+/// How long after its operation a slow call may still end. A task the operation
+/// aborted finishes the poll it is in, so a call that ends a moment after the
+/// operation may be that last poll's rather than a task's left behind.
+const LATE_AFTER: Duration = Duration::from_millis(50);
+
+/// What the slow and hung calls of a step count themselves in, which a call in
+/// the operation's own futures leaves when the operation is dropped: only a task
+/// the operation left behind keeps a call counted once it is over.
+#[derive(Clone, Default)]
+struct Watch {
+    /// Hung reads of data and index files, which Lance's I/O scheduler runs as
+    /// tasks of their own that a dropped scan does not stop: one only holds its
+    /// connection.
+    scan_reads: Arc<AtomicU64>,
+    /// Every other slow or hung call still in flight.
+    calls: Arc<AtomicU64>,
+    /// Slow calls, but scan reads, that ended well after their operation was over.
+    late: Arc<AtomicU64>,
+    /// When the operation of the step ended.
+    ended: Arc<Mutex<Option<Instant>>>,
+}
+
+impl Watch {
+    /// Runs a slow call, counted while in flight, and as late when it ends well
+    /// after its operation.
+    async fn track<T>(&self, call: impl Future<Output = T>) -> T {
+        let _live = Live::count(&self.calls);
+        let result = call.await;
+        let ended = *self.ended.lock().unwrap();
+        if ended.is_some_and(|ended| ended.elapsed() > LATE_AFTER) {
+            self.late.fetch_add(1, Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+/// What a step's slow and hung calls left behind once its operation was over.
+pub struct LeftBehind {
+    pub scan_reads: u64,
+    pub calls: u64,
+    pub late: u64,
+}
+
+/// One slow or hung call, counted while its future lives.
+struct Live(Arc<AtomicU64>);
+
+impl Live {
+    fn count(live: &Arc<AtomicU64>) -> Self {
+        live.fetch_add(1, Ordering::SeqCst);
+        Self(live.clone())
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -439,6 +609,13 @@ struct Armed {
     fired: u64,
     /// A `blind` incident has fired: reads of manifests fail.
     blinded: bool,
+    /// For `Slow`: the matching calls that each delay and the hang have seen.
+    delays_matched: Vec<u64>,
+    hang_matched: u64,
+    watch: Watch,
+    /// What a hang waits for: not the step's release, which comes as soon as the
+    /// operation ends.
+    hang_released: watch::Receiver<bool>,
 }
 
 impl Armed {
@@ -505,6 +682,54 @@ impl Armed {
                     _ => Action::Proceed,
                 };
                 (action, Some(self.matched))
+            }
+            // Every target counts every call it matches, so that two of them on
+            // the same kind of call agree on its number. A hung call is not slow.
+            Incident::Slow {
+                ref delays,
+                hang: hang_point,
+            } => {
+                let mut action = Action::Proceed;
+                let mut matched = None;
+                if let Some(point) = hang_point
+                    && point.method == method
+                    && point.area == area
+                {
+                    self.hang_matched += 1;
+                    matched = Some(self.hang_matched);
+                    if self.hang_matched == point.nth {
+                        self.fired += 1;
+                        action = Action::Hang(Hang {
+                            cancellation: self.cancellation.clone(),
+                            grace: Duration::from_millis(point.grace_ms),
+                            after: point.after,
+                            _live: Live::count(match scan_read(method, area) {
+                                true => &self.watch.scan_reads,
+                                false => &self.watch.calls,
+                            }),
+                            released: self.hang_released.clone(),
+                        });
+                    }
+                }
+                for (delay, seen) in delays.iter().zip(self.delays_matched.iter_mut()) {
+                    if delay.method == method && delay.area == area {
+                        *seen += 1;
+                        matched = Some(*seen);
+                        if *seen == delay.nth && matches!(action, Action::Proceed) {
+                            // With a hang planned, it alone counts: the delays only
+                            // slow the way to it.
+                            if hang_point.is_none() {
+                                self.fired += 1;
+                            }
+                            action = Action::Delay {
+                                millis: delay.millis,
+                                after: delay.after,
+                                watch: (!scan_read(method, area)).then(|| self.watch.clone()),
+                            };
+                        }
+                    }
+                }
+                (action, matched)
             }
             _ => (Action::Proceed, None),
         }
@@ -576,6 +801,14 @@ pub struct IncidentState {
     phase: Mutex<String>,
     armed: Mutex<Option<Armed>>,
     release: Mutex<Option<watch::Sender<bool>>>,
+    /// What the slow and hung calls count themselves in, and what lets the hung
+    /// ones go: only the step, once it has counted them, since a disarm comes as
+    /// soon as the operation ends.
+    watch: Watch,
+    hang_release: Mutex<Option<watch::Sender<bool>>>,
+    /// Writes that reached the store since `count_writes`.
+    writes: AtomicU64,
+    counting_writes: AtomicBool,
     /// The logical clock of a round, and when it last saw this state's manifest
     /// land. A `concurrency` round compares these between its operations.
     clock: Arc<AtomicU64>,
@@ -609,6 +842,10 @@ impl IncidentState {
             phase: Mutex::new("setup".to_string()),
             armed: Mutex::new(None),
             release: Mutex::new(None),
+            watch: Watch::default(),
+            hang_release: Mutex::new(None),
+            writes: AtomicU64::new(0),
+            counting_writes: AtomicBool::new(false),
             clock: Arc::new(AtomicU64::new(0)),
             last_commit: AtomicU64::new(0),
             lost_races: AtomicU64::new(0),
@@ -626,6 +863,10 @@ impl IncidentState {
             phase: Mutex::new(self.phase()),
             armed: Mutex::new(None),
             release: Mutex::new(None),
+            watch: Watch::default(),
+            hang_release: Mutex::new(None),
+            writes: AtomicU64::new(0),
+            counting_writes: AtomicBool::new(false),
             clock,
             last_commit: AtomicU64::new(0),
             lost_races: AtomicU64::new(0),
@@ -675,6 +916,14 @@ impl IncidentState {
         let cancel = Arc::new(Notify::new());
         let (release, released) = watch::channel(false);
         *self.release.lock().unwrap() = Some(release);
+        let (hang_release, hang_released) = watch::channel(false);
+        if matches!(incident, Some(Incident::Slow { hang: Some(_), .. })) {
+            *self.hang_release.lock().unwrap() = Some(hang_release);
+        }
+        let delays = match &incident {
+            Some(Incident::Slow { delays, .. }) => delays.len(),
+            _ => 0,
+        };
         *self.armed.lock().unwrap() = incident.map(|incident| Armed {
             incident,
             cancellation: Cancellation {
@@ -686,8 +935,74 @@ impl IncidentState {
             matched: 0,
             fired: 0,
             blinded: false,
+            delays_matched: vec![0; delays],
+            hang_matched: 0,
+            watch: self.watch.clone(),
+            hang_released,
         });
         cancel
+    }
+
+    /// Marks the operation of a step begun: none of its calls is late yet.
+    pub fn begin_operation(&self) {
+        *self.watch.ended.lock().unwrap() = None;
+        self.watch.late.store(0, Ordering::SeqCst);
+    }
+
+    /// Marks the operation over: a slow call that ends well after this was left
+    /// behind by it.
+    pub fn end_operation(&self) {
+        *self.watch.ended.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// The slow and hung calls still in flight but scan reads.
+    pub fn calls_in_flight(&self) -> u64 {
+        self.watch.calls.load(Ordering::SeqCst)
+    }
+
+    /// The hung scan reads still in flight.
+    pub fn scan_reads_in_flight(&self) -> u64 {
+        self.watch.scan_reads.load(Ordering::SeqCst)
+    }
+
+    /// Counts the writes that reach the store from now on, whatever is armed.
+    pub fn count_writes(&self) {
+        self.writes.store(0, Ordering::SeqCst);
+        self.counting_writes.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops counting writes, and tells how many came while it counted. A write
+    /// that raced the stop is left over in the count, so a step that never
+    /// counted gets none of it.
+    pub fn writes_counted(&self) -> u64 {
+        let counting = self.counting_writes.swap(false, Ordering::SeqCst);
+        let writes = self.writes.swap(0, Ordering::SeqCst);
+        if counting { writes } else { 0 }
+    }
+
+    /// What the operation left behind. A task it aborted drops its calls a
+    /// moment after the abort, so this waits up to `limit` for them.
+    pub async fn settle_left_behind(&self, limit: Duration) -> LeftBehind {
+        let started = Instant::now();
+        loop {
+            let scan_reads = self.watch.scan_reads.load(Ordering::SeqCst);
+            let calls = self.watch.calls.load(Ordering::SeqCst);
+            if (scan_reads == 0 && calls == 0) || started.elapsed() >= limit {
+                return LeftBehind {
+                    scan_reads,
+                    calls,
+                    late: self.watch.late.swap(0, Ordering::SeqCst),
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Lets every hung call end, with an error.
+    pub fn release_hung_calls(&self) {
+        if let Some(release) = self.hang_release.lock().unwrap().take() {
+            release.send_replace(true);
+        }
     }
 
     /// Arms a hold point: the operation waits at it until `gate` lets it go.
@@ -747,6 +1062,9 @@ impl IncidentState {
 
     fn on_call(&self, method: Method, location: &Path) -> Action {
         let area = self.area(location);
+        if writes(method) && self.counting_writes.load(Ordering::SeqCst) {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+        }
         let (action, matched) = match self.armed.lock().unwrap().as_mut() {
             Some(armed) => armed.on_call(method, area),
             None => (Action::Proceed, None),
@@ -809,6 +1127,20 @@ impl IncidentState {
             None => Ok(()),
         }
     }
+}
+
+/// A read of a data or index file: the only call Lance leaves behind by design,
+/// as its I/O scheduler runs each one as a task of its own.
+fn scan_read(method: Method, area: Area) -> bool {
+    method == Method::Get && matches!(area, Area::Data | Area::Indices)
+}
+
+/// A call that changes what the store holds.
+fn writes(method: Method) -> bool {
+    matches!(
+        method,
+        Method::Put | Method::PutMultipart | Method::Delete | Method::Copy | Method::Rename
+    )
 }
 
 fn released_error() -> lance_core::Error {
@@ -930,6 +1262,34 @@ async fn apply<T>(
             gate.pass().await;
             result
         }
+        Action::Delay {
+            millis,
+            after,
+            watch,
+        } => {
+            let slowed = async move {
+                let pause = Duration::from_millis(millis);
+                if after {
+                    let result = call.await;
+                    tokio::time::sleep(pause).await;
+                    result
+                } else {
+                    tokio::time::sleep(pause).await;
+                    call.await
+                }
+            };
+            match watch {
+                Some(watch) => watch.track(slowed).await,
+                None => slowed.await,
+            }
+        }
+        Action::Hang(hang) => {
+            if hang.after {
+                drop(call.await);
+            }
+            hang.wait().await;
+            Err(injected(0, method, location, "after a hang was let go"))
+        }
     }
 }
 
@@ -1040,6 +1400,24 @@ impl ObjectStore for StressStore {
                             Ok(location)
                         }
                         Action::Proceed | Action::Hold { .. } => Ok(location),
+                        // The plan slows or hangs a deletion only before its request.
+                        Action::Delay { millis, watch, .. } => {
+                            let pause = tokio::time::sleep(Duration::from_millis(millis));
+                            match watch {
+                                Some(watch) => watch.track(pause).await,
+                                None => pause.await,
+                            }
+                            Ok(location)
+                        }
+                        Action::Hang(hang) => {
+                            hang.wait().await;
+                            Err(injected(
+                                0,
+                                Method::Delete,
+                                &location,
+                                "after a hang was let go",
+                            ))
+                        }
                     }
                 }
             })
@@ -1104,6 +1482,49 @@ impl ObjectStore for StressStore {
                 self.inner.list(prefix).chain(end).boxed()
             }
             Action::Proceed => self.inner.list(prefix),
+            Action::Delay {
+                millis,
+                after,
+                watch,
+            } => {
+                let pause = async move {
+                    let pause = tokio::time::sleep(Duration::from_millis(millis));
+                    match watch {
+                        Some(watch) => watch.track(pause).await,
+                        None => pause.await,
+                    }
+                };
+                if after {
+                    let end = futures::stream::once(pause).filter_map(|()| future::ready(None));
+                    self.inner.list(prefix).chain(end).boxed()
+                } else {
+                    let inner = self.inner.clone();
+                    let prefix = prefix.cloned();
+                    futures::stream::once(async move {
+                        pause.await;
+                        inner.list(prefix.as_ref())
+                    })
+                    .flatten()
+                    .boxed()
+                }
+            }
+            Action::Hang(hang) => {
+                let after = hang.after;
+                let hung = futures::stream::once(async move {
+                    hang.wait().await;
+                    Err(injected(
+                        0,
+                        Method::List,
+                        &location,
+                        "after a hang was let go",
+                    ))
+                });
+                if after {
+                    self.inner.list(prefix).chain(hung).boxed()
+                } else {
+                    hung.boxed()
+                }
+            }
         }
     }
 

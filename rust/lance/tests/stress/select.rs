@@ -16,7 +16,7 @@ const OP_PREFIX: &str = "op:";
 
 /// Kinds of trouble and the scenarios that make them. A scenario may make more
 /// than one.
-const KINDS: [(&str, &[ScenarioKind]); 5] = [
+const KINDS: [(&str, &[ScenarioKind]); 6] = [
     ("faults", &[ScenarioKind::StorageFaults]),
     ("cancel", &[ScenarioKind::Cancellation]),
     ("kill", &[ScenarioKind::ProcessKill]),
@@ -25,6 +25,7 @@ const KINDS: [(&str, &[ScenarioKind]); 5] = [
         &[ScenarioKind::MemoryLimits, ScenarioKind::HeapGrowth],
     ),
     ("concurrency", &[ScenarioKind::Concurrency]),
+    ("latency", &[ScenarioKind::SlowStorage]),
 ];
 
 /// What a run takes. The default takes every scenario as it is.
@@ -186,6 +187,7 @@ fn selection_reads_kinds_scenarios_and_operations() {
                 "process_kill",
                 "memory_limits",
                 "concurrency",
+                "slow_storage",
             ],
         };
         assert_eq!(running, expected, "{value}");

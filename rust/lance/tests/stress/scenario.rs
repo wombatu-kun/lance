@@ -37,7 +37,7 @@ use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery, ScalarIndexPara
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use object_store::path::Path as ObjectPath;
-use object_store::{PutOptions, PutPayload};
+use object_store::{GetOptions, PutOptions, PutPayload};
 use roaring::RoaringBitmap;
 use tokio::sync::Notify;
 
@@ -47,8 +47,8 @@ use crate::harness::{
     READS_LOG, STEPS_LOG, ScenarioKind, SelfTest, field,
 };
 use crate::incidents::{
-    Area, CRASH_FIRED, CancelWhen, Death, Incident, IncidentState, Method, StressHooks,
-    StressWrapper, kill_this_process,
+    Area, CRASH_FIRED, CancelWhen, Death, Delay, HangPoint, Incident, IncidentState, Method,
+    StressHooks, StressWrapper, kill_this_process,
 };
 use crate::leaks::{
     Snapshot, TmpWatch, files_below, heap_peak_bytes, live_heap_bytes, quiesce, start_heap_peak,
@@ -565,13 +565,15 @@ impl Op {
 /// them: what its plans draw, and in `concurrency` what its forced pairs run.
 pub fn focusable_ops(kind: ScenarioKind) -> Vec<&'static str> {
     match kind {
-        ScenarioKind::StorageFaults | ScenarioKind::Cancellation => vec![
-            "append",
-            "delete",
-            "create_index",
-            "optimize_indices",
-            "cleanup",
-        ],
+        ScenarioKind::StorageFaults | ScenarioKind::Cancellation | ScenarioKind::SlowStorage => {
+            vec![
+                "append",
+                "delete",
+                "create_index",
+                "optimize_indices",
+                "cleanup",
+            ]
+        }
         ScenarioKind::ProcessKill => vec![
             "append",
             "delete",
@@ -900,6 +902,8 @@ impl Plan {
             ScenarioKind::ProcessKill if rng.chance(0.5) => StoreChoice::Local,
             ScenarioKind::ProcessKill => StoreChoice::FileObjectStore,
             ScenarioKind::MemoryLimits | ScenarioKind::HeapGrowth => StoreChoice::Local,
+            ScenarioKind::SlowStorage if rng.chance(0.5) => StoreChoice::SharedMemory,
+            ScenarioKind::SlowStorage => StoreChoice::FileObjectStore,
             ScenarioKind::Concurrency => match rng.range(0..=2) {
                 0 => StoreChoice::Local,
                 1 => StoreChoice::FileObjectStore,
@@ -959,7 +963,8 @@ impl Plan {
                     Op::CreateIndex(IndexKind::BTreeId)
                 }
                 // An optimization of the focus needs work: an index, and fragments
-                // it does not cover. Other steps go on as they would.
+                // it does not cover. Other steps go on as they would, short of
+                // taking that work away from the next step of the focus.
                 None if focus.contains("optimize_indices")
                     && index % 2 == 0
                     && !model.unindexed =>
@@ -972,7 +977,24 @@ impl Plan {
                         },
                     }
                 }
-                None => random_op(&mut rng, kind, &scale, &model),
+                None => {
+                    let op = random_op(&mut rng, kind, &scale, &model);
+                    let takes_the_work = focus.contains("optimize_indices")
+                        && index % 2 == 0
+                        && model.unindexed
+                        && {
+                            let mut after = model.clone();
+                            after.apply(&op);
+                            !after.unindexed
+                        };
+                    match takes_the_work {
+                        true => Op::Append {
+                            first_id: model.next_id,
+                            rows: added_rows(&mut rng, &scale),
+                        },
+                        false => op,
+                    }
+                }
             };
             model.apply(&op);
             let incident = random_incident(&mut rng, kind, store, &scale, &op);
@@ -1202,6 +1224,90 @@ fn cancel_call(method: Method, area: Area, nth: u64, when: CancelWhen) -> Incide
     }
 }
 
+/// How long a step waits for the hung calls of a task its operation aborted.
+const HUNG_SETTLE: Duration = Duration::from_secs(2);
+
+/// How long `slow_storage` slows a call: from a busy store to a struggling one.
+const DELAYS_MS: [u64; 6] = [10, 30, 100, 300, 1000, 3000];
+
+/// The calls each operation of `storage_faults` and `slow_storage` makes:
+/// (method, area, the highest call to target).
+fn storage_calls(op: &Op, scale: &Scale) -> Vec<(Method, Area, u64)> {
+    match *op {
+        Op::Append { rows, .. } => vec![
+            // One data file per fragment.
+            (
+                Method::Put,
+                Area::Data,
+                (rows as u64).div_ceil(scale.rows_per_file as u64),
+            ),
+            (Method::Put, Area::Transactions, 1),
+            (Method::Put, Area::Manifests, 1),
+            (Method::List, Area::Manifests, 1),
+        ],
+        Op::Delete { .. } => vec![
+            (Method::Get, Area::Data, 3),
+            (Method::Put, Area::Deletions, 1),
+            (Method::Put, Area::Transactions, 1),
+            (Method::Put, Area::Manifests, 1),
+            (Method::List, Area::Manifests, 1),
+        ],
+        Op::CreateIndex(_) => vec![
+            (Method::Get, Area::Data, 3),
+            (Method::Put, Area::Indices, 2),
+            (Method::Put, Area::Transactions, 1),
+            (Method::Put, Area::Manifests, 1),
+            (Method::List, Area::Manifests, 1),
+        ],
+        // It reads the segments it merges with.
+        Op::OptimizeIndices => vec![
+            (Method::Get, Area::Data, 3),
+            (Method::Get, Area::Indices, 2),
+            (Method::Put, Area::Indices, 2),
+            (Method::Put, Area::Transactions, 1),
+            (Method::Put, Area::Manifests, 1),
+            (Method::List, Area::Manifests, 1),
+        ],
+        // It lists the manifests for its policy, for itself and with the
+        // rest of the dataset, reads what it keeps, and goes on past a
+        // failed deletion.
+        Op::Cleanup { .. } => vec![
+            (Method::List, Area::Manifests, 3),
+            (Method::Get, Area::Manifests, 2),
+            (Method::List, Area::Data, 1),
+            (Method::List, Area::Indices, 1),
+            (Method::Delete, Area::Data, 1),
+            (Method::Delete, Area::Deletions, 1),
+            (Method::Delete, Area::Indices, 1),
+            (Method::Delete, Area::Transactions, 2),
+            (Method::Delete, Area::Manifests, 2),
+        ],
+        Op::MergeInsert { .. } | Op::Compact | Op::Scan => {
+            unreachable!("{op} is not part of this scenario")
+        }
+    }
+}
+
+/// The calls `slow_storage` slows: those of `storage_faults`, as `store` makes
+/// them. A store that lists in order finds the latest version by listing; another
+/// one through the hint and the manifests it names, and a commit rewrites the
+/// hint there (`uses_version_hint`). A cleanup lists on both.
+fn slow_calls(op: &Op, scale: &Scale, store: StoreChoice) -> Vec<(Method, Area, u64)> {
+    let mut calls = storage_calls(op, scale);
+    if store == StoreChoice::FileObjectStore && !matches!(op, Op::Cleanup { .. }) {
+        let commits = calls
+            .iter()
+            .any(|&(method, area, _)| method == Method::Put && area == Area::Manifests);
+        calls.retain(|&(method, area, _)| (method, area) != (Method::List, Area::Manifests));
+        calls.push((Method::Get, Area::VersionHint, 1));
+        calls.push((Method::Head, Area::Manifests, 2));
+        if commits {
+            calls.push((Method::Put, Area::VersionHint, 1));
+        }
+    }
+    calls
+}
+
 fn random_incident(
     rng: &mut PlanRng,
     kind: ScenarioKind,
@@ -1215,60 +1321,7 @@ fn random_incident(
             if !rng.chance(0.75) {
                 return None;
             }
-            // (method, area, the highest call to fail): calls each operation makes.
-            let targets: &[(Method, Area, u64)] = match *op {
-                Op::Append { rows, .. } => &[
-                    // One data file per fragment.
-                    (
-                        Method::Put,
-                        Area::Data,
-                        (rows as u64).div_ceil(scale.rows_per_file as u64),
-                    ),
-                    (Method::Put, Area::Transactions, 1),
-                    (Method::Put, Area::Manifests, 1),
-                    (Method::List, Area::Manifests, 1),
-                ],
-                Op::Delete { .. } => &[
-                    (Method::Get, Area::Data, 3),
-                    (Method::Put, Area::Deletions, 1),
-                    (Method::Put, Area::Transactions, 1),
-                    (Method::Put, Area::Manifests, 1),
-                    (Method::List, Area::Manifests, 1),
-                ],
-                Op::CreateIndex(_) => &[
-                    (Method::Get, Area::Data, 3),
-                    (Method::Put, Area::Indices, 2),
-                    (Method::Put, Area::Transactions, 1),
-                    (Method::Put, Area::Manifests, 1),
-                    (Method::List, Area::Manifests, 1),
-                ],
-                // It reads the segments it merges with.
-                Op::OptimizeIndices => &[
-                    (Method::Get, Area::Data, 3),
-                    (Method::Get, Area::Indices, 2),
-                    (Method::Put, Area::Indices, 2),
-                    (Method::Put, Area::Transactions, 1),
-                    (Method::Put, Area::Manifests, 1),
-                    (Method::List, Area::Manifests, 1),
-                ],
-                // It lists the manifests for its policy, for itself and with the
-                // rest of the dataset, reads what it keeps, and goes on past a
-                // failed deletion.
-                Op::Cleanup { .. } => &[
-                    (Method::List, Area::Manifests, 3),
-                    (Method::Get, Area::Manifests, 2),
-                    (Method::List, Area::Data, 1),
-                    (Method::List, Area::Indices, 1),
-                    (Method::Delete, Area::Data, 1),
-                    (Method::Delete, Area::Deletions, 1),
-                    (Method::Delete, Area::Indices, 1),
-                    (Method::Delete, Area::Transactions, 2),
-                    (Method::Delete, Area::Manifests, 2),
-                ],
-                Op::MergeInsert { .. } | Op::Compact | Op::Scan => {
-                    unreachable!("{op} is not part of this scenario")
-                }
-            };
+            let targets = storage_calls(op, scale);
             let (method, area, max_nth) = targets[rng.range(0..=targets.len() as u64 - 1) as usize];
             let nth = rng.range(1..=max_nth);
             let after_call = method == Method::Put && rng.chance(0.5);
@@ -1283,6 +1336,45 @@ fn random_incident(
                 sticky,
                 blind,
             })
+        }
+        ScenarioKind::SlowStorage => {
+            if !rng.chance(0.8) {
+                return None;
+            }
+            let targets = slow_calls(op, scale, store);
+            let mut delays: Vec<Delay> = Vec::new();
+            for _ in 0..rng.range(1..=3) {
+                let (method, area, max_nth) = *pick_from(rng, &targets);
+                let nth = rng.range(1..=max_nth);
+                let millis = *pick_from(rng, &DELAYS_MS);
+                // The store wrapper slows a listing or a deletion only before
+                // its request.
+                let after = !matches!(method, Method::List | Method::Delete) && rng.chance(0.5);
+                if !delays
+                    .iter()
+                    .any(|delay| (delay.method, delay.area, delay.nth) == (method, area, nth))
+                {
+                    delays.push(Delay {
+                        method,
+                        area,
+                        nth,
+                        millis,
+                        after,
+                    });
+                }
+            }
+            let hang = rng.chance(0.35).then(|| {
+                let (method, area, max_nth) = *pick_from(rng, &targets);
+                HangPoint {
+                    method,
+                    area,
+                    nth: rng.range(1..=max_nth),
+                    // Only a write can land and then never answer.
+                    after: method == Method::Put && rng.chance(0.5),
+                    grace_ms: rng.range(20..=500),
+                }
+            });
+            Some(Incident::Slow { delays, hang })
         }
         ScenarioKind::Cancellation | ScenarioKind::ProcessKill => {
             if !rng.chance(0.85) {
@@ -2091,6 +2183,17 @@ fn is_resources_exhausted(message: &str) -> bool {
     message.contains("Resources exhausted")
 }
 
+/// Whether an error says that a commit lost to another one.
+fn is_commit_conflict(message: &str) -> bool {
+    [
+        "Commit conflict for version",
+        "Retryable commit conflict for version",
+        "Incompatible transaction",
+    ]
+    .iter()
+    .any(|conflict| message.contains(conflict))
+}
+
 /// A defect of Lance, not a pool too small for the work. The scan of the fragments
 /// an index does not cover reaches the sort of an indexed merge insert through a
 /// `RepartitionExec`, which counts as a spilling consumer of the fair pool. The sort
@@ -2703,12 +2806,15 @@ impl Run {
                 in_flight.then(|| Duration::from_micros(step.in_flight_us)),
             )
         });
+        // Before `arm`: a call the step slows must never see the end of the step before.
+        self.state.begin_operation();
         let cancel = self.state.arm(step.incident.clone(), death);
         if n == 2 && self.generation == 1 {
             self.die_if_a_self_test_says_so().await?;
         }
         let heap_start = start_heap_peak();
         let outcome = self.execute(step.op, step.limit, Some(cancel)).await;
+        self.state.end_operation();
         let heap_growth_kib = (heap_peak_bytes() - heap_start) >> 10;
         let mut fired = self.state.disarm();
         // Lifted before the line that says the operation ended: a death before
@@ -2760,8 +2866,47 @@ impl Run {
         let shape = step.op.shape();
         let handle = self.ds.version().version;
         let ran_stale = self.handle_stale;
+        // Dropping the operation dropped every slow or hung call it awaited
+        // itself: one still in flight, or one that ended well after the operation
+        // was over, sits in a task the operation left behind, and a write there could
+        // land after the caller gave up. Only a scan read may: Lance's I/O
+        // scheduler runs each one as a task of its own, which holds its connection
+        // until the store's own timeout.
+        let left = self.state.settle_left_behind(HUNG_SETTLE).await;
+        // Lance retries a read once it is let go, and a task that waited for it
+        // goes on: from then on nothing of the operation may write. A hung read
+        // kept the wait above going for the whole of `HUNG_SETTLE`, so the last
+        // poll of a task the operation aborted is over by now.
+        if left.scan_reads > 0 {
+            self.state.count_writes();
+        }
+        self.state.release_hung_calls();
+        if left.calls + left.late > 0 {
+            return Err(fail(
+                "hung_call",
+                n,
+                format_args!(
+                    "of the calls the step slowed or hung, {} still wait and {} ended after {} was over, in tasks it left behind",
+                    left.calls, left.late, step.op
+                ),
+            ));
+        }
+        if left.scan_reads > 0 {
+            self.observe(n, "hung_read_left_behind");
+        }
         self.let_go_of_the_session(n, Some(&step.op)).await?;
         self.quiet_down(n).await;
+        let writes = self.state.writes_counted();
+        if writes > 0 {
+            return Err(fail(
+                "hung_call",
+                n,
+                format_args!(
+                    "{writes} writes reached the store after the hung reads of {} were let go, from a task it left behind",
+                    step.op
+                ),
+            ));
+        }
         if let (Op::Cleanup { .. }, Outcome::Cancelled) = (step.op, &outcome) {
             self.settle_files().await;
         }
@@ -2812,6 +2957,7 @@ impl Run {
                     ScenarioKind::ProcessKill => "kill_missed",
                     ScenarioKind::MemoryLimits | ScenarioKind::HeapGrowth => "limit_absorbed",
                     ScenarioKind::Concurrency => "hold_absorbed",
+                    ScenarioKind::SlowStorage => "delay_absorbed",
                 },
             );
         }
@@ -2872,12 +3018,21 @@ impl Run {
                 }
                 // Neither promises an error: both only change how the work is done.
                 Some(Limit::FtsMemory { .. } | Limit::IoBuffer { .. }) => false,
-                // A death injects no error.
-                None => fired > 0 && self.kind != ScenarioKind::ProcessKill,
+                // A death injects no error, and a slow or hung call none either.
+                None => {
+                    fired > 0
+                        && !matches!(
+                            self.kind,
+                            ScenarioKind::ProcessKill | ScenarioKind::SlowStorage
+                        )
+                }
             };
             if !explained {
-                // A stale handle may legitimately lose a conflict.
-                if !ran_stale {
+                // A stale handle may legitimately lose a conflict. A slow store
+                // injects no error at all, so there it may lose nothing else.
+                let excused = ran_stale
+                    && (self.kind != ScenarioKind::SlowStorage || is_commit_conflict(message));
+                if !excused {
                     return Err(fail(
                         "error_without_fault",
                         n,
@@ -3118,7 +3273,7 @@ impl Run {
     async fn let_go_of_the_session(&mut self, n: usize, op: Option<&Op>) -> Result<(), Failure> {
         if matches!(
             self.kind,
-            ScenarioKind::StorageFaults | ScenarioKind::Cancellation
+            ScenarioKind::StorageFaults | ScenarioKind::Cancellation | ScenarioKind::SlowStorage
         ) && !matches!(op, Some(Op::OptimizeIndices))
         {
             return Ok(());
@@ -3346,6 +3501,107 @@ impl Run {
             }
             SelfTest::TmpLeak => {
                 fs::write(self.tmp.join("self-test-leak"), b"leak").expect("leak a file");
+            }
+            // A write in a task that nothing drops meets a call that never answers.
+            SelfTest::HungCall => {
+                // What the step itself left behind goes first, so that the wait
+                // below can only end on this write.
+                self.state.release_hung_calls();
+                let _ = self.state.settle_left_behind(HUNG_SETTLE).await;
+                let path = self.ds.data_dir().join("self-test-hung.lance");
+                let store = self
+                    .ds
+                    .object_store(None)
+                    .await
+                    .expect("the store of the dataset");
+                self.state.arm(
+                    Some(Incident::Slow {
+                        delays: Vec::new(),
+                        hang: Some(HangPoint {
+                            method: Method::Put,
+                            area: Area::Data,
+                            nth: 1,
+                            after: false,
+                            grace_ms: 0,
+                        }),
+                    }),
+                    None,
+                );
+                tokio::spawn(async move {
+                    let _ = store.put(&path, b"stress").await;
+                });
+                while self.state.calls_in_flight() == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                self.state.disarm();
+            }
+            // A slow read in a task that nothing drops ends after the operation.
+            // Arming again leaves the end of the step's operation in place.
+            SelfTest::LateCall => {
+                self.state.release_hung_calls();
+                let _ = self.state.settle_left_behind(HUNG_SETTLE).await;
+                let manifest = self.ds.manifest_location().path.clone();
+                let store = self
+                    .ds
+                    .object_store(None)
+                    .await
+                    .expect("the store of the dataset");
+                self.state.arm(
+                    Some(Incident::Slow {
+                        delays: vec![Delay {
+                            method: Method::Get,
+                            area: Area::Manifests,
+                            nth: 1,
+                            millis: 300,
+                            after: false,
+                        }],
+                        hang: None,
+                    }),
+                    None,
+                );
+                let slow_read = tokio::spawn(async move {
+                    let _ = store.inner.get_opts(&manifest, GetOptions::default()).await;
+                });
+                // On a busy host the read may be over before this looks.
+                while self.state.calls_in_flight() == 0 && !slow_read.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                self.state.disarm();
+            }
+            // A task that nothing drops waits for a hung read of a data file, and
+            // writes once the read is let go.
+            SelfTest::WriteAfterRelease => {
+                self.state.release_hung_calls();
+                let _ = self.state.settle_left_behind(HUNG_SETTLE).await;
+                let read = self.ds.data_dir().join("self-test-read.lance");
+                let written = self.ds.data_dir().join("self-test-written.lance");
+                let store = self
+                    .ds
+                    .object_store(None)
+                    .await
+                    .expect("the store of the dataset");
+                self.state.arm(
+                    Some(Incident::Slow {
+                        delays: Vec::new(),
+                        hang: Some(HangPoint {
+                            method: Method::Get,
+                            area: Area::Data,
+                            nth: 1,
+                            after: false,
+                            grace_ms: 0,
+                        }),
+                    }),
+                    None,
+                );
+                tokio::spawn(async move {
+                    // The read ends with an error once it is let go.
+                    let _ = store.inner.get_opts(&read, GetOptions::default()).await;
+                    let _ = store.put(&written, b"stress").await;
+                });
+                while self.state.scan_reads_in_flight() == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                self.state.disarm();
             }
             SelfTest::ModelMismatch => {
                 self.model.live.pop_first();
@@ -3672,7 +3928,11 @@ impl Run {
             };
             self.check_expired_gone(n, boundary, may_stay).await?;
             // An expired manifest it failed to read leaves its files unverified.
-            swept = output.failed_deletes == 0 && (incident.is_none() || fired == 0);
+            // A slow call leaves no manifest unread, only a failed one does.
+            swept = output.failed_deletes == 0
+                && (incident.is_none()
+                    || fired == 0
+                    || matches!(incident, Some(Incident::Slow { .. })));
         }
         // A process that died during the cleanup took what it knew with it.
         if let Some(files) = self.cleanup_files.take() {
@@ -4090,6 +4350,7 @@ fn selection_focusable_operations_are_the_ones_plans_draw() {
         ScenarioKind::Cancellation,
         ScenarioKind::ProcessKill,
         ScenarioKind::MemoryLimits,
+        ScenarioKind::SlowStorage,
     ] {
         let mut drawn = BTreeSet::new();
         for seed in 1..=48 {
@@ -4161,6 +4422,57 @@ fn selection_focus_on_storage_faults() {
 #[test]
 fn selection_focus_on_cancellation() {
     check_focus(ScenarioKind::Cancellation, 16);
+}
+
+#[test]
+fn selection_focus_on_slow_storage() {
+    check_focus(ScenarioKind::SlowStorage, 16);
+}
+
+/// A slow step targets calls its operation makes, and slows or hangs a listing or a
+/// deletion only before its request, the only way the store wrapper can.
+#[test]
+fn selection_slow_storage_plans_what_the_store_wrapper_can_do() {
+    let everything = BTreeSet::new();
+    let (mut delays, mut hangs) = (0, 0);
+    for seed in 1..=48 {
+        let plan = Plan::generate(ScenarioKind::SlowStorage, seed, 8, true, &everything);
+        for step in &plan.steps {
+            let Some(Incident::Slow { delays: slow, hang }) = &step.incident else {
+                continue;
+            };
+            let calls = slow_calls(&step.op, &plan.scale, plan.store);
+            let made = |method: Method, area: Area, nth: u64| {
+                calls
+                    .iter()
+                    .any(|&(m, a, highest)| m == method && a == area && nth <= highest)
+            };
+            assert!((1..=3).contains(&slow.len()), "seed {seed}: {slow:?}");
+            for delay in slow {
+                assert!(
+                    made(delay.method, delay.area, delay.nth),
+                    "seed {seed}: {delay:?}"
+                );
+                assert!(
+                    !delay.after || !matches!(delay.method, Method::List | Method::Delete),
+                    "seed {seed}: {delay:?}"
+                );
+            }
+            if let Some(hang) = hang {
+                assert!(
+                    made(hang.method, hang.area, hang.nth),
+                    "seed {seed}: {hang:?}"
+                );
+                assert!(
+                    !hang.after || hang.method == Method::Put,
+                    "seed {seed}: {hang:?}"
+                );
+                hangs += 1;
+            }
+            delays += slow.len();
+        }
+    }
+    assert!(delays > 0 && hangs > 0, "{delays} delays and {hangs} hangs");
 }
 
 #[test]

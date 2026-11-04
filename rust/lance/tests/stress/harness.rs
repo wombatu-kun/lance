@@ -70,16 +70,18 @@ pub enum ScenarioKind {
     MemoryLimits,
     HeapGrowth,
     Concurrency,
+    SlowStorage,
 }
 
 impl ScenarioKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::StorageFaults,
         Self::Cancellation,
         Self::ProcessKill,
         Self::MemoryLimits,
         Self::HeapGrowth,
         Self::Concurrency,
+        Self::SlowStorage,
     ];
 
     /// Whether Lance reports its memory in this scenario, and the checks read it.
@@ -95,6 +97,7 @@ impl ScenarioKind {
             Self::MemoryLimits => "memory_limits",
             Self::HeapGrowth => "heap_growth",
             Self::Concurrency => "concurrency",
+            Self::SlowStorage => "slow_storage",
         }
     }
 
@@ -140,10 +143,16 @@ pub enum SelfTest {
     /// A hold point waits, with no limit, for what cannot happen, while a reader
     /// keeps reading: its reads must not count as progress.
     GateHang,
+    /// A task the operation left behind holds a call that never answers.
+    HungCall,
+    /// A slow call in a task the operation left behind ends after the operation.
+    LateCall,
+    /// A task the operation left behind writes once its hung read is let go.
+    WriteAfterRelease,
 }
 
 impl SelfTest {
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 23] = [
         Self::Hang,
         Self::Panic,
         Self::TaskLeak,
@@ -164,6 +173,9 @@ impl SelfTest {
         Self::DuplicateKey,
         Self::Lineage,
         Self::GateHang,
+        Self::HungCall,
+        Self::LateCall,
+        Self::WriteAfterRelease,
     ];
 
     pub fn name(self) -> &'static str {
@@ -188,6 +200,9 @@ impl SelfTest {
             Self::DuplicateKey => "duplicate_key",
             Self::Lineage => "lineage",
             Self::GateHang => "gate_hang",
+            Self::HungCall => "hung_call",
+            Self::LateCall => "late_call",
+            Self::WriteAfterRelease => "write_after_release",
         }
     }
 
@@ -209,6 +224,7 @@ impl SelfTest {
             | Self::DuplicateKey
             | Self::Lineage
             | Self::GateHang => ScenarioKind::Concurrency,
+            Self::HungCall | Self::LateCall | Self::WriteAfterRelease => ScenarioKind::SlowStorage,
             _ => ScenarioKind::StorageFaults,
         }
     }
@@ -235,6 +251,7 @@ impl SelfTest {
             Self::SnapshotChanged => &["snapshot_changed"],
             Self::DuplicateKey => &["duplicate_key"],
             Self::Lineage => &["lineage"],
+            Self::HungCall | Self::LateCall | Self::WriteAfterRelease => &["hung_call"],
         }
     }
 }
@@ -444,6 +461,22 @@ pub fn check_self_test(test: SelfTest) {
         report.detail,
         report.dir.display()
     );
+    // The branches of `hung_call` share the class, so the detail tells which fired.
+    let reason = match test {
+        SelfTest::HungCall => Some("hung, 1 still wait and 0 ended after"),
+        SelfTest::LateCall => Some("hung, 0 still wait and 1 ended after"),
+        SelfTest::WriteAfterRelease => Some("writes reached the store after the hung reads"),
+        _ => None,
+    };
+    if let Some(reason) = reason {
+        assert!(
+            report.detail.contains(reason),
+            "the {} self-test must fail with {reason:?}, but: {} (artifacts in {})",
+            test.name(),
+            report.detail,
+            report.dir.display()
+        );
+    }
     let resumed = report.journal.contains("generation=2 ");
     match test {
         SelfTest::ForeignKill => assert!(

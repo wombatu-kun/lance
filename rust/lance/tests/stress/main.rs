@@ -19,6 +19,25 @@
 //! drops the same operations at a named point: a storage call, an index build
 //! stage or a written fragment, on a local or a `shared-memory://` dataset.
 //!
+//! `slow_storage` slows the store under the same operations, on a
+//! `shared-memory://` or a `file-object-store://` dataset. A step slows one to three
+//! of the calls its operation makes by 10 ms to 3 s, before the request or once it
+//! has completed, and now and then one call never answers: the step gives the
+//! operation up a moment later, as an application whose deadline has passed, and
+//! goes on as after a cancellation. A delay alone must neither fail an operation
+//! nor change what it does. A slow or hung call that outlives its operation, in a
+//! task the operation left behind, fails the seed as `hung_call`, whether still in
+//! flight or done well after the operation was over: a write there could land
+//! after the caller gave up. A read of a data or index file is the exception, as
+//! Lance's I/O scheduler runs each one as a task of its own that a dropped scan
+//! does not stop: a hung one shows as the `hung_read_left_behind` observation.
+//! Lance retries such a read once it is let go, and a task that waited for it goes
+//! on, so from then until the step is quiet no write may reach the store: one that
+//! does comes from a task the operation left behind, and fails the seed as
+//! `hung_call` too. The calls a step slows are those its operation makes on that
+//! store: a `shared-memory://` dataset finds its latest version by listing, a
+//! `file-object-store://` one through the version hint.
+//!
 //! `process_kill` plans the same points, but there the process sends itself a
 //! SIGKILL. Its dataset is on disk, through the plain local path or through
 //! `file-object-store://`, which lets every write meet a point. A seed goes on
@@ -120,10 +139,15 @@
 //! that has caught up, since its effect on a stale one depends on what it raced
 //! with; a merge insert writes what the rows already hold, so a lost update does
 //! not show; a SIGKILL loses nothing the kernel holds, so a missing `fsync` does
-//! not show either. `concurrency` runs in one process, with faults, cancellation
-//! and limits off, and never overwrites, restores or changes the schema; its order
-//! of events is only as exact as its hold points make it, so a replay may not hit
-//! the same interleaving.
+//! not show either; `slow_storage` slows neither the parts of a multipart upload,
+//! which bypass the store wrapper, nor files large enough to need one, and sees a
+//! task an operation left behind only through the calls of it that the step slowed
+//! or hung and that are still going while the step settles, a slowed read of a
+//! data or index file aside, so a write such a task makes at full speed as the
+//! operation ends goes unseen. `concurrency` runs in one process, with faults,
+//! cancellation and limits off, and never overwrites, restores or changes the
+//! schema; its order of events is only as exact as its hold points make it, so a
+//! replay may not hit the same interleaving.
 //!
 //! Run with `cargo test -p lance --test stress -- --test-threads=2`. Each
 //! invocation gets a directory of its own, with `summary.txt`, `env.txt` and a
@@ -154,17 +178,18 @@
 //! - `LANCE_STRESS_SERIAL=1`: run the operations of a round one at a time; a failure
 //!   of `concurrency` that goes away with this needs a race.
 //! - `LANCE_STRESS_ONLY`: what a run takes, a comma-separated list. A kind of
-//!   trouble (`faults`, `cancel`, `kill`, `memory`, `concurrency`) or the name of a
+//!   trouble (`faults`, `cancel`, `kill`, `memory`, `concurrency`, `latency`) or the name of a
 //!   scenario picks scenarios, and the self-tests of those. `op:<operation>` makes
 //!   every other step of a seed one of the operations it names that has work
 //!   there and puts the incidents and limits on those steps alone, which takes at
 //!   least 2 steps. An index optimization has work once an index misses fragments,
-//!   so the steps between build an index and append when it has none, and it
-//!   alone takes 4 steps. In `concurrency` it keeps the forced pairs that run one
-//!   of them, which takes at least 3 rounds, and a round left without its pair,
-//!   the first one included, is an ordinary one. A scenario a kind picks drops out
-//!   if it has none of the operations, and one picked by name fails the run, as
-//!   does a name it does not know or a list that leaves nothing to run.
+//!   so the steps between build an index and append when it has none, and never
+//!   take that work away; it alone takes 4 steps. In `concurrency` it keeps the
+//!   forced pairs that run one of them, which takes at least 3 rounds, and a round
+//!   left without its pair, the first one included, is an ordinary one. A scenario
+//!   a kind picks drops out if it has none of the operations, and one picked by
+//!   name fails the run, as does a name it does not know or a list that leaves
+//!   nothing to run.
 #![cfg(target_os = "linux")]
 
 mod harness;
@@ -204,6 +229,11 @@ fn heap_growth() {
 #[test]
 fn concurrency() {
     harness::run(ScenarioKind::Concurrency);
+}
+
+#[test]
+fn slow_storage() {
+    harness::run(ScenarioKind::SlowStorage);
 }
 
 /// The entry point of a seed's child process. A normal test run skips it.
@@ -310,4 +340,19 @@ fn harness_reports_lineage() {
 #[test]
 fn harness_reports_gate_hang() {
     harness::check_self_test(SelfTest::GateHang);
+}
+
+#[test]
+fn harness_reports_hung_call() {
+    harness::check_self_test(SelfTest::HungCall);
+}
+
+#[test]
+fn harness_reports_late_call() {
+    harness::check_self_test(SelfTest::LateCall);
+}
+
+#[test]
+fn harness_reports_write_after_release() {
+    harness::check_self_test(SelfTest::WriteAfterRelease);
 }
