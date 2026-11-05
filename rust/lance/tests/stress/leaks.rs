@@ -129,8 +129,8 @@ pub struct Snapshot {
     pub tmp_files: Vec<PathBuf>,
     pub tmp_dirs: usize,
     pub fds: usize,
-    /// Recorded, not checked: Lance's thread pools start lazily.
-    threads: usize,
+    /// Recorded, not checked after a step: Lance's thread pools start lazily.
+    pub threads: usize,
     rss_kib: u64,
     hwm_kib: u64,
 }
@@ -185,6 +185,49 @@ pub async fn quiesce(baseline_tasks: usize, tmp: &Path, timeout: Duration) -> (S
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Waits until the counts of tokio tasks and of threads hold for `still`, with the
+/// temporary directory empty, or until `timeout` passes. A long-lived session keeps
+/// tasks of its own as long as its caches hold what they serve, so there is no
+/// count to wait for; a `still` longer than the blocking pool keeps an idle thread
+/// lets the threads of the last operations go first.
+pub async fn settle(tmp: &Path, still: Duration, timeout: Duration) -> (Snapshot, Duration) {
+    const POLL: Duration = Duration::from_millis(50);
+    let started = Instant::now();
+    let mut last = None;
+    let mut since = Instant::now();
+    loop {
+        let snapshot = Snapshot::take(tmp);
+        let counts = (snapshot.tasks, snapshot.threads);
+        if last != Some(counts) {
+            last = Some(counts);
+            since = Instant::now();
+        }
+        let quiet =
+            since.elapsed() >= still && snapshot.tmp_files.is_empty() && snapshot.tmp_dirs == 0;
+        if quiet || started.elapsed() >= timeout {
+            return (snapshot, started.elapsed());
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The anonymous part of the resident set once glibc has given back the free
+/// memory in its bins: the pages of the code are left out, and the top of every
+/// thread's arena, which `malloc_trim` keeps, stays in.
+pub fn trimmed_anon_kib() -> u64 {
+    // SAFETY: `malloc_trim` only returns free heap to the system.
+    unsafe { libc::malloc_trim(0) };
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status_kib(&status, "RssAnon:")
+}
+
+/// What malloc has handed out and not had back, in every arena, C code included.
+pub fn malloc_bytes() -> i64 {
+    // SAFETY: `mallinfo2` only reads the allocator's statistics.
+    let info = unsafe { libc::mallinfo2() };
+    (info.uordblks + info.hblkhd) as i64
 }
 
 /// Every file below a directory, whatever a listing through a store would show.

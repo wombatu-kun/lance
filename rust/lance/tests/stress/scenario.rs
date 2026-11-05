@@ -43,8 +43,8 @@ use tokio::sync::Notify;
 
 use crate::harness::{
     CALLS_LOG, ENV_CALIBRATE, ENV_CHILD, ENV_DIR, ENV_GENERATION, ENV_PARENT_PID, ENV_PLAN,
-    ENV_QUIET_SECS, ENV_SEED, ENV_SELF_TEST, ENV_STANDALONE, ENV_STEPS, MEMORY_LOG, PLAN_LOG,
-    READS_LOG, STEPS_LOG, ScenarioKind, SelfTest, field,
+    ENV_QUIET_SECS, ENV_SEED, ENV_SELF_TEST, ENV_SOAK_SECS, ENV_STANDALONE, ENV_STEPS, MEMORY_LOG,
+    PLAN_LOG, READS_LOG, STEPS_LOG, ScenarioKind, SelfTest, field,
 };
 use crate::incidents::{
     Area, CRASH_FIRED, CancelWhen, Death, Delay, HangPoint, Incident, IncidentState, Method,
@@ -57,6 +57,12 @@ use crate::limits::{OwnCgroup, log_memory_events};
 use crate::select::Selection;
 
 mod concurrency;
+mod soak;
+
+pub use soak::{
+    SELF_TEST_LEAK as SOAK_SELF_TEST_LEAK, SELF_TEST_SECS as SOAK_SELF_TEST_SECS,
+    SERIES_FILE as SOAK_CSV,
+};
 
 const POOL_VARIABLE: &str = "LANCE_MEM_POOL_SIZE";
 /// One cycle of `heap_growth`, repeated until a leak has had time to show. The
@@ -214,14 +220,17 @@ fn run_on_runtime(
     // A round's writers and readers are tasks, which only race with threads to
     // run on.
     let threads = match setting.kind {
-        ScenarioKind::Concurrency => 4,
+        ScenarioKind::Concurrency | ScenarioKind::Soak => 4,
         _ => 2,
     };
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(threads)
-        .enable_all()
-        .build()
-        .expect("build the runtime");
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(threads).enable_all();
+    // A soak counts threads: the blocking pool must not keep the ones of a peak
+    // that is over, as it would for 10 s while any work keeps coming.
+    if setting.kind == ScenarioKind::Soak {
+        builder.thread_keep_alive(soak::BLOCKING_KEEP_ALIVE);
+    }
+    let runtime = builder.build().expect("build the runtime");
     // A panic outside an operation, in a check for example, must still end in
     // a verdict. Dropping the runtime while unwinding would wait, without a
     // limit, for any thread that panic has wedged.
@@ -233,10 +242,12 @@ fn run_on_runtime(
             Box::pin(run.finish()).await
         })
     }));
-    // A failed round leaves its tasks running, and the process is about to exit.
-    // Shutting the runtime down would cancel their scans, and a scan cancelled
+    // A failed round or soak leaves its tasks running, and the process is about to
+    // exit. Shutting the runtime down would cancel their scans, and a scan cancelled
     // that way panics (`filtered_read.rs`), which would hide the failure.
-    if setting.kind == ScenarioKind::Concurrency && matches!(result, Ok(Err(_))) {
+    if matches!(setting.kind, ScenarioKind::Concurrency | ScenarioKind::Soak)
+        && matches!(result, Ok(Err(_)))
+    {
         std::mem::forget(runtime);
     } else {
         // A self-test leaves a task behind on purpose; do not wait for it.
@@ -593,8 +604,8 @@ pub fn focusable_ops(kind: ScenarioKind) -> Vec<&'static str> {
             "scan",
             "cleanup",
         ],
-        // Its cycle is fixed.
-        ScenarioKind::HeapGrowth => Vec::new(),
+        // Their cycles are their own.
+        ScenarioKind::HeapGrowth | ScenarioKind::Soak => Vec::new(),
         ScenarioKind::Concurrency => concurrency::focusable_ops(),
     }
 }
@@ -713,6 +724,22 @@ fn pool_floor_kib(op: &Op) -> u64 {
 /// The size of a `heap_growth` run.
 pub fn heap_growth_steps() -> u64 {
     (HEAP_CYCLES * HEAP_CYCLE_OPS) as u64
+}
+
+/// How long a `soak` run lasts. A sample needs a second at least.
+pub fn soak_secs() -> u64 {
+    let secs = match std::env::var(ENV_SOAK_SECS) {
+        Ok(value) => value.parse().unwrap_or_else(|_| {
+            panic!("{ENV_SOAK_SECS} must be an unsigned integer, got {value:?}")
+        }),
+        Err(_) => soak::DEFAULT_SECS,
+    };
+    assert!(
+        secs >= soak::SAMPLES as u64,
+        "{ENV_SOAK_SECS}={secs} leaves less than a second between two of its {} samples",
+        soak::SAMPLES
+    );
+    secs
 }
 
 /// The same cycle over and over, on a steady number of rows: whatever grows is
@@ -872,6 +899,8 @@ struct Plan {
     steps: Vec<Step>,
     /// What `concurrency` runs instead of `steps`.
     rounds: Option<concurrency::RoundsPlan>,
+    /// What `soak` runs instead of `steps`.
+    soak: Option<soak::SoakPlan>,
     /// The operations that `LANCE_STRESS_ONLY` puts the trouble on.
     focus: BTreeSet<&'static str>,
 }
@@ -909,6 +938,10 @@ impl Plan {
                 1 => StoreChoice::FileObjectStore,
                 _ => StoreChoice::SharedMemory,
             },
+            // An in-memory store keeps every file in the heap, with the whole 5 MiB
+            // upload buffer it was written from, so the heap would measure the files.
+            ScenarioKind::Soak if rng.chance(0.5) => StoreChoice::Local,
+            ScenarioKind::Soak => StoreChoice::FileObjectStore,
         };
         let scale = match kind {
             ScenarioKind::MemoryLimits => LARGE,
@@ -925,6 +958,19 @@ impl Plan {
                 initial_rows,
                 steps: heap_growth_plan(&mut rng, &scale, initial_rows),
                 rounds: None,
+                soak: None,
+                focus: BTreeSet::new(),
+            };
+        }
+        if kind == ScenarioKind::Soak {
+            return Self {
+                store,
+                scale,
+                data_seed,
+                initial_rows,
+                steps: Vec::new(),
+                rounds: None,
+                soak: Some(soak::plan(&mut rng, initial_rows)),
                 focus: BTreeSet::new(),
             };
         }
@@ -946,6 +992,7 @@ impl Plan {
                 initial_rows,
                 steps: Vec::new(),
                 rounds: Some(rounds),
+                soak: None,
                 focus: focus.clone(),
             };
         }
@@ -1028,6 +1075,7 @@ impl Plan {
             initial_rows,
             steps: planned,
             rounds: None,
+            soak: None,
             focus: focus.clone(),
         }
     }
@@ -1066,6 +1114,9 @@ impl Plan {
         }
         if let Some(rounds) = &self.rounds {
             text.push_str(&rounds.render());
+        }
+        if let Some(soak) = &self.soak {
+            text.push_str(&soak.render());
         }
         text
     }
@@ -1316,7 +1367,10 @@ fn random_incident(
     op: &Op,
 ) -> Option<Incident> {
     match kind {
-        ScenarioKind::MemoryLimits | ScenarioKind::HeapGrowth | ScenarioKind::Concurrency => None,
+        ScenarioKind::MemoryLimits
+        | ScenarioKind::HeapGrowth
+        | ScenarioKind::Concurrency
+        | ScenarioKind::Soak => None,
         ScenarioKind::StorageFaults => {
             if !rng.chance(0.75) {
                 return None;
@@ -2427,14 +2481,20 @@ impl Run {
                 enable_stable_row_ids: plan
                     .rounds
                     .as_ref()
-                    .is_some_and(|rounds| rounds.stable_row_ids),
+                    .is_some_and(|rounds| rounds.stable_row_ids)
+                    || plan.soak.as_ref().is_some_and(|soak| soak.stable_row_ids),
                 ..Default::default()
             };
-            let initial: Box<dyn RecordBatchReader + Send> = match &plan.rounds {
-                Some(rounds) => {
+            let initial: Box<dyn RecordBatchReader + Send> = match (&plan.rounds, &plan.soak) {
+                (Some(rounds), _) => {
                     Box::new(rounds.initial_source(plan.data_seed, plan.initial_rows, plan.scale))
                 }
-                None => Box::new(rows(plan.data_seed, 0..plan.initial_rows, plan.scale)),
+                (None, Some(_)) => Box::new(soak::initial_source(
+                    plan.data_seed,
+                    plan.initial_rows,
+                    plan.scale,
+                )),
+                (None, None) => Box::new(rows(plan.data_seed, 0..plan.initial_rows, plan.scale)),
             };
             Box::pin(Dataset::write(initial, uri.as_str(), Some(params))).await
         } else {
@@ -2652,7 +2712,14 @@ impl Run {
     /// its listings hide those. So a death inside a write can leave a file that
     /// neither a listing nor a cleanup through the store ever sees: only the
     /// file system tells.
-    fn observe_hidden_files(&self, n: usize, observation: &str, listed: &BTreeMap<String, i64>) {
+    /// Files on the disk that the store does not list, such as a staged upload;
+    /// how many there are.
+    fn observe_hidden_files(
+        &self,
+        n: usize,
+        observation: &str,
+        listed: &BTreeMap<String, i64>,
+    ) -> usize {
         let dataset = self.seed_dir().join("dataset");
         let hidden: Vec<PathBuf> = files_below(&dataset)
             .into_iter()
@@ -2664,7 +2731,7 @@ impl Run {
             })
             .collect();
         if hidden.is_empty() {
-            return;
+            return 0;
         }
         let bytes: u64 = hidden
             .iter()
@@ -2675,6 +2742,7 @@ impl Run {
             "step={n} observation={observation} files={} bytes={bytes} detail={hidden:?}",
             hidden.len()
         ));
+        hidden.len()
     }
 
     fn seed_dir(&self) -> &Path {
@@ -2705,6 +2773,9 @@ impl Run {
     async fn run_steps(&mut self) -> Result<(), Failure> {
         if self.plan.rounds.is_some() {
             return Box::pin(self.run_rounds()).await;
+        }
+        if self.plan.soak.is_some() {
+            return Box::pin(self.run_soak()).await;
         }
         for index in self.next_step..self.plan.steps.len() {
             let step = self.plan.steps[index].clone();
@@ -2958,6 +3029,7 @@ impl Run {
                     ScenarioKind::MemoryLimits | ScenarioKind::HeapGrowth => "limit_absorbed",
                     ScenarioKind::Concurrency => "hold_absorbed",
                     ScenarioKind::SlowStorage => "delay_absorbed",
+                    ScenarioKind::Soak => unreachable!("a soak runs no steps"),
                 },
             );
         }
@@ -3615,7 +3687,8 @@ impl Run {
             | SelfTest::OomRecovery
             | SelfTest::HangUnderLimit
             | SelfTest::MemoryEvents
-            | SelfTest::HeapLeak => {}
+            | SelfTest::HeapLeak
+            | SelfTest::SoakGrowth => {}
             SelfTest::TornSnapshot
             | SelfTest::LostWrite
             | SelfTest::StaleRead
@@ -3781,17 +3854,17 @@ impl Run {
                 data_seed: self.oracle_seed,
                 // Under concurrency an index can legitimately cover nothing by now:
                 // an update in place takes its fragments away from it.
-                check_plan: self.plan.rounds.is_none()
+                check_plan: (self.plan.rounds.is_none() && self.plan.soak.is_none())
                     || concurrency::covers_a_fragment(&ds, &indices, kind.name()),
                 salt: n,
             };
             Box::pin(check_index(&ds, n, *kind, &answers)).await?;
         }
-        // Only for the versions a cleanup keeps: in `heap_growth` the map would
-        // count as growth of the heap.
+        // Only for the versions a cleanup keeps: in `heap_growth` and `soak` the
+        // map would count as growth of the heap.
         if !matches!(
             self.kind,
-            ScenarioKind::HeapGrowth | ScenarioKind::Concurrency
+            ScenarioKind::HeapGrowth | ScenarioKind::Concurrency | ScenarioKind::Soak
         ) {
             // The rows of the latest version are the model's by now.
             let digest = ids_digest(self.model.live.iter().copied());
@@ -4220,6 +4293,7 @@ impl Run {
                 .rounds
                 .as_ref()
                 .map_or(0, |rounds| rounds.rounds.len())
+            + self.plan.soak.as_ref().map_or(0, |_| soak::SAMPLES)
             + 1;
         self.state.set_phase("final");
         self.journal.line(format_args!("step={n} final"));
@@ -4276,12 +4350,42 @@ impl Run {
                 .await
                 .expect("plant an orphan");
         }
+        self.check_orphans(n).await?;
+        Box::pin(self.check_content(n)).await?;
+        // The queries of an index need not touch every file of it.
+        Box::pin(self.check_kept_versions(n)).await?;
+        let snapshot = self.quiet_down(n).await;
+        self.check_leaks(n, &snapshot)
+    }
+
+    /// After a cleanup that may delete unverified files, with nothing in flight,
+    /// no file is left that no version references.
+    async fn check_orphans(&self, n: usize) -> Result<(), Failure> {
         let verifier = self.open_verifier(n).await?;
         let listed = file_sizes(verifier.all_files().await)
             .await
             .map_err(|error| fail("unreadable", n, error))?;
-        self.observe_hidden_files(n, "hidden_after_cleanup", &listed);
-        let cutoff = verifier.version().timestamp.timestamp_micros();
+        let hidden = self.observe_hidden_files(n, "hidden_after_cleanup", &listed);
+        // Nothing interrupts the writes of a soak, so none may leave a file behind.
+        if self.kind == ScenarioKind::Soak && hidden > 0 {
+            return Err(fail(
+                "orphans",
+                n,
+                format_args!(
+                    "{hidden} files the store does not list, see observation=hidden_after_cleanup"
+                ),
+            ));
+        }
+        // As cleanup takes it: the earliest commit time of the versions it keeps,
+        // which a clock that stepped back makes other than that of the oldest one.
+        let cutoff = verifier
+            .versions()
+            .await
+            .map_err(|error| fail("unreadable", n, error))?
+            .iter()
+            .map(|version| version.timestamp.timestamp_micros())
+            .min()
+            .unwrap_or(i64::MAX);
         let all = file_times(verifier.all_files().await)
             .await
             .map_err(|error| fail("unreadable", n, error))?;
@@ -4295,9 +4399,10 @@ impl Run {
                 continue;
             }
             match path.split('/').next() {
-                // Cleanup lists these only up to the commit time of the
-                // manifest it keeps.
-                Some(area @ ("_transactions" | "_deletions")) if *modified > cutoff => {
+                // Cleanup lists these only up to that time, to the nanosecond
+                // (`listing_unmodified_since` in `cleanup.rs`), and these times
+                // are in microseconds.
+                Some(area @ ("_transactions" | "_deletions")) if *modified >= cutoff => {
                     self.observe(n, &format!("orphan{area}"));
                 }
                 _ => orphans.push(path.clone()),
@@ -4334,11 +4439,7 @@ impl Run {
                 ));
             }
         }
-        Box::pin(self.check_content(n)).await?;
-        // The queries of an index need not touch every file of it.
-        Box::pin(self.check_kept_versions(n)).await?;
-        let snapshot = self.quiet_down(n).await;
-        self.check_leaks(n, &snapshot)
+        Ok(())
     }
 }
 

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Seeded stress scenarios: storage faults, cancellation, the death of the
-//! process, memory limits, heap growth and concurrency.
+//! process, memory limits, heap growth, concurrency, slow storage and a long run.
 //!
 //! Every seed runs in its own child process, a re-run of this test binary, so
 //! a hang, an abort or a leak in one seed cannot hide in another, and the
@@ -46,7 +46,8 @@
 //! that step, and a cleanup at the end must remove everything the death left
 //! that it can see. A write through a local object store goes by way of a file
 //! `name#digits`, which its listings hide: those are only reported, in the
-//! `hidden_after_kill` and `hidden_after_cleanup` observations.
+//! `hidden_after_kill` and `hidden_after_cleanup` observations, except in `soak`,
+//! where nothing interrupts a write and one fails the seed as `orphans`.
 //! Each death replays exactly, except for one in flight.
 //!
 //! `memory_limits` runs on the plain local path, in a cgroup of its own, below a
@@ -132,6 +133,28 @@
 //! retried, and no tokio task, temporary file or descriptor may be left behind.
 //! The run ends with a cleanup that must leave no unreferenced file.
 //!
+//! `soak` runs a long-lived service for `LANCE_STRESS_SOAK_SECS`, on a local or a
+//! `file-object-store://` dataset: 2 to 4 workers keep a handle each for the whole
+//! run, on one `Session` with caches of a few MiB, and go round appends, merge
+//! inserts, updates, deletes, compaction, index builds and optimizations, cleanups,
+//! scans and index queries. A worker only changes the rows of its class
+//! `id % workers`, and its scans and queries check them on its own handle,
+//! whatever version that is on. A cleanup keeps every version from the oldest one
+//! a handle is on, see #3718. The run takes 24 samples at even intervals, each
+//! once every worker has finished its operation and the runtime is quiet, into
+//! `soak.csv`: the heap, what malloc has handed out, descriptors, threads, tokio
+//! tasks, the caches of the session, and the versions, files and bytes of the
+//! dataset. After every sample a cleanup that may delete unverified files must
+//! leave no unreferenced file, and every fourth one the dataset must read as the
+//! rows of every class. A cache may never hold more than its capacity, and from the
+//! middle third of the run to the last no series may grow by more than its
+//! tolerance, which fails the seed as `soak_growth`. The heap is the series that
+//! matters, and what malloc has handed out adds what C code holds. The resident set
+//! goes into `soak.csv` as well, but no verdict reads it: glibc keeps the top of
+//! every thread's arena, which `malloc_trim` does not give back, so it wanders by
+//! tens of MiB with nothing held. A worker's operations are a prefix of what its
+//! seed draws, but how far it gets and what it races with depend on timing.
+//!
 //! Known blind spots: work in the blocking pool and in the CPU and rayon pools
 //! is visible only through what it leaves behind; a local store writes data,
 //! index, transaction and deletion files around the object store, so faults
@@ -147,7 +170,20 @@
 //! operation ends goes unseen. `concurrency` runs in one process, with faults,
 //! cancellation and limits off, and never overwrites, restores or changes the
 //! schema; its order of events is only as exact as its hold points make it, so a
-//! replay may not hit the same interleaving.
+//! replay may not hit the same interleaving. `soak` checks no further of the
+//! conflicts it meets than that a retry on the latest version lands, and gives up
+//! maintenance that keeps losing; its cleanups take turns, and its series show a
+//! leak only once it outgrows the noise of a third of the run. Its rows live for
+//! seconds and each index is built anew every few seconds, so fragments and index
+//! segments never pile up: a compaction that never commits or an optimization that
+//! keeps every delta stays level. The checks of a sample run 24 times whatever the
+//! length of the run, so a leak in them grows no faster in a long one, and the
+//! workers never reopen the dataset. A cache is held to the sizes it reports for
+//! its entries, so an entry that holds more than its `deep_size_of` shows only in
+//! the heap, and only while the cache fills. A thread of the blocking pool lives no
+//! longer than a sample interval, so what it keeps for itself goes at every sample.
+//! Memory a library maps for itself rather than takes from malloc shows only in
+//! the resident set.
 //!
 //! Run with `cargo test -p lance --test stress -- --test-threads=2`. Each
 //! invocation gets a directory of its own, with `summary.txt`, `env.txt` and a
@@ -156,30 +192,36 @@
 //! also holds `cgroup.log` with the memory of the cgroup every 200 ms and
 //! `memory.log` with Lance's memory events: the last start without an end is
 //! where a killed process stood. `replay.sh` there holds the command that reruns
-//! the seed with the same settings.
+//! the seed with the same settings. A `soak` seed also leaves its samples beside
+//! `summary.txt`, as `soak-seed-N.csv`.
 //!
 //! Environment:
 //! - `LANCE_STRESS_SEED`: run only this seed, and keep its artifacts.
-//! - `LANCE_STRESS_SEEDS` (16) and `LANCE_STRESS_SEED_BASE` (1): which seeds run.
+//! - `LANCE_STRESS_SEEDS` (16, for `soak` 1) and `LANCE_STRESS_SEED_BASE` (1): which
+//!   seeds run.
 //! - `LANCE_STRESS_REPEAT` (1): how many times each seed runs.
-//! - `LANCE_STRESS_STEPS` (8): operations per seed.
+//! - `LANCE_STRESS_STEPS` (8): operations per seed; `soak` runs for a time instead.
 //! - `LANCE_STRESS_ARTIFACTS`: where the artifacts go, `$CARGO_TARGET_TMPDIR/stress`
 //!   by default.
 //! - `LANCE_STRESS_KEEP=1`: keep the artifacts of passing seeds too; `logs` keeps
 //!   them without the dataset and the temporary files.
 //! - `LANCE_STRESS_CALIBRATE=1`: plan no incident and no limit, and report the
 //!   heap each operation takes, to size the budgets in `scenario.rs`.
-//! - `LANCE_STRESS_STALL_SECS` (60, for `concurrency` 150): how long a child may go
-//!   without progress.
+//! - `LANCE_STRESS_STALL_SECS` (60, for `concurrency` and `soak` 150): how long a
+//!   child may go without progress.
 //! - `LANCE_STRESS_DEADLINE_SECS` (120 + 60 per step, for `concurrency` 300 + 120 per
-//!   step): how long a child may run.
+//!   step, for `soak` its length + 300): how long a child may run, for `soak` at
+//!   least its length + 60.
+//! - `LANCE_STRESS_SOAK_SECS` (180): how long a `soak` seed runs, at least 24; its
+//!   plan and fingerprint hold it. A night takes hours.
 //! - `LANCE_STRESS_PLAN`: the plan a replay expects; a different one fails.
 //! - `LANCE_STRESS_STANDALONE=1`: run a seed in this process, for gdb or rr.
 //! - `LANCE_STRESS_SERIAL=1`: run the operations of a round one at a time; a failure
 //!   of `concurrency` that goes away with this needs a race.
 //! - `LANCE_STRESS_ONLY`: what a run takes, a comma-separated list. A kind of
-//!   trouble (`faults`, `cancel`, `kill`, `memory`, `concurrency`, `latency`) or the name of a
-//!   scenario picks scenarios, and the self-tests of those. `op:<operation>` makes
+//!   trouble (`faults`, `cancel`, `kill`, `memory`, `concurrency`, `latency`,
+//!   `soak`) or the name of a scenario picks scenarios, and the self-tests of
+//!   those; `memory` takes `soak` too. `op:<operation>` makes
 //!   every other step of a seed one of the operations it names that has work
 //!   there and puts the incidents and limits on those steps alone, which takes at
 //!   least 2 steps. An index optimization has work once an index misses fragments,
@@ -188,8 +230,8 @@
 //!   forced pairs that run one of them, which takes at least 3 rounds, and a round
 //!   left without its pair, the first one included, is an ordinary one. A scenario
 //!   a kind picks drops out if it has none of the operations, and one picked by
-//!   name fails the run, as does a name it does not know or a list that leaves
-//!   nothing to run.
+//!   name, `soak` and `concurrency` included, fails the run, as does a name it does
+//!   not know or a list that leaves nothing to run.
 #![cfg(target_os = "linux")]
 
 mod harness;
@@ -234,6 +276,11 @@ fn concurrency() {
 #[test]
 fn slow_storage() {
     harness::run(ScenarioKind::SlowStorage);
+}
+
+#[test]
+fn soak() {
+    harness::run(ScenarioKind::Soak);
 }
 
 /// The entry point of a seed's child process. A normal test run skips it.
@@ -355,4 +402,9 @@ fn harness_reports_late_call() {
 #[test]
 fn harness_reports_write_after_release() {
     harness::check_self_test(SelfTest::WriteAfterRelease);
+}
+
+#[test]
+fn harness_reports_soak_growth() {
+    harness::check_self_test(SelfTest::SoakGrowth);
 }

@@ -34,6 +34,8 @@ pub const ENV_CALIBRATE: &str = "LANCE_STRESS_CALIBRATE";
 /// Workers run one operation at a time, in the order of their ranks: a failure of
 /// `concurrency` that goes away with this needs a race.
 pub const ENV_SERIAL: &str = "LANCE_STRESS_SERIAL";
+/// How long a `soak` run lasts, in seconds.
+pub const ENV_SOAK_SECS: &str = "LANCE_STRESS_SOAK_SECS";
 
 pub const PLAN_LOG: &str = "plan.log";
 pub const STEPS_LOG: &str = "steps.log";
@@ -71,10 +73,11 @@ pub enum ScenarioKind {
     HeapGrowth,
     Concurrency,
     SlowStorage,
+    Soak,
 }
 
 impl ScenarioKind {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::StorageFaults,
         Self::Cancellation,
         Self::ProcessKill,
@@ -82,6 +85,7 @@ impl ScenarioKind {
         Self::HeapGrowth,
         Self::Concurrency,
         Self::SlowStorage,
+        Self::Soak,
     ];
 
     /// Whether Lance reports its memory in this scenario, and the checks read it.
@@ -98,6 +102,7 @@ impl ScenarioKind {
             Self::HeapGrowth => "heap_growth",
             Self::Concurrency => "concurrency",
             Self::SlowStorage => "slow_storage",
+            Self::Soak => "soak",
         }
     }
 
@@ -149,10 +154,12 @@ pub enum SelfTest {
     LateCall,
     /// A task the operation left behind writes once its hung read is let go.
     WriteAfterRelease,
+    /// Heap goes missing at every sample of a long run.
+    SoakGrowth,
 }
 
 impl SelfTest {
-    const ALL: [Self; 23] = [
+    const ALL: [Self; 24] = [
         Self::Hang,
         Self::Panic,
         Self::TaskLeak,
@@ -176,6 +183,7 @@ impl SelfTest {
         Self::HungCall,
         Self::LateCall,
         Self::WriteAfterRelease,
+        Self::SoakGrowth,
     ];
 
     pub fn name(self) -> &'static str {
@@ -203,6 +211,7 @@ impl SelfTest {
             Self::HungCall => "hung_call",
             Self::LateCall => "late_call",
             Self::WriteAfterRelease => "write_after_release",
+            Self::SoakGrowth => "soak_growth",
         }
     }
 
@@ -225,6 +234,7 @@ impl SelfTest {
             | Self::Lineage
             | Self::GateHang => ScenarioKind::Concurrency,
             Self::HungCall | Self::LateCall | Self::WriteAfterRelease => ScenarioKind::SlowStorage,
+            Self::SoakGrowth => ScenarioKind::Soak,
             _ => ScenarioKind::StorageFaults,
         }
     }
@@ -252,6 +262,7 @@ impl SelfTest {
             Self::DuplicateKey => &["duplicate_key"],
             Self::Lineage => &["lineage"],
             Self::HungCall | Self::LateCall | Self::WriteAfterRelease => &["hung_call"],
+            Self::SoakGrowth => &["soak_growth"],
         }
     }
 }
@@ -262,6 +273,8 @@ struct RunConfig {
     /// touches another run's artifacts.
     run_dir: PathBuf,
     steps: u64,
+    /// How long a `soak` seed runs.
+    soak_secs: u64,
     stall: Duration,
     deadline: Duration,
     quiet_secs: u64,
@@ -287,8 +300,11 @@ impl RunConfig {
         // they check.
         // A hold's wait goes into the first try of a commit, which sets the unit of
         // Lance's backoff: 10 s there can become a silent sleep of over a minute.
+        // An update or a delete of a soak retries its lost commits inside Lance as
+        // quietly, for the two minutes of `concurrency`'s helpers that it shares,
+        // while a sample holds the other workers back.
         let default_stall = match kind {
-            ScenarioKind::Concurrency => 150,
+            ScenarioKind::Concurrency | ScenarioKind::Soak => 150,
             _ => 60,
         };
         let (steps, quiet_secs, stall_secs) = match self_test {
@@ -300,17 +316,30 @@ impl RunConfig {
             ),
         };
         // Repeated cycles are the point of this scenario: it has a size of its own.
+        // A soak runs for a time rather than for steps.
         let steps = match kind {
             ScenarioKind::HeapGrowth => scenario::heap_growth_steps(),
+            ScenarioKind::Soak => 0,
             _ => steps,
+        };
+        let soak_secs = match (kind, self_test) {
+            (ScenarioKind::Soak, Some(_)) => scenario::SOAK_SELF_TEST_SECS,
+            (ScenarioKind::Soak, None) => scenario::soak_secs(),
+            _ => 0,
         };
         let default_deadline = match kind {
             ScenarioKind::Concurrency => 300 + 120 * steps,
+            ScenarioKind::Soak => soak_secs + 300,
             _ => 120 + 60 * steps,
         };
         assert!(
             stall_secs >= quiet_secs + 10,
             "{ENV_STALL_SECS}={stall_secs} must exceed the {quiet_secs}s a step may wait for quiet by 10s"
+        );
+        let deadline_secs = env_u64(ENV_DEADLINE_SECS, default_deadline);
+        assert!(
+            kind != ScenarioKind::Soak || self_test.is_some() || deadline_secs >= soak_secs + 60,
+            "{ENV_DEADLINE_SECS}={deadline_secs} must exceed the {soak_secs}s a soak runs by 60s"
         );
         let name = match self_test {
             Some(test) => format!("self-test-{}", test.name()),
@@ -340,8 +369,9 @@ impl RunConfig {
             kind,
             run_dir,
             steps,
+            soak_secs,
             stall: Duration::from_secs(stall_secs),
-            deadline: Duration::from_secs(env_u64(ENV_DEADLINE_SECS, default_deadline)),
+            deadline: Duration::from_secs(deadline_secs),
             quiet_secs,
             keep,
             repeat: env_u64("LANCE_STRESS_REPEAT", 1).max(1),
@@ -420,7 +450,12 @@ pub fn run(kind: ScenarioKind) {
         vec![env_u64(ENV_SEED, 0)]
     } else {
         let base = env_u64("LANCE_STRESS_SEED_BASE", 1);
-        (base..base + env_u64("LANCE_STRESS_SEEDS", 16)).collect()
+        // A soak seed takes minutes and checks one long run, not a variety of plans.
+        let default_seeds = match kind {
+            ScenarioKind::Soak => 1,
+            _ => 16,
+        };
+        (base..base + env_u64("LANCE_STRESS_SEEDS", default_seeds)).collect()
     };
     let mut summary = Summary::new(&config, &seeds);
     for &seed in &seeds {
@@ -466,6 +501,7 @@ pub fn check_self_test(test: SelfTest) {
         SelfTest::HungCall => Some("hung, 1 still wait and 0 ended after"),
         SelfTest::LateCall => Some("hung, 0 still wait and 1 ended after"),
         SelfTest::WriteAfterRelease => Some("writes reached the store after the hung reads"),
+        SelfTest::SoakGrowth => Some("heap_bytes from"),
         _ => None,
     };
     if let Some(reason) = reason {
@@ -473,6 +509,23 @@ pub fn check_self_test(test: SelfTest) {
             report.detail.contains(reason),
             "the {} self-test must fail with {reason:?}, but: {} (artifacts in {})",
             test.name(),
+            report.detail,
+            report.dir.display()
+        );
+    }
+    if test == SelfTest::SoakGrowth {
+        // The leak puts 8 of its samples between the medians of the thirds, far
+        // more than a run this short grows by itself.
+        let growth = report
+            .detail
+            .split_once("heap_bytes from ")
+            .and_then(|(_, rest)| rest.split_once(','))
+            .and_then(|(range, _)| range.split_once(" to "))
+            .and_then(|(from, to)| Some(to.parse::<i64>().ok()? - from.parse::<i64>().ok()?));
+        let least = 6 * scenario::SOAK_SELF_TEST_LEAK as i64;
+        assert!(
+            growth.is_some_and(|growth| growth >= least),
+            "the soak_growth self-test must grow the heap by {least} or more, but: {} (artifacts in {})",
             report.detail,
             report.dir.display()
         );
@@ -630,6 +683,7 @@ fn replay_command(config: &RunConfig, seed: u64) -> String {
         ENV_CALIBRATE,
         ENV_SERIAL,
         ENV_ONLY,
+        ENV_SOAK_SECS,
     ] {
         if let Ok(value) = std::env::var(name) {
             vars.push(format!("{name}={}", shell_quote(&value)));
@@ -693,6 +747,9 @@ fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
     if let Ok(only) = std::env::var(ENV_ONLY) {
         write!(standalone_vars, "{ENV_ONLY}={} ", shell_quote(&only)).unwrap();
     }
+    if config.kind == ScenarioKind::Soak {
+        write!(standalone_vars, "{ENV_SOAK_SECS}={} ", config.soak_secs).unwrap();
+    }
     let standalone = format!(
         "# Or in one process, for gdb or rr, into a fresh directory, where no cgroup limit applies. After a death, go on with {ENV_GENERATION}=2 in the same directory:\n# {standalone_vars}{ENV_STANDALONE}=1 {ENV_CHILD}={} {ENV_SEED}={seed} {ENV_GENERATION}=1 {ENV_STEPS}={} {ENV_QUIET_SECS}={} {ENV_DIR}=<dir> TMPDIR=<dir>/tmp {} --exact child --nocapture\n",
         config.kind.name(),
@@ -742,6 +799,14 @@ fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
         }
     };
     drop(cgroup);
+    // The series of a soak outlive the seed's directory, which a pass removes.
+    if config.kind == ScenarioKind::Soak {
+        let series = dir.join(scenario::SOAK_CSV);
+        let name = dir
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().to_string());
+        fs::copy(&series, config.run_dir.join(format!("soak-{name}.csv"))).ok();
+    }
     let mut report = judge(seed, attempt, dir, end);
     if report.class.is_some() {
         write!(report.detail, " | replay: {replay}").unwrap();
@@ -833,6 +898,11 @@ fn start_child(
     if config.kind == ScenarioKind::Concurrency {
         command.env(COMMIT_RETRY_TIMEOUT_VARIABLE, COMMIT_RETRY_TIMEOUT_SECS);
     }
+    // The child takes its length from here, so that a self-test can set its own.
+    match config.kind {
+        ScenarioKind::Soak => command.env(ENV_SOAK_SECS, config.soak_secs.to_string()),
+        _ => command.env_remove(ENV_SOAK_SECS),
+    };
     match cgroup {
         Some(cgroup) => {
             command.env(ENV_CGROUP, cgroup.dir());

@@ -16,16 +16,21 @@ const OP_PREFIX: &str = "op:";
 
 /// Kinds of trouble and the scenarios that make them. A scenario may make more
 /// than one.
-const KINDS: [(&str, &[ScenarioKind]); 6] = [
+const KINDS: [(&str, &[ScenarioKind]); 7] = [
     ("faults", &[ScenarioKind::StorageFaults]),
     ("cancel", &[ScenarioKind::Cancellation]),
     ("kill", &[ScenarioKind::ProcessKill]),
     (
         "memory",
-        &[ScenarioKind::MemoryLimits, ScenarioKind::HeapGrowth],
+        &[
+            ScenarioKind::MemoryLimits,
+            ScenarioKind::HeapGrowth,
+            ScenarioKind::Soak,
+        ],
     ),
     ("concurrency", &[ScenarioKind::Concurrency]),
     ("latency", &[ScenarioKind::SlowStorage]),
+    ("soak", &[ScenarioKind::Soak]),
 ];
 
 /// What a run takes. The default takes every scenario as it is.
@@ -63,6 +68,8 @@ impl Selection {
                 selection.focus.insert(op);
             } else if let Some((_, kinds)) = KINDS.iter().find(|(kind, _)| *kind == name) {
                 selection.picked.extend(kinds.iter().copied());
+                // `soak` and `concurrency` name a scenario too, which must not drop out.
+                named.extend(ScenarioKind::from_name(name));
             } else if let Some(kind) = ScenarioKind::from_name(name) {
                 selection.picked.insert(kind);
                 named.insert(kind);
@@ -78,7 +85,7 @@ impl Selection {
         if let Some(kind) = named.iter().find(|kind| !selection.runs(**kind)) {
             let ops = focusable_ops(*kind);
             let runs = match ops.is_empty() {
-                true => "a fixed cycle".to_string(),
+                true => "a cycle of its own".to_string(),
                 false => ops.join(", "),
             };
             return Err(format!(
@@ -143,9 +150,11 @@ fn selection_reads_kinds_scenarios_and_operations() {
     let selection = Selection::parse("memory, process_kill ,op: compact").unwrap();
     assert!(selection.runs(ScenarioKind::MemoryLimits));
     assert!(selection.runs(ScenarioKind::ProcessKill));
-    // Its cycle is fixed, so there is no compaction to put trouble on.
+    // Their cycles are their own, so there is no compaction to put trouble on.
     assert!(!selection.runs(ScenarioKind::HeapGrowth));
     assert!(selection.runs_self_test(ScenarioKind::HeapGrowth));
+    assert!(!selection.runs(ScenarioKind::Soak));
+    assert!(selection.runs_self_test(ScenarioKind::Soak));
     assert!(!selection.runs(ScenarioKind::StorageFaults));
     assert!(!selection.runs_self_test(ScenarioKind::StorageFaults));
     assert_eq!(
@@ -208,6 +217,8 @@ fn selection_refuses_what_it_does_not_know_and_what_picks_nothing() {
         "op:scans",
         "op:reserve",
         "heap_growth,op:compact",
+        "soak,op:compact",
+        "soak,process_kill,op:compact",
         "faults,op:scan",
         "storage_faults,process_kill,op:compact",
     ] {
@@ -216,8 +227,20 @@ fn selection_refuses_what_it_does_not_know_and_what_picks_nothing() {
             "{value:?} must be refused"
         );
     }
+    // A kind that is also the name of a scenario counts as its name.
+    let error = Selection::parse("soak,process_kill,op:compact").unwrap_err();
+    assert!(
+        error.contains("asks for soak") && error.contains("a cycle of its own"),
+        "{error}"
+    );
     let error = Selection::parse("fault").unwrap_err();
-    for name in ["faults", "storage_faults", "op:compact", "op:cleanup"] {
+    for name in [
+        "faults",
+        "storage_faults",
+        "soak",
+        "op:compact",
+        "op:cleanup",
+    ] {
         assert!(error.contains(name), "{name} is missing from: {error}");
     }
 }

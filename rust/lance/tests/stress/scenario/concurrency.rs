@@ -94,9 +94,9 @@ const CONTENDED_KINDS: [&str; 3] = ["contended_upsert", "contended_update", "con
 const NUMBERS_PER_ROUND: i64 = 100;
 
 /// The rows of one class: each id with the `gen` it holds.
-type ClassRows = BTreeMap<i64, i64>;
+pub(super) type ClassRows = BTreeMap<i64, i64>;
 
-fn id_run(first_id: i64, rows: i64, stride: i64) -> impl Iterator<Item = i64> {
+pub(super) fn id_run(first_id: i64, rows: i64, stride: i64) -> impl Iterator<Item = i64> {
     (0..rows).map(move |slot| first_id + slot * stride)
 }
 
@@ -1418,21 +1418,7 @@ impl RoundsPlan {
     }
 
     fn schema(&self) -> SchemaRef {
-        let mut id = Field::new("id", DataType::Int64, false);
-        if self.declared_key {
-            id = id.with_metadata(HashMap::from([(
-                LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
-                "true".to_string(),
-            )]));
-        }
-        let item = Arc::new(Field::new("item", DataType::Float32, true));
-        Arc::new(Schema::new(vec![
-            id,
-            Field::new("category", DataType::Int32, false),
-            Field::new("vec", DataType::FixedSizeList(item, VECTOR_DIM), false),
-            Field::new("text", DataType::Utf8, false),
-            Field::new("gen", DataType::Int64, false),
-        ]))
+        schema(self.declared_key)
     }
 
     pub(super) fn initial_source(
@@ -1446,13 +1432,32 @@ impl RoundsPlan {
     }
 }
 
-fn source_of(batch: RecordBatch) -> impl RecordBatchReader + Send + 'static {
+/// The columns of the rows, with `gen`, which tells the operations apart.
+pub(super) fn schema(declared_key: bool) -> SchemaRef {
+    let mut id = Field::new("id", DataType::Int64, false);
+    if declared_key {
+        id = id.with_metadata(HashMap::from([(
+            LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
+            "true".to_string(),
+        )]));
+    }
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    Arc::new(Schema::new(vec![
+        id,
+        Field::new("category", DataType::Int32, false),
+        Field::new("vec", DataType::FixedSizeList(item, VECTOR_DIM), false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new("gen", DataType::Int64, false),
+    ]))
+}
+
+pub(super) fn source_of(batch: RecordBatch) -> impl RecordBatchReader + Send + 'static {
     let schema = batch.schema();
     RecordBatchIterator::new(vec![Ok(batch)], schema)
 }
 
 /// Full rows, every column a function of the id but `gen`.
-fn full_batch(
+pub(super) fn full_batch(
     schema: &SchemaRef,
     data_seed: u64,
     scale: &Scale,
@@ -2503,7 +2508,7 @@ struct RowCounts {
 
 /// What a try of an operation reports.
 #[derive(Default)]
-struct Attempted {
+pub(super) struct Attempted {
     output: OpOutput,
     counts: Option<RowCounts>,
     /// How many tries Lance itself made inside, where it says.
@@ -2511,7 +2516,7 @@ struct Attempted {
 }
 
 /// The rows of a worker's class in a range of ids.
-fn class_range(stride: i64, worker: usize, lo: i64, hi: i64) -> String {
+pub(super) fn class_range(stride: i64, worker: usize, lo: i64, hi: i64) -> String {
     format!("id % {stride} = {worker} AND id >= {lo} AND id < {hi}")
 }
 
@@ -2663,7 +2668,7 @@ fn attempt<'a>(
     }
 }
 
-async fn delete(ds: &mut Dataset, predicate: String) -> lance::Result<Attempted> {
+pub(super) async fn delete(ds: &mut Dataset, predicate: String) -> lance::Result<Attempted> {
     let deleted = DeleteBuilder::new(Arc::new(ds.clone()), predicate)
         .retry_timeout(RETRY_TIMEOUT)
         .execute()
@@ -2678,7 +2683,11 @@ async fn delete(ds: &mut Dataset, predicate: String) -> lance::Result<Attempted>
     })
 }
 
-async fn update(ds: &mut Dataset, predicate: &str, value: &str) -> lance::Result<Attempted> {
+pub(super) async fn update(
+    ds: &mut Dataset,
+    predicate: &str,
+    value: &str,
+) -> lance::Result<Attempted> {
     let job = UpdateBuilder::new(Arc::new(ds.clone()))
         .update_where(predicate)?
         .set("gen", value)?
@@ -2703,7 +2712,7 @@ fn upsert_job(ds: &Dataset) -> lance::Result<MergeInsertJob> {
         .try_build()
 }
 
-async fn upsert(
+pub(super) async fn upsert(
     ds: &mut Dataset,
     source: Box<dyn RecordBatchReader + Send>,
 ) -> lance::Result<Attempted> {
