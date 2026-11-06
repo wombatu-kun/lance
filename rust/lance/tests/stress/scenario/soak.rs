@@ -3,32 +3,58 @@
 
 //! The `soak` scenario: a long-lived service on one dataset.
 //!
-//! Workers keep one handle each for the whole run, all of them on one `Session`
-//! with small caches, and go round the work of a service: appends, merge inserts,
-//! updates and deletes, compaction, index builds and optimizations, cleanups that
-//! keep a few versions, scans and index queries. A row belongs to the class
+//! Workers keep one handle each, all of them on one `Session` with small caches,
+//! and go round the work of a service: appends, merge inserts, updates and
+//! deletes, compaction, index optimizations, cleanups that keep a few versions,
+//! reopening the dataset, scans and index queries. A row belongs to the class
 //! `id % workers`, and a worker only changes its own class, so whatever version its
 //! handle is on, its rows are what its own operations left, which its scans and
 //! queries check. The operations of a worker follow from the seed and from its rows
 //! alone: every run of a seed takes a prefix of the same sequence, while how far it
 //! gets and how the workers interleave depend on timing.
 //!
+//! The state of the dataset lasts as long as the run, as a service's would. The
+//! older half of the rows a class starts with is its core, which no operation
+//! deletes: updates move its rows to new fragments and merge inserts rewrite their
+//! `gen` column in place, so fragments that live for the whole run collect
+//! deletions and dead columns for compaction to clear. The other rows of a class
+//! turn over: appends and merge inserts add rows above the newest, and deletes take
+//! the oldest. The indices are built once, before the workers start, and from then
+//! on only optimized. Lance gives a vector index a new segment for new rows unless
+//! told to merge, which it leaves to the caller, so some optimizations merge every
+//! segment.
+//!
 //! A worker waits a little between its operations, as a service waits for work:
 //! with none, a compaction loses the race for its commit to the writes that land
 //! meanwhile most of the time, and every loss leaves the files it wrote behind.
+//! Maintenance that keeps losing is left for later, as a service would leave it.
+//! The samples count how often each kind was drawn and gave up, but nothing judges
+//! the counts: the workers that run maintenance also make the load it races with,
+//! so a compaction made 2 s slower loses four tries in five and still lands half
+//! of its draws.
 //!
-//! A run takes `SAMPLES` samples at even intervals. For each one the workers finish
-//! what they are doing and wait, and once the runtime is quiet the sample measures
-//! the process, the caches of the session and the dataset, so that what an
-//! operation holds while it runs does not count. Then a cleanup that may delete
-//! unverified files runs, as a service would run one with nothing in flight, and
-//! must leave no file that no version references, and the versions, files and bytes
-//! of the dataset are measured after it, so that they count what the versions it
-//! keeps hold rather than what lost races left; every `CHECK_EVERY` samples the
-//! dataset is checked against the rows of every class too. A cache may never hold
-//! more than its capacity, and each series must level off: the median of its last
-//! third of the samples may exceed that of the middle third by no more than the
-//! tolerance of the series. The first third warms the caches up.
+//! A run takes at least `MIN_SAMPLES` samples, at even intervals of at most
+//! `MAX_SAMPLE_INTERVAL`, so the checks of a sample run in proportion to its
+//! length. For each one the workers finish what they are doing and wait,
+//! maintenance after the try it is on, and once the runtime is quiet the sample
+//! measures the process, the caches of the session and the dataset, so that what
+//! an operation holds while it runs does not count.
+//! Then a cleanup that may delete unverified files runs, as a service would run one
+//! with nothing in flight, and must leave no file that no version references, and
+//! the dataset is measured after it, so that its series count what the versions
+//! the cleanup keeps hold rather than what lost races left; every `CHECK_EVERY`
+//! samples the dataset is checked against the rows of every class too. A cache may
+//! never hold more than its capacity, and each series must level off: the median
+//! of its last third of the samples may exceed that of the middle third by no more
+//! than the tolerance of the series. The first third warms the caches up.
+//!
+//! A compaction or an index optimization that does not merge only raises the level
+//! the series settle at: an update moves rows out of their fragment, and a commit
+//! drops a fragment with no rows left and a segment that covers no fragment unless
+//! it is the last of its index, so with a bounded number of rows little piles up
+//! for long. After the last sample,
+//! with nothing in flight, merging the segments of every index and then compacting
+//! must leave one fragment, which one segment of each index covers.
 //!
 //! Lance's own tests build `lance-io` with `test-util`, under which a store keeps a
 //! record of every request it served until someone takes its statistics. A sample
@@ -36,7 +62,7 @@
 //! checks, before it reads the heap: a build without the feature keeps counts
 //! alone.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::fs::File;
 use std::io::Write as _;
@@ -52,19 +78,23 @@ use lance::Dataset;
 use lance::Error;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
+use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::{WriteMode, WriteParams};
+use lance::index::DatasetIndexExt;
 use lance::session::Session;
 use lance_core::cache::CacheStats;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
-use lance_io::object_store::ObjectStore;
-use tokio::sync::{Mutex as TurnLock, RwLock};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use tokio::sync::{Mutex as TurnLock, RwLock, RwLockReadGuard};
 use tokio::task::{JoinError, JoinSet};
 
 use super::concurrency::{
-    ClassRows, class_range, delete, full_batch, id_run, schema, source_of, update, upsert,
+    ClassRows, class_range, delete, full_batch, id_run, schema, source_of, stamp_job, stamp_source,
+    update, upsert,
 };
 use super::{
-    Answers, CATEGORIES, Failure, IVF_PARTITIONS, IndexKind, Journal, NEIGHBORS, Op, PlanRng, Run,
+    ALL_PARTITIONS, Answers, CATEGORIES, Failure, IndexKind, Journal, NEIGHBORS, Op, PlanRng, Run,
     Scale, category, check_neighbors, compare_ids, fail, file_sizes, fingerprint, int64_column,
     is_commit_conflict, listed_versions, op_future, pick_from, soak_secs, tokens, vector,
 };
@@ -72,10 +102,12 @@ use crate::harness::SelfTest;
 use crate::incidents::{IncidentState, StressHooks};
 use crate::leaks::{live_heap_bytes, malloc_bytes, settle, trimmed_anon_kib};
 
-pub const SAMPLES: usize = 24;
+/// The fewest samples a run takes, and the longest it waits between two: a long
+/// run takes more samples rather than longer intervals.
+pub const MIN_SAMPLES: usize = 24;
+const MAX_SAMPLE_INTERVAL: Duration = Duration::from_millis(7500);
 const CHECK_EVERY: usize = 4;
-const MIDDLE: Range<usize> = 8..16;
-const LAST: Range<usize> = 16..24;
+/// Takes `MIN_SAMPLES` samples `MAX_SAMPLE_INTERVAL` apart.
 pub const DEFAULT_SECS: u64 = 180;
 pub const SELF_TEST_SECS: u64 = 24;
 /// The samples of a seed, one row each, in its directory.
@@ -110,10 +142,73 @@ const INDICES: [IndexKind; 4] = [
     IndexKind::IvfFlat,
     IndexKind::Inverted,
 ];
+/// Outside these percentages of the rows it starts with, a class only appends or
+/// only deletes until it is back within them, and an operation drawn within them
+/// may take it beyond them by the rows of one operation. The older part of those
+/// rows, its core, is never deleted.
+const CLASS_LOW_PERCENT: usize = 75;
+const CLASS_HIGH_PERCENT: usize = 125;
+const CORE_PERCENT: usize = 50;
+
+/// What a worker draws while its class is within its bounds.
+#[derive(Clone, Copy)]
+enum Draw {
+    Append,
+    MergeInsert,
+    MergeInsertColumns,
+    Update,
+    Delete,
+    Scan,
+    Query,
+    Reopen,
+    OptimizeIndices,
+    MergeIndices,
+    Compact,
+    Cleanup,
+}
+
+/// How often a worker draws each operation, in hundredths. A quarter of the index
+/// optimizations merge every segment, which Lance leaves to the caller.
+const DRAWS: [(Draw, u64); 12] = [
+    (Draw::Append, 12),
+    (Draw::MergeInsert, 6),
+    (Draw::MergeInsertColumns, 6),
+    (Draw::Update, 14),
+    (Draw::Delete, 14),
+    (Draw::Scan, 8),
+    (Draw::Query, 12),
+    (Draw::Reopen, 4),
+    (Draw::OptimizeIndices, 6),
+    (Draw::MergeIndices, 2),
+    (Draw::Compact, 8),
+    (Draw::Cleanup, 8),
+];
+
+const _: () = {
+    let mut total = 0;
+    let mut at = 0;
+    while at < DRAWS.len() {
+        total += DRAWS[at].1;
+        at += 1;
+    }
+    assert!(total == 100, "the weights of DRAWS must add up to 100");
+};
+
+/// The operation a roll from 0 to 99 picks.
+fn pick_draw(roll: u64) -> Draw {
+    let mut left = roll;
+    for (draw, weight) in DRAWS {
+        if left < weight {
+            return draw;
+        }
+        left -= weight;
+    }
+    unreachable!("the weights of DRAWS add up to 100")
+}
 
 /// What a sample measures, as the columns of `SERIES_FILE` name it, and how far
 /// the median of the last third may rise above that of the middle third.
-const SERIES: [(&str, i64); 8] = [
+const SERIES: [(&str, i64); 11] = [
     // What Rust code holds, the series that matters.
     ("heap_bytes", 2 << 20),
     // What malloc has handed out: the heap, and what C code holds besides it. It
@@ -122,13 +217,26 @@ const SERIES: [(&str, i64); 8] = [
     ("malloc_bytes", 3 << 20),
     ("fds", 4),
     ("threads", 8),
-    // Readers that the caches of the session hold keep tasks of their own: the
-    // median of a third has risen by up to 4 on its own.
-    ("tasks", 12),
+    // Readers that the caches of the session hold keep tasks of their own: in a
+    // run of 180 s the median of a third moves by up to 8 either way on its own.
+    ("tasks", 16),
     // What the versions a cleanup keeps hold, measured after it.
     ("versions", 16),
     ("files", 100),
     ("dataset_bytes", 2 << 20),
+    // The latest version, after the cleanup too: what maintenance keeps in check.
+    ("fragments", 24),
+    ("index_segments", 8),
+    // Its size swings by up to 8 KB within a run on its own.
+    ("manifest_bytes", 16 << 10),
+];
+
+/// The maintenance whose draws and give-ups the samples count. A cleanup commits
+/// no version, so it has no race to lose.
+const MAINTENANCE: [SoakOp; 3] = [
+    SoakOp::Compact,
+    SoakOp::OptimizeIndices,
+    SoakOp::MergeIndices,
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -143,23 +251,34 @@ enum SoakOp {
         first_id: i64,
         rows: i64,
     },
+    /// Sets `gen` on a run of core rows with a merge insert that rewrites the
+    /// column in place, so the rows stay in their fragments.
+    MergeInsertColumns {
+        first_id: i64,
+        rows: i64,
+    },
     /// Sets `gen` on the rows of the class in a range of ids.
     Update {
         lo: i64,
         hi: i64,
     },
-    /// Deletes the rows of the class in a range of ids, the oldest ones.
+    /// Deletes the rows of the class in a range of ids, the oldest ones past its
+    /// core.
     Delete {
         lo: i64,
         hi: i64,
     },
     /// Reads the class.
     Scan,
-    /// Reads rows of the class through an index, or through a scan while there is
-    /// none.
+    /// Reads rows of the class through an index.
     Query(IndexKind),
-    CreateIndex(IndexKind),
+    /// Drops the handle and opens the dataset again on the same session.
+    Reopen,
+    /// Indexes the rows no index covers.
     OptimizeIndices,
+    /// Indexes the rows no index covers and merges the segments of each index
+    /// into one.
+    MergeIndices,
     Compact,
     /// Removes the versions before the last `retain`, but none a handle is on.
     Cleanup {
@@ -172,12 +291,14 @@ impl SoakOp {
         match self {
             Self::Append { .. } => "append",
             Self::MergeInsert { .. } => "merge_insert",
+            Self::MergeInsertColumns { .. } => "merge_insert_columns",
             Self::Update { .. } => "update",
             Self::Delete { .. } => "delete",
             Self::Scan => "scan",
             Self::Query(_) => "query",
-            Self::CreateIndex(_) => "create_index",
+            Self::Reopen => "reopen",
             Self::OptimizeIndices => "optimize_indices",
+            Self::MergeIndices => "merge_indices",
             Self::Compact => "compact",
             Self::Cleanup { .. } => "cleanup",
         }
@@ -188,6 +309,7 @@ impl SoakOp {
             self,
             Self::Append { .. }
                 | Self::MergeInsert { .. }
+                | Self::MergeInsertColumns { .. }
                 | Self::Update { .. }
                 | Self::Delete { .. }
         )
@@ -197,17 +319,21 @@ impl SoakOp {
 impl fmt::Display for SoakOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Append { first_id, rows } | Self::MergeInsert { first_id, rows } => {
+            Self::Append { first_id, rows }
+            | Self::MergeInsert { first_id, rows }
+            | Self::MergeInsertColumns { first_id, rows } => {
                 write!(f, "{}:first={first_id},rows={rows}", self.kind())
             }
             Self::Update { lo, hi } | Self::Delete { lo, hi } => {
                 write!(f, "{}:ids={lo}..{hi}", self.kind())
             }
-            Self::Query(kind) | Self::CreateIndex(kind) => {
-                write!(f, "{}:{}", self.kind(), kind.name())
-            }
+            Self::Query(kind) => write!(f, "{}:{}", self.kind(), kind.name()),
             Self::Cleanup { retain } => write!(f, "cleanup:retain={retain}"),
-            Self::Scan | Self::OptimizeIndices | Self::Compact => f.write_str(self.kind()),
+            Self::Scan
+            | Self::Reopen
+            | Self::OptimizeIndices
+            | Self::MergeIndices
+            | Self::Compact => f.write_str(self.kind()),
         }
     }
 }
@@ -218,11 +344,15 @@ struct OpSource {
     rng: PlanRng,
     worker: usize,
     stride: i64,
-    /// Its class: each id with the `gen` it holds. Deletes take the oldest ids and
-    /// writes add new ones above the newest, so the ids form one run.
+    /// Its class: each id with the `gen` it holds. The oldest `core` ids are its
+    /// core, which no operation deletes; deletes take the oldest ids past it and
+    /// writes add new ones above the newest, so the ids form two runs.
     rows: ClassRows,
+    core: usize,
     next_id: i64,
-    /// The class stays between these sizes, around the one it starts with.
+    /// Below the one size the class only grows and above the other it only
+    /// shrinks; an operation drawn between them may take it beyond them by its
+    /// rows.
     low: usize,
     high: usize,
     drawn: u64,
@@ -257,9 +387,10 @@ impl OpSource {
             worker,
             stride,
             rows,
+            core: size * CORE_PERCENT / 100,
             next_id,
-            low: size * 3 / 4,
-            high: size * 5 / 4,
+            low: size * CLASS_LOW_PERCENT / 100,
+            high: size * CLASS_HIGH_PERCENT / 100,
             drawn: 0,
         }
     }
@@ -280,13 +411,18 @@ impl OpSource {
         let catch_up = self.rng.chance(0.7);
         let think =
             Duration::from_millis(self.rng.range(0..=THINK_MS_PER_WORKER * self.stride as u64));
-        // Never more than the class holds: it stays above `low` less a run.
         let run = self.rng.range(10..=40) as usize;
         let roll = self.rng.range(0..=99);
         let size = self.rows.len();
-        let delete_oldest = |source: &Self| SoakOp::Delete {
-            lo: source.id_at(0),
-            hi: source.id_at(run - 1) + 1,
+        // Within its bounds a class holds at least a quarter of the rows it starts
+        // with past its core, which may be fewer than a run.
+        let past_core = size - self.core;
+        let delete_oldest = |source: &Self| {
+            let count = run.min(past_core);
+            SoakOp::Delete {
+                lo: source.id_at(source.core),
+                hi: source.id_at(source.core + count - 1) + 1,
+            }
         };
         let append = |source: &Self| SoakOp::Append {
             first_id: source.next_id,
@@ -297,26 +433,35 @@ impl OpSource {
         } else if size < self.low {
             append(self)
         } else {
-            match roll {
-                0..=11 => append(self),
-                12..=23 => SoakOp::MergeInsert {
+            match pick_draw(roll) {
+                Draw::Append => append(self),
+                Draw::MergeInsert => SoakOp::MergeInsert {
                     first_id: self.id_at(size - run / 2),
                     rows: run as i64,
                 },
-                24..=37 => {
+                Draw::MergeInsertColumns => {
+                    let rows = run.min(self.core);
+                    let start = self.rng.range(0..=(self.core - rows) as u64) as usize;
+                    SoakOp::MergeInsertColumns {
+                        first_id: self.id_at(start),
+                        rows: rows as i64,
+                    }
+                }
+                Draw::Update => {
                     let start = self.rng.range(0..=(size - run) as u64) as usize;
                     SoakOp::Update {
                         lo: self.id_at(start),
                         hi: self.id_at(start + run - 1) + 1,
                     }
                 }
-                38..=51 => delete_oldest(self),
-                52..=59 => SoakOp::Scan,
-                60..=71 => SoakOp::Query(*pick_from(&mut self.rng, &INDICES)),
-                72..=77 => SoakOp::CreateIndex(*pick_from(&mut self.rng, &INDICES)),
-                78..=83 => SoakOp::OptimizeIndices,
-                84..=91 => SoakOp::Compact,
-                _ => SoakOp::Cleanup {
+                Draw::Delete => delete_oldest(self),
+                Draw::Scan => SoakOp::Scan,
+                Draw::Query => SoakOp::Query(*pick_from(&mut self.rng, &INDICES)),
+                Draw::Reopen => SoakOp::Reopen,
+                Draw::OptimizeIndices => SoakOp::OptimizeIndices,
+                Draw::MergeIndices => SoakOp::MergeIndices,
+                Draw::Compact => SoakOp::Compact,
+                Draw::Cleanup => SoakOp::Cleanup {
                     retain: self.rng.range(1..=3) as usize,
                 },
             }
@@ -338,6 +483,11 @@ impl OpSource {
                     .extend(id_run(first_id, rows, self.stride).map(|id| (id, number)));
                 self.next_id = self.next_id.max(first_id + rows * self.stride);
             }
+            SoakOp::MergeInsertColumns { first_id, rows } => {
+                for id in id_run(first_id, rows, self.stride) {
+                    *self.rows.get_mut(&id).expect("a row of the core") = number;
+                }
+            }
             SoakOp::Update { lo, hi } => {
                 for (_, stamp) in self.rows.range_mut(lo..hi) {
                     *stamp = number;
@@ -353,6 +503,7 @@ impl OpSource {
 #[derive(Clone, Debug)]
 pub(super) struct SoakPlan {
     secs: u64,
+    samples: usize,
     workers: usize,
     pub(super) stable_row_ids: bool,
     initial_rows: i64,
@@ -362,8 +513,13 @@ pub(super) struct SoakPlan {
 
 pub(super) fn plan(rng: &mut PlanRng, initial_rows: i64) -> SoakPlan {
     let workers = rng.range(2..=4) as usize;
+    let secs = soak_secs();
+    let samples = (secs * 1000)
+        .div_ceil(MAX_SAMPLE_INTERVAL.as_millis() as u64)
+        .max(MIN_SAMPLES as u64) as usize;
     SoakPlan {
-        secs: soak_secs(),
+        secs,
+        samples,
         workers,
         stable_row_ids: rng.chance(0.5),
         initial_rows,
@@ -373,7 +529,11 @@ pub(super) fn plan(rng: &mut PlanRng, initial_rows: i64) -> SoakPlan {
 
 impl SoakPlan {
     fn interval(&self) -> Duration {
-        Duration::from_secs(self.secs) / SAMPLES as u32
+        Duration::from_secs(self.secs) / self.samples as u32
+    }
+
+    pub(super) fn samples(&self) -> usize {
+        self.samples
     }
 
     fn source(&self, worker: usize) -> OpSource {
@@ -387,8 +547,9 @@ impl SoakPlan {
 
     pub(super) fn render(&self) -> String {
         let mut text = format!(
-            "soak secs={} interval_ms={} workers={} stable_row_ids={} index_cache_bytes={INDEX_CACHE_BYTES} metadata_cache_bytes={METADATA_CACHE_BYTES}\n",
+            "soak secs={} samples={} interval_ms={} workers={} stable_row_ids={} index_cache_bytes={INDEX_CACHE_BYTES} metadata_cache_bytes={METADATA_CACHE_BYTES}\n",
             self.secs,
+            self.samples,
             self.interval().as_millis(),
             self.workers,
             self.stable_row_ids
@@ -437,12 +598,15 @@ pub(super) fn initial_source(
 /// What the workers and the samples share.
 struct Shared {
     session: Arc<Session>,
+    /// Where a worker opens the dataset again.
+    uri: String,
     schema: SchemaRef,
     data_seed: u64,
     scale: Scale,
     stride: i64,
-    /// An operation runs under the read lock. A sample takes the write lock, which
-    /// waits for the operations in flight and holds back the next ones.
+    /// An operation runs under the read lock, maintenance one try at a time. A
+    /// sample takes the write lock, which waits for what holds it and holds back
+    /// the rest.
     pause: RwLock<()>,
     stop: AtomicBool,
     /// Set by a worker that fails, before it lets go of the pause.
@@ -455,8 +619,10 @@ struct Shared {
     handles: Vec<AtomicU64>,
     /// The newest version a cleanup was allowed to remove the versions before.
     expired_below: AtomicU64,
-    indices: Mutex<BTreeSet<IndexKind>>,
     ops: AtomicU64,
+    /// For each kind of `MAINTENANCE`, how many times it was drawn and how many of
+    /// those gave up.
+    maintenance: [[AtomicU64; 2]; MAINTENANCE.len()],
     /// The sample being collected, which a failure gives as its step.
     sample: AtomicUsize,
     journal: Arc<Journal>,
@@ -529,7 +695,7 @@ impl Drop for MarkFailed<'_> {
 
 async fn run_worker(shared: Arc<Shared>, worker: usize, mut ds: Dataset) -> Result<(), Failure> {
     loop {
-        let running = shared.pause.read().await;
+        let mut running = Some(shared.pause.read().await);
         if shared.stop.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -537,7 +703,7 @@ async fn run_worker(shared: Arc<Shared>, worker: usize, mut ds: Dataset) -> Resu
         // it lets go of the pause, and a sample that takes the pause meanwhile must
         // not check the rows the failed operation was to leave.
         let failing = MarkFailed(&shared.failed);
-        let think = Box::pin(run_next(&shared, worker, &mut ds)).await?;
+        let think = Box::pin(run_next(&shared, worker, &mut ds, &mut running)).await?;
         std::mem::forget(failing);
         // Outside the lock, so that a sample need not wait for it.
         drop(running);
@@ -545,9 +711,14 @@ async fn run_worker(shared: Arc<Shared>, worker: usize, mut ds: Dataset) -> Resu
     }
 }
 
-/// Draws the next operation of a worker and runs it; how long the worker waits
-/// after it.
-async fn run_next(shared: &Shared, worker: usize, ds: &mut Dataset) -> Result<Duration, Failure> {
+/// Draws the next operation of a worker and runs it under `running`, its hold on
+/// the pause; how long the worker waits after it.
+async fn run_next<'s>(
+    shared: &'s Shared,
+    worker: usize,
+    ds: &mut Dataset,
+    running: &mut Option<RwLockReadGuard<'s, ()>>,
+) -> Result<Duration, Failure> {
     let drawn = shared.sources[worker].lock().unwrap().next();
     let n = shared.sample.load(Ordering::SeqCst);
     if drawn.catch_up {
@@ -561,9 +732,19 @@ async fn run_next(shared: &Shared, worker: usize, ds: &mut Dataset) -> Result<Du
         drawn.seq, drawn.op
     ));
     let started = Instant::now();
-    let (outcome, tries) = Box::pin(run_op(shared, worker, ds, &drawn, n)).await?;
+    let (outcome, tries) = Box::pin(run_op(shared, worker, ds, &drawn, n, running)).await?;
     shared.handles[worker].store(ds.version().version, Ordering::SeqCst);
     shared.ops.fetch_add(1, Ordering::SeqCst);
+    if let Some(slot) = MAINTENANCE
+        .iter()
+        .position(|op| op.kind() == drawn.op.kind())
+    {
+        let [draws, gave_up] = &shared.maintenance[slot];
+        draws.fetch_add(1, Ordering::SeqCst);
+        if outcome == "gave_up" {
+            gave_up.fetch_add(1, Ordering::SeqCst);
+        }
+    }
     shared.journal.line(format_args!(
         "step={n} soak worker={worker} seq={} op={} outcome={outcome} tries={tries} version={} ms={}",
         drawn.seq,
@@ -577,12 +758,13 @@ async fn run_next(shared: &Shared, worker: usize, ds: &mut Dataset) -> Result<Du
 /// Runs an operation until it lands. One that keeps losing the race for a commit
 /// is tried again on the latest version, and maintenance that still loses is left
 /// for later, as a service would; a write must land.
-async fn run_op(
-    shared: &Shared,
+async fn run_op<'s>(
+    shared: &'s Shared,
     worker: usize,
     ds: &mut Dataset,
     drawn: &Drawn,
-    n: usize,
+    mut n: usize,
+    running: &mut Option<RwLockReadGuard<'s, ()>>,
 ) -> Result<(&'static str, usize), Failure> {
     for tries in 1..=TRIES {
         let error = match Box::pin(attempt(shared, worker, ds, drawn, n)).await {
@@ -617,6 +799,18 @@ async fn run_op(
                 drawn.op.kind()
             ));
             return Ok(("gave_up", tries));
+        }
+        // Maintenance changes no row, so a sample may run between its tries: one
+        // that waited for them all would stop the other workers and hand the next
+        // try a store with nothing in flight.
+        if !drawn.op.changes_rows() {
+            running.take();
+            *running = Some(shared.pause.read().await);
+            // That sample may have been the last one, or have failed the run.
+            if shared.stop.load(Ordering::SeqCst) {
+                return Ok(("stopped", tries));
+            }
+            n = shared.sample.load(Ordering::SeqCst);
         }
         Box::pin(ds.checkout_latest())
             .await
@@ -657,6 +851,12 @@ async fn attempt(
         SoakOp::MergeInsert { first_id, rows } => {
             Box::pin(upsert(ds, source(first_id, rows))).await?;
         }
+        SoakOp::MergeInsertColumns { first_id, rows } => {
+            let ids: Vec<i64> = id_run(first_id, rows, stride).collect();
+            let columns = stamp_source(&shared.schema, ids, drawn.number);
+            let (merged, _) = Box::pin(stamp_job(ds)?.execute_reader(columns)).await?;
+            *ds = merged.as_ref().clone();
+        }
         SoakOp::Update { lo, hi } => {
             let predicate = class_range(stride, worker, lo, hi);
             Box::pin(update(ds, &predicate, &drawn.number.to_string())).await?;
@@ -671,14 +871,20 @@ async fn attempt(
             let rows = shared.rows(worker);
             Box::pin(query_class(ds, shared, worker, kind, &rows, drawn.seq, n)).await?;
         }
-        SoakOp::CreateIndex(kind) => {
-            let op = Op::CreateIndex(kind);
-            op_future(ds, hooks, shared.data_seed, shared.scale, op, None).await?;
-            shared.indices.lock().unwrap().insert(kind);
+        SoakOp::Reopen => {
+            *ds = Box::pin(
+                DatasetBuilder::from_uri(&shared.uri)
+                    .with_session(shared.session.clone())
+                    .load(),
+            )
+            .await?;
         }
         SoakOp::OptimizeIndices => {
             let op = Op::OptimizeIndices;
             op_future(ds, hooks, shared.data_seed, shared.scale, op, None).await?;
+        }
+        SoakOp::MergeIndices => {
+            Box::pin(merge_indices(ds, hooks)).await?;
         }
         SoakOp::Compact => {
             op_future(ds, hooks, shared.data_seed, shared.scale, Op::Compact, None).await?;
@@ -721,6 +927,71 @@ async fn attempt(
         }
     }
     Ok(())
+}
+
+/// Indexes the rows no index covers and merges the segments of each index into
+/// one: Lance merges the segments of a vector index only when told to.
+async fn merge_indices(ds: &mut Dataset, hooks: &Arc<StressHooks>) -> lance::Result<()> {
+    let segments = ds.load_indices().await?.len();
+    let options = OptimizeOptions::merge(segments.max(1)).progress(hooks.clone());
+    Box::pin(ds.optimize_indices(&options)).await
+}
+
+/// How many segments each index of a soak has.
+async fn index_segments(ds: &Dataset) -> lance::Result<BTreeMap<&'static str, usize>> {
+    let indices = ds.load_indices().await?;
+    Ok(INDICES
+        .iter()
+        .map(|kind| {
+            let name = kind.name();
+            let segments = indices.iter().filter(|index| index.name == name).count();
+            (name, segments)
+        })
+        .collect())
+}
+
+/// The most partitions a segment of the vector index has. Lance keeps the last
+/// segment of an index once it covers no fragment, with no statistics, which count
+/// as none. Read segment by segment, which writes nothing: the statistics of a
+/// whole index commit a version when its segments overlap.
+async fn ivf_partitions(ds: &Dataset, n: usize) -> Result<u64, Failure> {
+    let name = IndexKind::IvfFlat.name();
+    let unreadable = |error: Error| fail("unreadable", n, error);
+    let segments: Vec<_> = ds
+        .load_indices()
+        .await
+        .map_err(unreadable)?
+        .iter()
+        .filter(|index| index.name == name)
+        .map(|index| index.uuid)
+        .collect();
+    let statistics = ds
+        .index_segment_statistics(name, &segments)
+        .await
+        .map_err(unreadable)?;
+    let mut most = 0;
+    for segment in &statistics {
+        let uncovered = segment
+            .statistics
+            .as_object()
+            .is_some_and(|fields| fields.is_empty());
+        let partitions = match segment.statistics.get("num_partitions") {
+            Some(count) => count.as_u64(),
+            None if uncovered => Some(0),
+            None => None,
+        };
+        most = most.max(partitions.ok_or_else(|| {
+            fail(
+                "harness",
+                n,
+                format_args!(
+                    "no partition count in the statistics of segment {} of {name}: {}",
+                    segment.index_uuid, segment.statistics
+                ),
+            )
+        })?);
+    }
+    Ok(most)
 }
 
 /// The rows of a worker's class on its handle must be what its operations left,
@@ -807,7 +1078,7 @@ async fn query_class(
             // The neighbors among the class alone: the filter goes first.
             let query = vector(!shared.data_seed, salt as i64);
             scan.nearest("vec", &Float32Array::from(query.to_vec()), NEIGHBORS)?;
-            scan.minimum_nprobes(IVF_PARTITIONS);
+            scan.minimum_nprobes(ALL_PARTITIONS);
             scan.prefilter(true);
             scan.filter(&format!("id % {stride} = {worker}"))?;
             scan.project(&["id"])?;
@@ -884,13 +1155,17 @@ struct Sample {
     /// verdict reads it: glibc keeps the top of every thread's arena, so it wanders
     /// by tens of MiB with nothing held.
     rss_anon_kib: u64,
+    /// The most partitions a segment of the vector index has.
+    ivf_partitions: u64,
+    /// What `Shared::maintenance` counted up to the sample.
+    maintenance: [[u64; 2]; MAINTENANCE.len()],
 }
 
 impl Sample {
     fn header() -> String {
         let series: Vec<&str> = SERIES.iter().map(|(name, _)| *name).collect();
         let mut header = format!(
-            "sample,t_ms,ops,latest,quiet_ms,{},rss_anon_kib",
+            "sample,t_ms,ops,latest,quiet_ms,{},rss_anon_kib,ivf_partitions",
             series.join(",")
         );
         for cache in ["index_cache", "metadata_cache"] {
@@ -899,6 +1174,10 @@ impl Sample {
             }
         }
         header.push_str(",read_iops,read_bytes,write_iops,written_bytes");
+        for op in MAINTENANCE {
+            let kind = op.kind();
+            write!(header, ",{kind}_draws,{kind}_gave_up").unwrap();
+        }
         header
     }
 
@@ -910,7 +1189,7 @@ impl Sample {
         for value in self.series {
             write!(row, ",{value}").unwrap();
         }
-        write!(row, ",{}", self.rss_anon_kib).unwrap();
+        write!(row, ",{},{}", self.rss_anon_kib, self.ivf_partitions).unwrap();
         for stats in [&self.index_cache, &self.metadata_cache] {
             write!(
                 row,
@@ -919,7 +1198,11 @@ impl Sample {
             )
             .unwrap();
         }
-        for count in self.io {
+        for count in self
+            .io
+            .into_iter()
+            .chain(self.maintenance.into_iter().flatten())
+        {
             write!(row, ",{count}").unwrap();
         }
         row
@@ -934,34 +1217,67 @@ fn worker_end(ended: Result<Result<(), Failure>, JoinError>, n: usize) -> Result
 impl Run {
     pub(super) async fn run_soak(&mut self) -> Result<(), Failure> {
         let plan = self.plan.soak.clone().expect("a soak plan");
+        // Without caches: under the default session, the catch-up before every
+        // sample would keep the manifest of each version it lands on, up to 1 GiB.
+        self.ds = Box::pin(
+            DatasetBuilder::from_uri(&self.uri)
+                .with_session(Arc::new(Session::new(0, 0, Default::default())))
+                .with_store_params(ObjectStoreParams {
+                    object_store_wrapper: Some(self.wrapper.clone()),
+                    ..Default::default()
+                })
+                .load(),
+        )
+        .await
+        .map_err(|error| fail("unreadable", 1, error))?;
         let started = Instant::now();
         let session = Arc::new(Session::new(
             INDEX_CACHE_BYTES,
             METADATA_CACHE_BYTES,
             Default::default(),
         ));
+        let sink = Arc::new(IncidentState::new(
+            self.root.clone(),
+            Path::new("/dev/null"),
+            started,
+        ));
+        let hooks = Arc::new(StressHooks::new(sink));
         let mut handles = Vec::with_capacity(plan.workers);
-        for _ in 0..plan.workers {
-            let ds = Box::pin(
+        for worker in 0..plan.workers {
+            let mut ds = Box::pin(
                 DatasetBuilder::from_uri(&self.uri)
                     .with_session(session.clone())
                     .load(),
             )
             .await
             .map_err(|error| fail("unreadable", 1, error))?;
+            // Built once: from then on a service only optimizes its indices.
+            if worker == 0 {
+                for kind in INDICES {
+                    let (data_seed, scale) = (self.plan.data_seed, self.plan.scale);
+                    let op = Op::CreateIndex(kind);
+                    op_future(&mut ds, &hooks, data_seed, scale, op, None)
+                        .await
+                        .map_err(|error| {
+                            let index = kind.name();
+                            fail(
+                                "error_without_fault",
+                                1,
+                                format_args!("building {index}: {error}"),
+                            )
+                        })?;
+                }
+            }
             handles.push(ds);
         }
+        self.model.indices = INDICES.into_iter().collect();
         let store = handles[0]
             .object_store(None)
             .await
             .map_err(|error| fail("unreadable", 1, error))?;
-        let sink = Arc::new(IncidentState::new(
-            self.root.clone(),
-            Path::new("/dev/null"),
-            started,
-        ));
         let shared = Arc::new(Shared {
             session,
+            uri: self.uri.clone(),
             schema: schema(false),
             data_seed: self.plan.data_seed,
             scale: self.plan.scale,
@@ -978,11 +1294,11 @@ impl Run {
                 .map(|ds| AtomicU64::new(ds.version().version))
                 .collect(),
             expired_below: AtomicU64::new(self.expired_below),
-            indices: Mutex::new(BTreeSet::new()),
             ops: AtomicU64::new(0),
+            maintenance: Default::default(),
             sample: AtomicUsize::new(1),
             journal: self.journal.clone(),
-            hooks: Arc::new(StressHooks::new(sink)),
+            hooks,
             store,
         });
         let mut workers = JoinSet::new();
@@ -1001,9 +1317,13 @@ impl Run {
             }
         };
         while let Some(ended) = workers.join_next().await {
-            worker_end(ended, SAMPLES)?;
+            if let Err(failure) = worker_end(ended, plan.samples) {
+                workers.detach_all();
+                return Err(failure);
+            }
         }
-        self.check_series(&samples)?;
+        let left = Box::pin(self.check_maintenance(&shared, plan.samples)).await?;
+        self.check_series(&samples, left)?;
         self.sync_model(&shared);
         Ok(())
     }
@@ -1020,8 +1340,8 @@ impl Run {
             |error: std::io::Error| fail("harness", 0, format_args!("{SERIES_FILE}: {error}"));
         let mut series = File::create(&path).map_err(harness)?;
         writeln!(series, "{}", Sample::header()).map_err(harness)?;
-        let mut samples = Vec::with_capacity(SAMPLES);
-        for index in 0..SAMPLES {
+        let mut samples = Vec::with_capacity(plan.samples);
+        for index in 0..plan.samples {
             let n = index + 1;
             let due = started + plan.interval() * n as u32;
             tokio::select! {
@@ -1130,21 +1450,56 @@ impl Run {
             metadata_cache,
             io,
             rss_anon_kib: trimmed_anon_kib(),
+            ivf_partitions: 0,
+            maintenance: shared.maintenance.each_ref().map(|[draws, gave_up]| {
+                [draws.load(Ordering::SeqCst), gave_up.load(Ordering::SeqCst)]
+            }),
         })
     }
 
-    /// The versions, files and bytes of the dataset, the last three series.
+    /// The versions, files and bytes of the dataset, and the fragments, index
+    /// segments and manifest size of its latest version: the series after the
+    /// five of the process. Besides, the most partitions a segment of its vector
+    /// index has, which must stay within what a query probes.
     async fn measure_dataset(&self, sample: &mut Sample, n: usize) -> Result<(), Failure> {
         let verifier = self.open_verifier(n).await?;
         let versions = listed_versions(&verifier, n).await?.len();
         let files = file_sizes(verifier.all_files().await)
             .await
             .map_err(|error| fail("unreadable", n, error))?;
+        let segments = index_segments(&verifier)
+            .await
+            .map_err(|error| fail("unreadable", n, error))?;
+        // The listing names a file from the root of the dataset.
+        let manifest = &verifier.manifest_location().path;
+        let manifest_file = format!("_versions/{}", manifest.filename().unwrap_or_default());
+        let manifest_bytes = *files.get(&manifest_file).ok_or_else(|| {
+            fail(
+                "harness",
+                n,
+                format_args!("the dataset lists no {manifest_file} for its manifest {manifest}"),
+            )
+        })?;
+        sample.ivf_partitions = ivf_partitions(&verifier, n).await?;
+        if sample.ivf_partitions > ALL_PARTITIONS as u64 {
+            return Err(fail(
+                "harness",
+                n,
+                format_args!(
+                    "a segment of {} has {} partitions, more than the {ALL_PARTITIONS} a query probes",
+                    IndexKind::IvfFlat.name(),
+                    sample.ivf_partitions
+                ),
+            ));
+        }
         sample.latest = verifier.version().version;
         sample.series[5..].copy_from_slice(&[
             versions as i64,
             files.len() as i64,
             files.values().sum(),
+            verifier.get_fragments().len() as i64,
+            segments.values().sum::<usize>() as i64,
+            manifest_bytes,
         ]);
         Ok(())
     }
@@ -1212,7 +1567,6 @@ impl Run {
         let live: BTreeSet<i64> = shared.all_rows().into_keys().collect();
         self.model.next_id = live.last().map_or(0, |last| last + 1);
         self.model.live = live;
-        self.model.indices = shared.indices.lock().unwrap().clone();
         self.expired_below = shared.expired_below.load(Ordering::SeqCst);
     }
 
@@ -1240,8 +1594,11 @@ impl Run {
         Ok(())
     }
 
-    /// Each series must have levelled off by the middle third of the run.
-    fn check_series(&self, samples: &[Sample]) -> Result<(), Failure> {
+    /// Each series must have levelled off by the middle third of the run, and the
+    /// maintenance at its end must have left what `check_maintenance` expects;
+    /// `left` is what it left otherwise.
+    fn check_series(&self, samples: &[Sample], left: Option<String>) -> Result<(), Failure> {
+        let n = samples.len();
         let median = |range: Range<usize>, column: usize| {
             let mut values: Vec<i64> = samples[range]
                 .iter()
@@ -1252,9 +1609,10 @@ impl Run {
         };
         let mut grown = Vec::new();
         for (column, (name, tolerance)) in SERIES.iter().enumerate() {
-            let (middle, last) = (median(MIDDLE, column), median(LAST, column));
+            let middle = median(n / 3..2 * n / 3, column);
+            let last = median(2 * n / 3..n, column);
             self.journal.line(format_args!(
-                "step={SAMPLES} soak series={name} middle={middle} last={last} tolerance={tolerance}"
+                "step={n} soak series={name} middle={middle} last={last} tolerance={tolerance}"
             ));
             if last - middle > *tolerance {
                 grown.push(format!(
@@ -1262,16 +1620,104 @@ impl Run {
                 ));
             }
         }
-        if !grown.is_empty() {
-            return Err(fail(
-                "soak_growth",
-                SAMPLES,
-                format_args!(
-                    "from the middle third of the run to the last, the median of {}; the samples are in {SERIES_FILE}",
-                    grown.join(", ")
-                ),
+        // What was drawn in the last third: the counts of the sample before it end
+        // where those of the last third begin.
+        let (before, end) = (&samples[2 * n / 3 - 1], &samples[n - 1]);
+        for (slot, op) in MAINTENANCE.iter().enumerate() {
+            let [draws_before, gave_up_before] = before.maintenance[slot];
+            let [draws, gave_up] = end.maintenance[slot];
+            self.journal.line(format_args!(
+                "step={n} soak last_third={} draws={} gave_up={}",
+                op.kind(),
+                draws - draws_before,
+                gave_up - gave_up_before
             ));
         }
+        let mut reasons = Vec::new();
+        if !grown.is_empty() {
+            reasons.push(format!(
+                "from the middle third of the run to the last, the median of {}; the samples are in {SERIES_FILE}",
+                grown.join(", ")
+            ));
+        }
+        reasons.extend(left);
+        if !reasons.is_empty() {
+            return Err(fail("soak_growth", n, reasons.join("; ")));
+        }
         Ok(())
+    }
+
+    /// With nothing in flight, merging the segments of every index and then
+    /// compacting must leave one fragment, which the one segment of each index
+    /// covers: every fragment holds far fewer rows than a compaction puts in one,
+    /// and once the indices are merged every fragment has the same coverage, so
+    /// nothing keeps two apart. What it left otherwise; either way the rows and
+    /// the indices must read right afterwards.
+    ///
+    /// It runs on a handle of its own on the session of the workers: an index in
+    /// the cache of a session keeps a task of its reader until the session goes,
+    /// which that of the checks' handle never does before the run ends.
+    async fn check_maintenance(
+        &mut self,
+        shared: &Shared,
+        n: usize,
+    ) -> Result<Option<String>, Failure> {
+        let failed = |error: Error| fail("error_without_fault", n, error);
+        let mut ds = Box::pin(
+            DatasetBuilder::from_uri(&self.uri)
+                .with_session(shared.session.clone())
+                .load(),
+        )
+        .await
+        .map_err(|error| fail("unreadable", n, error))?;
+        let fragments_before = ds.get_fragments().len();
+        let segments_before = index_segments(&ds).await.map_err(failed)?;
+        Box::pin(merge_indices(&mut ds, &shared.hooks))
+            .await
+            .map_err(failed)?;
+        Box::pin(compact_files(&mut ds, CompactionOptions::default(), None))
+            .await
+            .map_err(failed)?;
+        let fragments: Vec<u32> = ds
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect();
+        let indices = ds.load_indices().await.map_err(failed)?;
+        let segments = index_segments(&ds).await.map_err(failed)?;
+        drop(ds);
+        self.journal.line(format_args!(
+            "step={n} soak maintenance fragments={fragments_before}->{} segments={segments_before:?}->{segments:?}",
+            fragments.len()
+        ));
+        let mut left = Vec::new();
+        if fragments.len() != 1 {
+            left.push(format!("{} fragments", fragments.len()));
+        }
+        for (name, count) in &segments {
+            let covering = indices.iter().filter(|index| {
+                index.name == *name
+                    && index
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| fragments.iter().all(|id| bitmap.contains(*id)))
+            });
+            if *count != 1 {
+                left.push(format!("{count} segments of {name}"));
+            } else if covering.count() != 1 {
+                left.push(format!(
+                    "a segment of {name} that does not cover every fragment"
+                ));
+            }
+        }
+        self.sync_model(shared);
+        Box::pin(self.check_content(n)).await?;
+        self.check_stamps(shared, n).await?;
+        Ok((!left.is_empty()).then(|| {
+            format!(
+                "with nothing in flight, merging the index segments and compacting left {}",
+                left.join(", ")
+            )
+        }))
     }
 }

@@ -76,6 +76,12 @@ const HEAP_LATE_CYCLES: Range<usize> = 13..16;
 const HEAP_GROWTH_LIMIT: i64 = 16 << 10;
 const VECTOR_DIM: i32 = 32;
 const IVF_PARTITIONS: usize = 2;
+/// The probes of an exact IVF query, far more partitions than an index of a seed
+/// reaches. A default `optimize_indices` splits a partition whose entries, those
+/// of deleted and moved rows included, pass four times the rows per partition the
+/// index was built with, so an index may come to have more than `IVF_PARTITIONS`;
+/// Lance probes no more partitions than a segment has.
+const ALL_PARTITIONS: usize = 1 << 16;
 const NEIGHBORS: usize = 10;
 const CATEGORIES: i32 = 7;
 /// The rows of one generated batch: the reader builds them only when asked, so
@@ -735,9 +741,9 @@ pub fn soak_secs() -> u64 {
         Err(_) => soak::DEFAULT_SECS,
     };
     assert!(
-        secs >= soak::SAMPLES as u64,
+        secs >= soak::MIN_SAMPLES as u64,
         "{ENV_SOAK_SECS}={secs} leaves less than a second between two of its {} samples",
-        soak::SAMPLES
+        soak::MIN_SAMPLES
     );
     secs
 }
@@ -2118,7 +2124,7 @@ async fn check_index(
                 scan.nearest("vec", &Float32Array::from(query.to_vec()), NEIGHBORS)
                     .map_err(unreadable)?;
                 // Every partition: IVF_FLAT is then exact.
-                scan.minimum_nprobes(IVF_PARTITIONS);
+                scan.minimum_nprobes(ALL_PARTITIONS);
                 scan.project(&["id"]).map_err(unreadable)?;
                 if position == 0 && answers.check_plan {
                     let plan = scan.explain_plan(true).await.map_err(unreadable)?;
@@ -4293,7 +4299,7 @@ impl Run {
                 .rounds
                 .as_ref()
                 .map_or(0, |rounds| rounds.rounds.len())
-            + self.plan.soak.as_ref().map_or(0, |_| soak::SAMPLES)
+            + self.plan.soak.as_ref().map_or(0, |soak| soak.samples())
             + 1;
         self.state.set_phase("final");
         self.journal.line(format_args!("step={n} final"));

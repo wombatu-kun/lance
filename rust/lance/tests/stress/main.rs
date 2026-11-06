@@ -134,26 +134,34 @@
 //! The run ends with a cleanup that must leave no unreferenced file.
 //!
 //! `soak` runs a long-lived service for `LANCE_STRESS_SOAK_SECS`, on a local or a
-//! `file-object-store://` dataset: 2 to 4 workers keep a handle each for the whole
-//! run, on one `Session` with caches of a few MiB, and go round appends, merge
-//! inserts, updates, deletes, compaction, index builds and optimizations, cleanups,
-//! scans and index queries. A worker only changes the rows of its class
+//! `file-object-store://` dataset: 2 to 4 workers keep a handle each, on one
+//! `Session` with caches of a few MiB, and go round appends, merge inserts,
+//! updates, deletes, compaction, index optimizations, cleanups, reopening the
+//! dataset, scans and index queries. A worker only changes the rows of its class
 //! `id % workers`, and its scans and queries check them on its own handle,
-//! whatever version that is on. A cleanup keeps every version from the oldest one
-//! a handle is on, see #3718. The run takes 24 samples at even intervals, each
-//! once every worker has finished its operation and the runtime is quiet, into
-//! `soak.csv`: the heap, what malloc has handed out, descriptors, threads, tokio
-//! tasks, the caches of the session, and the versions, files and bytes of the
-//! dataset. After every sample a cleanup that may delete unverified files must
-//! leave no unreferenced file, and every fourth one the dataset must read as the
-//! rows of every class. A cache may never hold more than its capacity, and from the
-//! middle third of the run to the last no series may grow by more than its
-//! tolerance, which fails the seed as `soak_growth`. The heap is the series that
-//! matters, and what malloc has handed out adds what C code holds. The resident set
-//! goes into `soak.csv` as well, but no verdict reads it: glibc keeps the top of
-//! every thread's arena, which `malloc_trim` does not give back, so it wanders by
-//! tens of MiB with nothing held. A worker's operations are a prefix of what its
-//! seed draws, but how far it gets and what it races with depend on timing.
+//! whatever version that is on. The state of the dataset lasts as long as the run:
+//! no operation deletes the older half of the rows a class starts with, and the
+//! indices are built once, before the workers start, and from then on only
+//! optimized, now and then merging every segment. A cleanup keeps every version
+//! from the oldest one a handle is on, see #3718. The run takes a sample at least
+//! every 7.5 s and at least 24, each once every worker has finished its operation,
+//! maintenance the try it is on, and the runtime is quiet, into `soak.csv`: the
+//! heap, what malloc has handed out, descriptors, threads, tokio tasks, the caches
+//! of the session, the versions, files and bytes of the dataset, the fragments,
+//! index segments and manifest size of its latest version, the partitions of its
+//! vector index, and how often compaction, index optimization and the merging of
+//! index segments were drawn and gave up. After every sample a cleanup that may
+//! delete unverified files must leave no unreferenced file, and every fourth one
+//! the dataset must read as the rows of every class. A cache may never hold more
+//! than its capacity, from the middle third of the run to the last no series may
+//! grow by more than its tolerance, and once the workers stop, merging the
+//! segments of every index and then compacting must leave one fragment, which one
+//! segment of each index covers; each fails the seed as `soak_growth`. The heap is the series that matters, and what malloc has
+//! handed out adds what C code holds. The resident set goes into `soak.csv` as
+//! well, but no verdict reads it: glibc keeps the top of every thread's arena,
+//! which `malloc_trim` does not give back, so it wanders by tens of MiB with
+//! nothing held. A worker's operations are a prefix of what its seed draws, but
+//! how far it gets and what it races with depend on timing.
 //!
 //! Known blind spots: work in the blocking pool and in the CPU and rayon pools
 //! is visible only through what it leaves behind; a local store writes data,
@@ -171,14 +179,25 @@
 //! cancellation and limits off, and never overwrites, restores or changes the
 //! schema; its order of events is only as exact as its hold points make it, so a
 //! replay may not hit the same interleaving. `soak` checks no further of the
-//! conflicts it meets than that a retry on the latest version lands, and gives up
-//! maintenance that keeps losing; its cleanups take turns, and its series show a
-//! leak only once it outgrows the noise of a third of the run. Its rows live for
-//! seconds and each index is built anew every few seconds, so fragments and index
-//! segments never pile up: a compaction that never commits or an optimization that
-//! keeps every delta stays level. The checks of a sample run 24 times whatever the
-//! length of the run, so a leak in them grows no faster in a long one, and the
-//! workers never reopen the dataset. A cache is held to the sizes it reports for
+//! conflicts it meets than that a retry on the latest version lands, and does not
+//! judge maintenance that keeps losing them: the workers that run it also make the
+//! load it races with, so a compaction made 2 s slower loses four tries in five
+//! and still lands half of its draws, and only the maintenance at the end of the
+//! run, with nothing in flight, must land; its cleanups take turns, and its series
+//! show a leak only once it outgrows the noise of a third of the run, and the
+//! median of the last third misses growth that starts after the middle of that
+//! third. It creates its indices before the first sample, so a leak in creating
+//! one shows only in `heap_growth`, which creates all four again every cycle; of
+//! creating an index, a run repeats only the training of centroids, when an
+//! optimization splits a partition; and since a default optimization folds new
+//! rows into the last segment of a scalar or full-text index, only the vector
+//! index has segments to merge. A compaction or an index optimization that does
+//! not merge only raises the level the series of the dataset settle at, since an
+//! update moves rows out of their fragment and a commit drops a fragment with no
+//! rows left and a segment that covers none unless it is the last of its index, so
+//! only the maintenance at the end of the run shows it. A leak on opening a dataset grows
+//! with the samples, whose checks open it without the session, and on the session
+//! with the workers' reopenings. A cache is held to the sizes it reports for
 //! its entries, so an entry that holds more than its `deep_size_of` shows only in
 //! the heap, and only while the cache fills. A thread of the blocking pool lives no
 //! longer than a sample interval, so what it keeps for itself goes at every sample.

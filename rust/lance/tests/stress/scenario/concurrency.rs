@@ -2722,7 +2722,7 @@ pub(super) async fn upsert(
 }
 
 /// Rewrites `gen` in place for the rows that exist, and inserts none.
-fn stamp_job(ds: &Dataset) -> lance::Result<MergeInsertJob> {
+pub(super) fn stamp_job(ds: &Dataset) -> lance::Result<MergeInsertJob> {
     MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["id".to_string()])?
         .when_matched(WhenMatched::UpdateAll)
         .when_not_matched(WhenNotMatched::DoNothing)
@@ -2731,7 +2731,7 @@ fn stamp_job(ds: &Dataset) -> lance::Result<MergeInsertJob> {
         .try_build()
 }
 
-fn stamp_source(
+pub(super) fn stamp_source(
     schema: &SchemaRef,
     ids: Vec<i64>,
     number: i64,
