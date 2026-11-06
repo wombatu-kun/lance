@@ -683,11 +683,15 @@ fn replay_command(config: &RunConfig, seed: u64) -> String {
         ENV_CALIBRATE,
         ENV_SERIAL,
         ENV_ONLY,
-        ENV_SOAK_SECS,
     ] {
         if let Ok(value) = std::env::var(name) {
             vars.push(format!("{name}={}", shell_quote(&value)));
         }
+    }
+    // The plan of a soak holds its length, so a replay pins it instead of taking
+    // whatever the default is when it runs.
+    if config.kind == ScenarioKind::Soak {
+        vars.push(format!("{ENV_SOAK_SECS}={}", config.soak_secs));
     }
     format!(
         "{} cargo test -p lance --test stress -- --exact {} --nocapture",
@@ -1557,4 +1561,39 @@ fn selection_dead_pairs_count_seeds_not_rounds() {
         summary.dead_pairs(),
         ["append:cleanup planned=6 seeds=2 met=0"]
     );
+}
+
+#[test]
+fn replay_pins_the_length_of_a_soak() {
+    let config = RunConfig {
+        kind: ScenarioKind::Soak,
+        run_dir: PathBuf::new(),
+        steps: 0,
+        soak_secs: 4321,
+        stall: Duration::from_secs(150),
+        deadline: Duration::from_secs(4621),
+        quiet_secs: 20,
+        keep: Keep::Nothing,
+        repeat: 1,
+        self_test: None,
+        scope: None,
+    };
+    let replay = replay_command(&config, 7);
+    assert_eq!(
+        replay.matches(&format!("{ENV_SOAK_SECS}=")).count(),
+        1,
+        "{replay}"
+    );
+    assert!(
+        replay.contains(&format!("{ENV_SOAK_SECS}=4321 ")),
+        "{replay}"
+    );
+    let faults = RunConfig {
+        kind: ScenarioKind::StorageFaults,
+        steps: 8,
+        soak_secs: 0,
+        ..config
+    };
+    let replay = replay_command(&faults, 7);
+    assert!(!replay.contains(ENV_SOAK_SECS), "{replay}");
 }
