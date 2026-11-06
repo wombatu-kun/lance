@@ -225,7 +225,7 @@
 //! - `LANCE_STRESS_KEEP=1`: keep the artifacts of passing seeds too; `logs` keeps
 //!   them without the dataset and the temporary files.
 //! - `LANCE_STRESS_CALIBRATE=1`: plan no incident and no limit, and report the
-//!   heap each operation takes, to size the budgets in `scenario.rs`.
+//!   heap each operation takes, to size the budgets in `scenario/memory_limits.rs`.
 //! - `LANCE_STRESS_STALL_SECS` (60, for `concurrency` and `soak` 150): how long a
 //!   child may go without progress.
 //! - `LANCE_STRESS_DEADLINE_SECS` (120 + 60 per step, for `concurrency` 300 + 120 per
@@ -253,177 +253,17 @@
 //!   not know or a list that leaves nothing to run.
 #![cfg(target_os = "linux")]
 
+mod engine;
 mod harness;
 mod incidents;
 mod leaks;
 mod limits;
+mod memory_events;
 mod scenario;
 mod select;
-
-use harness::{ScenarioKind, SelfTest};
-
-#[test]
-fn storage_faults() {
-    harness::run(ScenarioKind::StorageFaults);
-}
-
-#[test]
-fn cancellation() {
-    harness::run(ScenarioKind::Cancellation);
-}
-
-#[test]
-fn process_kill() {
-    harness::run(ScenarioKind::ProcessKill);
-}
-
-#[test]
-fn memory_limits() {
-    harness::run(ScenarioKind::MemoryLimits);
-}
-
-#[test]
-fn heap_growth() {
-    harness::run(ScenarioKind::HeapGrowth);
-}
-
-#[test]
-fn concurrency() {
-    harness::run(ScenarioKind::Concurrency);
-}
-
-#[test]
-fn slow_storage() {
-    harness::run(ScenarioKind::SlowStorage);
-}
-
-#[test]
-fn soak() {
-    harness::run(ScenarioKind::Soak);
-}
 
 /// The entry point of a seed's child process. A normal test run skips it.
 #[test]
 fn child() {
-    scenario::run_child_if_requested();
-}
-
-#[test]
-fn harness_reports_hang() {
-    harness::check_self_test(SelfTest::Hang);
-}
-
-#[test]
-fn harness_reports_panic() {
-    harness::check_self_test(SelfTest::Panic);
-}
-
-#[test]
-fn harness_reports_task_leak() {
-    harness::check_self_test(SelfTest::TaskLeak);
-}
-
-#[test]
-fn harness_reports_tmp_leak() {
-    harness::check_self_test(SelfTest::TmpLeak);
-}
-
-#[test]
-fn harness_reports_model_mismatch() {
-    harness::check_self_test(SelfTest::ModelMismatch);
-}
-
-#[test]
-fn harness_reports_column_mismatch() {
-    harness::check_self_test(SelfTest::ColumnMismatch);
-}
-
-#[test]
-fn harness_reports_orphan() {
-    harness::check_self_test(SelfTest::Orphan);
-}
-
-#[test]
-fn harness_reports_foreign_kill() {
-    harness::check_self_test(SelfTest::ForeignKill);
-}
-
-#[test]
-fn harness_reports_kill_then_missing_file() {
-    harness::check_self_test(SelfTest::KillThenMissingFile);
-}
-
-#[test]
-fn harness_reports_oom_recovery() {
-    harness::check_self_test(SelfTest::OomRecovery);
-}
-
-#[test]
-fn harness_reports_hang_under_limit() {
-    harness::check_self_test(SelfTest::HangUnderLimit);
-}
-
-#[test]
-fn harness_reports_memory_events() {
-    harness::check_self_test(SelfTest::MemoryEvents);
-}
-
-#[test]
-fn harness_reports_heap_leak() {
-    harness::check_self_test(SelfTest::HeapLeak);
-}
-
-#[test]
-fn harness_reports_torn_snapshot() {
-    harness::check_self_test(SelfTest::TornSnapshot);
-}
-
-#[test]
-fn harness_reports_lost_write() {
-    harness::check_self_test(SelfTest::LostWrite);
-}
-
-#[test]
-fn harness_reports_stale_read() {
-    harness::check_self_test(SelfTest::StaleRead);
-}
-
-#[test]
-fn harness_reports_snapshot_changed() {
-    harness::check_self_test(SelfTest::SnapshotChanged);
-}
-
-#[test]
-fn harness_reports_duplicate_key() {
-    harness::check_self_test(SelfTest::DuplicateKey);
-}
-
-#[test]
-fn harness_reports_lineage() {
-    harness::check_self_test(SelfTest::Lineage);
-}
-
-#[test]
-fn harness_reports_gate_hang() {
-    harness::check_self_test(SelfTest::GateHang);
-}
-
-#[test]
-fn harness_reports_hung_call() {
-    harness::check_self_test(SelfTest::HungCall);
-}
-
-#[test]
-fn harness_reports_late_call() {
-    harness::check_self_test(SelfTest::LateCall);
-}
-
-#[test]
-fn harness_reports_write_after_release() {
-    harness::check_self_test(SelfTest::WriteAfterRelease);
-}
-
-#[test]
-fn harness_reports_soak_growth() {
-    harness::check_self_test(SelfTest::SoakGrowth);
+    engine::run_child_if_requested();
 }

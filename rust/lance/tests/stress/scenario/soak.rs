@@ -74,6 +74,7 @@ use std::time::{Duration, Instant};
 
 use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
+use async_trait::async_trait;
 use lance::Dataset;
 use lance::Error;
 use lance::dataset::builder::DatasetBuilder;
@@ -89,29 +90,55 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use tokio::sync::{Mutex as TurnLock, RwLock, RwLockReadGuard};
 use tokio::task::{JoinError, JoinSet};
 
-use super::concurrency::{
+use crate::engine::checks::{
+    Answers, check_neighbors, compare_ids, file_sizes, int64_column, is_commit_conflict,
+    listed_versions,
+};
+use crate::engine::data::{
+    ALL_PARTITIONS, CATEGORIES, NEIGHBORS, SMALL, Scale, category, tokens, vector,
+};
+use crate::engine::ops::{IndexKind, Op, op_future};
+use crate::engine::rows::{
     ClassRows, class_range, delete, full_batch, id_run, schema, source_of, stamp_job, stamp_source,
     update, upsert,
 };
-use super::{
-    ALL_PARTITIONS, Answers, CATEGORIES, Failure, IndexKind, Journal, NEIGHBORS, Op, PlanRng, Run,
-    Scale, category, check_neighbors, compare_ids, fail, file_sizes, fingerprint, int64_column,
-    is_commit_conflict, listed_versions, op_future, pick_from, soak_secs, tokens, vector,
+use crate::engine::run::Run;
+use crate::engine::steps::{StepCheck, pick_from};
+use crate::engine::{
+    Body, ContentRules, Failure, Header, Journal, PlanInput, PlanRng, StoreChoice, fail,
+    fingerprint,
 };
-use crate::harness::SelfTest;
+use crate::harness::SeedReport;
 use crate::incidents::{IncidentState, StressHooks};
 use crate::leaks::{live_heap_bytes, malloc_bytes, settle, trimmed_anon_kib};
+use crate::scenario::{Runtime, Scenario, SelfTest, Settings};
 
+pub const SCENARIO: &dyn Scenario = &Soak;
+
+/// Heap goes missing at every sample of a long run.
+const SOAK_GROWTH: SelfTest = SelfTest {
+    name: "soak_growth",
+    expected: &["soak_growth"],
+    reason: Some("heap_bytes from"),
+    verify: grew_by_the_leak,
+};
+
+self_tests! {
+    soak_growth: SOAK_GROWTH,
+}
+
+/// How long a run lasts, in seconds.
+pub const ENV_SOAK_SECS: &str = "LANCE_STRESS_SOAK_SECS";
 /// The fewest samples a run takes, and the longest it waits between two: a long
 /// run takes more samples rather than longer intervals.
-pub const MIN_SAMPLES: usize = 24;
+const MIN_SAMPLES: usize = 24;
 const MAX_SAMPLE_INTERVAL: Duration = Duration::from_millis(7500);
 const CHECK_EVERY: usize = 4;
 /// Takes `MIN_SAMPLES` samples `MAX_SAMPLE_INTERVAL` apart.
-pub const DEFAULT_SECS: u64 = 180;
-pub const SELF_TEST_SECS: u64 = 24;
+const DEFAULT_SECS: u64 = 180;
+const SELF_TEST_SECS: u64 = 24;
 /// The samples of a seed, one row each, in its directory.
-pub const SERIES_FILE: &str = "soak.csv";
+const SERIES_FILE: &str = "soak.csv";
 /// How many operations of each worker a plan shows.
 const PLANNED_OPS: usize = 48;
 /// How many its fingerprint covers, those past the ones shown as a digest: a
@@ -130,10 +157,10 @@ const THINK_MS_PER_WORKER: u64 = 100;
 const SAMPLE_QUIET: Duration = Duration::from_secs(5);
 /// How long the blocking pool of a soak keeps an idle thread, and how long the
 /// counts of a sample must hold, which is longer.
-pub const BLOCKING_KEEP_ALIVE: Duration = Duration::from_millis(500);
+const BLOCKING_KEEP_ALIVE: Duration = Duration::from_millis(500);
 const SAMPLE_STILL: Duration = Duration::from_millis(600);
 /// What the self-test leaks at every sample.
-pub const SELF_TEST_LEAK: usize = 1 << 20;
+const SELF_TEST_LEAK: usize = 1 << 20;
 /// Tells the operations of the workers apart in `gen`; above the most workers.
 const NUMBER_STRIDE: i64 = 8;
 const INDICES: [IndexKind; 4] = [
@@ -287,7 +314,7 @@ enum SoakOp {
 }
 
 impl SoakOp {
-    fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &'static str {
         match self {
             Self::Append { .. } => "append",
             Self::MergeInsert { .. } => "merge_insert",
@@ -359,7 +386,7 @@ struct OpSource {
 }
 
 /// An operation as a worker runs it.
-struct Drawn {
+pub struct Drawn {
     seq: u64,
     /// The `gen` it writes.
     number: i64,
@@ -371,7 +398,7 @@ struct Drawn {
 }
 
 impl OpSource {
-    fn new(seed: u64, worker: usize, workers: usize, initial_rows: i64) -> Self {
+    pub fn new(seed: u64, worker: usize, workers: usize, initial_rows: i64) -> Self {
         let stride = workers as i64;
         let rows: ClassRows = (worker as i64..initial_rows)
             .step_by(workers)
@@ -405,7 +432,7 @@ impl OpSource {
 
     /// The next operation, already applied to the rows: a worker runs it until it
     /// lands, or fails the seed.
-    fn next(&mut self) -> Drawn {
+    pub fn next(&mut self) -> Drawn {
         self.drawn += 1;
         let number = self.drawn as i64 * NUMBER_STRIDE + self.worker as i64 + 1;
         let catch_up = self.rng.chance(0.7);
@@ -476,7 +503,7 @@ impl OpSource {
         }
     }
 
-    fn apply(&mut self, op: &SoakOp, number: i64) {
+    pub fn apply(&mut self, op: &SoakOp, number: i64) {
         match *op {
             SoakOp::Append { first_id, rows } | SoakOp::MergeInsert { first_id, rows } => {
                 self.rows
@@ -499,19 +526,144 @@ impl OpSource {
     }
 }
 
+struct Soak;
+
+impl Scenario for Soak {
+    fn name(&self) -> &'static str {
+        "soak"
+    }
+
+    fn trouble_kinds(&self) -> &'static [&'static str] {
+        &["soak", "memory"]
+    }
+
+    /// Its workers run the work of a service, which no focus takes.
+    fn focusable_ops(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    fn least_focus_steps(&self, _focused: &[&str]) -> u64 {
+        0
+    }
+
+    fn settings(&self, self_test: Option<&SelfTest>, _steps: u64) -> Settings {
+        let secs = match self_test {
+            Some(_) => SELF_TEST_SECS,
+            None => soak_secs(),
+        };
+        settings_of(secs, self_test)
+    }
+
+    fn self_tests(&self) -> &'static [&'static SelfTest] {
+        SELF_TESTS
+    }
+
+    fn checks(&self) -> &'static [&'static dyn StepCheck] {
+        &[]
+    }
+
+    fn artifacts(&self) -> &'static [&'static str] {
+        &[SERIES_FILE]
+    }
+
+    /// Its workers are tasks, which only race with threads to run on. A soak
+    /// counts threads: the blocking pool must not keep the ones of a peak that is
+    /// over, as it would for 10 s while any work keeps coming.
+    fn runtime(&self) -> Runtime {
+        Runtime {
+            worker_threads: 4,
+            blocking_keep_alive: Some(BLOCKING_KEEP_ALIVE),
+            leaves_tasks_on_failure: true,
+        }
+    }
+
+    /// An in-memory store keeps every file in the heap, with the whole 5 MiB
+    /// upload buffer it was written from, so the heap would measure the files.
+    fn store(&self, rng: &mut PlanRng) -> StoreChoice {
+        match rng.chance(0.5) {
+            true => StoreChoice::Local,
+            false => StoreChoice::FileObjectStore,
+        }
+    }
+
+    fn scale(&self) -> Scale {
+        SMALL
+    }
+
+    fn plan(&self, rng: &mut PlanRng, input: &PlanInput<'_>) -> Box<dyn Body> {
+        Box::new(plan_soak(rng, input.header.initial_rows))
+    }
+}
+
+/// How the seeds of a soak of `secs` run. A seed takes minutes and checks one long
+/// run, not a variety of plans, for a time rather than for steps.
+pub fn settings_of(secs: u64, self_test: Option<&SelfTest>) -> Settings {
+    Settings {
+        seeds: 1,
+        steps: 0,
+        // An update or a delete retries its lost commits inside Lance quietly, for
+        // the two minutes of `RETRY_TIMEOUT` in `engine/rows.rs`, while a sample
+        // holds the other workers back.
+        stall_secs: 150,
+        deadline_secs: secs + 300,
+        least_deadline: self_test
+            .is_none()
+            .then(|| (secs + 60, format!("the {secs}s a soak runs, and 60s more"))),
+        // The child takes its length from here, so that a self-test can set its own.
+        child_env: vec![(ENV_SOAK_SECS, Some(secs.to_string()))],
+        // The plan holds the length, so a replay pins it instead of taking whatever
+        // the default is when it runs.
+        replay_env: vec![(ENV_SOAK_SECS, secs.to_string())],
+        cgroup: false,
+    }
+}
+
+/// How long a run lasts. A sample needs a second at least.
+fn soak_secs() -> u64 {
+    let secs = match std::env::var(ENV_SOAK_SECS) {
+        Ok(value) => value.parse().unwrap_or_else(|_| {
+            panic!("{ENV_SOAK_SECS} must be an unsigned integer, got {value:?}")
+        }),
+        Err(_) => DEFAULT_SECS,
+    };
+    assert!(
+        secs >= MIN_SAMPLES as u64,
+        "{ENV_SOAK_SECS}={secs} leaves less than a second between two of its {MIN_SAMPLES} samples"
+    );
+    secs
+}
+
+/// The leak puts 8 of its samples between the medians of the thirds, far more
+/// than a run this short grows by itself.
+fn grew_by_the_leak(report: &SeedReport) {
+    let growth = report
+        .detail
+        .split_once("heap_bytes from ")
+        .and_then(|(_, rest)| rest.split_once(','))
+        .and_then(|(range, _)| range.split_once(" to "))
+        .and_then(|(from, to)| Some(to.parse::<i64>().ok()? - from.parse::<i64>().ok()?));
+    let least = 6 * SELF_TEST_LEAK as i64;
+    assert!(
+        growth.is_some_and(|growth| growth >= least),
+        "the soak_growth self-test must grow the heap by {least} or more, but: {} (artifacts in {})",
+        report.detail,
+        report.dir.display()
+    );
+}
+
 /// What a seed decides about its run.
 #[derive(Clone, Debug)]
-pub(super) struct SoakPlan {
+pub struct SoakPlan {
     secs: u64,
     samples: usize,
     workers: usize,
-    pub(super) stable_row_ids: bool,
+    stable_row_ids: bool,
     initial_rows: i64,
     /// Where the operations of each worker start from.
     worker_seeds: Vec<u64>,
 }
 
-pub(super) fn plan(rng: &mut PlanRng, initial_rows: i64) -> SoakPlan {
+fn plan_soak(rng: &mut PlanRng, initial_rows: i64) -> SoakPlan {
     let workers = rng.range(2..=4) as usize;
     let secs = soak_secs();
     let samples = (secs * 1000)
@@ -532,10 +684,6 @@ impl SoakPlan {
         Duration::from_secs(self.secs) / self.samples as u32
     }
 
-    pub(super) fn samples(&self) -> usize {
-        self.samples
-    }
-
     fn source(&self, worker: usize) -> OpSource {
         OpSource::new(
             self.worker_seeds[worker],
@@ -544,8 +692,11 @@ impl SoakPlan {
             self.initial_rows,
         )
     }
+}
 
-    pub(super) fn render(&self) -> String {
+#[async_trait(?Send)]
+impl Body for SoakPlan {
+    fn render(&self) -> String {
         let mut text = format!(
             "soak secs={} samples={} interval_ms={} workers={} stable_row_ids={} index_cache_bytes={INDEX_CACHE_BYTES} metadata_cache_bytes={METADATA_CACHE_BYTES}\n",
             self.secs,
@@ -584,9 +735,39 @@ impl SoakPlan {
         }
         text
     }
+
+    fn steps(&self) -> usize {
+        self.samples
+    }
+
+    /// Nothing interrupts the writes of a soak, so none may leave a file behind.
+    fn content(&self) -> ContentRules {
+        ContentRules {
+            versions_stay_listed: true,
+            indices_cover_the_model: false,
+            digests: false,
+            hidden_files_fail: true,
+        }
+    }
+
+    fn stable_row_ids(&self) -> bool {
+        self.stable_row_ids
+    }
+
+    fn initial_source(&self, header: &Header) -> Box<dyn RecordBatchReader + Send> {
+        Box::new(initial_source(
+            header.data_seed,
+            header.initial_rows,
+            header.scale,
+        ))
+    }
+
+    async fn run(&self, run: &mut Run) -> Result<(), Failure> {
+        Box::pin(run.run_soak(self)).await
+    }
 }
 
-pub(super) fn initial_source(
+fn initial_source(
     data_seed: u64,
     initial_rows: i64,
     scale: Scale,
@@ -596,7 +777,7 @@ pub(super) fn initial_source(
 }
 
 /// What the workers and the samples share.
-struct Shared {
+pub struct Shared {
     session: Arc<Session>,
     /// Where a worker opens the dataset again.
     uri: String,
@@ -651,7 +832,7 @@ impl Shared {
         self.sources[worker].lock().unwrap().rows.clone()
     }
 
-    fn all_rows(&self) -> ClassRows {
+    pub fn all_rows(&self) -> ClassRows {
         (0..self.sources.len())
             .flat_map(|worker| self.rows(worker))
             .collect()
@@ -693,7 +874,11 @@ impl Drop for MarkFailed<'_> {
     }
 }
 
-async fn run_worker(shared: Arc<Shared>, worker: usize, mut ds: Dataset) -> Result<(), Failure> {
+pub async fn run_worker(
+    shared: Arc<Shared>,
+    worker: usize,
+    mut ds: Dataset,
+) -> Result<(), Failure> {
     loop {
         let mut running = Some(shared.pause.read().await);
         if shared.stop.load(Ordering::SeqCst) {
@@ -758,7 +943,7 @@ async fn run_next<'s>(
 /// Runs an operation until it lands. One that keeps losing the race for a commit
 /// is tried again on the latest version, and maintenance that still loses is left
 /// for later, as a service would; a write must land.
-async fn run_op<'s>(
+pub async fn run_op<'s>(
     shared: &'s Shared,
     worker: usize,
     ds: &mut Dataset,
@@ -1215,8 +1400,7 @@ fn worker_end(ended: Result<Result<(), Failure>, JoinError>, n: usize) -> Result
 }
 
 impl Run {
-    pub(super) async fn run_soak(&mut self) -> Result<(), Failure> {
-        let plan = self.plan.soak.clone().expect("a soak plan");
+    pub async fn run_soak(&mut self, plan: &SoakPlan) -> Result<(), Failure> {
         // Without caches: under the default session, the catch-up before every
         // sample would keep the manifest of each version it lands on, up to 1 GiB.
         self.ds = Box::pin(
@@ -1254,7 +1438,7 @@ impl Run {
             // Built once: from then on a service only optimizes its indices.
             if worker == 0 {
                 for kind in INDICES {
-                    let (data_seed, scale) = (self.plan.data_seed, self.plan.scale);
+                    let (data_seed, scale) = (self.header.data_seed, self.header.scale);
                     let op = Op::CreateIndex(kind);
                     op_future(&mut ds, &hooks, data_seed, scale, op, None)
                         .await
@@ -1279,8 +1463,8 @@ impl Run {
             session,
             uri: self.uri.clone(),
             schema: schema(false),
-            data_seed: self.plan.data_seed,
-            scale: self.plan.scale,
+            data_seed: self.header.data_seed,
+            scale: self.header.scale,
             stride: plan.workers as i64,
             pause: RwLock::new(()),
             stop: AtomicBool::new(false),
@@ -1305,7 +1489,7 @@ impl Run {
         for (worker, ds) in handles.into_iter().enumerate() {
             workers.spawn(run_worker(shared.clone(), worker, ds));
         }
-        let result = Box::pin(self.take_samples(&shared, &plan, &mut workers, started)).await;
+        let result = Box::pin(self.take_samples(&shared, plan, &mut workers, started)).await;
         shared.stop.store(true, Ordering::SeqCst);
         let samples = match result {
             Ok(samples) => samples,
@@ -1401,7 +1585,7 @@ impl Run {
     /// Measures the process once the operations that ended have let go of what
     /// they held. The dataset is measured later, after a cleanup.
     async fn sample(&self, shared: &Shared, n: usize, started: Instant) -> Result<Sample, Failure> {
-        if self.self_test == Some(SelfTest::SoakGrowth) {
+        if self.self_test == Some(&SOAK_GROWTH) {
             Box::leak(vec![1u8; SELF_TEST_LEAK].into_boxed_slice());
         }
         let timeout = SAMPLE_QUIET.min(self.quiet);

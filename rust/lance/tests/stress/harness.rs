@@ -13,9 +13,10 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::engine;
 use crate::incidents::CRASH_FIRED;
 use crate::limits::{ENV_CGROUP, RunScope, SeedCgroup};
-use crate::scenario;
+use crate::scenario::{self, Scenario, SelfTest};
 use crate::select::{ENV_ONLY, Selection};
 
 pub const ENV_CHILD: &str = "LANCE_STRESS_CHILD";
@@ -34,16 +35,10 @@ pub const ENV_CALIBRATE: &str = "LANCE_STRESS_CALIBRATE";
 /// Workers run one operation at a time, in the order of their ranks: a failure of
 /// `concurrency` that goes away with this needs a race.
 pub const ENV_SERIAL: &str = "LANCE_STRESS_SERIAL";
-/// How long a `soak` run lasts, in seconds.
-pub const ENV_SOAK_SECS: &str = "LANCE_STRESS_SOAK_SECS";
 
 pub const PLAN_LOG: &str = "plan.log";
 pub const STEPS_LOG: &str = "steps.log";
 pub const CALLS_LOG: &str = "calls.log";
-pub const MEMORY_LOG: &str = "memory.log";
-/// Reads have a log of their own: the watchdog counts the growth of the step log
-/// as progress, and a busy reader must not hide a hung writer.
-pub const READS_LOG: &str = "reads.log";
 
 const POLL: Duration = Duration::from_millis(200);
 const GDB_TIMEOUT: Duration = Duration::from_secs(60);
@@ -60,229 +55,26 @@ const DEAD_HOLD_PLANNED: usize = 3;
 /// Seeds, not rounds: 16 seeds force each pair twice, and one seed never judges
 /// a pair, whether it is repeated or a focus forces the pair in several rounds.
 const DEAD_PAIR_SEEDS: usize = 2;
-/// How long a commit may keep retrying: a hold point can eat the default 30 s.
-const COMMIT_RETRY_TIMEOUT_VARIABLE: &str = "LANCE_COMMIT_RETRY_TIMEOUT_SECS";
-const COMMIT_RETRY_TIMEOUT_SECS: &str = "120";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ScenarioKind {
-    StorageFaults,
-    Cancellation,
-    ProcessKill,
-    MemoryLimits,
-    HeapGrowth,
-    Concurrency,
-    SlowStorage,
-    Soak,
-}
-
-impl ScenarioKind {
-    pub const ALL: [Self; 8] = [
-        Self::StorageFaults,
-        Self::Cancellation,
-        Self::ProcessKill,
-        Self::MemoryLimits,
-        Self::HeapGrowth,
-        Self::Concurrency,
-        Self::SlowStorage,
-        Self::Soak,
-    ];
-
-    /// Whether Lance reports its memory in this scenario, and the checks read it.
-    pub fn observes_memory(self) -> bool {
-        matches!(self, Self::ProcessKill | Self::MemoryLimits)
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::StorageFaults => "storage_faults",
-            Self::Cancellation => "cancellation",
-            Self::ProcessKill => "process_kill",
-            Self::MemoryLimits => "memory_limits",
-            Self::HeapGrowth => "heap_growth",
-            Self::Concurrency => "concurrency",
-            Self::SlowStorage => "slow_storage",
-            Self::Soak => "soak",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|kind| kind.name() == name)
-    }
-}
-
-/// A defect a child injects on purpose, to show that the parent reports it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SelfTest {
-    Hang,
-    Panic,
-    TaskLeak,
-    TmpLeak,
-    ModelMismatch,
-    ColumnMismatch,
-    Orphan,
-    /// A SIGKILL nobody planned: the seed must end there.
-    ForeignKill,
-    /// A file a manifest references goes away while the process is dead.
-    KillThenMissingFile,
-    /// A step goes over its limit: the seed goes on and ends well.
-    OomRecovery,
-    /// A step hangs under a limit.
-    HangUnderLimit,
-    /// An index build reports no memory events, though it must.
-    MemoryEvents,
-    /// Heap goes missing on every cycle of a repeated workload.
-    HeapLeak,
-    /// An update lands as two commits, each with half of its rows.
-    TornSnapshot,
-    /// A commit restores the version the round started from.
-    LostWrite,
-    /// A reader that should see the latest version reads the first of the round.
-    StaleRead,
-    /// A reader's pinned version turns into another between two reads.
-    SnapshotChanged,
-    /// A row is appended a second time.
-    DuplicateKey,
-    /// The history of a row's lineage is not what the rows say.
-    Lineage,
-    /// A hold point waits, with no limit, for what cannot happen, while a reader
-    /// keeps reading: its reads must not count as progress.
-    GateHang,
-    /// A task the operation left behind holds a call that never answers.
-    HungCall,
-    /// A slow call in a task the operation left behind ends after the operation.
-    LateCall,
-    /// A task the operation left behind writes once its hung read is let go.
-    WriteAfterRelease,
-    /// Heap goes missing at every sample of a long run.
-    SoakGrowth,
-}
-
-impl SelfTest {
-    const ALL: [Self; 24] = [
-        Self::Hang,
-        Self::Panic,
-        Self::TaskLeak,
-        Self::TmpLeak,
-        Self::ModelMismatch,
-        Self::ColumnMismatch,
-        Self::Orphan,
-        Self::ForeignKill,
-        Self::KillThenMissingFile,
-        Self::OomRecovery,
-        Self::HangUnderLimit,
-        Self::MemoryEvents,
-        Self::HeapLeak,
-        Self::TornSnapshot,
-        Self::LostWrite,
-        Self::StaleRead,
-        Self::SnapshotChanged,
-        Self::DuplicateKey,
-        Self::Lineage,
-        Self::GateHang,
-        Self::HungCall,
-        Self::LateCall,
-        Self::WriteAfterRelease,
-        Self::SoakGrowth,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Hang => "hang",
-            Self::Panic => "panic",
-            Self::TaskLeak => "task_leak",
-            Self::TmpLeak => "tmp_leak",
-            Self::ModelMismatch => "model_mismatch",
-            Self::ColumnMismatch => "column_mismatch",
-            Self::Orphan => "orphan",
-            Self::ForeignKill => "foreign_kill",
-            Self::KillThenMissingFile => "kill_then_missing_file",
-            Self::OomRecovery => "oom_recovery",
-            Self::HangUnderLimit => "hang_under_limit",
-            Self::MemoryEvents => "memory_events",
-            Self::HeapLeak => "heap_leak",
-            Self::TornSnapshot => "torn_snapshot",
-            Self::LostWrite => "lost_write",
-            Self::StaleRead => "stale_read",
-            Self::SnapshotChanged => "snapshot_changed",
-            Self::DuplicateKey => "duplicate_key",
-            Self::Lineage => "lineage",
-            Self::GateHang => "gate_hang",
-            Self::HungCall => "hung_call",
-            Self::LateCall => "late_call",
-            Self::WriteAfterRelease => "write_after_release",
-            Self::SoakGrowth => "soak_growth",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|test| test.name() == name)
-    }
-
-    fn scenario(self) -> ScenarioKind {
-        match self {
-            Self::ForeignKill | Self::KillThenMissingFile | Self::MemoryEvents => {
-                ScenarioKind::ProcessKill
-            }
-            Self::OomRecovery | Self::HangUnderLimit => ScenarioKind::MemoryLimits,
-            Self::HeapLeak => ScenarioKind::HeapGrowth,
-            Self::TornSnapshot
-            | Self::LostWrite
-            | Self::StaleRead
-            | Self::SnapshotChanged
-            | Self::DuplicateKey
-            | Self::Lineage
-            | Self::GateHang => ScenarioKind::Concurrency,
-            Self::HungCall | Self::LateCall | Self::WriteAfterRelease => ScenarioKind::SlowStorage,
-            Self::SoakGrowth => ScenarioKind::Soak,
-            _ => ScenarioKind::StorageFaults,
-        }
-    }
-
-    /// The failure classes the parent may report for this defect; none means
-    /// the seed must pass.
-    fn expected_classes(self) -> &'static [&'static str] {
-        match self {
-            Self::Hang | Self::HangUnderLimit | Self::GateHang => &["hang"],
-            Self::Panic => &["panic"],
-            Self::TaskLeak => &["task_leak"],
-            Self::TmpLeak => &["tmp_leak"],
-            Self::ModelMismatch | Self::ColumnMismatch => &["content"],
-            Self::Orphan => &["orphans"],
-            Self::ForeignKill => &["crash"],
-            // Which check meets the missing file first depends on the file.
-            Self::KillThenMissingFile => &["validate", "missing_files", "unreadable"],
-            Self::OomRecovery => &[],
-            Self::MemoryEvents => &["memory_events"],
-            Self::HeapLeak => &["heap_growth"],
-            Self::TornSnapshot => &["torn_snapshot"],
-            Self::LostWrite => &["lost_write"],
-            Self::StaleRead => &["stale_read"],
-            Self::SnapshotChanged => &["snapshot_changed"],
-            Self::DuplicateKey => &["duplicate_key"],
-            Self::Lineage => &["lineage"],
-            Self::HungCall | Self::LateCall | Self::WriteAfterRelease => &["hung_call"],
-            Self::SoakGrowth => &["soak_growth"],
-        }
-    }
-}
 
 struct RunConfig {
-    kind: ScenarioKind,
+    scenario: &'static dyn Scenario,
     /// This invocation's own directory: a replay or a concurrent run never
     /// touches another run's artifacts.
     run_dir: PathBuf,
     steps: u64,
-    /// How long a `soak` seed runs.
-    soak_secs: u64,
+    /// How many seeds a run takes, unless `LANCE_STRESS_SEEDS` says otherwise.
+    seeds: u64,
     stall: Duration,
     deadline: Duration,
     quiet_secs: u64,
     keep: Keep,
     repeat: u64,
-    self_test: Option<SelfTest>,
+    self_test: Option<&'static SelfTest>,
     /// Where the children of a run under memory limits live.
     scope: Option<RunScope>,
+    /// What the children get, the variables of the checks of the scenario included.
+    child_env: Vec<(&'static str, Option<String>)>,
+    replay_env: Vec<(&'static str, String)>,
 }
 
 /// What stays of a seed that passed.
@@ -295,55 +87,32 @@ enum Keep {
 }
 
 impl RunConfig {
-    fn new(kind: ScenarioKind, self_test: Option<SelfTest>) -> Self {
+    fn new(scenario: &'static dyn Scenario, self_test: Option<&'static SelfTest>) -> Self {
         // Self-tests ignore the tuning variables: their timing is part of what
         // they check.
-        // A hold's wait goes into the first try of a commit, which sets the unit of
-        // Lance's backoff: 10 s there can become a silent sleep of over a minute.
-        // An update or a delete of a soak retries its lost commits inside Lance as
-        // quietly, for the two minutes of `concurrency`'s helpers that it shares,
-        // while a sample holds the other workers back.
-        let default_stall = match kind {
-            ScenarioKind::Concurrency | ScenarioKind::Soak => 150,
-            _ => 60,
+        let (steps, quiet_secs) = match self_test {
+            Some(_) => (3, 2),
+            None => (env_u64(ENV_STEPS, 8), 20),
         };
-        let (steps, quiet_secs, stall_secs) = match self_test {
-            Some(_) => (3, 2, 15),
-            None => (
-                env_u64(ENV_STEPS, 8),
-                20,
-                env_u64(ENV_STALL_SECS, default_stall),
-            ),
-        };
-        // Repeated cycles are the point of this scenario: it has a size of its own.
-        // A soak runs for a time rather than for steps.
-        let steps = match kind {
-            ScenarioKind::HeapGrowth => scenario::heap_growth_steps(),
-            ScenarioKind::Soak => 0,
-            _ => steps,
-        };
-        let soak_secs = match (kind, self_test) {
-            (ScenarioKind::Soak, Some(_)) => scenario::SOAK_SELF_TEST_SECS,
-            (ScenarioKind::Soak, None) => scenario::soak_secs(),
-            _ => 0,
-        };
-        let default_deadline = match kind {
-            ScenarioKind::Concurrency => 300 + 120 * steps,
-            ScenarioKind::Soak => soak_secs + 300,
-            _ => 120 + 60 * steps,
+        let settings = scenario.settings(self_test, steps);
+        let stall_secs = match self_test {
+            Some(_) => 15,
+            None => env_u64(ENV_STALL_SECS, settings.stall_secs),
         };
         assert!(
             stall_secs >= quiet_secs + 10,
             "{ENV_STALL_SECS}={stall_secs} must exceed the {quiet_secs}s a step may wait for quiet by 10s"
         );
-        let deadline_secs = env_u64(ENV_DEADLINE_SECS, default_deadline);
-        assert!(
-            kind != ScenarioKind::Soak || self_test.is_some() || deadline_secs >= soak_secs + 60,
-            "{ENV_DEADLINE_SECS}={deadline_secs} must exceed the {soak_secs}s a soak runs by 60s"
-        );
+        let deadline_secs = env_u64(ENV_DEADLINE_SECS, settings.deadline_secs);
+        if let Some((least, why)) = &settings.least_deadline {
+            assert!(
+                deadline_secs >= *least,
+                "{ENV_DEADLINE_SECS}={deadline_secs} must be at least {least}, {why}"
+            );
+        }
         let name = match self_test {
-            Some(test) => format!("self-test-{}", test.name()),
-            None => kind.name().to_string(),
+            Some(test) => format!("self-test-{}", test.name),
+            None => scenario.name().to_string(),
         };
         let run_dir = artifacts_root().join(format!(
             "{name}-{}-{}",
@@ -360,16 +129,23 @@ impl RunConfig {
                 _ => Keep::Nothing,
             }
         };
-        let scope = (kind == ScenarioKind::MemoryLimits).then(|| {
+        let scope = settings.cgroup.then(|| {
             RunScope::create(&name).unwrap_or_else(|error| {
-                panic!("the memory limit scenarios cannot run here: {error}")
+                panic!(
+                    "{} runs in cgroups, which it cannot create here: {error}",
+                    scenario.name()
+                )
             })
         });
+        let mut child_env = settings.child_env;
+        for check in scenario.checks() {
+            child_env.extend(check.child_env(self_test));
+        }
         Self {
-            kind,
+            scenario,
             run_dir,
-            steps,
-            soak_secs,
+            steps: settings.steps,
+            seeds: settings.seeds,
             stall: Duration::from_secs(stall_secs),
             deadline: Duration::from_secs(deadline_secs),
             quiet_secs,
@@ -377,6 +153,8 @@ impl RunConfig {
             repeat: env_u64("LANCE_STRESS_REPEAT", 1).max(1),
             self_test,
             scope,
+            child_env,
+            replay_env: settings.replay_env,
         }
     }
 }
@@ -412,37 +190,31 @@ fn artifacts_root() -> PathBuf {
 }
 
 /// Runs every requested seed of a scenario and fails if any seed failed.
-pub fn run(kind: ScenarioKind) {
+pub fn run(scenario: &'static dyn Scenario) {
     // libtest has no verdict for a test that did not run: it passes. A replay
     // names its scenario, so there it would pass for a seed it never ran.
     let selection = Selection::from_env();
-    if !selection.runs(kind) {
+    if !selection.runs(scenario) {
         let replay = std::env::var_os(ENV_SEED).is_some() && std::env::var_os(ENV_PLAN).is_some();
         assert!(
             !replay,
             "{ENV_PLAN} replays a seed of {}, which {ENV_ONLY} leaves out",
-            kind.name()
+            scenario.name()
         );
         return;
     }
-    let config = RunConfig::new(kind, None);
-    // A focus takes every other step, and in `concurrency` the forced pairs, from
-    // the third round on: with fewer, it would fall on nothing. An index
-    // optimization has work from the fourth step on, after an index build and an
-    // append.
-    let focused: Vec<&str> = scenario::focusable_ops(kind)
+    let config = RunConfig::new(scenario, None);
+    // With fewer steps, a focus would fall on nothing.
+    let focused: Vec<&str> = scenario
+        .focusable_ops()
         .into_iter()
         .filter(|op| selection.focus().contains(op))
         .collect();
-    let least = match kind {
-        ScenarioKind::Concurrency => 3,
-        _ if focused == ["optimize_indices"] => 4,
-        _ => 2,
-    };
+    let least = scenario.least_focus_steps(&focused);
     assert!(
         selection.focus().is_empty() || config.steps >= least,
         "the operations of {ENV_ONLY} need {ENV_STEPS} of at least {least} in {}",
-        kind.name()
+        scenario.name()
     );
     fs::create_dir_all(&config.run_dir).expect("create the run directory");
     record_environment(&config.run_dir);
@@ -450,12 +222,7 @@ pub fn run(kind: ScenarioKind) {
         vec![env_u64(ENV_SEED, 0)]
     } else {
         let base = env_u64("LANCE_STRESS_SEED_BASE", 1);
-        // A soak seed takes minutes and checks one long run, not a variety of plans.
-        let default_seeds = match kind {
-            ScenarioKind::Soak => 1,
-            _ => 16,
-        };
-        (base..base + env_u64("LANCE_STRESS_SEEDS", default_seeds)).collect()
+        (base..base + env_u64("LANCE_STRESS_SEEDS", config.seeds)).collect()
     };
     let mut summary = Summary::new(&config, &seeds);
     for &seed in &seeds {
@@ -477,124 +244,40 @@ pub fn run(kind: ScenarioKind) {
 }
 
 /// Runs one seed with a defect injected and checks that it is reported.
-pub fn check_self_test(test: SelfTest) {
-    if !Selection::from_env().runs_self_test(test.scenario()) {
+pub fn check_self_test(scenario: &'static dyn Scenario, test: &'static SelfTest) {
+    assert!(
+        scenario::by_name(scenario.name()).is_some(),
+        "{} has self-tests but is missing from `scenarios!` in scenario.rs",
+        scenario.name()
+    );
+    if !Selection::from_env().runs_self_test(scenario) {
         return;
     }
-    let config = RunConfig::new(test.scenario(), Some(test));
+    let config = RunConfig::new(scenario, Some(test));
     fs::create_dir_all(&config.run_dir).expect("create the run directory");
     let report = run_seed(&config, 1, 1);
-    let expected = test.expected_classes();
     assert!(
         match report.class.as_deref() {
-            Some(class) => expected.contains(&class),
-            None => expected.is_empty(),
+            Some(class) => test.expected.contains(&class),
+            None => test.expected.is_empty(),
         },
         "the {} self-test was reported as {:?}: {} (artifacts in {})",
-        test.name(),
+        test.name,
         report.class,
         report.detail,
         report.dir.display()
     );
-    // The branches of `hung_call` share the class, so the detail tells which fired.
-    let reason = match test {
-        SelfTest::HungCall => Some("hung, 1 still wait and 0 ended after"),
-        SelfTest::LateCall => Some("hung, 0 still wait and 1 ended after"),
-        SelfTest::WriteAfterRelease => Some("writes reached the store after the hung reads"),
-        SelfTest::SoakGrowth => Some("heap_bytes from"),
-        _ => None,
-    };
-    if let Some(reason) = reason {
+    if let Some(reason) = test.reason {
         assert!(
             report.detail.contains(reason),
             "the {} self-test must fail with {reason:?}, but: {} (artifacts in {})",
-            test.name(),
+            test.name,
             report.detail,
             report.dir.display()
         );
     }
-    if test == SelfTest::SoakGrowth {
-        // The leak puts 8 of its samples between the medians of the thirds, far
-        // more than a run this short grows by itself.
-        let growth = report
-            .detail
-            .split_once("heap_bytes from ")
-            .and_then(|(_, rest)| rest.split_once(','))
-            .and_then(|(range, _)| range.split_once(" to "))
-            .and_then(|(from, to)| Some(to.parse::<i64>().ok()? - from.parse::<i64>().ok()?));
-        let least = 6 * scenario::SOAK_SELF_TEST_LEAK as i64;
-        assert!(
-            growth.is_some_and(|growth| growth >= least),
-            "the soak_growth self-test must grow the heap by {least} or more, but: {} (artifacts in {})",
-            report.detail,
-            report.dir.display()
-        );
-    }
-    let resumed = report.journal.contains("generation=2 ");
-    match test {
-        SelfTest::ForeignKill => assert!(
-            !resumed,
-            "a death nobody planned must end the seed, see {}",
-            report.dir.display()
-        ),
-        SelfTest::KillThenMissingFile => assert!(
-            resumed,
-            "the death was planned, so a later process must look at the dataset, see {}",
-            report.dir.display()
-        ),
-        SelfTest::OomRecovery => assert!(
-            resumed
-                && report.journal.contains("observation=killed:oom_kill")
-                && report.journal.contains("outcome=killed"),
-            "the step must have died of its limit and been concluded later, see {}",
-            report.dir.display()
-        ),
-        SelfTest::HangUnderLimit => {
-            let cgroup = fs::read_to_string(report.dir.join("cgroup.txt")).unwrap_or_default();
-            // Taken before the kill, so the child is still there to see.
-            assert!(
-                cgroup
-                    .split("== cgroup.procs\n")
-                    .nth(1)
-                    .is_some_and(|procs| !procs.trim().is_empty()),
-                "a hang under a limit must leave the cgroup as it was in {}",
-                report.dir.display()
-            );
-        }
-        _ => {}
-    }
-    if test == SelfTest::GateHang {
-        // The stall, not the deadline, must have ended it, with the reader going
-        // on long after the last line of the step log.
-        assert!(
-            report.detail.contains("no progress for"),
-            "the watchdog must have seen no progress, but: {}",
-            report.detail
-        );
-        let last_tick = |name: &str| {
-            fs::read_to_string(report.dir.join(name))
-                .unwrap_or_default()
-                .lines()
-                .rev()
-                .find_map(|line| field(line, "t").and_then(|tick| tick.parse::<u64>().ok()))
-                .unwrap_or(0)
-        };
-        assert!(
-            last_tick(READS_LOG) >= last_tick(STEPS_LOG) + 10_000,
-            "a reader must have kept reading during the hang, see {}",
-            report.dir.display()
-        );
-        let calls = fs::read_to_string(report.dir.join(CALLS_LOG)).unwrap_or_default();
-        assert!(
-            calls.contains("hold_before"),
-            "the hang must come from the hold point, see {}",
-            report.dir.display()
-        );
-    }
-    if matches!(
-        test,
-        SelfTest::Hang | SelfTest::HangUnderLimit | SelfTest::GateHang
-    ) {
+    (test.verify)(&report);
+    if test.expected == ["hang"] {
         let threads = fs::read_to_string(report.dir.join("threads.txt")).unwrap_or_default();
         assert!(
             !threads.is_empty(),
@@ -660,10 +343,12 @@ fn shell_quote(value: &str) -> String {
 /// fingerprint of the plan, non-default limits, and every Lance tuning
 /// variable the run inherited.
 fn replay_command(config: &RunConfig, seed: u64) -> String {
+    // The path of the test, which `scenarios!` and `self_tests!` make.
     if let Some(test) = config.self_test {
         return format!(
-            "cargo test -p lance --test stress -- --exact harness_reports_{} --nocapture",
-            test.name()
+            "cargo test -p lance --test stress -- --exact scenario::{}::self_test::{} --nocapture",
+            config.scenario.name(),
+            test.name
         );
     }
     let mut vars: Vec<String> = std::env::vars()
@@ -675,7 +360,7 @@ fn replay_command(config: &RunConfig, seed: u64) -> String {
     vars.push(format!("{ENV_STEPS}={}", config.steps));
     vars.push(format!(
         "{ENV_PLAN}={}",
-        scenario::plan_fingerprint(config.kind, seed, config.steps as usize)
+        engine::plan_fingerprint(config.scenario, seed, config.steps as usize)
     ));
     for name in [
         ENV_STALL_SECS,
@@ -688,25 +373,53 @@ fn replay_command(config: &RunConfig, seed: u64) -> String {
             vars.push(format!("{name}={}", shell_quote(&value)));
         }
     }
-    // The plan of a soak holds its length, so a replay pins it instead of taking
-    // whatever the default is when it runs.
-    if config.kind == ScenarioKind::Soak {
-        vars.push(format!("{ENV_SOAK_SECS}={}", config.soak_secs));
+    for (name, value) in &config.replay_env {
+        vars.push(format!("{name}={}", shell_quote(value)));
     }
     format!(
-        "{} cargo test -p lance --test stress -- --exact {} --nocapture",
+        "{} cargo test -p lance --test stress -- --exact scenario::{} --nocapture",
         vars.join(" "),
-        config.kind.name()
+        config.scenario.name()
     )
 }
 
-struct SeedReport {
-    seed: u64,
-    attempt: u64,
-    class: Option<String>,
-    detail: String,
-    dir: PathBuf,
-    journal: String,
+/// The command that runs `seed` in this process, for gdb or rr, with the
+/// variables `start_child` gives a child.
+fn standalone_command(config: &RunConfig, seed: u64) -> String {
+    let mut vars = String::new();
+    for (name, value) in &config.child_env {
+        if let Some(value) = value {
+            write!(vars, "{name}={} ", shell_quote(value)).unwrap();
+        }
+    }
+    if std::env::var(ENV_CALIBRATE).is_ok_and(|value| value == "1") {
+        write!(vars, "{ENV_CALIBRATE}=1 ").unwrap();
+    }
+    if std::env::var(ENV_SERIAL).is_ok_and(|value| value == "1") {
+        write!(vars, "{ENV_SERIAL}=1 ").unwrap();
+    }
+    if let Some(test) = config.self_test {
+        write!(vars, "{ENV_SELF_TEST}={} ", test.name).unwrap();
+    } else if let Ok(only) = std::env::var(ENV_ONLY) {
+        write!(vars, "{ENV_ONLY}={} ", shell_quote(&only)).unwrap();
+    }
+    format!(
+        "# Or in one process, for gdb or rr, into a fresh directory, where no cgroup limit applies. After a death, go on with {ENV_GENERATION}=2 in the same directory:\n# {vars}{ENV_STANDALONE}=1 {ENV_CHILD}={} {ENV_SEED}={seed} {ENV_GENERATION}=1 {ENV_STEPS}={} {ENV_QUIET_SECS}={} {ENV_DIR}=<dir> TMPDIR=<dir>/tmp {} --exact child --nocapture\n",
+        config.scenario.name(),
+        config.steps,
+        config.quiet_secs,
+        fs::read_link("/proc/self/exe")
+            .map_or_else(|_| "<test binary>".into(), |exe| exe.display().to_string())
+    )
+}
+
+pub struct SeedReport {
+    pub seed: u64,
+    pub attempt: u64,
+    pub class: Option<String>,
+    pub detail: String,
+    pub dir: PathBuf,
+    pub journal: String,
 }
 
 fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
@@ -731,37 +444,7 @@ fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
         );
     }
     let replay = replay_command(config, seed);
-    let mut standalone_vars = String::new();
-    if config.kind.observes_memory() {
-        standalone_vars.push_str("LANCE_MEMORY_OBSERVE=1 ");
-    }
-    if std::env::var(ENV_CALIBRATE).is_ok_and(|value| value == "1") {
-        write!(standalone_vars, "{ENV_CALIBRATE}=1 ").unwrap();
-    }
-    if config.kind == ScenarioKind::Concurrency {
-        write!(
-            standalone_vars,
-            "{COMMIT_RETRY_TIMEOUT_VARIABLE}={COMMIT_RETRY_TIMEOUT_SECS} "
-        )
-        .unwrap();
-    }
-    if std::env::var(ENV_SERIAL).is_ok_and(|value| value == "1") {
-        write!(standalone_vars, "{ENV_SERIAL}=1 ").unwrap();
-    }
-    if let Ok(only) = std::env::var(ENV_ONLY) {
-        write!(standalone_vars, "{ENV_ONLY}={} ", shell_quote(&only)).unwrap();
-    }
-    if config.kind == ScenarioKind::Soak {
-        write!(standalone_vars, "{ENV_SOAK_SECS}={} ", config.soak_secs).unwrap();
-    }
-    let standalone = format!(
-        "# Or in one process, for gdb or rr, into a fresh directory, where no cgroup limit applies. After a death, go on with {ENV_GENERATION}=2 in the same directory:\n# {standalone_vars}{ENV_STANDALONE}=1 {ENV_CHILD}={} {ENV_SEED}={seed} {ENV_GENERATION}=1 {ENV_STEPS}={} {ENV_QUIET_SECS}={} {ENV_DIR}=<dir> TMPDIR=<dir>/tmp {} --exact child --nocapture\n",
-        config.kind.name(),
-        config.steps,
-        config.quiet_secs,
-        fs::read_link("/proc/self/exe")
-            .map_or_else(|_| "<test binary>".into(), |exe| exe.display().to_string())
-    );
+    let standalone = standalone_command(config, seed);
     if let Err(error) = fs::write(dir.join("replay.sh"), format!("{replay}\n{standalone}")) {
         return report("harness", format!("cannot write replay.sh: {error}"));
     }
@@ -798,18 +481,29 @@ fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
             );
         }
         generation += 1;
-        if let Err(error) = note_the_death(&dir, generation, cause) {
+        let logs: Vec<&str> = config
+            .scenario
+            .checks()
+            .iter()
+            .flat_map(|check| check.logs())
+            .copied()
+            .collect();
+        if let Err(error) = note_the_death(&dir, generation, cause, &logs) {
             return report("harness", format!("cannot note a death: {error}"));
         }
     };
     drop(cgroup);
-    // The series of a soak outlive the seed's directory, which a pass removes.
-    if config.kind == ScenarioKind::Soak {
-        let series = dir.join(scenario::SOAK_CSV);
+    // They outlive the seed's directory, which a pass removes, as
+    // `<stem>-<seed's directory>.<extension>`.
+    for artifact in config.scenario.artifacts() {
         let name = dir
             .file_name()
             .map_or_else(String::new, |name| name.to_string_lossy().to_string());
-        fs::copy(&series, config.run_dir.join(format!("soak-{name}.csv"))).ok();
+        let kept = match artifact.rsplit_once('.') {
+            Some((stem, extension)) => format!("{stem}-{name}.{extension}"),
+            None => format!("{artifact}-{name}"),
+        };
+        fs::copy(dir.join(artifact), config.run_dir.join(kept)).ok();
     }
     let mut report = judge(seed, attempt, dir, end);
     if report.class.is_some() {
@@ -851,7 +545,7 @@ fn start_child(
     let mut command = Command::new("/proc/self/exe");
     command
         .args(["--exact", "child", "--nocapture", "--test-threads=1"])
-        .env(ENV_CHILD, config.kind.name())
+        .env(ENV_CHILD, config.scenario.name())
         .env(ENV_SEED, seed.to_string())
         .env(ENV_DIR, dir)
         .env(ENV_GENERATION, generation.to_string())
@@ -876,7 +570,7 @@ fn start_child(
     // A self-test plans as if nothing were selected: its defect lands on the
     // steps it expects.
     match config.self_test {
-        Some(test) => command.env(ENV_SELF_TEST, test.name()).env_remove(ENV_ONLY),
+        Some(test) => command.env(ENV_SELF_TEST, test.name).env_remove(ENV_ONLY),
         None => command.env_remove(ENV_SELF_TEST),
     };
     // A replay pins the plan it expects, so a changed generator cannot pass
@@ -887,26 +581,12 @@ fn start_child(
     {
         command.env(ENV_PLAN, plan);
     }
-    // Read once, when a process first needs it, so it is set from the start.
-    if config.kind.observes_memory() && config.self_test != Some(SelfTest::MemoryEvents) {
-        command.env("LANCE_MEMORY_OBSERVE", "1");
-    } else {
-        command.env_remove("LANCE_MEMORY_OBSERVE");
+    for (name, value) in &config.child_env {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
     }
-    // The steps of this scenario set the pool, and the switch would turn it off.
-    if config.kind == ScenarioKind::MemoryLimits {
-        command
-            .env_remove("LANCE_MEM_POOL_SIZE")
-            .env_remove("LANCE_BYPASS_SPILLING");
-    }
-    if config.kind == ScenarioKind::Concurrency {
-        command.env(COMMIT_RETRY_TIMEOUT_VARIABLE, COMMIT_RETRY_TIMEOUT_SECS);
-    }
-    // The child takes its length from here, so that a self-test can set its own.
-    match config.kind {
-        ScenarioKind::Soak => command.env(ENV_SOAK_SECS, config.soak_secs.to_string()),
-        _ => command.env_remove(ENV_SOAK_SECS),
-    };
     match cgroup {
         Some(cgroup) => {
             command.env(ENV_CGROUP, cgroup.dir());
@@ -951,9 +631,10 @@ fn planned_death(
 }
 
 /// A SIGKILL can tear a write at a page boundary, so whatever comes next to a
-/// log of a dead process starts a line of its own.
-fn note_the_death(dir: &Path, generation: u64, cause: &str) -> std::io::Result<()> {
-    for name in [STEPS_LOG, CALLS_LOG, MEMORY_LOG] {
+/// log of a dead process starts a line of its own: the logs of the harness, and
+/// `logs` of the checks of the scenario.
+fn note_the_death(dir: &Path, generation: u64, cause: &str, logs: &[&str]) -> std::io::Result<()> {
+    for name in [STEPS_LOG, CALLS_LOG].iter().chain(logs) {
         let path = dir.join(name);
         if fs::read(&path).is_ok_and(|log| !log.is_empty() && !log.ends_with(b"\n")) {
             File::options().append(true).open(&path)?.write_all(b"\n")?;
@@ -1292,7 +973,7 @@ struct Coverage {
 
 struct Summary {
     header: String,
-    kind: ScenarioKind,
+    scenario: &'static dyn Scenario,
     runs: usize,
     outcomes: BTreeMap<String, usize>,
     observations: BTreeMap<String, usize>,
@@ -1307,7 +988,7 @@ impl Summary {
     fn new(config: &RunConfig, seeds: &[u64]) -> Self {
         let mut header = format!(
             "scenario={} run_dir={} steps={} repeat={} seeds={}..={}",
-            config.kind.name(),
+            config.scenario.name(),
             config.run_dir.display(),
             config.steps,
             config.repeat,
@@ -1319,7 +1000,7 @@ impl Summary {
         }
         Self {
             header,
-            kind: config.kind,
+            scenario: config.scenario,
             runs: 0,
             outcomes: BTreeMap::new(),
             observations: BTreeMap::new(),
@@ -1521,7 +1202,7 @@ impl Summary {
             writeln!(
                 text,
                 "replay a seed with the command after `replay:`; scenario {}",
-                self.kind.name()
+                self.scenario.name()
             )
             .unwrap();
         }
@@ -1544,7 +1225,7 @@ fn selection_dead_pairs_count_seeds_not_rounds() {
     };
     let mut summary = Summary {
         header: String::new(),
-        kind: ScenarioKind::Concurrency,
+        scenario: scenario::concurrency::SCENARIO,
         runs: 0,
         outcomes: BTreeMap::new(),
         observations: BTreeMap::new(),
@@ -1565,18 +1246,22 @@ fn selection_dead_pairs_count_seeds_not_rounds() {
 
 #[test]
 fn replay_pins_the_length_of_a_soak() {
+    use scenario::soak::ENV_SOAK_SECS;
+    let soak = scenario::soak::settings_of(4321, None);
     let config = RunConfig {
-        kind: ScenarioKind::Soak,
+        scenario: scenario::soak::SCENARIO,
         run_dir: PathBuf::new(),
-        steps: 0,
-        soak_secs: 4321,
-        stall: Duration::from_secs(150),
-        deadline: Duration::from_secs(4621),
+        steps: soak.steps,
+        seeds: soak.seeds,
+        stall: Duration::from_secs(soak.stall_secs),
+        deadline: Duration::from_secs(soak.deadline_secs),
         quiet_secs: 20,
         keep: Keep::Nothing,
         repeat: 1,
         self_test: None,
         scope: None,
+        child_env: soak.child_env,
+        replay_env: soak.replay_env,
     };
     let replay = replay_command(&config, 7);
     assert_eq!(
@@ -1588,12 +1273,33 @@ fn replay_pins_the_length_of_a_soak() {
         replay.contains(&format!("{ENV_SOAK_SECS}=4321 ")),
         "{replay}"
     );
-    let faults = RunConfig {
-        kind: ScenarioKind::StorageFaults,
-        steps: 8,
-        soak_secs: 0,
+    // The child runs the length that the replay pins.
+    assert_eq!(
+        config.child_env,
+        [(ENV_SOAK_SECS, Some("4321".to_string()))]
+    );
+    let faults = scenario::storage_faults::SCENARIO.settings(None, 8);
+    let config = RunConfig {
+        scenario: scenario::storage_faults::SCENARIO,
+        steps: faults.steps,
+        seeds: faults.seeds,
+        child_env: faults.child_env,
+        replay_env: faults.replay_env,
         ..config
     };
-    let replay = replay_command(&faults, 7);
+    let replay = replay_command(&config, 7);
     assert!(!replay.contains(ENV_SOAK_SECS), "{replay}");
+}
+
+#[test]
+fn replay_runs_a_self_test_standalone_as_its_child() {
+    let faults = scenario::storage_faults::SCENARIO;
+    let line = standalone_command(&RunConfig::new(faults, None), 7);
+    assert!(!line.contains(ENV_SELF_TEST), "{line}");
+    let test = faults.self_tests()[0];
+    let line = standalone_command(&RunConfig::new(faults, Some(test)), 7);
+    assert!(
+        line.contains(&format!(" {ENV_SELF_TEST}={} ", test.name)),
+        "{line}"
+    );
 }

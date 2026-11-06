@@ -34,7 +34,7 @@ use object_store::{
 };
 use tokio::sync::{Notify, watch};
 
-use crate::scenario::Journal;
+use crate::engine::Journal;
 
 /// The kind of a storage call. Reads of whole objects and of ranges are both
 /// `Get`, a metadata-only read is `Head`.

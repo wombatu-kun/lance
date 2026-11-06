@@ -12,25 +12,14 @@
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
-use std::fmt::{self, Write as _};
+use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::Write as _;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use lance_core::utils::tracing::TRACE_MEMORY;
-use tracing::field::{Field, Visit};
-use tracing::{Event, Subscriber};
-use tracing_subscriber::Registry;
-use tracing_subscriber::filter::filter_fn;
-use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-
-use crate::incidents::IncidentState;
 
 pub const ENV_CGROUP: &str = "LANCE_STRESS_CGROUP";
 
@@ -426,68 +415,4 @@ impl OwnCgroup {
     pub fn lift_limit(&self) -> Result<(), String> {
         write_file(&self.dir.join("memory.max"), "max")
     }
-}
-
-/// One line of `memory.log`: the fields of an event as `name=value`.
-struct EventLine(String);
-
-impl Visit for EventLine {
-    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        write!(self.0, " {}={value:?}", field.name()).unwrap();
-    }
-
-    fn record_str(&mut self, field: &Field, value: &str) {
-        write!(self.0, " {}={value}", field.name()).unwrap();
-    }
-}
-
-/// Lance's memory events, with what this process was doing. Each goes out in a
-/// single write and stays in the page cache, so a SIGKILL cannot take it back:
-/// the last line of a dead process says where it stood.
-struct MemoryLog {
-    file: Mutex<File>,
-    started: Instant,
-    generation: u64,
-    state: Arc<IncidentState>,
-}
-
-impl<S: Subscriber> Layer<S> for MemoryLog {
-    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
-        let mut line = EventLine(format!(
-            "t={} generation={} phase={}",
-            self.started.elapsed().as_millis(),
-            self.generation,
-            self.state.phase()
-        ));
-        event.record(&mut line);
-        // A SIGKILL can tear a write at a page boundary; `end=1` tells a whole line.
-        line.0.push_str(" end=1\n");
-        self.file
-            .lock()
-            .unwrap()
-            .write_all(line.0.as_bytes())
-            .expect("write the memory log");
-    }
-}
-
-pub fn log_memory_events(
-    path: &Path,
-    started: Instant,
-    generation: u64,
-    state: Arc<IncidentState>,
-) -> Result<(), String> {
-    let file = File::options()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| format!("cannot open {path:?}: {error}"))?;
-    let layer = MemoryLog {
-        file: Mutex::new(file),
-        started,
-        generation,
-        state,
-    }
-    .with_filter(filter_fn(|metadata| metadata.target() == TRACE_MEMORY));
-    tracing::subscriber::set_global_default(Registry::default().with(layer))
-        .map_err(|error| format!("cannot install the memory log: {error}"))
 }
