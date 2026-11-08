@@ -1,0 +1,9 @@
+# The seeds of a nightly run, one scenario a job: what each runs in about an hour of
+# a runner. LANCE_STRESS_SEED_BASE says where they start.
+storage_faults.seeds=200
+cancellation.seeds=200
+process_kill.seeds=200
+concurrency.seeds=100
+slow_storage.seeds=100
+memory_limits.seeds=50
+heap_growth.seeds=8

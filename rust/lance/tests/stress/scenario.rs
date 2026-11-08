@@ -184,6 +184,237 @@ pub fn by_name(name: &str) -> Option<&'static dyn Scenario> {
         .find(|scenario| scenario.name() == name)
 }
 
+/// The names a section of a guide puts first in the rows of its table, in backticks,
+/// each cut where its first `<` starts the values it carries.
+#[cfg(test)]
+fn table_names(doc: &str, heading: &str) -> BTreeSet<String> {
+    let (_, section) = doc
+        .split_once(&format!("\n## {heading}\n"))
+        .unwrap_or_else(|| panic!("no section {heading:?}"));
+    let section = section.split("\n## ").next().unwrap_or(section);
+    section
+        .lines()
+        .filter_map(|line| line.strip_prefix("| "))
+        .filter_map(|line| line.split(" | ").next())
+        .flat_map(|cell| cell.split('`').skip(1).step_by(2))
+        .map(|name| name.split('<').next().unwrap_or(name).to_string())
+        .collect()
+}
+
+/// The arguments of a call whose text starts after its opening parenthesis, up to
+/// the parenthesis that closes it.
+#[cfg(test)]
+fn arguments(text: &str) -> &str {
+    let (mut depth, mut quoted) = (1, false);
+    for (index, c) in text.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    return &text[..index];
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+/// The guide names everything a run can report, and nothing it cannot: every
+/// scenario and kind of trouble in `README.md`, every class in the tables of both
+/// files, every observation in `AGENTS.md`. A class a call of `fail` spells out is
+/// declared, even on a path no run takes.
+#[test]
+fn registry_docs_name_every_scenario_class_and_observation() {
+    const README: &str = include_str!("README.md");
+    const AGENTS: &str = include_str!("AGENTS.md");
+    let set = |names: &[&str]| -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    };
+    let scenarios: Vec<&str> = REGISTRY.iter().map(|scenario| scenario.name()).collect();
+    assert_eq!(table_names(README, "Scenarios"), set(&scenarios));
+    let kinds: Vec<&str> = REGISTRY
+        .iter()
+        .flat_map(|scenario| scenario.trouble_kinds().iter().copied())
+        .collect();
+    let line = README
+        .lines()
+        .find(|line| line.contains("takes kinds ("))
+        .expect("the kinds of LANCE_STRESS_ONLY");
+    let (_, listed) = line.split_once("takes kinds (").unwrap_or_default();
+    let listed = listed.split(')').next().unwrap_or_default();
+    let listed: Vec<&str> = listed.split('`').skip(1).step_by(2).collect();
+    assert_eq!(set(&listed), set(&kinds));
+    let classes = set(crate::engine::CLASSES);
+    assert_eq!(table_names(README, "Failure classes"), classes, "README.md");
+    assert_eq!(table_names(AGENTS, "Where to look"), classes, "AGENTS.md");
+    assert_eq!(
+        table_names(AGENTS, "Observations"),
+        set(crate::engine::OBSERVATIONS),
+        "AGENTS.md"
+    );
+    // What the code spells out is checked where it is written, not only when a run
+    // meets it: a class in a call of `fail` or `report`, an observation in a call of
+    // `observe`, as what a step absorbs, or in a journal line.
+    let (mut classes_spelled, mut observations_spelled) = (BTreeSet::new(), BTreeSet::new());
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/stress");
+    let mut dirs = vec![root];
+    while let Some(dir) = dirs.pop() {
+        for entry in
+            std::fs::read_dir(&dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
+        {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            if !name.ends_with(".rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            let file = path.display().to_string();
+            // Spelled in parts, so that this test does not take its own patterns. A
+            // class is the first argument; an observation any literal of its call.
+            for (call, class) in [
+                (["fail", "("].concat(), true),
+                (["report", "("].concat(), true),
+                (["observe", "("].concat(), false),
+                (["observe_hidden_files", "("].concat(), false),
+            ] {
+                for (at, _) in source.match_indices(call.as_str()) {
+                    // Only the engine's `fail` and the parent's `report`, which no
+                    // method of another type shares a name with.
+                    let before = source[..at].chars().next_back();
+                    let method = before == Some('.') && class;
+                    if before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                        || method
+                        || source[..at].ends_with("fn ")
+                    {
+                        continue;
+                    }
+                    let statement = arguments(&source[at + call.len()..]);
+                    let literals: Vec<&str> = match class {
+                        true => statement
+                            .trim_start()
+                            .strip_prefix('"')
+                            .and_then(|literal| literal.split('"').next())
+                            .into_iter()
+                            .collect(),
+                        false => statement.split('"').skip(1).step_by(2).collect(),
+                    };
+                    for literal in literals {
+                        let value = literal.split(['{', ' ']).next().unwrap_or_default();
+                        let spelled = match class {
+                            true => &mut classes_spelled,
+                            false => &mut observations_spelled,
+                        };
+                        if !value.is_empty() {
+                            spelled.insert((value.to_string(), file.clone()));
+                        }
+                    }
+                }
+            }
+            // What a step of the engine observes when it absorbed its trouble.
+            let absorbed = ["absorbed", ": \""].concat();
+            for (at, _) in source.match_indices(absorbed.as_str()) {
+                let value = source[at + absorbed.len()..]
+                    .split('"')
+                    .next()
+                    .unwrap_or_default();
+                observations_spelled.insert((value.to_string(), file.clone()));
+            }
+            for (at, _) in source.match_indices("observation=") {
+                let value = &source[at + "observation=".len()..];
+                let value = value
+                    .split(['{', ' ', '"', '`', '<', ',', ')', '\\'])
+                    .next()
+                    .unwrap_or_default();
+                if !value.is_empty() {
+                    observations_spelled.insert((value.to_string(), file.clone()));
+                }
+            }
+        }
+    }
+    for (class, file) in &classes_spelled {
+        assert!(
+            crate::engine::CLASSES.contains(&class.as_str()),
+            "{file}: the class {class:?} is not in CLASSES of engine.rs"
+        );
+    }
+    for (observation, file) in &observations_spelled {
+        assert!(
+            crate::engine::declared_observation(observation),
+            "{file}: the observation {observation:?} is not in OBSERVATIONS of engine.rs"
+        );
+    }
+    // Nothing is declared that the code no longer spells out, but the verdicts the
+    // parent gives a child it watched.
+    let spelled: BTreeSet<&str> = classes_spelled
+        .iter()
+        .map(|(class, _)| class.as_str())
+        .collect();
+    let unspelled: BTreeSet<&str> = crate::engine::CLASSES
+        .iter()
+        .copied()
+        .filter(|class| !spelled.contains(class))
+        .collect();
+    assert_eq!(unspelled, BTreeSet::from(["crash", "hang"]));
+    for declared in crate::engine::OBSERVATIONS {
+        assert!(
+            observations_spelled
+                .iter()
+                .any(|(spelled, _)| declared == spelled || declared.starts_with(spelled.as_str())),
+            "{declared:?} of OBSERVATIONS is spelled nowhere in the sources"
+        );
+    }
+}
+
+/// `scenario_template.rs` names every method of the traits a scenario implements,
+/// those with a default too, which the compiler would not ask a copy for.
+#[test]
+fn registry_template_names_every_method_of_a_scenario() {
+    const TEMPLATE: &str = include_str!("scenario_template.rs");
+    let traits = [
+        (include_str!("scenario.rs"), "pub trait Scenario"),
+        (include_str!("engine/steps.rs"), "pub trait StepPlanner"),
+        (include_str!("engine.rs"), "pub trait Body"),
+    ];
+    for (source, head) in traits {
+        let (_, rest) = source
+            .split_once(head)
+            .unwrap_or_else(|| panic!("no {head}"));
+        let body = rest.split("\n}\n").next().unwrap_or(rest);
+        let methods: Vec<&str> = body
+            .lines()
+            .map(str::trim_start)
+            .filter_map(|line| {
+                line.strip_prefix("fn ")
+                    .or_else(|| line.strip_prefix("async fn "))
+            })
+            .filter_map(|line| line.split(['(', '<']).next())
+            .collect();
+        assert!(methods.len() >= 5, "{head}: {methods:?}");
+        let name = head.trim_start_matches("pub trait ");
+        let (_, implemented) = TEMPLATE
+            .split_once(&format!("impl {name} for "))
+            .unwrap_or_else(|| panic!("scenario_template.rs implements no {name}"));
+        let implemented = implemented.split("\n}\n").next().unwrap_or(implemented);
+        for method in methods {
+            assert!(
+                implemented.contains(&format!("fn {method}("))
+                    || implemented.contains(&format!("fn {method}<")),
+                "scenario_template.rs has no {method} of {name}"
+            );
+        }
+    }
+}
+
 #[test]
 fn registry_names_scenarios_after_their_modules_and_self_tests_once() {
     let names: Vec<&str> = REGISTRY.iter().map(|scenario| scenario.name()).collect();

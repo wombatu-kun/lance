@@ -1382,8 +1382,45 @@ fn every_key_is_checked_against_the_whole_registry() {
     }
 }
 
-/// A child reads only its record, and must land on the knobs of its parent: every
-/// one at its default, and every one off it.
+/// Each profile of CI resolves for every scenario and leaves it the deadline it
+/// needs, so that a knob renamed or a bound moved fails here rather than in a
+/// nightly run. The nightly profile gives every scenario but `soak` its seeds.
+#[test]
+fn profiles_resolve_for_every_scenario() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/stress/profiles");
+    let mut profiles = 0;
+    for entry in
+        std::fs::read_dir(&dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
+    {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|extension| extension != "txt") {
+            continue;
+        }
+        let text = path.display().to_string();
+        for scenario in REGISTRY {
+            let knobs = Knobs::resolve(*scenario, &Env::from([(ENV_SET_FILE, text.as_str())]))
+                .unwrap_or_else(|error| panic!("{error}"));
+            knobs
+                .check_least_deadline(*scenario, None)
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        profiles += 1;
+    }
+    assert!(profiles > 0, "no profile in {}", dir.display());
+    let nightly = std::fs::read_to_string(dir.join("nightly.txt")).unwrap();
+    for scenario in REGISTRY.iter().filter(|scenario| scenario.name() != "soak") {
+        let prefix = format!("{}.seeds=", scenario.name());
+        let lines: Vec<&str> = nightly
+            .lines()
+            .filter(|line| line.starts_with(&prefix))
+            .collect();
+        assert!(
+            lines.len() == 1 && lines[0][prefix.len()..].chars().all(|c| c.is_ascii_digit()),
+            "nightly.txt: {prefix}<n> once: {lines:?}"
+        );
+    }
+}
+
 /// The least deadline is that of the test that runs: a short form, which takes no
 /// prefix, sets the deadline of every scenario, and only a run of `soak` asks for
 /// more than a minute.
@@ -1483,6 +1520,8 @@ fn the_environment_refuses_a_variable_of_lance_that_is_not_utf8() {
     Env::of([(OsString::from("LANCE_IO_THREADS"), bad())]);
 }
 
+/// A child reads only its record, and must land on the knobs of its parent: every
+/// one at its default, and every one off it.
 #[test]
 fn the_record_reads_back_as_itself() {
     for scenario in REGISTRY {

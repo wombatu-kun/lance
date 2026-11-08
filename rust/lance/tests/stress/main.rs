@@ -278,6 +278,8 @@ mod leaks;
 mod limits;
 mod memory_events;
 mod scenario;
+#[expect(dead_code, reason = "a scenario to copy, which no registry lists")]
+mod scenario_template;
 mod select;
 
 /// The entry point of a seed's child process. A normal test run skips it.

@@ -181,13 +181,9 @@ impl Run {
             .await
         }
         // A dead process must not take the dataset with it.
-        .map_err(|error| {
-            let class = if generation == 1 {
-                "setup"
-            } else {
-                "unreadable"
-            };
-            fail(class, 0, error)
+        .map_err(|error| match generation {
+            1 => fail("setup", 0, error),
+            _ => fail("unreadable", 0, error),
         })?;
         let mut run = Self {
             scenario,

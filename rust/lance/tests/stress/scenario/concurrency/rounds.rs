@@ -616,15 +616,15 @@ impl Run {
             };
             // Once a round, as its others meet or miss together: forced by the holds
             // only, and a pair forced twice that never meets fails the run.
-            let forced: BTreeSet<String> = context
+            let forced: BTreeSet<&str> = context
                 .round
                 .ops
                 .iter()
                 .filter(|op| op.worker != 0 && op.hold.is_some())
-                .map(|x| format!("pair_planned:{}:{}", x.op.kind(), landed.op.kind()))
+                .map(|x| x.op.kind())
                 .collect();
             for planned in forced {
-                self.observe(n, &planned);
+                self.observe(n, &format!("pair_planned:{planned}:{}", landed.op.kind()));
             }
             for x in context.round.ops.iter().filter(|op| op.worker != 0) {
                 let commit = tick(&spans[x.rank].commit);

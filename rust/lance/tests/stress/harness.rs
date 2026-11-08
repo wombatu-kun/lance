@@ -302,14 +302,7 @@ pub fn run(scenario: &'static dyn Scenario) {
                 .expect("write the summary");
         }
     }
-    assert!(
-        summary.failures.is_empty()
-            && summary.dead_limits().is_empty()
-            && summary.dead_holds().is_empty()
-            && summary.dead_pairs().is_empty(),
-        "{}",
-        summary.render()
-    );
+    assert!(summary.passed(), "{}", summary.render());
 }
 
 /// Runs one seed with a defect injected and checks that it is reported.
@@ -1038,8 +1031,12 @@ fn judge(seed: u64, attempt: u64, dir: PathBuf, end: ChildEnd) -> SeedReport {
         "panic".to_string()
     } else if let Some(line) = failed {
         notes.push(line.to_string());
-        // A fail line without a class still fails.
-        field(line, "class").unwrap_or("fail").to_string()
+        // A fail line torn before its step lost its class, or the end of it: the
+        // verdict never ended.
+        field(line, "class")
+            .filter(|_| field(line, "step").is_some())
+            .unwrap_or("crash")
+            .to_string()
     } else if hung.is_some() {
         notes.push(format!("last: {last_line}"));
         "hang".to_string()
@@ -1109,6 +1106,8 @@ struct Summary {
     coverage: BTreeMap<String, Coverage>,
     holds: BTreeMap<String, Coverage>,
     failures: Vec<SeedReport>,
+    /// Classes and observations the lists of `engine.rs` do not declare.
+    undeclared: BTreeSet<String>,
 }
 
 impl Summary {
@@ -1142,6 +1141,7 @@ impl Summary {
             coverage: BTreeMap::new(),
             holds: BTreeMap::new(),
             failures: Vec::new(),
+            undeclared: BTreeSet::new(),
         }
     }
 
@@ -1191,6 +1191,16 @@ impl Summary {
             .collect()
     }
 
+    /// Whether the run passes: no seed failed, nothing that enough seeds planned
+    /// stayed dead, and no name was undeclared.
+    fn passed(&self) -> bool {
+        self.failures.is_empty()
+            && self.dead_limits().is_empty()
+            && self.dead_holds().is_empty()
+            && self.dead_pairs().is_empty()
+            && self.undeclared.is_empty()
+    }
+
     /// Pairs of operations a run forced often enough that never met: the first
     /// always committed before the second landed, so the rebase it is there for
     /// never ran. Per seed this could be chance, as an operation may find nothing
@@ -1228,6 +1238,9 @@ impl Summary {
         }
         for (index, line) in report.journal.lines().enumerate() {
             if let Some(observation) = field(line, "observation") {
+                if !engine::declared_observation(observation) {
+                    self.undeclared.insert(format!("observation {observation}"));
+                }
                 *self
                     .observations
                     .entry(observation.to_string())
@@ -1275,7 +1288,10 @@ impl Summary {
                 *coverage.outcomes.entry(outcome).or_default() += 1;
             }
         }
-        if report.class.is_some() {
+        if let Some(class) = &report.class {
+            if !engine::CLASSES.contains(&class.as_str()) {
+                self.undeclared.insert(format!("class {class}"));
+            }
             self.failures.push(report);
         }
     }
@@ -1334,6 +1350,10 @@ impl Summary {
         for pair in self.dead_pairs() {
             writeln!(text, "dead pair: {pair}").unwrap();
         }
+        // Something the guide cannot explain, which fails the run like a dead line.
+        for name in &self.undeclared {
+            writeln!(text, "undeclared: {name}").unwrap();
+        }
         if !self.failures.is_empty() {
             writeln!(text, "failed:").unwrap();
             for report in &self.failures {
@@ -1382,15 +1402,74 @@ fn selection_dead_pairs_count_seeds_not_rounds() {
         coverage: BTreeMap::new(),
         holds: BTreeMap::new(),
         failures: Vec::new(),
+        undeclared: BTreeSet::new(),
     };
     summary.add(report(5));
     summary.add(report(5));
     assert!(summary.dead_pairs().is_empty(), "one seed, even repeated");
+    assert!(summary.passed());
+    // A name the lists of `engine.rs` do not declare fails the run, as a dead
+    // line does.
+    // Spelled in two parts, so that the scan of the sources does not take it.
+    let lost = ["pair", "_lost:append:cleanup"].concat();
+    summary.add(SeedReport {
+        journal: format!(
+            "t=1 step=2 observation=gate_timeout\n\
+             t=2 step=2 observation=killed_at:append:fragment_begin\n\
+             t=3 step=2 observation=fault_abs\n\
+             t=4 step=2 observation={lost}\n"
+        ),
+        ..report(5)
+    });
+    assert!(!summary.passed());
+    summary.add(SeedReport {
+        class: Some("fail".to_string()),
+        ..report(5)
+    });
+    assert_eq!(
+        summary.undeclared,
+        BTreeSet::from([
+            "class fail".to_string(),
+            "observation pair_lost:append:cleanup".to_string()
+        ])
+    );
+    assert!(
+        summary
+            .render()
+            .contains("undeclared: observation pair_lost:append:cleanup\n"),
+        "{}",
+        summary.render()
+    );
     summary.add(report(6));
     assert_eq!(
         summary.dead_pairs(),
-        ["append:cleanup planned=6 seeds=2 met=0"]
+        ["append:cleanup planned=8 seeds=2 met=0"]
     );
+}
+
+/// A verdict that a death tore is a crash: a fail line without its class, or with
+/// the class cut short before its step, names no class of its own.
+#[test]
+fn replay_judges_a_torn_verdict_as_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("stderr.log"), "").unwrap();
+    for (result, class) in [
+        ("result=fail", "crash"),
+        ("result=fail class=lost_wr", "crash"),
+        (
+            "result=fail class=lost_write step=3 detail=gone",
+            "lost_write",
+        ),
+    ] {
+        fs::write(
+            dir.path().join(STEPS_LOG),
+            format!("t=1 step=1 verdict incident=none\nt=2 {result}"),
+        )
+        .unwrap();
+        let end = ChildEnd::Exited(ExitStatus::from_raw(1 << 8));
+        let report = judge(1, 1, dir.path().to_path_buf(), end);
+        assert_eq!(report.class.as_deref(), Some(class), "{result}");
+    }
 }
 
 #[test]
@@ -1419,6 +1498,7 @@ fn selection_dead_holds_and_limits_count_seeds_not_tries() {
         coverage: BTreeMap::new(),
         holds: BTreeMap::new(),
         failures: Vec::new(),
+        undeclared: BTreeSet::new(),
     };
     for attempt in 1..=3 {
         summary.add(report(5, attempt));

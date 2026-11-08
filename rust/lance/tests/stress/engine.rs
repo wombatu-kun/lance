@@ -514,6 +514,114 @@ pub fn fail(class: &'static str, step: usize, detail: impl fmt::Display) -> Fail
     }
 }
 
+/// Every class a seed can fail with, in the child or in the parent. `README.md` and
+/// `AGENTS.md` describe each, a test holds both and the classes the code spells out
+/// to this list, and one the parent meets that is not here shows as `undeclared`.
+pub const CLASSES: &[&str] = &[
+    "content",
+    "duplicate_key",
+    "lost_write",
+    "torn_snapshot",
+    "stale_read",
+    "snapshot_changed",
+    "lineage",
+    "lost_commit",
+    "error_after_commit",
+    "error_without_fault",
+    "retry_failed",
+    "version_jump",
+    "stale_handle",
+    "missing_files",
+    "orphans",
+    "unreadable",
+    "validate",
+    "cleanup",
+    "index_not_used",
+    "memory_events",
+    "heap_growth",
+    "soak_growth",
+    "task_leak",
+    "tmp_leak",
+    "fd_leak",
+    "hung_call",
+    "panic",
+    "hang",
+    "crash",
+    "setup",
+    "harness",
+    "plan_changed",
+];
+
+/// Every observation a run can count, by its name or, for one that carries values,
+/// by what comes before them, which ends in `:`: `killed_at:` for
+/// `killed_at:<op>:<point>`. `AGENTS.md` describes each, a test holds it and the
+/// observations the code spells out to this list, and one the parent meets that is
+/// not here fails the run.
+pub const OBSERVATIONS: &[&str] = &[
+    // The step engine.
+    "fault_absorbed",
+    "delay_absorbed",
+    "cancel_missed",
+    "kill_missed",
+    "limit_absorbed",
+    "status_unknown_landed",
+    "status_unknown_lost",
+    "cancel_after_commit",
+    "killed_after_commit",
+    "late_commit",
+    "killed_at:",
+    "killed:",
+    "not_reached",
+    "error_on_stale_handle",
+    "spill:",
+    "failed_deletes_under_limit",
+    "orphans_after_kill",
+    "tmp_after_kill",
+    "hidden_after_kill",
+    "hidden_after_cleanup",
+    "orphan_transactions",
+    "orphan_deletions",
+    "index_dir_extra",
+    "expired_version_broken",
+    "optimize_left_unindexed",
+    "hung_read_left_behind",
+    // `concurrency`.
+    "legal_error:",
+    "internal_retry:",
+    "lost_manifest_race:",
+    "overlap:",
+    "shared_fragment:",
+    "pair_planned:",
+    "pair_met:",
+    "pair_missed:",
+    "hole_landed:",
+    "hole_refused:",
+    "hole_conflict:",
+    "hole_masked:",
+    "hole_error:",
+    "hole_nothing:",
+    "new_key_race",
+    "only_new_keys_race",
+    "only_new_keys_race_indexed",
+    "old_snapshot_gone",
+    "gate_timeout",
+    // `soak`.
+    "soak_retry:",
+    "soak_gave_up:",
+    "soak_unsettled",
+];
+
+/// Whether `OBSERVATIONS` declares `observation`, by its name or by the start of it,
+/// or holds a name that starts with it: a death can tear a line, and the scan of
+/// the sources cuts a name where its first value starts.
+pub fn declared_observation(observation: &str) -> bool {
+    OBSERVATIONS.iter().any(|declared| {
+        observation == *declared
+            || (declared.ends_with(':') && observation.starts_with(declared))
+            || declared.starts_with(observation)
+    })
+}
+
 pub fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
