@@ -6,15 +6,19 @@
 //! `file-object-store://` dataset.
 
 use std::collections::BTreeSet;
+use std::ops::RangeInclusive;
+use std::time::Duration;
 
 use crate::engine::data::{SMALL, Scale};
 use crate::engine::ops::{IndexKind, Op};
 use crate::engine::steps::{
-    self, HUNG_CALL, LATE_CALL, OpMix, StepCheck, StepPlanner, StepRules, WRITE_AFTER_RELEASE,
-    pick_from, storage_calls,
+    self, HUNG_CALL, HUNG_SETTLE, LATE_CALL, OpMix, SETTLE, StepCheck, StepPlanner, StepRules,
+    TROUBLE, WRITE_AFTER_RELEASE, pick_from, storage_calls,
 };
 use crate::engine::{Body, PlanInput, PlanRng, StoreChoice};
-use crate::incidents::{Area, Delay, HangPoint, Incident, Method};
+use crate::harness::QUIET_SECS;
+use crate::incidents::{Area, DEFAULT_LATE_AFTER, Delay, HangPoint, Incident, LATE_AFTER, Method};
+use crate::knobs::{Class, Key, Knob, Knobs, STEPS};
 use crate::scenario::{Runtime, Scenario, SelfTest, Settings};
 
 pub const SCENARIO: &dyn Scenario = &SlowStorage;
@@ -54,8 +58,13 @@ const RULES: StepRules = StepRules {
     checks_kept_versions: true,
 };
 
-/// How long `slow_storage` slows a call: from a busy store to a struggling one.
+/// How long `slow_storage` slows a call, `delay_scale` times: from a busy store to
+/// a struggling one. Up to 5 times, since a slowed read of a data file that a step
+/// left behind must end within the 20 s a step waits for quiet.
 const DELAYS_MS: [u64; 6] = [10, 30, 100, 300, 1000, 3000];
+const DELAY_SCALE: Key<f64> = Key::new("delay_scale");
+const SLOWED_CALLS: Key<RangeInclusive<u64>> = Key::new("slowed_calls");
+const HANG: Key<f64> = Key::new("hang");
 
 /// The calls `slow_storage` slows: those of `storage_faults`, as `store` makes
 /// them. A store that lists in order finds the latest version by listing; another
@@ -94,8 +103,62 @@ impl Scenario for SlowStorage {
         steps::least_focus_steps(focused)
     }
 
-    fn settings(&self, _self_test: Option<&SelfTest>, steps: u64) -> Settings {
-        steps::settings(steps)
+    fn knobs(&self) -> Vec<Knob> {
+        let mut knobs = steps::knobs(0.8);
+        knobs.extend([
+            // No smaller: the two longest delays must outlast the longest
+            // `late_after`, or a call a task left behind could never end late.
+            DELAY_SCALE.share(
+                Class::Plan,
+                1.0,
+                0.4..=5.0,
+                "a factor on the delays of slowed calls",
+            ),
+            SLOWED_CALLS.range(
+                Class::Plan,
+                1..=3,
+                1..=8,
+                "how many calls of a step it slows",
+            ),
+            HANG.share(
+                Class::Plan,
+                0.35,
+                0.0..=1.0,
+                "the share of slowed steps with a call that never answers",
+            ),
+            // Each at least its default, which is the margin for the last poll of
+            // a task the operation aborted.
+            LATE_AFTER.duration(
+                Class::Judge,
+                DEFAULT_LATE_AFTER,
+                DEFAULT_LATE_AFTER..=Duration::from_millis(300),
+                "how long after its operation a slow call may still end",
+            ),
+            SETTLE.duration(
+                Class::Judge,
+                HUNG_SETTLE,
+                HUNG_SETTLE..=Duration::from_secs(60),
+                "how long a step waits for the calls its operation left behind",
+            ),
+        ]);
+        knobs
+    }
+
+    /// A step can stay silent while each call it slows waits in turn, the longest
+    /// delay every time, then while it waits for what its operation left behind,
+    /// and then for quiet.
+    fn settings(&self, _self_test: Option<&SelfTest>, knobs: &Knobs) -> Settings {
+        let longest = (DELAYS_MS[DELAYS_MS.len() - 1] as f64 * DELAY_SCALE.get(knobs)).round();
+        let delays = longest as u64 * *SLOWED_CALLS.get(knobs).end();
+        let silence =
+            Duration::from_millis(delays) + SETTLE.get(knobs) + Duration::from_secs(QUIET_SECS);
+        let count = STEPS.get(knobs);
+        let per_step = Duration::from_secs(60).max(silence);
+        Settings {
+            stall: Duration::from_secs(60).max(silence + Duration::from_secs(10)),
+            deadline: Duration::from_secs(120) + per_step * count as u32,
+            ..steps::settings(count)
+        }
     }
 
     fn self_tests(&self) -> &'static [&'static SelfTest] {
@@ -106,7 +169,7 @@ impl Scenario for SlowStorage {
         &[]
     }
 
-    fn runtime(&self) -> Runtime {
+    fn runtime(&self, _knobs: &Knobs) -> Runtime {
         steps::RUNTIME
     }
 
@@ -145,16 +208,18 @@ impl StepPlanner for SlowStorage {
         store: StoreChoice,
         scale: &Scale,
         op: &Op,
+        knobs: &Knobs,
     ) -> Option<Incident> {
-        if !rng.chance(0.8) {
+        if !rng.chance(TROUBLE.get(knobs)) {
             return None;
         }
         let targets = slow_calls(op, scale, store);
+        let delay_scale = DELAY_SCALE.get(knobs);
         let mut delays: Vec<Delay> = Vec::new();
-        for _ in 0..rng.range(1..=3) {
+        for _ in 0..rng.range(SLOWED_CALLS.get(knobs)) {
             let (method, area, max_nth) = *pick_from(rng, &targets);
             let nth = rng.range(1..=max_nth);
-            let millis = *pick_from(rng, &DELAYS_MS);
+            let millis = (*pick_from(rng, &DELAYS_MS) as f64 * delay_scale).round() as u64;
             // The store wrapper slows a listing or a deletion only before
             // its request.
             let after = !matches!(method, Method::List | Method::Delete) && rng.chance(0.5);
@@ -171,7 +236,7 @@ impl StepPlanner for SlowStorage {
                 });
             }
         }
-        let hang = rng.chance(0.35).then(|| {
+        let hang = rng.chance(HANG.get(knobs)).then(|| {
             let (method, area, max_nth) = *pick_from(rng, &targets);
             HangPoint {
                 method,

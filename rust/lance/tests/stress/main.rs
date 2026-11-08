@@ -20,9 +20,9 @@
 //! stage or a written fragment, on a local or a `shared-memory://` dataset.
 //!
 //! `slow_storage` slows the store under the same operations, on a
-//! `shared-memory://` or a `file-object-store://` dataset. A step slows one to three
-//! of the calls its operation makes by 10 ms to 3 s, before the request or once it
-//! has completed, and now and then one call never answers: the step gives the
+//! `shared-memory://` or a `file-object-store://` dataset. By default a step slows one
+//! to three of the calls its operation makes by 10 ms to 3 s, before the request or
+//! once it has completed, and now and then one call never answers: the step gives the
 //! operation up a moment later, as an application whose deadline has passed, and
 //! goes on as after a cancellation. A delay alone must neither fail an operation
 //! nor change what it does. A slow or hung call that outlives its operation, in a
@@ -57,9 +57,6 @@
 //! and goes on as above; `LANCE_MEM_POOL_SIZE`, which ends in spilling or in a
 //! clean error; the memory limit of an FTS build; the I/O buffer of a scan.
 //! Checks and retries run without a limit, so a budget concerns one operation.
-//! A merge insert that runs out of a pool because a `RepartitionExec` took a share
-//! of it is a defect of Lance rather than of the budget: it does not fail the seed
-//! and shows as the `known_defect:merge_insert_pool_share` observation.
 //! A seed fixes the limits, not the moment of a kill, which is why the first
 //! scenario is there too: kills land on allocation peaks and rarely in a commit.
 //! Both turn on Lance's memory events and check them against what happened.
@@ -69,8 +66,8 @@
 //! Rust code holds rather than the resident set, which also holds what the
 //! allocator keeps; what C libraries allocate for themselves does not show.
 //!
-//! `concurrency` runs rounds rather than single operations. In a round, 2 to 4
-//! workers run their operations at once, each with a handle and a store wrapper
+//! `concurrency` runs rounds rather than single operations. In a round, by default
+//! 2 to 4 workers run their operations at once, each with a handle and a store wrapper
 //! of its own, and by seed one `Session` for all or one each, while readers check
 //! snapshots. A row belongs to the class `id % (workers + 2)`, and a worker only
 //! changes its own class, so every snapshot must show a worker's rows as of some
@@ -80,11 +77,11 @@
 //! over, the points a cancellation uses, which is what makes commits overlap; the
 //! `overlap:<X>:<Y>` observations count the pairs that did, and
 //! `shared_fragment:<X>:<Y>` those that landed on a fragment in common. A point
-//! that a run plans again and again and that never fires fails it. A fast operation
+//! that three seeds of a run plan and that never fires fails it. A fast operation
 //! rarely sees a slow one land under it, so rounds 3, 5 and 7 of the default eight
 //! each force one pair of `PAIRS`: the others stand on the version the round starts
 //! from and commit over what the first worker landed, `pair_met:<X>:<Y>` when they
-//! did, and a pair that a run forces twice and that never meets fails it. A cleanup
+//! did, and a pair that two seeds of a run force and that never meets fails it. A cleanup
 //! in a pair starts once one of the others is at its commit point, so that it runs
 //! while files nobody has committed yet exist. Seeds take the pairs in turn. Round 1
 //! leaves a hole in the history: the others prepare their write without a commit,
@@ -133,8 +130,8 @@
 //! retried, and no tokio task, temporary file or descriptor may be left behind.
 //! The run ends with a cleanup that must leave no unreferenced file.
 //!
-//! `soak` runs a long-lived service for `LANCE_STRESS_SOAK_SECS`, on a local or a
-//! `file-object-store://` dataset: 2 to 4 workers keep a handle each, on one
+//! `soak` runs a long-lived service for `soak.secs`, 180 s by default, on a local or a
+//! `file-object-store://` dataset: by default 2 to 4 workers keep a handle each, on one
 //! `Session` with caches of a few MiB, and go round appends, merge inserts,
 //! updates, deletes, compaction, index optimizations, cleanups, reopening the
 //! dataset, scans and index queries. A worker only changes the rows of its class
@@ -144,7 +141,8 @@
 //! indices are built once, before the workers start, and from then on only
 //! optimized, now and then merging every segment. A cleanup keeps every version
 //! from the oldest one a handle is on, see #3718. The run takes a sample at least
-//! every 7.5 s and at least 24, each once every worker has finished its operation,
+//! every `soak.interval`, 7.5 s by default, and at least 24, each once every worker
+//! has finished its operation,
 //! maintenance the try it is on, and the runtime is quiet, into `soak.csv`: the
 //! heap, what malloc has handed out, descriptors, threads, tokio tasks, the caches
 //! of the session, the versions, files and bytes of the dataset, the fragments,
@@ -214,25 +212,44 @@
 //! the seed with the same settings. A `soak` seed also leaves its samples beside
 //! `summary.txt`, as `soak-seed-N.csv`.
 //!
-//! Environment:
+//! Knobs change numbers the code holds as defaults, without a rebuild: how many
+//! seeds run, the size of a plan, how often trouble comes and how bad it is, the
+//! tolerances of the verdicts. `cargo test -p lance --test stress -- --exact
+//! knobs::list --nocapture` lists each with its default and bounds.
+//! - `LANCE_STRESS_SET`: `<knob>=<value>` pairs separated by commas, such as
+//!   `steps=12,concurrency.workers=4..=8,soak.secs=2h`. A key without a prefix sets
+//!   the knob of every scenario that has one. A length takes a unit (`ms`, `s`, `m`,
+//!   `h`, `d`), a size one too (`B`, `KiB`, `MiB`, `GiB`), and a range is `a..=b`.
+//! - `LANCE_STRESS_SET_FILE`: a file of such pairs, one per line, `#` for a comment.
+//!   What a variable sets wins over it.
+//! - `LANCE_STRESS_SEEDS` (16, for `soak` 1), `LANCE_STRESS_SEED_BASE` (1),
+//!   `LANCE_STRESS_REPEAT` (1), `LANCE_STRESS_STEPS` (8, the rounds of `concurrency`),
+//!   `LANCE_STRESS_STALL_SECS`, `LANCE_STRESS_DEADLINE_SECS` and
+//!   `LANCE_STRESS_SOAK_SECS` (180) set `seeds`, `seed_base`, `repeat`, `steps`,
+//!   `stall`, `deadline` and `soak.secs`, as integers and seconds. A knob that one of
+//!   them and `LANCE_STRESS_SET` both set fails the run.
+//! - `stall` (60 s, for `concurrency` and `soak` 150 s) is how long a child may go
+//!   without progress, and `deadline` (120 s + 60 s per step, for `concurrency`
+//!   300 s + 120 s per round, for `soak` its length + 300 s) how long it may run, for
+//!   a run of `soak` at least its length + 60 s. More steps, cycles or a longer soak
+//!   raise the deadline; a longer wait at a hold, or slower calls, raise the stall
+//!   too. A value a source sets stays as it is set.
+//!
+//! A knob off its default shows in `summary.txt`, one of the plan in `plan.log` too,
+//! and so in the fingerprint of the plan. A replay pins every knob but how many seeds
+//! run, and a stall or a deadline that no source set, which it derives again from
+//! the knobs it pins, and it removes from its shell what could set them. Self-tests
+//! take a deadline from the knobs and nothing else, and the parts of a plan that a
+//! seed's guarantees rest on stay as the code has them.
+//!
+//! Modes:
 //! - `LANCE_STRESS_SEED`: run only this seed, and keep its artifacts.
-//! - `LANCE_STRESS_SEEDS` (16, for `soak` 1) and `LANCE_STRESS_SEED_BASE` (1): which
-//!   seeds run.
-//! - `LANCE_STRESS_REPEAT` (1): how many times each seed runs.
-//! - `LANCE_STRESS_STEPS` (8): operations per seed; `soak` runs for a time instead.
 //! - `LANCE_STRESS_ARTIFACTS`: where the artifacts go, `$CARGO_TARGET_TMPDIR/stress`
 //!   by default.
 //! - `LANCE_STRESS_KEEP=1`: keep the artifacts of passing seeds too; `logs` keeps
 //!   them without the dataset and the temporary files.
 //! - `LANCE_STRESS_CALIBRATE=1`: plan no incident and no limit, and report the
 //!   heap each operation takes, to size the budgets in `scenario/memory_limits.rs`.
-//! - `LANCE_STRESS_STALL_SECS` (60, for `concurrency` and `soak` 150): how long a
-//!   child may go without progress.
-//! - `LANCE_STRESS_DEADLINE_SECS` (120 + 60 per step, for `concurrency` 300 + 120 per
-//!   step, for `soak` its length + 300): how long a child may run, for `soak` at
-//!   least its length + 60.
-//! - `LANCE_STRESS_SOAK_SECS` (180): how long a `soak` seed runs, at least 24; its
-//!   plan and fingerprint hold it. A night takes hours.
 //! - `LANCE_STRESS_PLAN`: the plan a replay expects; a different one fails.
 //! - `LANCE_STRESS_STANDALONE=1`: run a seed in this process, for gdb or rr.
 //! - `LANCE_STRESS_SERIAL=1`: run the operations of a round one at a time; a failure
@@ -256,6 +273,7 @@
 mod engine;
 mod harness;
 mod incidents;
+mod knobs;
 mod leaks;
 mod limits;
 mod memory_events;

@@ -66,7 +66,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::fs::File;
 use std::io::Write as _;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -109,7 +109,8 @@ use crate::engine::{
     fingerprint,
 };
 use crate::harness::SeedReport;
-use crate::incidents::{IncidentState, StressHooks};
+use crate::incidents::{DEFAULT_LATE_AFTER, IncidentState, StressHooks};
+use crate::knobs::{self, Class, Key, Knob, Knobs};
 use crate::leaks::{live_heap_bytes, malloc_bytes, settle, trimmed_anon_kib};
 use crate::scenario::{Runtime, Scenario, SelfTest, Settings};
 
@@ -127,12 +128,18 @@ self_tests! {
     soak_growth: SOAK_GROWTH,
 }
 
-/// How long a run lasts, in seconds.
+/// The short form of `SECS`, in seconds.
 pub const ENV_SOAK_SECS: &str = "LANCE_STRESS_SOAK_SECS";
-/// The fewest samples a run takes, and the longest it waits between two: a long
-/// run takes more samples rather than longer intervals.
+/// How long a run lasts.
+pub const SECS: Key<Duration> = Key::new("secs");
+/// The fewest samples a run takes, and the longest it waits between two by
+/// default: a long run takes more samples rather than longer intervals.
 const MIN_SAMPLES: usize = 24;
 const MAX_SAMPLE_INTERVAL: Duration = Duration::from_millis(7500);
+/// The longest wait between two samples.
+const INTERVAL: Key<Duration> = Key::new("interval");
+/// How many workers a seed runs.
+const WORKERS: Key<RangeInclusive<u64>> = Key::new("workers");
 const CHECK_EVERY: usize = 4;
 /// Takes `MIN_SAMPLES` samples `MAX_SAMPLE_INTERVAL` apart.
 const DEFAULT_SECS: u64 = 180;
@@ -233,29 +240,39 @@ fn pick_draw(roll: u64) -> Draw {
     unreachable!("the weights of DRAWS add up to 100")
 }
 
-/// What a sample measures, as the columns of `SERIES_FILE` name it, and how far
-/// the median of the last third may rise above that of the middle third.
-const SERIES: [(&str, i64); 11] = [
+/// What a sample measures, as the columns of `SERIES_FILE` name it, the knob of
+/// how far the median of the last third may rise above that of the middle third,
+/// and that tolerance by default.
+const SERIES: [(&str, Key<u64>, u64); 11] = [
     // What Rust code holds, the series that matters.
-    ("heap_bytes", 2 << 20),
+    ("heap_bytes", Key::new("heap_bytes_tolerance"), 2 << 20),
     // What malloc has handed out: the heap, and what C code holds besides it. It
     // moves by a third more than the heap, for chunk headers and the caches of each
     // thread, which a tolerance of the heap's would make the tighter of the two.
-    ("malloc_bytes", 3 << 20),
-    ("fds", 4),
-    ("threads", 8),
+    ("malloc_bytes", Key::new("malloc_bytes_tolerance"), 3 << 20),
+    ("fds", Key::new("fds_tolerance"), 4),
+    ("threads", Key::new("threads_tolerance"), 8),
     // Readers that the caches of the session hold keep tasks of their own: in a
     // run of 180 s the median of a third moves by up to 8 either way on its own.
-    ("tasks", 16),
+    ("tasks", Key::new("tasks_tolerance"), 16),
     // What the versions a cleanup keeps hold, measured after it.
-    ("versions", 16),
-    ("files", 100),
-    ("dataset_bytes", 2 << 20),
+    ("versions", Key::new("versions_tolerance"), 16),
+    ("files", Key::new("files_tolerance"), 100),
+    (
+        "dataset_bytes",
+        Key::new("dataset_bytes_tolerance"),
+        2 << 20,
+    ),
     // The latest version, after the cleanup too: what maintenance keeps in check.
-    ("fragments", 24),
-    ("index_segments", 8),
-    // Its size swings by up to 8 KB within a run on its own.
-    ("manifest_bytes", 16 << 10),
+    ("fragments", Key::new("fragments_tolerance"), 24),
+    ("index_segments", Key::new("index_segments_tolerance"), 8),
+    // Its size swings by up to 8 KB within a run on its own; over hours the
+    // coverage that a merged vector index keeps of dropped fragments makes it grow.
+    (
+        "manifest_bytes",
+        Key::new("manifest_bytes_tolerance"),
+        16 << 10,
+    ),
 ];
 
 /// The maintenance whose draws and give-ups the samples count. A cleanup commits
@@ -546,12 +563,65 @@ impl Scenario for Soak {
         0
     }
 
-    fn settings(&self, self_test: Option<&SelfTest>, _steps: u64) -> Settings {
-        let secs = match self_test {
-            Some(_) => SELF_TEST_SECS,
-            None => soak_secs(),
-        };
-        settings_of(secs, self_test)
+    fn knobs(&self) -> Vec<Knob> {
+        let mut knobs = knobs::harness(1);
+        knobs.extend([
+            // No longer: the parent reads the journal of a seed whole, and a day
+            // of it is about 200 MB.
+            SECS.duration(
+                Class::Plan,
+                Duration::from_secs(DEFAULT_SECS),
+                Duration::from_secs(MIN_SAMPLES as u64)..=Duration::from_secs(86_400),
+                "how long a seed runs",
+            ),
+            WORKERS.range(
+                Class::Plan,
+                2..=4,
+                2..=NUMBER_STRIDE as u64 - 1,
+                "how many workers a seed runs",
+            ),
+            // A sample may wait `SAMPLE_QUIET` for quiet and then take about a
+            // second, so a shorter interval falls behind and, over a long run,
+            // meets the deadline.
+            INTERVAL.duration(
+                Class::Plan,
+                MAX_SAMPLE_INTERVAL,
+                MAX_SAMPLE_INTERVAL..=Duration::from_secs(600),
+                "the longest wait between two samples",
+            ),
+        ]);
+        // A tolerance only rises: the defaults sit close to what a series moves by
+        // on its own, as those of `tasks` and `manifest_bytes` say.
+        for (column, knob, tolerance) in SERIES {
+            let about =
+                "how far the median of the series may rise from the middle third to the last";
+            let bounds = tolerance..=1000 * tolerance;
+            knobs.push(match column.ends_with("_bytes") {
+                true => knob.bytes(Class::Judge, tolerance, bounds, about),
+                false => knob.count(Class::Judge, tolerance, bounds, about),
+            });
+        }
+        knobs
+    }
+
+    /// A seed takes minutes and checks one long run, not a variety of plans, for a
+    /// time rather than for steps.
+    fn settings(&self, self_test: Option<&SelfTest>, knobs: &Knobs) -> Settings {
+        let length = run_length(self_test, knobs);
+        Settings {
+            steps: 0,
+            // An update or a delete retries its lost commits inside Lance quietly,
+            // for the two minutes of `RETRY_TIMEOUT` in `engine/rows.rs`, while a
+            // sample holds the other workers back.
+            stall: Duration::from_secs(150),
+            deadline: length + Duration::from_secs(300),
+            least_deadline: self_test.is_none().then(|| {
+                let least = length + Duration::from_secs(60);
+                (least, format!("the {length:?} a soak runs, and 60s more"))
+            }),
+            child_env: Vec::new(),
+            cgroup: false,
+        }
     }
 
     fn self_tests(&self) -> &'static [&'static SelfTest] {
@@ -566,12 +636,13 @@ impl Scenario for Soak {
         &[SERIES_FILE]
     }
 
-    /// Its workers are tasks, which only race with threads to run on. A soak
-    /// counts threads: the blocking pool must not keep the ones of a peak that is
-    /// over, as it would for 10 s while any work keeps coming.
-    fn runtime(&self) -> Runtime {
+    /// Its workers are tasks, which only race with threads to run on: as many as
+    /// workers, and 4 at least. A soak counts threads: the blocking pool must not
+    /// keep the ones of a peak that is over, as it would for 10 s while any work
+    /// keeps coming.
+    fn runtime(&self, knobs: &Knobs) -> Runtime {
         Runtime {
-            worker_threads: 4,
+            worker_threads: 4.max(*WORKERS.get(knobs).end() as usize),
             blocking_keep_alive: Some(BLOCKING_KEEP_ALIVE),
             leaves_tasks_on_failure: true,
         }
@@ -591,46 +662,16 @@ impl Scenario for Soak {
     }
 
     fn plan(&self, rng: &mut PlanRng, input: &PlanInput<'_>) -> Box<dyn Body> {
-        Box::new(plan_soak(rng, input.header.initial_rows))
+        Box::new(plan_soak(rng, input))
     }
 }
 
-/// How the seeds of a soak of `secs` run. A seed takes minutes and checks one long
-/// run, not a variety of plans, for a time rather than for steps.
-pub fn settings_of(secs: u64, self_test: Option<&SelfTest>) -> Settings {
-    Settings {
-        seeds: 1,
-        steps: 0,
-        // An update or a delete retries its lost commits inside Lance quietly, for
-        // the two minutes of `RETRY_TIMEOUT` in `engine/rows.rs`, while a sample
-        // holds the other workers back.
-        stall_secs: 150,
-        deadline_secs: secs + 300,
-        least_deadline: self_test
-            .is_none()
-            .then(|| (secs + 60, format!("the {secs}s a soak runs, and 60s more"))),
-        // The child takes its length from here, so that a self-test can set its own.
-        child_env: vec![(ENV_SOAK_SECS, Some(secs.to_string()))],
-        // The plan holds the length, so a replay pins it instead of taking whatever
-        // the default is when it runs.
-        replay_env: vec![(ENV_SOAK_SECS, secs.to_string())],
-        cgroup: false,
+/// How long a run lasts: a self-test takes a length of its own.
+fn run_length(self_test: Option<&SelfTest>, knobs: &Knobs) -> Duration {
+    match self_test {
+        Some(_) => Duration::from_secs(SELF_TEST_SECS),
+        None => SECS.get(knobs),
     }
-}
-
-/// How long a run lasts. A sample needs a second at least.
-fn soak_secs() -> u64 {
-    let secs = match std::env::var(ENV_SOAK_SECS) {
-        Ok(value) => value.parse().unwrap_or_else(|_| {
-            panic!("{ENV_SOAK_SECS} must be an unsigned integer, got {value:?}")
-        }),
-        Err(_) => DEFAULT_SECS,
-    };
-    assert!(
-        secs >= MIN_SAMPLES as u64,
-        "{ENV_SOAK_SECS}={secs} leaves less than a second between two of its {MIN_SAMPLES} samples"
-    );
-    secs
 }
 
 /// The leak puts 8 of its samples between the medians of the thirds, far more
@@ -654,7 +695,7 @@ fn grew_by_the_leak(report: &SeedReport) {
 /// What a seed decides about its run.
 #[derive(Clone, Debug)]
 pub struct SoakPlan {
-    secs: u64,
+    length: Duration,
     samples: usize,
     workers: usize,
     stable_row_ids: bool,
@@ -663,25 +704,25 @@ pub struct SoakPlan {
     worker_seeds: Vec<u64>,
 }
 
-fn plan_soak(rng: &mut PlanRng, initial_rows: i64) -> SoakPlan {
-    let workers = rng.range(2..=4) as usize;
-    let secs = soak_secs();
-    let samples = (secs * 1000)
-        .div_ceil(MAX_SAMPLE_INTERVAL.as_millis() as u64)
+fn plan_soak(rng: &mut PlanRng, input: &PlanInput<'_>) -> SoakPlan {
+    let workers = rng.range(WORKERS.get(input.knobs)) as usize;
+    let length = run_length(input.self_test, input.knobs);
+    let samples = (length.as_millis() as u64)
+        .div_ceil(INTERVAL.get(input.knobs).as_millis() as u64)
         .max(MIN_SAMPLES as u64) as usize;
     SoakPlan {
-        secs,
+        length,
         samples,
         workers,
         stable_row_ids: rng.chance(0.5),
-        initial_rows,
+        initial_rows: input.header.initial_rows,
         worker_seeds: (0..workers).map(|_| rng.next()).collect(),
     }
 }
 
 impl SoakPlan {
     fn interval(&self) -> Duration {
-        Duration::from_secs(self.secs) / self.samples as u32
+        self.length / self.samples as u32
     }
 
     fn source(&self, worker: usize) -> OpSource {
@@ -699,7 +740,7 @@ impl Body for SoakPlan {
     fn render(&self) -> String {
         let mut text = format!(
             "soak secs={} samples={} interval_ms={} workers={} stable_row_ids={} index_cache_bytes={INDEX_CACHE_BYTES} metadata_cache_bytes={METADATA_CACHE_BYTES}\n",
-            self.secs,
+            self.length.as_secs_f64(),
             self.samples,
             self.interval().as_millis(),
             self.workers,
@@ -738,6 +779,10 @@ impl Body for SoakPlan {
 
     fn steps(&self) -> usize {
         self.samples
+    }
+
+    fn shown_knobs(&self) -> &'static [&'static str] {
+        &[SECS.name]
     }
 
     /// Nothing interrupts the writes of a soak, so none may leave a file behind.
@@ -1348,7 +1393,7 @@ struct Sample {
 
 impl Sample {
     fn header() -> String {
-        let series: Vec<&str> = SERIES.iter().map(|(name, _)| *name).collect();
+        let series: Vec<&str> = SERIES.iter().map(|(name, ..)| *name).collect();
         let mut header = format!(
             "sample,t_ms,ops,latest,quiet_ms,{},rss_anon_kib,ivf_partitions",
             series.join(",")
@@ -1424,6 +1469,7 @@ impl Run {
             self.root.clone(),
             Path::new("/dev/null"),
             started,
+            DEFAULT_LATE_AFTER,
         ));
         let hooks = Arc::new(StressHooks::new(sink));
         let mut handles = Vec::with_capacity(plan.workers);
@@ -1792,13 +1838,14 @@ impl Run {
             values[values.len() / 2]
         };
         let mut grown = Vec::new();
-        for (column, (name, tolerance)) in SERIES.iter().enumerate() {
+        for (column, (name, knob, _)) in SERIES.iter().enumerate() {
             let middle = median(n / 3..2 * n / 3, column);
             let last = median(2 * n / 3..n, column);
+            let tolerance = knob.get(&self.knobs) as i64;
             self.journal.line(format_args!(
                 "step={n} soak series={name} middle={middle} last={last} tolerance={tolerance}"
             ));
-            if last - middle > *tolerance {
+            if last - middle > tolerance {
                 grown.push(format!(
                     "{name} from {middle} to {last}, over its tolerance of {tolerance}"
                 ));

@@ -5,16 +5,21 @@
 //! progress, and turns what the child left behind into a verdict.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::engine;
+use crate::engine::{self, ChildPlan};
 use crate::incidents::CRASH_FIRED;
+use crate::knobs::{
+    Class, DEADLINE, ENV_SET, Env, Knobs, REPEAT, SEED_BASE, SEEDS, STALL, STEPS, UNPINNED, Value,
+};
 use crate::limits::{ENV_CGROUP, RunScope, SeedCgroup};
 use crate::scenario::{self, Scenario, SelfTest};
 use crate::select::{ENV_ONLY, Selection};
@@ -29,12 +34,13 @@ pub const ENV_QUIET_SECS: &str = "LANCE_STRESS_QUIET_SECS";
 pub const ENV_SELF_TEST: &str = "LANCE_STRESS_SELF_TEST";
 pub const ENV_PLAN: &str = "LANCE_STRESS_PLAN";
 pub const ENV_STANDALONE: &str = "LANCE_STRESS_STANDALONE";
-const ENV_STALL_SECS: &str = "LANCE_STRESS_STALL_SECS";
-const ENV_DEADLINE_SECS: &str = "LANCE_STRESS_DEADLINE_SECS";
 pub const ENV_CALIBRATE: &str = "LANCE_STRESS_CALIBRATE";
 /// Workers run one operation at a time, in the order of their ranks: a failure of
 /// `concurrency` that goes away with this needs a race.
 pub const ENV_SERIAL: &str = "LANCE_STRESS_SERIAL";
+
+/// How long a step may wait for the runtime to go quiet, but in a self-test.
+pub const QUIET_SECS: u64 = 20;
 
 pub const PLAN_LOG: &str = "plan.log";
 pub const STEPS_LOG: &str = "steps.log";
@@ -50,8 +56,10 @@ const THRASH_PATIENCE: Duration = Duration::from_secs(10);
 /// A silent child that used this share of the stall on the CPU is busy, not
 /// hung. A loop that never ends meets the deadline.
 const BUSY_SHARE: f64 = 0.05;
-const DEAD_LIMIT_PLANNED: usize = 3;
-const DEAD_HOLD_PLANNED: usize = 3;
+/// Seeds, not plans: one seed that plans a limit or a hold point many times, or
+/// runs many times, may never reach it by chance, as all its tries plan the same.
+const DEAD_LIMIT_SEEDS: usize = 3;
+const DEAD_HOLD_SEEDS: usize = 3;
 /// Seeds, not rounds: 16 seeds force each pair twice, and one seed never judges
 /// a pair, whether it is repeated or a focus forces the pair in several rounds.
 const DEAD_PAIR_SEEDS: usize = 2;
@@ -61,20 +69,27 @@ struct RunConfig {
     /// This invocation's own directory: a replay or a concurrent run never
     /// touches another run's artifacts.
     run_dir: PathBuf,
+    /// The size of a plan, as its header and the child take it.
     steps: u64,
-    /// How many seeds a run takes, unless `LANCE_STRESS_SEEDS` says otherwise.
-    seeds: u64,
+    /// The knobs of the run, its stall and deadline derived.
+    knobs: Knobs,
     stall: Duration,
     deadline: Duration,
     quiet_secs: u64,
     keep: Keep,
-    repeat: u64,
     self_test: Option<&'static SelfTest>,
     /// Where the children of a run under memory limits live.
     scope: Option<RunScope>,
     /// What the children get, the variables of the checks of the scenario included.
     child_env: Vec<(&'static str, Option<String>)>,
-    replay_env: Vec<(&'static str, String)>,
+    selection: Selection,
+    calibrate: bool,
+    serial: bool,
+    /// The seed that `LANCE_STRESS_SEED` runs alone, and the plan a replay of it
+    /// expects.
+    replay: Option<(u64, Option<String>)>,
+    /// The variables of Lance the run inherited, which its replay repeats.
+    lance_env: Vec<(String, String)>,
 }
 
 /// What stays of a seed that passed.
@@ -87,45 +102,64 @@ enum Keep {
 }
 
 impl RunConfig {
-    fn new(scenario: &'static dyn Scenario, self_test: Option<&'static SelfTest>) -> Self {
-        // Self-tests ignore the tuning variables: their timing is part of what
-        // they check.
-        let (steps, quiet_secs) = match self_test {
-            Some(_) => (3, 2),
-            None => (env_u64(ENV_STEPS, 8), 20),
+    /// A run of `scenario`, or of one of its self-tests, with the knobs `env` sets.
+    fn new(
+        scenario: &'static dyn Scenario,
+        self_test: Option<&'static SelfTest>,
+        env: &Env,
+        selection: Selection,
+        knobs: Knobs,
+    ) -> Self {
+        // Self-tests run at the defaults, on plans of 3 steps: their timing is part
+        // of what they check. A deadline, which a slow host may need, is all they
+        // take from the knobs.
+        let (mut knobs, quiet_secs) = match self_test {
+            Some(_) => {
+                let mut defaults = Knobs::defaults(scenario);
+                if defaults.declares(STEPS.name) {
+                    STEPS.set(&mut defaults, 3);
+                }
+                if let Some(deadline) = DEADLINE.explicit(&knobs) {
+                    DEADLINE.set(&mut defaults, deadline);
+                }
+                (defaults, 2)
+            }
+            None => (knobs, QUIET_SECS),
         };
-        let settings = scenario.settings(self_test, steps);
-        let stall_secs = match self_test {
-            Some(_) => 15,
-            None => env_u64(ENV_STALL_SECS, settings.stall_secs),
+        let settings = scenario.settings(self_test, &knobs);
+        knobs.derive(STALL, settings.stall);
+        knobs.derive(DEADLINE, settings.deadline);
+        let stall = match self_test {
+            Some(_) => Duration::from_secs(15),
+            None => STALL.get(&knobs),
         };
         assert!(
-            stall_secs >= quiet_secs + 10,
-            "{ENV_STALL_SECS}={stall_secs} must exceed the {quiet_secs}s a step may wait for quiet by 10s"
+            stall >= Duration::from_secs(quiet_secs + 10),
+            "stall={stall:?} must exceed the {quiet_secs}s a step may wait for quiet by 10s"
         );
-        let deadline_secs = env_u64(ENV_DEADLINE_SECS, settings.deadline_secs);
-        if let Some((least, why)) = &settings.least_deadline {
-            assert!(
-                deadline_secs >= *least,
-                "{ENV_DEADLINE_SECS}={deadline_secs} must be at least {least}, {why}"
-            );
-        }
+        // `Knobs::resolve` held a deadline set by hand to the least one.
+        let deadline = DEADLINE.get(&knobs);
         let name = match self_test {
             Some(test) => format!("self-test-{}", test.name),
             None => scenario.name().to_string(),
         };
-        let run_dir = artifacts_root().join(format!(
+        let run_dir = artifacts_root(env).join(format!(
             "{name}-{}-{}",
             chrono::Utc::now().format("%Y%m%d-%H%M%S"),
             std::process::id()
         ));
-        let replaying = std::env::var(ENV_SEED).is_ok();
-        let keep = if self_test.is_some() || replaying {
+        let replay = env.get(ENV_SEED).map(|seed| {
+            let seed = seed
+                .parse()
+                .unwrap_or_else(|_| panic!("{ENV_SEED} must be an unsigned integer, got {seed:?}"));
+            (seed, env.get(ENV_PLAN).map(str::to_string))
+        });
+        let keep = if self_test.is_some() || replay.is_some() {
             Keep::Everything
         } else {
-            match std::env::var("LANCE_STRESS_KEEP").as_deref() {
-                Ok("1") => Keep::Everything,
-                Ok("logs") => Keep::Logs,
+            match env.get("LANCE_STRESS_KEEP") {
+                Some("1") => Keep::Everything,
+                Some("logs") => Keep::Logs,
                 _ => Keep::Nothing,
             }
         };
@@ -145,34 +179,41 @@ impl RunConfig {
             scenario,
             run_dir,
             steps: settings.steps,
-            seeds: settings.seeds,
-            stall: Duration::from_secs(stall_secs),
-            deadline: Duration::from_secs(deadline_secs),
+            knobs,
+            stall,
+            deadline,
             quiet_secs,
             keep,
-            repeat: env_u64("LANCE_STRESS_REPEAT", 1).max(1),
             self_test,
             scope,
             child_env,
-            replay_env: settings.replay_env,
+            selection,
+            calibrate: env.get(ENV_CALIBRATE) == Some("1"),
+            serial: env.get(ENV_SERIAL) == Some("1"),
+            replay,
+            lance_env: env
+                .lance_tuning()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
         }
     }
-}
 
-fn env_u64(name: &str, default: u64) -> u64 {
-    match std::env::var(name) {
-        Ok(value) => value
-            .parse()
-            .unwrap_or_else(|_| panic!("{name} must be an unsigned integer, got {value:?}")),
-        Err(_) => default,
+    /// The knobs a child gets: all of them, or none for a self-test, which runs at
+    /// the defaults.
+    fn child_record(&self) -> String {
+        match self.self_test {
+            Some(_) => String::new(),
+            None => self.knobs.record(),
+        }
     }
 }
 
 /// The artifacts root, absolute and without `.` or `..`. Lance spells local
 /// paths that way, and the incidents tell a dataset's directories apart by
 /// that spelling.
-fn artifacts_root() -> PathBuf {
-    let root = std::env::var_os("LANCE_STRESS_ARTIFACTS")
+fn artifacts_root(env: &Env) -> PathBuf {
+    let root = env
+        .get("LANCE_STRESS_ARTIFACTS")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_TARGET_TMPDIR")).join("stress"));
     let absolute = std::path::absolute(&root).expect("resolve the artifacts root");
@@ -189,44 +230,72 @@ fn artifacts_root() -> PathBuf {
     normal
 }
 
-/// Runs every requested seed of a scenario and fails if any seed failed.
-pub fn run(scenario: &'static dyn Scenario) {
-    // libtest has no verdict for a test that did not run: it passes. A replay
-    // names its scenario, so there it would pass for a seed it never ran.
-    let selection = Selection::from_env();
-    if !selection.runs(scenario) {
-        let replay = std::env::var_os(ENV_SEED).is_some() && std::env::var_os(ENV_PLAN).is_some();
+/// The run that `env` asks of `scenario`, or of one of its self-tests, or none
+/// when the selection leaves it out.
+fn prepare(
+    scenario: &'static dyn Scenario,
+    self_test: Option<&'static SelfTest>,
+    env: &Env,
+) -> Option<RunConfig> {
+    let selection = Selection::read(env);
+    // Even when the selection leaves the scenario out: a key no scenario has must
+    // fail every test.
+    let knobs = Knobs::resolve(scenario, env).unwrap_or_else(|error| panic!("{error}"));
+    let selected = match self_test {
+        Some(_) => selection.runs_self_test(scenario),
+        None => selection.runs(scenario),
+    };
+    if !selected {
+        // libtest has no verdict for a test that did not run: it passes. A
+        // replay names its scenario, so there it would pass for a seed it never
+        // ran.
+        let replay =
+            self_test.is_none() && env.get(ENV_SEED).is_some() && env.get(ENV_PLAN).is_some();
         assert!(
             !replay,
             "{ENV_PLAN} replays a seed of {}, which {ENV_ONLY} leaves out",
             scenario.name()
         );
-        return;
+        return None;
     }
-    let config = RunConfig::new(scenario, None);
+    knobs
+        .check_least_deadline(scenario, self_test)
+        .unwrap_or_else(|error| panic!("{error}"));
+    Some(RunConfig::new(scenario, self_test, env, selection, knobs))
+}
+
+/// Runs every requested seed of a scenario and fails if any seed failed.
+pub fn run(scenario: &'static dyn Scenario) {
+    let Some(config) = prepare(scenario, None, &Env::of_process()) else {
+        return;
+    };
     // With fewer steps, a focus would fall on nothing.
+    let focus = config.selection.focus();
     let focused: Vec<&str> = scenario
         .focusable_ops()
         .into_iter()
-        .filter(|op| selection.focus().contains(op))
+        .filter(|op| focus.contains(op))
         .collect();
     let least = scenario.least_focus_steps(&focused);
     assert!(
-        selection.focus().is_empty() || config.steps >= least,
-        "the operations of {ENV_ONLY} need {ENV_STEPS} of at least {least} in {}",
-        scenario.name()
+        focus.is_empty() || config.steps >= least,
+        "the operations of {ENV_ONLY} need {} of at least {least} in {}, not {}",
+        STEPS.name,
+        scenario.name(),
+        config.steps
     );
     fs::create_dir_all(&config.run_dir).expect("create the run directory");
     record_environment(&config.run_dir);
-    let seeds: Vec<u64> = if std::env::var(ENV_SEED).is_ok() {
-        vec![env_u64(ENV_SEED, 0)]
-    } else {
-        let base = env_u64("LANCE_STRESS_SEED_BASE", 1);
-        (base..base + env_u64("LANCE_STRESS_SEEDS", config.seeds)).collect()
+    let seeds: Vec<u64> = match config.replay {
+        Some((seed, _)) => vec![seed],
+        None => {
+            let base = SEED_BASE.get(&config.knobs);
+            (base..base + SEEDS.get(&config.knobs)).collect()
+        }
     };
     let mut summary = Summary::new(&config, &seeds);
     for &seed in &seeds {
-        for attempt in 1..=config.repeat {
+        for attempt in 1..=REPEAT.get(&config.knobs) {
             summary.add(run_seed(&config, seed, attempt));
             // Written after every seed, so an interrupted run keeps its verdicts.
             fs::write(config.run_dir.join("summary.txt"), summary.render())
@@ -250,10 +319,9 @@ pub fn check_self_test(scenario: &'static dyn Scenario, test: &'static SelfTest)
         "{} has self-tests but is missing from `scenarios!` in scenario.rs",
         scenario.name()
     );
-    if !Selection::from_env().runs_self_test(scenario) {
+    let Some(config) = prepare(scenario, Some(test), &Env::of_process()) else {
         return;
-    }
-    let config = RunConfig::new(scenario, Some(test));
+    };
     fs::create_dir_all(&config.run_dir).expect("create the run directory");
     let report = run_seed(&config, 1, 1);
     assert!(
@@ -311,7 +379,18 @@ fn record_environment(run_dir: &Path) {
         std::thread::available_parallelism().map_or(0, |n| n.get())
     )
     .unwrap();
-    let mut vars: Vec<(String, String)> = std::env::vars()
+    for (name, value) in recorded_vars(std::env::vars_os()) {
+        writeln!(text, "{name}={value}").unwrap();
+    }
+    fs::write(run_dir.join("env.txt"), text).expect("write env.txt");
+}
+
+/// The variables of `vars` worth a record, sorted, a value that is not UTF-8 as
+/// near as it reads.
+fn recorded_vars(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(String, String)> {
+    let mut recorded: Vec<(String, String)> = vars
+        .into_iter()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value)))
         .filter(|(name, _)| {
             ["LANCE_", "RUST_", "TOKIO_", "RAYON_"]
                 .iter()
@@ -320,12 +399,10 @@ fn record_environment(run_dir: &Path) {
                     .iter()
                     .any(|word| name.contains(word))
         })
+        .map(|(name, value)| (name, value.to_string_lossy().into_owned()))
         .collect();
-    vars.sort();
-    for (name, value) in vars {
-        writeln!(text, "{name}={value}").unwrap();
-    }
-    fs::write(run_dir.join("env.txt"), text).expect("write env.txt");
+    recorded.sort();
+    recorded
 }
 
 fn shell_quote(value: &str) -> String {
@@ -339,78 +416,157 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-/// The command that reruns `seed` with the same settings: the plan size, the
-/// fingerprint of the plan, non-default limits, and every Lance tuning
-/// variable the run inherited.
+/// The command that reruns `seed` with the same settings: the fingerprint of the
+/// plan, every knob of the plan and the verdicts, the modes, and every Lance tuning
+/// variable the run inherited. It removes from the shell the sources of what the
+/// record leaves out, and a selection the run did not have, which would change
+/// the replay without failing it.
 fn replay_command(config: &RunConfig, seed: u64) -> String {
+    let only = config
+        .selection
+        .given()
+        .filter(|_| config.self_test.is_none());
+    let mut vars: Vec<String> = UNPINNED
+        .iter()
+        .chain(only.is_none().then_some(&ENV_ONLY))
+        .map(|name| format!("-u {name}"))
+        .collect();
+    vars.extend(
+        config
+            .lance_env
+            .iter()
+            .map(|(name, value)| format!("{name}={}", shell_quote(value))),
+    );
     // The path of the test, which `scenarios!` and `self_tests!` make.
     if let Some(test) = config.self_test {
+        // A self-test takes a deadline from the knobs and nothing else.
+        let deadline = DEADLINE.explicit(&config.knobs).map(|deadline| {
+            format!(
+                "{}.{}={}",
+                config.scenario.name(),
+                DEADLINE.name,
+                Value::Duration(deadline)
+            )
+        });
+        vars.push(format!("{ENV_SET}={}", deadline.unwrap_or_default()));
         return format!(
-            "cargo test -p lance --test stress -- --exact scenario::{}::self_test::{} --nocapture",
+            "env {} cargo test -p lance --test stress -- --exact scenario::{}::self_test::{} --nocapture",
+            vars.join(" "),
             config.scenario.name(),
             test.name
         );
     }
-    let mut vars: Vec<String> = std::env::vars()
-        .filter(|(name, _)| name.starts_with("LANCE_") && !name.starts_with("LANCE_STRESS_"))
-        .map(|(name, value)| format!("{name}={}", shell_quote(&value)))
-        .collect();
-    vars.sort();
     vars.push(format!("{ENV_SEED}={seed}"));
-    vars.push(format!("{ENV_STEPS}={}", config.steps));
+    // The plan its child draws, from the variables it would get.
+    let child: Env = child_vars(config, seed, "", 1)
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value?)))
+        .collect();
+    let plan = ChildPlan::read(config.scenario, &child);
     vars.push(format!(
         "{ENV_PLAN}={}",
-        engine::plan_fingerprint(config.scenario, seed, config.steps as usize)
+        engine::fingerprint(&plan.rendered)
     ));
-    for name in [
-        ENV_STALL_SECS,
-        ENV_DEADLINE_SECS,
-        ENV_CALIBRATE,
-        ENV_SERIAL,
-        ENV_ONLY,
+    vars.push(format!("{ENV_SET}={}", shell_quote(&config.knobs.record())));
+    // A mode that is off is pinned too, so that one left in the shell cannot
+    // change what the replay runs.
+    for (name, on) in [
+        (ENV_CALIBRATE, config.calibrate),
+        (ENV_SERIAL, config.serial),
     ] {
-        if let Ok(value) = std::env::var(name) {
-            vars.push(format!("{name}={}", shell_quote(&value)));
-        }
+        vars.push(format!("{name}={}", u8::from(on)));
     }
-    for (name, value) in &config.replay_env {
-        vars.push(format!("{name}={}", shell_quote(value)));
+    if let Some(only) = only {
+        vars.push(format!("{ENV_ONLY}={}", shell_quote(only)));
     }
     format!(
-        "{} cargo test -p lance --test stress -- --exact scenario::{} --nocapture",
+        "env {} cargo test -p lance --test stress -- --exact scenario::{} --nocapture",
         vars.join(" "),
         config.scenario.name()
     )
 }
 
 /// The command that runs `seed` in this process, for gdb or rr, with the
-/// variables `start_child` gives a child.
+/// variables `start_child` gives a child: it removes the ones a child does not
+/// get, so that none of the shell's comes in.
 fn standalone_command(config: &RunConfig, seed: u64) -> String {
-    let mut vars = String::new();
-    for (name, value) in &config.child_env {
-        if let Some(value) = value {
-            write!(vars, "{name}={} ", shell_quote(value)).unwrap();
+    let (mut removed, mut set) = (String::new(), String::new());
+    let vars = child_vars(config, seed, "<dir>", 1);
+    for (name, value) in &vars {
+        match value {
+            Some(value) => write!(set, "{name}={} ", shell_quote(value)),
+            None => write!(removed, "-u {name} "),
+        }
+        .unwrap();
+    }
+    // What a child inherits from the parent, which a fresh shell would not hold.
+    for (name, value) in &config.lance_env {
+        if !vars.iter().any(|(child, _)| child == name) {
+            write!(set, "{name}={} ", shell_quote(value)).unwrap();
         }
     }
-    if std::env::var(ENV_CALIBRATE).is_ok_and(|value| value == "1") {
-        write!(vars, "{ENV_CALIBRATE}=1 ").unwrap();
-    }
-    if std::env::var(ENV_SERIAL).is_ok_and(|value| value == "1") {
-        write!(vars, "{ENV_SERIAL}=1 ").unwrap();
-    }
-    if let Some(test) = config.self_test {
-        write!(vars, "{ENV_SELF_TEST}={} ", test.name).unwrap();
-    } else if let Ok(only) = std::env::var(ENV_ONLY) {
-        write!(vars, "{ENV_ONLY}={} ", shell_quote(&only)).unwrap();
-    }
     format!(
-        "# Or in one process, for gdb or rr, into a fresh directory, where no cgroup limit applies. After a death, go on with {ENV_GENERATION}=2 in the same directory:\n# {vars}{ENV_STANDALONE}=1 {ENV_CHILD}={} {ENV_SEED}={seed} {ENV_GENERATION}=1 {ENV_STEPS}={} {ENV_QUIET_SECS}={} {ENV_DIR}=<dir> TMPDIR=<dir>/tmp {} --exact child --nocapture\n",
-        config.scenario.name(),
-        config.steps,
-        config.quiet_secs,
-        fs::read_link("/proc/self/exe")
-            .map_or_else(|_| "<test binary>".into(), |exe| exe.display().to_string())
+        "# Or in one process, for gdb or rr, into a fresh directory, where no cgroup limit applies. After a death, go on with {ENV_GENERATION}=2 in the same directory:\n# env {removed}{set}{ENV_STANDALONE}=1 {} --exact child --nocapture\n",
+        fs::read_link("/proc/self/exe").map_or_else(
+            |_| "<test binary>".into(),
+            |exe| shell_quote(&exe.display().to_string())
+        )
     )
+}
+
+/// The variables the child of `seed` gets, each set or removed: `start_child`
+/// gives them to each process of the seed, and the standalone command spells
+/// them out. A self-test runs at the defaults and in no mode, and plans as if
+/// nothing were selected, so that its defect lands on the steps it expects.
+fn child_vars(
+    config: &RunConfig,
+    seed: u64,
+    dir: &str,
+    generation: u64,
+) -> Vec<(&'static str, Option<String>)> {
+    let test = config.self_test;
+    let mode = |on: bool| (test.is_none() && on).then(|| "1".to_string());
+    let tmp = format!("{dir}/tmp");
+    let mut vars = vec![
+        (ENV_CHILD, Some(config.scenario.name().to_string())),
+        (ENV_SEED, Some(seed.to_string())),
+        (ENV_DIR, Some(dir.to_string())),
+        (ENV_GENERATION, Some(generation.to_string())),
+        (ENV_STEPS, Some(config.steps.to_string())),
+        (ENV_QUIET_SECS, Some(config.quiet_secs.to_string())),
+        (ENV_SET, Some(config.child_record())),
+        (ENV_SELF_TEST, test.map(|test| test.name.to_string())),
+        (
+            ENV_ONLY,
+            config
+                .selection
+                .given()
+                .filter(|_| test.is_none())
+                .map(str::to_string),
+        ),
+        (ENV_CALIBRATE, mode(config.calibrate)),
+        (ENV_SERIAL, mode(config.serial)),
+        // A replay pins the plan it expects, so a changed generator cannot pass
+        // for a failure that went away. A leftover value must not fail other runs.
+        (
+            ENV_PLAN,
+            match (test, &config.replay) {
+                (None, Some((_, Some(plan)))) => Some(plan.clone()),
+                _ => None,
+            },
+        ),
+        (ENV_CGROUP, None),
+        // A temporary file left behind is a leak, so every seed counts them in a
+        // directory of its own.
+        ("TMPDIR", Some(tmp.clone())),
+        ("TMP", Some(tmp.clone())),
+        ("TEMP", Some(tmp)),
+        ("LANCE_CPU_THREADS", Some("2".to_string())),
+        ("RAYON_NUM_THREADS", Some("2".to_string())),
+        ("RUST_BACKTRACE", Some("1".to_string())),
+    ];
+    vars.extend(config.child_env.iter().cloned());
+    vars
 }
 
 pub struct SeedReport {
@@ -423,7 +579,7 @@ pub struct SeedReport {
 }
 
 fn run_seed(config: &RunConfig, seed: u64, attempt: u64) -> SeedReport {
-    let name = match config.repeat {
+    let name = match REPEAT.get(&config.knobs) {
         1 => format!("seed-{seed}"),
         _ => format!("seed-{seed}-try{attempt}"),
     };
@@ -539,62 +695,31 @@ fn start_child(
             .open(dir.join(name))
             .map_err(|error| format!("cannot open {name}: {error}"))
     };
-    let tmp = dir.join("tmp");
     // /proc/self/exe runs this very binary even if a build has replaced the
     // file since the run started.
     let mut command = Command::new("/proc/self/exe");
     command
         .args(["--exact", "child", "--nocapture", "--test-threads=1"])
-        .env(ENV_CHILD, config.scenario.name())
-        .env(ENV_SEED, seed.to_string())
-        .env(ENV_DIR, dir)
-        .env(ENV_GENERATION, generation.to_string())
-        .env(ENV_PARENT_PID, std::process::id().to_string())
-        .env(ENV_STEPS, config.steps.to_string())
-        .env(ENV_QUIET_SECS, config.quiet_secs.to_string())
-        .env_remove(ENV_STANDALONE)
-        .env_remove(ENV_PLAN)
-        // A temporary file left behind is a leak, so every seed counts them in
-        // a directory of its own.
-        .env("TMPDIR", &tmp)
-        .env("TMP", &tmp)
-        .env("TEMP", &tmp)
-        .env("LANCE_CPU_THREADS", "2")
-        .env("RAYON_NUM_THREADS", "2")
-        .env("RUST_BACKTRACE", "1")
         .stdin(Stdio::null())
         .stdout(log("stdout.log")?)
         .stderr(log("stderr.log")?)
         // A process group of its own, so that a kill reaches all of it.
         .process_group(0);
-    // A self-test plans as if nothing were selected: its defect lands on the
-    // steps it expects.
-    match config.self_test {
-        Some(test) => command.env(ENV_SELF_TEST, test.name).env_remove(ENV_ONLY),
-        None => command.env_remove(ENV_SELF_TEST),
-    };
-    // A replay pins the plan it expects, so a changed generator cannot pass
-    // for a failure that went away. A leftover value must not fail other runs.
-    if config.self_test.is_none()
-        && std::env::var(ENV_SEED).is_ok()
-        && let Ok(plan) = std::env::var(ENV_PLAN)
-    {
-        command.env(ENV_PLAN, plan);
-    }
-    for (name, value) in &config.child_env {
+    let dir = dir
+        .to_str()
+        .ok_or_else(|| format!("{} is not UTF-8", dir.display()))?;
+    for (name, value) in child_vars(config, seed, dir, generation) {
         match value {
             Some(value) => command.env(name, value),
             None => command.env_remove(name),
         };
     }
-    match cgroup {
-        Some(cgroup) => {
-            command.env(ENV_CGROUP, cgroup.dir());
-            cgroup.add_to(&mut command)?;
-        }
-        None => {
-            command.env_remove(ENV_CGROUP);
-        }
+    command
+        .env(ENV_PARENT_PID, std::process::id().to_string())
+        .env_remove(ENV_STANDALONE);
+    if let Some(cgroup) = cgroup {
+        command.env(ENV_CGROUP, cgroup.dir());
+        cgroup.add_to(&mut command)?;
     }
     command.spawn().map_err(|error| error.to_string())
 }
@@ -964,6 +1089,8 @@ pub fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 #[derive(Default)]
 struct Coverage {
     planned: usize,
+    /// The seeds that planned it.
+    seeds: BTreeSet<u64>,
     fired: usize,
     /// How many of those found their gate closed: a hold point only.
     waited: usize,
@@ -991,12 +1118,19 @@ impl Summary {
             config.scenario.name(),
             config.run_dir.display(),
             config.steps,
-            config.repeat,
+            REPEAT.get(&config.knobs),
             seeds.first().copied().unwrap_or_default(),
             seeds.last().copied().unwrap_or_default()
         );
-        if let Ok(only) = std::env::var(ENV_ONLY) {
+        if let Some(only) = config.selection.given() {
             write!(header, " only={only}").unwrap();
+        }
+        // A knob off its default changes what a seed runs or what passes.
+        for (title, class) in [("plan knobs", Class::Plan), ("judge knobs", Class::Judge)] {
+            let knobs = config.knobs.off_default(class, &[]);
+            if !knobs.is_empty() {
+                write!(header, "\n{title}: {}", knobs.join(" ")).unwrap();
+            }
         }
         Self {
             header,
@@ -1015,21 +1149,28 @@ impl Summary {
     /// a limit that has stopped working would otherwise stay green. Per seed
     /// this could be chance, as a watcher can miss a short spill.
     fn dead_limits(&self) -> Vec<String> {
-        let mut limits: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut limits: BTreeMap<String, Coverage> = BTreeMap::new();
         for (kind, coverage) in &self.coverage {
             let mut parts = kind.split(':');
             if let (Some("memory"), Some(op), Some(limit @ ("pool" | "fts_memory"))) =
                 (parts.next(), parts.next(), parts.next())
             {
                 let entry = limits.entry(format!("{op}:{limit}")).or_default();
-                entry.0 += coverage.planned;
-                entry.1 += coverage.fired;
+                entry.planned += coverage.planned;
+                entry.seeds.extend(&coverage.seeds);
+                entry.fired += coverage.fired;
             }
         }
         limits
             .into_iter()
-            .filter(|(_, (planned, fired))| *planned >= DEAD_LIMIT_PLANNED && *fired == 0)
-            .map(|(limit, (planned, _))| format!("{limit} planned={planned} fired=0"))
+            .filter(|(_, limit)| limit.seeds.len() >= DEAD_LIMIT_SEEDS && limit.fired == 0)
+            .map(|(kind, limit)| {
+                format!(
+                    "{kind} planned={} seeds={} fired=0",
+                    limit.planned,
+                    limit.seeds.len()
+                )
+            })
             .collect()
     }
 
@@ -1039,8 +1180,14 @@ impl Summary {
     fn dead_holds(&self) -> Vec<String> {
         self.holds
             .iter()
-            .filter(|(_, hold)| hold.planned >= DEAD_HOLD_PLANNED && hold.fired == 0)
-            .map(|(kind, hold)| format!("{kind} planned={} fired=0", hold.planned))
+            .filter(|(_, hold)| hold.seeds.len() >= DEAD_HOLD_SEEDS && hold.fired == 0)
+            .map(|(kind, hold)| {
+                format!(
+                    "{kind} planned={} seeds={} fired=0",
+                    hold.planned,
+                    hold.seeds.len()
+                )
+            })
             .collect()
     }
 
@@ -1095,6 +1242,7 @@ impl Summary {
             if let Some(hold) = field(line, "hold") {
                 let coverage = self.holds.entry(hold.to_string()).or_default();
                 coverage.planned += 1;
+                coverage.seeds.insert(report.seed);
                 coverage.fired += usize::from(field(line, "fired").is_some_and(|f| f != "0"));
                 coverage.waited += usize::from(field(line, "waited").is_some_and(|w| w != "0"));
             }
@@ -1122,6 +1270,7 @@ impl Summary {
             if let Some(incident) = field(line, "incident").filter(|kind| *kind != "none") {
                 let coverage = self.coverage.entry(incident.to_string()).or_default();
                 coverage.planned += 1;
+                coverage.seeds.insert(report.seed);
                 coverage.fired += usize::from(field(line, "fired").is_some_and(|f| f != "0"));
                 *coverage.outcomes.entry(outcome).or_default() += 1;
             }
@@ -1245,61 +1394,377 @@ fn selection_dead_pairs_count_seeds_not_rounds() {
 }
 
 #[test]
-fn replay_pins_the_length_of_a_soak() {
-    use scenario::soak::ENV_SOAK_SECS;
-    let soak = scenario::soak::settings_of(4321, None);
-    let config = RunConfig {
-        scenario: scenario::soak::SCENARIO,
-        run_dir: PathBuf::new(),
-        steps: soak.steps,
-        seeds: soak.seeds,
-        stall: Duration::from_secs(soak.stall_secs),
-        deadline: Duration::from_secs(soak.deadline_secs),
-        quiet_secs: 20,
-        keep: Keep::Nothing,
-        repeat: 1,
-        self_test: None,
-        scope: None,
-        child_env: soak.child_env,
-        replay_env: soak.replay_env,
+fn selection_dead_holds_and_limits_count_seeds_not_tries() {
+    // One seed plans a hold point twice and a limit once, and neither fires.
+    let report = |seed: u64, attempt: u64| {
+        SeedReport {
+        seed,
+        attempt,
+        class: None,
+        detail: String::new(),
+        dir: PathBuf::new(),
+        journal: "t=1 step=2 hold=hold:append:hold:put:data:before worker=1 rank=1 until=0 fired=0 waited=0\n\
+                  t=2 step=4 hold=hold:append:hold:put:data:before worker=2 rank=3 until=0 fired=0 waited=0\n\
+                  t=3 step=5 verdict incident=memory:compact:pool:128 fired=0 outcome=ok committed=true\n"
+            .to_string(),
+    }
     };
-    let replay = replay_command(&config, 7);
-    assert_eq!(
-        replay.matches(&format!("{ENV_SOAK_SECS}=")).count(),
-        1,
-        "{replay}"
+    let mut summary = Summary {
+        header: String::new(),
+        scenario: scenario::concurrency::SCENARIO,
+        runs: 0,
+        outcomes: BTreeMap::new(),
+        observations: BTreeMap::new(),
+        pair_seeds: BTreeMap::new(),
+        coverage: BTreeMap::new(),
+        holds: BTreeMap::new(),
+        failures: Vec::new(),
+    };
+    for attempt in 1..=3 {
+        summary.add(report(5, attempt));
+    }
+    summary.add(report(6, 1));
+    assert!(
+        summary.dead_holds().is_empty(),
+        "two seeds, one tried 3 times"
     );
     assert!(
-        replay.contains(&format!("{ENV_SOAK_SECS}=4321 ")),
-        "{replay}"
+        summary.dead_limits().is_empty(),
+        "two seeds, one tried 3 times"
     );
-    // The child runs the length that the replay pins.
+    summary.add(report(7, 1));
     assert_eq!(
-        config.child_env,
-        [(ENV_SOAK_SECS, Some("4321".to_string()))]
+        summary.dead_holds(),
+        ["hold:append:hold:put:data:before planned=10 seeds=3 fired=0"]
     );
-    let faults = scenario::storage_faults::SCENARIO.settings(None, 8);
-    let config = RunConfig {
-        scenario: scenario::storage_faults::SCENARIO,
-        steps: faults.steps,
-        seeds: faults.seeds,
-        child_env: faults.child_env,
-        replay_env: faults.replay_env,
-        ..config
+    assert_eq!(
+        summary.dead_limits(),
+        ["compact:pool planned=5 seeds=3 fired=0"]
+    );
+}
+
+/// A run of `scenario` with the variables of `env` and no others.
+#[cfg(test)]
+fn config_of(
+    scenario: &'static dyn Scenario,
+    self_test: Option<&'static SelfTest>,
+    env: &Env,
+) -> RunConfig {
+    prepare(scenario, self_test, env).expect("a run the selection keeps")
+}
+
+/// The variables a replay line leaves its command, as a shell and `env` read it:
+/// a pair before `env` is the shell's, `-u` removes a variable, a pair sets one.
+#[cfg(test)]
+fn replay_vars(line: &str) -> Env {
+    let (vars, _) = line.split_once(" cargo test ").expect("a replay line");
+    let mut env = BTreeMap::new();
+    let mut tokens = vars.split(' ');
+    while let Some(token) = tokens.next() {
+        match token {
+            "env" => {}
+            "-u" => {
+                env.remove(tokens.next().expect("a variable after -u"));
+            }
+            pair => {
+                let (name, value) = pair.split_once('=').expect("a variable");
+                env.insert(name, value.to_string());
+            }
+        }
+    }
+    env.into_iter().collect()
+}
+
+#[test]
+fn selection_leaves_no_knob_unchecked() {
+    let faults = scenario::storage_faults::SCENARIO;
+    let test = faults.self_tests()[0];
+    // Even a test the selection leaves out fails on a key no scenario has.
+    for self_test in [None, Some(test)] {
+        let env = Env::from([(ENV_ONLY, "soak"), (ENV_SET, "stepz=3")]);
+        let run = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            prepare(faults, self_test, &env).is_some()
+        }));
+        assert!(run.is_err(), "{self_test:?}");
+        let env = Env::from([(ENV_ONLY, "soak"), (ENV_SET, "steps=3")]);
+        assert!(prepare(faults, self_test, &env).is_none());
+    }
+}
+
+/// A replay line, run in a shell, sets up the very run it came from: the same
+/// knobs, modes and plan, and so the same line again.
+#[rstest::rstest]
+#[case::soak(
+    "soak",
+    &[("LANCE_STRESS_SOAK_SECS", "4321"), ("LANCE_STRESS_SEEDS", "3"), ("LANCE_STRESS_REPEAT", "2"), ("LANCE_IO_THREADS", "4")],
+    "soak secs=4321 "
+)]
+#[case::focus(
+    "storage_faults",
+    &[(ENV_ONLY, "op:optimize_indices"), (ENV_CALIBRATE, "1")],
+    " focus=optimize_indices\n"
+)]
+#[case::serial(
+    "concurrency",
+    &[(ENV_SET, "concurrency.gate_limit=20s,stall=200s"), (ENV_SERIAL, "1")],
+    "\nknobs concurrency.gate_limit=20s\n"
+)]
+fn replay_line_runs_what_its_seed_ran(
+    #[case] name: &str,
+    #[case] vars: &[(&str, &str)],
+    #[case] planned: &str,
+) {
+    let scenario = scenario::by_name(name).expect("a scenario of the registry");
+    let env: Env = vars
+        .iter()
+        .map(|(name, value)| (*name, value.to_string()))
+        .collect();
+    let config = config_of(scenario, None, &env);
+    let line = replay_command(&config, 7);
+    for (name, value) in vars
+        .iter()
+        .filter(|(name, _)| name.starts_with("LANCE_") && !name.starts_with("LANCE_STRESS_"))
+    {
+        assert!(
+            line.contains(&format!(" {name}={value} ")),
+            "{name}: {line}"
+        );
+    }
+    // A replay runs one seed, and pins no derived knob no source set.
+    for absent in ["SOAK_SECS", "seeds=", "repeat=", "deadline="] {
+        assert!(!line.contains(absent), "{absent}: {line}");
+    }
+    let replay = config_of(scenario, None, &replay_vars(&line));
+    assert_eq!(replay.knobs.record(), config.knobs.record());
+    assert_eq!(
+        (replay.steps, replay.stall, replay.deadline),
+        (config.steps, config.stall, config.deadline)
+    );
+    assert_eq!(
+        (replay.calibrate, replay.serial, replay.selection.given()),
+        (config.calibrate, config.serial, config.selection.given())
+    );
+    assert_eq!(replay_command(&replay, 7), line);
+    // A mode that is off is pinned as well, against one left in the shell.
+    for (name, on) in [
+        (ENV_CALIBRATE, config.calibrate),
+        (ENV_SERIAL, config.serial),
+    ] {
+        assert!(
+            line.contains(&format!(" {name}={} ", u8::from(on))),
+            "{name}: {line}"
+        );
+    }
+    // The plan the line pins is the one its child draws, and that plan follows
+    // the knobs and modes.
+    let child: Env = child_vars(&replay, 7, "", 1)
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value?)))
+        .collect();
+    let rendered = ChildPlan::read(scenario, &child).rendered;
+    let pinned = replay.replay.as_ref().and_then(|(_, plan)| plan.clone());
+    assert_eq!(pinned, Some(engine::fingerprint(&rendered)));
+    assert!(rendered.contains(planned), "{rendered}");
+    // It is the plan the variables of the run draw, as a child reads them without
+    // `child_vars`, and the child of the replay gets it to check against.
+    let modes: Vec<(&'static str, &str)> = [ENV_ONLY, ENV_CALIBRATE]
+        .into_iter()
+        .filter_map(|name| Some((name, env.get(name)?)))
+        .collect();
+    let drawn = ChildPlan::read(
+        scenario,
+        &engine::child_vars_of(scenario, 7, &config.knobs, &modes),
+    )
+    .rendered;
+    assert_eq!(pinned, Some(engine::fingerprint(&drawn)));
+    assert!(
+        child.get(ENV_PLAN) == pinned.as_deref(),
+        "{ENV_PLAN}: {:?}",
+        child.get(ENV_PLAN)
+    );
+    // In the shell of the replay, a short form of a knob it pins is refused.
+    let short = match name {
+        "soak" => "LANCE_STRESS_SOAK_SECS",
+        _ => "LANCE_STRESS_STEPS",
     };
-    let replay = replay_command(&config, 7);
-    assert!(!replay.contains(ENV_SOAK_SECS), "{replay}");
+    let shell = replay_vars(&format!("{short}=60 {line}"));
+    let error = Knobs::resolve(scenario, &shell).unwrap_err();
+    assert!(error.contains(short), "{error}");
+}
+
+/// A deadline that suits the scenario that runs is taken, whatever another one
+/// needs: a short form, which takes no prefix, sets the deadline of all of them.
+#[test]
+fn selection_takes_a_deadline_that_suits_what_runs() {
+    let env = Env::from([("LANCE_STRESS_DEADLINE_SECS", "200")]);
+    let config = config_of(scenario::storage_faults::SCENARIO, None, &env);
+    assert_eq!(config.deadline, Duration::from_secs(200));
+    let soak = scenario::soak::SCENARIO;
+    assert!(prepare(soak, Some(soak.self_tests()[0]), &env).is_some());
+    let refused =
+        std::panic::catch_unwind(AssertUnwindSafe(|| prepare(soak, None, &env).is_some()))
+            .expect_err("a soak of 3 min with a deadline of 200 s")
+            .downcast::<String>()
+            .expect("a message");
+    assert!(
+        refused.contains("is shorter than the 4m that soak needs"),
+        "{refused}"
+    );
+}
+
+/// What the shell of a replay holds besides the line does not reach the run: not
+/// a stall, a deadline or a file of knobs, which the record leaves out, and not a
+/// selection the run did not have.
+#[test]
+fn replay_line_leaves_the_shell_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("knobs.txt");
+    fs::write(&file, "storage_faults.stall=31s\n").unwrap();
+    let shell = format!(
+        "{}=31 {}=100 {}={} {ENV_ONLY}=op:append",
+        crate::knobs::ENV_STALL_SECS,
+        crate::knobs::ENV_DEADLINE_SECS,
+        crate::knobs::ENV_SET_FILE,
+        file.display()
+    );
+    let faults = scenario::storage_faults::SCENARIO;
+    let config = config_of(faults, None, &Env::default());
+    let line = replay_command(&config, 7);
+    let replay = config_of(faults, None, &replay_vars(&format!("{shell} {line}")));
+    assert_eq!(
+        (replay.stall, replay.deadline, replay.selection.given()),
+        (config.stall, config.deadline, None)
+    );
+    assert_eq!(replay_command(&replay, 7), line);
+    // A self-test the shell's selection leaves out still runs from its line.
+    let test = faults.self_tests()[0];
+    let line = replay_command(&config_of(faults, Some(test), &Env::default()), 7);
+    let env = replay_vars(&format!("{ENV_ONLY}=soak {shell} {line}"));
+    assert!(prepare(faults, Some(test), &env).is_some(), "{line}");
+    // It keeps a deadline the run set, and that alone.
+    let env = Env::from([(ENV_SET, "deadline=2h,steps=12")]);
+    let line = replay_command(&config_of(faults, Some(test), &env), 7);
+    assert!(
+        line.contains(&format!(
+            " {ENV_SET}=storage_faults.deadline=2h cargo test "
+        )),
+        "{line}"
+    );
+    let replay = config_of(faults, Some(test), &replay_vars(&line));
+    assert_eq!(replay.deadline, Duration::from_secs(7200));
+}
+
+/// `env.txt` takes a value that is not UTF-8 as near as it reads, and no secret.
+#[test]
+fn replay_records_the_environment_whatever_it_holds() {
+    use std::os::unix::ffi::OsStringExt;
+    let recorded = recorded_vars([
+        (
+            OsString::from("RUST_LOG"),
+            OsString::from_vec(vec![b'i', 0xff]),
+        ),
+        (OsString::from("LANCE_IO_THREADS"), OsString::from("4")),
+        (OsString::from("LANCE_S3_SECRET_KEY"), OsString::from("x")),
+        (OsString::from("HOME"), OsString::from("/home")),
+    ]);
+    assert_eq!(
+        recorded,
+        [
+            ("LANCE_IO_THREADS".to_string(), "4".to_string()),
+            ("RUST_LOG".to_string(), "i\u{fffd}".to_string()),
+        ]
+    );
 }
 
 #[test]
 fn replay_runs_a_self_test_standalone_as_its_child() {
     let faults = scenario::storage_faults::SCENARIO;
-    let line = standalone_command(&RunConfig::new(faults, None), 7);
-    assert!(!line.contains(ENV_SELF_TEST), "{line}");
+    let env = Env::from([
+        (ENV_SET, "storage_faults.steps=5"),
+        (ENV_ONLY, "op:optimize_indices"),
+        (ENV_SERIAL, "1"),
+        ("LANCE_IO_THREADS", "4"),
+    ]);
+    let config = config_of(faults, None, &env);
+    let line = standalone_command(&config, 7);
+    for expected in [
+        " LANCE_IO_THREADS=4 ".to_string(),
+        format!(" {ENV_SET}={} ", config.knobs.record()),
+        format!(" {ENV_ONLY}=op:optimize_indices "),
+        format!(" {ENV_SERIAL}=1 "),
+        // What a child does not get, the shell may not give it either.
+        format!(" -u {ENV_SELF_TEST} "),
+        format!(" -u {ENV_CALIBRATE} "),
+        format!(" -u {ENV_PLAN} "),
+        " LANCE_CPU_THREADS=2 ".to_string(),
+    ] {
+        assert!(line.contains(&expected), "{expected}: {line}");
+    }
+    // A self-test runs at the defaults and in no mode, whatever the shell sets.
     let test = faults.self_tests()[0];
-    let line = standalone_command(&RunConfig::new(faults, Some(test)), 7);
+    let line = standalone_command(&config_of(faults, Some(test), &env), 7);
+    for expected in [
+        format!(" {ENV_SELF_TEST}={} ", test.name),
+        format!(" {ENV_SET}= "),
+        format!(" -u {ENV_ONLY} "),
+        format!(" -u {ENV_SERIAL} "),
+    ] {
+        assert!(line.contains(&expected), "{expected}: {line}");
+    }
+}
+
+#[test]
+fn replay_of_a_self_test_takes_only_its_deadline_from_the_knobs() {
+    let faults = scenario::storage_faults::SCENARIO;
+    let test = faults.self_tests()[0];
+    let env = Env::from([("LANCE_STRESS_SET", "deadline=2h,steps=12,stall=5m")]);
+    let config = config_of(faults, Some(test), &env);
+    assert_eq!(config.steps, 3);
+    assert_eq!(config.stall, Duration::from_secs(15));
+    assert_eq!(config.deadline, Duration::from_secs(7200));
+    // Without one of its own, the deadline is that of a plan of 3 steps.
+    let config = config_of(faults, Some(test), &Env::default());
+    assert_eq!(config.deadline, Duration::from_secs(300));
+}
+
+/// A stall or a deadline no source set stays out of the replay line, which derives
+/// it again: a knob edited in the line moves it as it would in a fresh run.
+#[test]
+fn replay_derives_what_no_source_set() {
+    let slow = scenario::slow_storage::SCENARIO;
+    let line = replay_command(&config_of(slow, None, &Env::default()), 7);
+    let edited = line.replace("slow_storage.settle=2s", "slow_storage.settle=1m");
+    assert_ne!(edited, line);
+    let config = config_of(slow, None, &replay_vars(&edited));
+    // 3 slowed calls of 3 s, a settle of 60 s and 20 s of quiet: 89 s of silence.
+    assert_eq!(
+        (config.stall, config.deadline),
+        (Duration::from_secs(99), Duration::from_secs(120 + 8 * 89))
+    );
+}
+
+#[test]
+fn replay_keeps_a_pinned_stall_below_its_derived_default() {
+    let concurrency = scenario::concurrency::SCENARIO;
+    // A longer gate limit raises the stall it derives...
+    let env = Env::from([(ENV_SET, "concurrency.gate_limit=30s")]);
+    assert_eq!(
+        config_of(concurrency, None, &env).stall,
+        Duration::from_secs(450)
+    );
+    // ...but a stall a replay pins stays, held to the old rule alone.
+    let env = Env::from([(ENV_SET, "concurrency.gate_limit=30s,stall=60s")]);
+    let config = config_of(concurrency, None, &env);
+    assert_eq!(config.stall, Duration::from_secs(60));
+    let summary = Summary::new(&config, &[1]);
     assert!(
-        line.contains(&format!(" {ENV_SELF_TEST}={} ", test.name)),
-        "{line}"
+        summary
+            .header
+            .contains("\nplan knobs: concurrency.gate_limit=30s")
+            && summary
+                .header
+                .contains("\njudge knobs: concurrency.stall=1m"),
+        "{}",
+        summary.header
     );
 }

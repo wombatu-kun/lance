@@ -35,6 +35,7 @@ use object_store::{
 use tokio::sync::{Notify, watch};
 
 use crate::engine::Journal;
+use crate::knobs::Key;
 
 /// The kind of a storage call. Reads of whole objects and of ranges are both
 /// `Get`, a metadata-only read is `Head`.
@@ -373,13 +374,17 @@ impl Hang {
 /// How long after its operation a slow call may still end. A task the operation
 /// aborted finishes the poll it is in, so a call that ends a moment after the
 /// operation may be that last poll's rather than a task's left behind.
-const LATE_AFTER: Duration = Duration::from_millis(50);
+pub const LATE_AFTER: Key<Duration> = Key::new("late_after");
+/// What `LATE_AFTER` is by default, and in a scenario that slows no call.
+pub const DEFAULT_LATE_AFTER: Duration = Duration::from_millis(50);
 
 /// What the slow and hung calls of a step count themselves in, which a call in
 /// the operation's own futures leaves when the operation is dropped: only a task
 /// the operation left behind keeps a call counted once it is over.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Watch {
+    /// How long after the operation a call that ends counts as late.
+    late_after: Duration,
     /// Hung reads of data and index files, which Lance's I/O scheduler runs as
     /// tasks of their own that a dropped scan does not stop: one only holds its
     /// connection.
@@ -393,13 +398,23 @@ struct Watch {
 }
 
 impl Watch {
+    fn new(late_after: Duration) -> Self {
+        Self {
+            late_after,
+            scan_reads: Arc::default(),
+            calls: Arc::default(),
+            late: Arc::default(),
+            ended: Arc::default(),
+        }
+    }
+
     /// Runs a slow call, counted while in flight, and as late when it ends well
     /// after its operation.
     async fn track<T>(&self, call: impl Future<Output = T>) -> T {
         let _live = Live::count(&self.calls);
         let result = call.await;
         let ended = *self.ended.lock().unwrap();
-        if ended.is_some_and(|ended| ended.elapsed() > LATE_AFTER) {
+        if ended.is_some_and(|ended| ended.elapsed() > self.late_after) {
             self.late.fetch_add(1, Ordering::SeqCst);
         }
         result
@@ -827,7 +842,8 @@ impl fmt::Debug for IncidentState {
 }
 
 impl IncidentState {
-    pub fn new(root: String, calls_log: &FsPath, started: Instant) -> Self {
+    /// A slow call that ends more than `late_after` after its operation is late.
+    pub fn new(root: String, calls_log: &FsPath, started: Instant, late_after: Duration) -> Self {
         Self {
             root,
             // A seed's processes share the log, one after the other.
@@ -842,7 +858,7 @@ impl IncidentState {
             phase: Mutex::new("setup".to_string()),
             armed: Mutex::new(None),
             release: Mutex::new(None),
-            watch: Watch::default(),
+            watch: Watch::new(late_after),
             hang_release: Mutex::new(None),
             writes: AtomicU64::new(0),
             counting_writes: AtomicBool::new(false),
@@ -863,7 +879,7 @@ impl IncidentState {
             phase: Mutex::new(self.phase()),
             armed: Mutex::new(None),
             release: Mutex::new(None),
-            watch: Watch::default(),
+            watch: Watch::new(self.watch.late_after),
             hang_release: Mutex::new(None),
             writes: AtomicU64::new(0),
             counting_writes: AtomicBool::new(false),

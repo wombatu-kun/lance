@@ -60,7 +60,7 @@ impl Run {
             .map_err(|error| fail("unreadable", n, error))?;
         let oldest = versions.first().map_or(before, |version| version.version);
         let gate_timeouts = Arc::new(AtomicU64::new(0));
-        let gate_limit = (self.self_test != Some(&GATE_HANG)).then_some(GATE_LIMIT);
+        let gate_limit = (self.self_test != Some(&GATE_HANG)).then(|| GATE_LIMIT.get(&self.knobs));
         let (open, gates) = round
             .ops
             .iter()

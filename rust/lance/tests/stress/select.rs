@@ -5,8 +5,8 @@
 //! by name, and which operations meet that trouble.
 
 use std::collections::BTreeSet;
-use std::env::VarError;
 
+use crate::knobs::Env;
 use crate::scenario::{REGISTRY, Scenario};
 
 pub const ENV_ONLY: &str = "LANCE_STRESS_ONLY";
@@ -41,19 +41,21 @@ pub struct Selection {
     picked: BTreeSet<usize>,
     /// The operations that the trouble falls on; none leaves it everywhere.
     focus: BTreeSet<&'static str>,
+    /// The list as the run was given it.
+    given: Option<String>,
 }
 
 impl Selection {
-    /// The selection of this process. A value that names something unknown, or
+    /// The selection that `env` asks for. A value that names something unknown, or
     /// that leaves no scenario to run, fails right here: a typo must not pass for
     /// a run that checked nothing.
-    pub fn from_env() -> Self {
-        match std::env::var(ENV_ONLY) {
-            Ok(value) => {
-                Self::parse(&value).unwrap_or_else(|error| panic!("{ENV_ONLY}={value:?} {error}"))
-            }
-            Err(VarError::NotPresent) => Self::default(),
-            Err(error) => panic!("{ENV_ONLY}: {error}"),
+    pub fn read(env: &Env) -> Self {
+        match env.get(ENV_ONLY) {
+            Some(value) => Self {
+                given: Some(value.to_string()),
+                ..Self::parse(value).unwrap_or_else(|error| panic!("{ENV_ONLY}={value:?} {error}"))
+            },
+            None => Self::default(),
         }
     }
 
@@ -128,6 +130,11 @@ impl Selection {
     /// The operations a plan puts its trouble on; empty for all of them.
     pub fn focus(&self) -> &BTreeSet<&'static str> {
         &self.focus
+    }
+
+    /// The list as the run was given it, which its replay repeats.
+    pub fn given(&self) -> Option<&str> {
+        self.given.as_deref()
     }
 }
 

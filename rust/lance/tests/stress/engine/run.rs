@@ -22,7 +22,8 @@ use object_store::{PutOptions, PutPayload};
 use roaring::RoaringBitmap;
 
 use crate::harness::CALLS_LOG;
-use crate::incidents::{IncidentState, StressHooks, StressWrapper};
+use crate::incidents::{DEFAULT_LATE_AFTER, IncidentState, LATE_AFTER, StressHooks, StressWrapper};
+use crate::knobs::Knobs;
 use crate::leaks::{Snapshot, files_below, quiesce};
 use crate::limits::OwnCgroup;
 use crate::scenario::{Scenario, SelfTest, nothing_more};
@@ -89,6 +90,8 @@ pub struct Run {
     baseline_fds: usize,
     pub quiet: Duration,
     pub self_test: Option<&'static SelfTest>,
+    /// The knobs of the run, for what they decide while it runs.
+    pub knobs: Knobs,
 }
 
 impl Run {
@@ -105,6 +108,7 @@ impl Run {
             generation,
             self_test,
             started,
+            knobs,
         } = setting;
         let (uri, root) = match header.store {
             StoreChoice::Local | StoreChoice::FileObjectStore => {
@@ -124,10 +128,12 @@ impl Run {
                 "ds".to_string(),
             ),
         };
+        let late_after = LATE_AFTER.find(&knobs).unwrap_or(DEFAULT_LATE_AFTER);
         let state = Arc::new(IncidentState::new(
             root.clone(),
             &dir.join(CALLS_LOG),
             started,
+            late_after,
         ));
         let hooks = Arc::new(StressHooks::new(state.clone()));
         for check in scenario.checks() {
@@ -135,8 +141,14 @@ impl Run {
                 .start(dir, started, generation, state.clone())
                 .map_err(|error| fail("harness", 0, error))?;
         }
+        // Where calls are slowed, what one that ends after its operation is judged
+        // by, as the watch has it.
+        let judged = match knobs.declares(LATE_AFTER.name) {
+            true => format!(" late_after={late_after:?}"),
+            false => String::new(),
+        };
         journal.line(format_args!(
-            "setup store={:?} uri={uri} rows={} generation={generation}",
+            "setup store={:?} uri={uri} rows={} generation={generation}{judged}",
             header.store, header.initial_rows
         ));
         let wrapper = Arc::new(StressWrapper::new(state.clone()));
@@ -205,6 +217,7 @@ impl Run {
             baseline_fds: 0,
             quiet,
             self_test,
+            knobs,
         };
         if generation == 1 {
             Box::pin(run.measure_baseline(0)).await?;

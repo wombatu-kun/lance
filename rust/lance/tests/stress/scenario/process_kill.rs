@@ -8,10 +8,11 @@ use crate::engine::data::{SMALL, Scale};
 use crate::engine::ops::{IndexKind, Op};
 use crate::engine::steps::{
     self, FOREIGN_KILL, KILL_THEN_MISSING_FILE, OpMix, Other, StepCheck, StepPlanner, StepRules,
-    cancel_point,
+    TROUBLE, cancel_point,
 };
 use crate::engine::{Body, PlanInput, PlanRng, StoreChoice};
 use crate::incidents::Incident;
+use crate::knobs::{Knob, Knobs, STEPS};
 use crate::memory_events;
 use crate::scenario::{Runtime, Scenario, SelfTest, Settings};
 
@@ -80,8 +81,12 @@ impl Scenario for ProcessKill {
         steps::least_focus_steps(focused)
     }
 
-    fn settings(&self, _self_test: Option<&SelfTest>, steps: u64) -> Settings {
-        steps::settings(steps)
+    fn knobs(&self) -> Vec<Knob> {
+        steps::knobs(0.85)
+    }
+
+    fn settings(&self, _self_test: Option<&SelfTest>, knobs: &Knobs) -> Settings {
+        steps::settings(STEPS.get(knobs))
     }
 
     fn self_tests(&self) -> &'static [&'static SelfTest] {
@@ -92,7 +97,7 @@ impl Scenario for ProcessKill {
         &[memory_events::CHECK]
     }
 
-    fn runtime(&self) -> Runtime {
+    fn runtime(&self, _knobs: &Knobs) -> Runtime {
         steps::RUNTIME
     }
 
@@ -140,8 +145,9 @@ impl StepPlanner for ProcessKill {
         store: StoreChoice,
         scale: &Scale,
         op: &Op,
+        knobs: &Knobs,
     ) -> Option<Incident> {
-        cancel_point(rng, store, scale, op)
+        cancel_point(rng, store, scale, op, TROUBLE.get(knobs))
     }
 }
 

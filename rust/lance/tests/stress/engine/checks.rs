@@ -18,7 +18,7 @@ use lance_table::format::IndexMetadata;
 use super::data::{
     ALL_PARTITIONS, CATEGORIES, NEIGHBORS, Scale, VECTOR_DIM, category, squared_l2, tokens, vector,
 };
-use super::ops::{IndexKind, Op};
+use super::ops::IndexKind;
 use super::{Failure, fail, mix};
 
 pub fn int64_column(batch: &RecordBatch, name: &str) -> Vec<i64> {
@@ -455,15 +455,4 @@ pub fn is_commit_conflict(message: &str) -> bool {
     ]
     .iter()
     .any(|conflict| message.contains(conflict))
-}
-
-/// A defect of Lance, not a pool too small for the work. The scan of the fragments
-/// an index does not cover reaches the sort of an indexed merge insert through a
-/// `RepartitionExec`, which counts as a spilling consumer of the fair pool. The sort
-/// is then left with less than the two batches of an eighth of the pool each that
-/// `HardCapBatchSizeExec` lets through, at any pool size.
-pub fn is_merge_insert_pool_share_defect(op: &Op, message: &str) -> bool {
-    matches!(op, Op::MergeInsert { .. })
-        && message.contains("RepartitionExec[")
-        && message.contains("for ExternalSorter[")
 }

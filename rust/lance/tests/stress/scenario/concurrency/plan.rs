@@ -10,8 +10,8 @@ use std::fmt;
 use lance::Error;
 
 use super::{
-    CONTENDED_EXISTING_KEYS, CONTENDED_KINDS, CONTENDED_NEW_KEYS, MIN_CLASS_ROWS,
-    NUMBERS_PER_ROUND, PARALLEL_ATTEMPTS,
+    CATCH_UP, CONTENDED_EXISTING_KEYS, CONTENDED_KINDS, CONTENDED_NEW_KEYS, HOLD, MIN_CLASS_ROWS,
+    NUMBERS_PER_ROUND, PARALLEL_ATTEMPTS, WORKERS,
 };
 use crate::engine::data::Scale;
 use crate::engine::ops::{IndexKind, OpOutput};
@@ -19,6 +19,7 @@ use crate::engine::rows::{ClassRows, id_run};
 use crate::engine::steps::pick_from;
 use crate::engine::{PlanRng, StoreChoice};
 use crate::incidents::{Area, Incident, Method};
+use crate::knobs::Knobs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoundOp {
@@ -778,8 +779,9 @@ pub fn plan_rounds(
     rounds: usize,
     with_holds: bool,
     focus: &BTreeSet<&'static str>,
+    knobs: &Knobs,
 ) -> RoundsPlan {
-    let workers = rng.range(2..=4) as usize;
+    let workers = rng.range(WORKERS.get(knobs)) as usize;
     let stable_row_ids = rng.chance(0.5);
     let shared_session = rng.chance(0.5);
     // A quarter of the seeds leave the key undeclared, where a duplicate is legal.
@@ -821,6 +823,7 @@ pub fn plan_rounds(
                 kind,
                 index_ahead,
                 with_holds,
+                knobs,
             )
         })
         .collect();
@@ -922,6 +925,7 @@ fn plan_round(
     kind: RoundKind,
     index_ahead: bool,
     with_holds: bool,
+    knobs: &Knobs,
 ) -> Round {
     let workers = rows.workers;
     let hole = matches!(kind, RoundKind::Hole { .. });
@@ -1087,10 +1091,10 @@ fn plan_round(
             .map(|other| other.rank)
             .collect();
         let mut hold = None;
-        let roll = rng.chance(0.6);
+        let roll = rng.chance(HOLD.get(knobs));
         // Without a catch up, the handle stands on the version the round starts from
         // for as long as the other takes.
-        let mut catch_up = rng.chance(0.7);
+        let mut catch_up = rng.chance(CATCH_UP.get(knobs));
         // The racers start once the index on the key is there, and see it.
         let mut start_after = (indexed_keys && worker != 0 && cursors[worker] == 1).then_some(0);
         catch_up |= start_after.is_some();

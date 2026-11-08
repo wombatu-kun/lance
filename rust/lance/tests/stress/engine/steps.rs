@@ -26,13 +26,14 @@ use crate::incidents::{
     Area, CRASH_FIRED, CancelWhen, Death, Delay, HangPoint, Incident, IncidentState, Method,
     kill_this_process,
 };
+use crate::knobs::{Class, Key, Knob, Knobs};
 use crate::leaks::{Snapshot, TmpWatch, files_below, heap_peak_bytes, start_heap_peak};
 use crate::limits::OwnCgroup;
 use crate::scenario::{Runtime, Scenario, SelfTest, Settings, nothing_more};
 
 use super::checks::{
-    file_sizes, file_times, files_by_version, is_commit_conflict,
-    is_merge_insert_pool_share_defect, is_resources_exhausted, listed_versions, paths,
+    file_sizes, file_times, files_by_version, is_commit_conflict, is_resources_exhausted,
+    listed_versions, paths,
 };
 use super::data::Scale;
 use super::ops::{
@@ -205,7 +206,7 @@ pub trait StepPlanner: Scenario {
 
     /// The limit of a step, given the model with its operation. Drawn like the
     /// incident.
-    fn limit(&self, _rng: &mut PlanRng, _op: &Op, _model: &Model) -> Option<Limit> {
+    fn limit(&self, _rng: &mut PlanRng, _op: &Op, _model: &Model, _knobs: &Knobs) -> Option<Limit> {
         None
     }
 
@@ -217,6 +218,7 @@ pub trait StepPlanner: Scenario {
         store: StoreChoice,
         scale: &Scale,
         op: &Op,
+        knobs: &Knobs,
     ) -> Option<Incident>;
 }
 
@@ -306,16 +308,31 @@ pub trait StepCheck: Sync {
     ) -> Result<(), Failure>;
 }
 
+/// The share of the steps that meet trouble: an incident, or a limit.
+pub const TROUBLE: Key<f64> = Key::new("trouble");
+
+/// The knobs of a scenario of the step engine, whose steps meet trouble `trouble`
+/// of the time by default.
+pub fn knobs(trouble: f64) -> Vec<Knob> {
+    let mut knobs = crate::knobs::harness(16);
+    knobs.push(crate::knobs::steps());
+    knobs.push(TROUBLE.share(
+        Class::Plan,
+        trouble,
+        0.05..=1.0,
+        "the share of steps that meet trouble",
+    ));
+    knobs
+}
+
 /// How the seeds of a scenario of the step engine run, for plans of `steps`.
 pub fn settings(steps: u64) -> Settings {
     Settings {
-        seeds: 16,
         steps,
-        stall_secs: 60,
-        deadline_secs: 120 + 60 * steps,
+        stall: Duration::from_secs(60),
+        deadline: Duration::from_secs(120 + 60 * steps),
         least_deadline: None,
         child_env: Vec::new(),
-        replay_env: Vec::new(),
         cgroup: false,
     }
 }
@@ -428,12 +445,12 @@ pub fn plan(planner: &dyn StepPlanner, rng: &mut PlanRng, input: &PlanInput<'_>)
             },
         };
         model.apply(&op);
-        let incident = planner.incident(rng, store, scale, &op);
+        let incident = planner.incident(rng, store, scale, &op, input.knobs);
         // A stale handle is covered by the scenarios of its own; a read
         // or a merge on one would only report what it was left with.
         let resync = rng.chance(0.7) || matches!(op, Op::Delete { .. }) || planner.always_resync();
         let in_flight_us = planner.in_flight_us(rng);
-        let limit = planner.limit(rng, &op, &model);
+        let limit = planner.limit(rng, &op, &model, input.knobs);
         planned.push(Step {
             op,
             incident: incident.filter(|_| with_incidents && troubled),
@@ -626,7 +643,9 @@ fn cancel_call(method: Method, area: Area, nth: u64, when: CancelWhen) -> Incide
 }
 
 /// How long a step waits for the hung calls of a task its operation aborted.
-const HUNG_SETTLE: Duration = Duration::from_secs(2);
+pub const SETTLE: Key<Duration> = Key::new("settle");
+/// What `SETTLE` is by default, and in a scenario that slows no call.
+pub const HUNG_SETTLE: Duration = Duration::from_secs(2);
 
 /// The calls each operation of `storage_faults` and `slow_storage` makes:
 /// (method, area, the highest call to target).
@@ -686,15 +705,17 @@ pub fn storage_calls(op: &Op, scale: &Scale) -> Vec<(Method, Area, u64)> {
     }
 }
 
-/// Where a cancellation or a death meets an operation: a call of its commit, a
-/// stage of an index build, a fragment it writes, or a write of its files.
+/// Where a cancellation or a death meets an operation, on a share `trouble` of
+/// the steps: a call of its commit, a stage of an index build, a fragment it
+/// writes, or a write of its files.
 pub fn cancel_point(
     rng: &mut PlanRng,
     store: StoreChoice,
     scale: &Scale,
     op: &Op,
+    trouble: f64,
 ) -> Option<Incident> {
-    if !rng.chance(0.85) {
+    if !rng.chance(trouble) {
         return None;
     }
     // The manifest write passes the wrapper on every store. Only a local
@@ -988,19 +1009,21 @@ impl ResumePoint {
     }
 }
 
-/// A plan of eight steps, as a seed of `planner` draws it.
+/// A plan of eight steps, as a seed of `planner` draws it at the defaults.
 pub fn plan_of(
     planner: &dyn StepPlanner,
     seed: u64,
     focus: &BTreeSet<&'static str>,
 ) -> (Header, StepsBody) {
     let (mut rng, header) = Plan::draw_header(planner, seed, focus);
+    let knobs = Knobs::defaults(planner);
     let input = PlanInput {
         seed,
         steps: 8,
         header: &header,
         with_incidents: true,
         self_test: None,
+        knobs: &knobs,
     };
     let body = plan(planner, &mut rng, &input);
     (header, body)
@@ -1385,11 +1408,12 @@ impl Run {
         // land after the caller gave up. Only a scan read may: Lance's I/O
         // scheduler runs each one as a task of its own, which holds its connection
         // until the store's own timeout.
-        let left = self.state.settle_left_behind(HUNG_SETTLE).await;
+        let settle = SETTLE.find(&self.knobs).unwrap_or(HUNG_SETTLE);
+        let left = self.state.settle_left_behind(settle).await;
         // Lance retries a read once it is let go, and a task that waited for it
         // goes on: from then on nothing of the operation may write. A hung read
-        // kept the wait above going for the whole of `HUNG_SETTLE`, so the last
-        // poll of a task the operation aborted is over by now.
+        // kept the wait above going for the whole of `settle`, so the last poll
+        // of a task the operation aborted is over by now.
         if left.scan_reads > 0 {
             self.state.count_writes();
         }
@@ -1516,11 +1540,7 @@ impl Run {
                 }
                 // Enough for the work to spill, so an error here is a regression.
                 Some(Limit::Pool { kib }) => {
-                    let defect = is_merge_insert_pool_share_defect(&step.op, message);
-                    if defect {
-                        self.observe(n, "known_defect:merge_insert_pool_share");
-                    }
-                    defect || (kib < pool_floor_kib(&step.op) && is_resources_exhausted(message))
+                    kib < pool_floor_kib(&step.op) && is_resources_exhausted(message)
                 }
                 // Neither promises an error: both only change how the work is done.
                 Some(Limit::FtsMemory { .. } | Limit::IoBuffer { .. }) => false,

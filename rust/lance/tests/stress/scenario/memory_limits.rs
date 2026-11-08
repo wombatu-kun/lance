@@ -7,10 +7,11 @@
 use crate::engine::data::{LARGE, Scale};
 use crate::engine::ops::{IndexKind, Limit, Model, Op, POOL_VARIABLE};
 use crate::engine::steps::{
-    self, HANG_UNDER_LIMIT, OOM_RECOVERY, OpMix, Other, StepCheck, StepPlanner, StepRules,
+    self, HANG_UNDER_LIMIT, OOM_RECOVERY, OpMix, Other, StepCheck, StepPlanner, StepRules, TROUBLE,
 };
 use crate::engine::{Body, PlanInput, PlanRng, StoreChoice};
 use crate::incidents::Incident;
+use crate::knobs::{Class, Key, Knob, Knobs, STEPS};
 use crate::memory_events;
 use crate::scenario::{Runtime, Scenario, SelfTest, Settings};
 
@@ -81,13 +82,24 @@ impl Scenario for MemoryLimits {
         steps::least_focus_steps(focused)
     }
 
-    fn settings(&self, _self_test: Option<&SelfTest>, steps: u64) -> Settings {
+    fn knobs(&self) -> Vec<Knob> {
+        let mut knobs = steps::knobs(0.85);
+        knobs.push(BUDGET_SCALE.share(
+            Class::Plan,
+            1.0,
+            0.25..=4.0,
+            "a factor on the budgets of the cgroup's limits",
+        ));
+        knobs
+    }
+
+    fn settings(&self, _self_test: Option<&SelfTest>, knobs: &Knobs) -> Settings {
         Settings {
             // The steps of this scenario set the pool, and the switch would turn
             // it off.
             child_env: vec![(POOL_VARIABLE, None), ("LANCE_BYPASS_SPILLING", None)],
             cgroup: true,
-            ..steps::settings(steps)
+            ..steps::settings(STEPS.get(knobs))
         }
     }
 
@@ -99,7 +111,7 @@ impl Scenario for MemoryLimits {
         &[memory_events::CHECK]
     }
 
-    fn runtime(&self) -> Runtime {
+    fn runtime(&self, _knobs: &Knobs) -> Runtime {
         steps::RUNTIME
     }
 
@@ -139,8 +151,9 @@ impl StepPlanner for MemoryLimits {
         true
     }
 
-    fn limit(&self, rng: &mut PlanRng, op: &Op, model: &Model) -> Option<Limit> {
-        rng.chance(0.85).then(|| random_limit(rng, op, model))
+    fn limit(&self, rng: &mut PlanRng, op: &Op, model: &Model, knobs: &Knobs) -> Option<Limit> {
+        rng.chance(TROUBLE.get(knobs))
+            .then(|| random_limit(rng, op, model, BUDGET_SCALE.get(knobs)))
     }
 
     fn incident(
@@ -149,10 +162,14 @@ impl StepPlanner for MemoryLimits {
         _store: StoreChoice,
         _scale: &Scale,
         _op: &Op,
+        _knobs: &Knobs,
     ) -> Option<Incident> {
         None
     }
 }
+
+/// A factor on the budgets of the cgroup's limits, which keeps their ratios.
+const BUDGET_SCALE: Key<f64> = Key::new("budget_scale");
 
 /// The budgets a seed picks from for an operation: an eighth, a quarter, a half,
 /// one and two times the heap a calibration run saw it take on the data of this
@@ -183,7 +200,8 @@ fn pick(rng: &mut PlanRng, values: &[u64]) -> u64 {
 /// The limit on a step. Half of the steps a limit of Lance's own applies to get
 /// that one instead of the kernel's. Pool sizes follow what is sorted, not the
 /// heap of the operation: a BTree sorts 12 bytes per row, around 0.5 MB here.
-fn random_limit(rng: &mut PlanRng, op: &Op, model: &Model) -> Limit {
+/// The budgets of the kernel's are `budget_scale` times those of the table.
+fn random_limit(rng: &mut PlanRng, op: &Op, model: &Model, budget_scale: f64) -> Limit {
     let own = rng.chance(0.5);
     match op {
         Op::CreateIndex(IndexKind::BTree | IndexKind::BTreeId) if own => Limit::Pool {
@@ -205,7 +223,7 @@ fn random_limit(rng: &mut PlanRng, op: &Op, model: &Model) -> Limit {
             kib: pick(rng, &[4, 64, 1024, 16384]),
         },
         _ => Limit::Cgroup {
-            budget_kib: pick(rng, cgroup_budgets_kib(op)),
+            budget_kib: (pick(rng, cgroup_budgets_kib(op)) as f64 * budget_scale).round() as u64,
         },
     }
 }

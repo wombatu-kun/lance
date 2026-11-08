@@ -9,10 +9,11 @@ use crate::engine::ops::{IndexKind, Op};
 use crate::engine::run::ORPHAN;
 use crate::engine::steps::{
     self, COLUMN_MISMATCH, HANG, MODEL_MISMATCH, OpMix, PANIC, StepCheck, StepPlanner, StepRules,
-    TASK_LEAK, TMP_LEAK, storage_calls,
+    TASK_LEAK, TMP_LEAK, TROUBLE, storage_calls,
 };
 use crate::engine::{Body, PlanInput, PlanRng, StoreChoice};
 use crate::incidents::{Area, Incident, Method};
+use crate::knobs::{Knob, Knobs, STEPS};
 use crate::scenario::{Runtime, Scenario, SelfTest, Settings};
 
 pub const SCENARIO: &dyn Scenario = &StorageFaults;
@@ -73,8 +74,12 @@ impl Scenario for StorageFaults {
         steps::least_focus_steps(focused)
     }
 
-    fn settings(&self, _self_test: Option<&SelfTest>, steps: u64) -> Settings {
-        steps::settings(steps)
+    fn knobs(&self) -> Vec<Knob> {
+        steps::knobs(0.75)
+    }
+
+    fn settings(&self, _self_test: Option<&SelfTest>, knobs: &Knobs) -> Settings {
+        steps::settings(STEPS.get(knobs))
     }
 
     fn self_tests(&self) -> &'static [&'static SelfTest] {
@@ -85,7 +90,7 @@ impl Scenario for StorageFaults {
         &[]
     }
 
-    fn runtime(&self) -> Runtime {
+    fn runtime(&self, _knobs: &Knobs) -> Runtime {
         steps::RUNTIME
     }
 
@@ -121,8 +126,9 @@ impl StepPlanner for StorageFaults {
         _store: StoreChoice,
         scale: &Scale,
         op: &Op,
+        knobs: &Knobs,
     ) -> Option<Incident> {
-        if !rng.chance(0.75) {
+        if !rng.chance(TROUBLE.get(knobs)) {
             return None;
         }
         let targets = storage_calls(op, scale);

@@ -17,6 +17,7 @@ use crate::engine::data::Scale;
 use crate::engine::steps::StepCheck;
 use crate::engine::{Body, PlanInput, PlanRng, StoreChoice};
 use crate::harness::SeedReport;
+use crate::knobs::{Knob, Knobs};
 
 /// Declares the self-tests of a scenario: `SELF_TESTS` for its `Scenario`, and a
 /// test of each, named as the self-test is.
@@ -98,8 +99,11 @@ pub trait Scenario: Sync {
     /// the third round on.
     fn least_focus_steps(&self, focused: &[&str]) -> u64;
 
-    /// How its seeds run, for a plan of `steps` steps.
-    fn settings(&self, self_test: Option<&SelfTest>, steps: u64) -> Settings;
+    /// Its knobs, each with the default the code held before it was one.
+    fn knobs(&self) -> Vec<Knob>;
+
+    /// How its seeds run with these knobs.
+    fn settings(&self, self_test: Option<&SelfTest>, knobs: &Knobs) -> Settings;
 
     /// Its self-tests, as `self_tests!` lists them.
     fn self_tests(&self) -> &'static [&'static SelfTest];
@@ -112,7 +116,7 @@ pub trait Scenario: Sync {
         &[]
     }
 
-    fn runtime(&self) -> Runtime;
+    fn runtime(&self, knobs: &Knobs) -> Runtime;
 
     /// The store of a seed: the first draw of its plan.
     fn store(&self, rng: &mut PlanRng) -> StoreChoice;
@@ -125,18 +129,16 @@ pub trait Scenario: Sync {
 
 /// How the parent runs the seeds of a scenario.
 pub struct Settings {
-    /// How many seeds a run takes, unless `LANCE_STRESS_SEEDS` says otherwise.
-    pub seeds: u64,
     /// The size of a plan, as its header and the child take it.
     pub steps: u64,
-    pub stall_secs: u64,
-    pub deadline_secs: u64,
+    /// The stall and the deadline the plans of these knobs need, unless the knobs
+    /// set their own.
+    pub stall: Duration,
+    pub deadline: Duration,
     /// The least deadline the scenario can run under, and why.
-    pub least_deadline: Option<(u64, String)>,
+    pub least_deadline: Option<(Duration, String)>,
     /// The variables a child gets, or must not inherit when `None`.
     pub child_env: Vec<(&'static str, Option<String>)>,
-    /// The variables a replay pins besides the fingerprint, as the plan holds them.
-    pub replay_env: Vec<(&'static str, String)>,
     /// Every seed runs in a cgroup of its own.
     pub cgroup: bool,
 }

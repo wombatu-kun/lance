@@ -47,6 +47,7 @@ use crate::engine::{
 };
 use crate::harness::{CALLS_LOG, STEPS_LOG, SeedReport, field};
 use crate::incidents::{Area, Incident, Method};
+use crate::knobs::{self, Class, Key, Knob, Knobs, STEPS};
 use crate::scenario::{Runtime, Scenario, SelfTest, Settings, nothing_more};
 use history::LineageTrack;
 use plan::{
@@ -135,7 +136,13 @@ const COMMIT_RETRY_TIMEOUT_SECS: &str = "120";
 /// out a circle of holds, but a shared `Session` can close one: its metadata cache
 /// loads a file once, so a hold inside that load stalls whoever reads that file,
 /// perhaps the very operation the hold waits for.
-const GATE_LIMIT: Duration = Duration::from_secs(10);
+const GATE_LIMIT: Key<Duration> = Key::new("gate_limit");
+/// How many workers a round runs.
+const WORKERS: Key<RangeInclusive<u64>> = Key::new("workers");
+/// The share of operations that hold at a point until another one is over.
+const HOLD: Key<f64> = Key::new("hold");
+/// The share of operations whose handle moves to the latest version first.
+const CATCH_UP: Key<f64> = Key::new("catch_up");
 /// How many times a worker tries an operation among the others. After that it
 /// waits for them to finish and tries alone, when it must succeed.
 const PARALLEL_ATTEMPTS: usize = 3;
@@ -166,20 +173,56 @@ impl Scenario for Concurrency {
         3
     }
 
+    fn knobs(&self) -> Vec<Knob> {
+        let mut knobs = knobs::harness(16);
+        knobs.extend([
+            knobs::steps(),
+            WORKERS.range(Class::Plan, 2..=4, 2..=8, "how many workers a round runs"),
+            HOLD.share(
+                Class::Plan,
+                0.6,
+                0.0..=1.0,
+                "the share of operations that hold until another one is over",
+            ),
+            CATCH_UP.share(
+                Class::Plan,
+                0.7,
+                0.0..=1.0,
+                "the share of operations on the latest version",
+            ),
+            // A hold longer than this eats the 120 s a commit may retry for, and
+            // its try gives up after it committed.
+            // No shorter: in a round of a pair, the second operation waits at its
+            // commit for the first to end, and one that gives up first misses the
+            // pair.
+            GATE_LIMIT.duration(
+                Class::Plan,
+                Duration::from_secs(10),
+                Duration::from_secs(10)..=Duration::from_secs(30),
+                "how long a hold waits before it gives up",
+            ),
+        ]);
+        knobs
+    }
+
     /// A hold's wait goes into the first try of a commit, which sets the unit of
-    /// Lance's backoff: 10 s there can become a silent sleep of over a minute.
-    fn settings(&self, _self_test: Option<&SelfTest>, steps: u64) -> Settings {
+    /// Lance's backoff: 10 s there can become a silent sleep of over a minute, and
+    /// a round of two minutes. Workers past the default four make more such
+    /// commits in a round.
+    fn settings(&self, _self_test: Option<&SelfTest>, knobs: &Knobs) -> Settings {
+        let steps = STEPS.get(knobs);
+        let gate_limit = GATE_LIMIT.get(knobs);
+        let crowd = WORKERS.get(knobs).end().div_ceil(4) as u32;
         Settings {
-            seeds: 16,
             steps,
-            stall_secs: 150,
-            deadline_secs: 300 + 120 * steps,
+            stall: Duration::from_secs(150).max(gate_limit * 15),
+            deadline: Duration::from_secs(300)
+                + Duration::from_secs(120).max(gate_limit * 12) * crowd * steps as u32,
             least_deadline: None,
             child_env: vec![(
                 COMMIT_RETRY_TIMEOUT_VARIABLE,
                 Some(COMMIT_RETRY_TIMEOUT_SECS.to_string()),
             )],
-            replay_env: Vec::new(),
             cgroup: false,
         }
     }
@@ -193,10 +236,10 @@ impl Scenario for Concurrency {
     }
 
     /// A round's writers and readers are tasks, which only race with threads to
-    /// run on.
-    fn runtime(&self) -> Runtime {
+    /// run on: as many as workers, and 4 at least.
+    fn runtime(&self, knobs: &Knobs) -> Runtime {
         Runtime {
-            worker_threads: 4,
+            worker_threads: 4.max(*WORKERS.get(knobs).end() as usize),
             blocking_keep_alive: None,
             leaves_tasks_on_failure: true,
         }
@@ -225,6 +268,7 @@ impl Scenario for Concurrency {
             input.steps,
             input.with_incidents,
             &header.focus,
+            input.knobs,
         );
         if let Some(test) = input.self_test {
             rounds.for_self_test(test, header.initial_rows);
