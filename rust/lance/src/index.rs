@@ -3760,6 +3760,12 @@ async fn gather_fragment_statistics(
 /// Reader availability is checked separately by [`index_is_usable`], because
 /// an unknown type has no meaningful maximum version in this build.
 pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
+    // IVF_VAMANA_* sits above `IndexType::max_vector_version()` rather than
+    // raising it: newer upstream builds write IVF_HNSW_RQ at version 3, which
+    // this build cannot read and must keep hiding.
+    if vector::vamana::is_vamana_segment(index) {
+        return None;
+    }
     let max_supported_version = index
         .index_details
         .as_ref()
@@ -4239,7 +4245,10 @@ impl Dataset {
                     partition_cache,
                     remapping,
                 )
-                .await;
+                .await
+                .and_then(|index| {
+                    vector::vamana::wrap_for_search(self, index_meta, column, index)
+                });
         }
 
         // Fallback: in-memory cache for legacy indices.
@@ -4500,6 +4509,23 @@ impl Dataset {
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
+                    }
+
+                    "IVF_VAMANA_FLAT" | "IVF_VAMANA_SQ" | "IVF_VAMANA_PQ" => {
+                        vector::vamana::open_ivf(
+                            self,
+                            index_meta,
+                            column,
+                            index_metadata.index_type.as_str(),
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            remapping,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await
                     }
 
                     _ => Err(Error::index(format!(

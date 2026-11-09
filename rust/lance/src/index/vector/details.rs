@@ -52,6 +52,8 @@ struct VectorDetailsJson {
     compression: Option<CompressionDetailsJson>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     runtime_hints: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vamana: Option<super::vamana::details::VamanaDetailsJson>,
 }
 
 #[derive(Serialize)]
@@ -146,6 +148,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
             StageParams::RQ(rq) => {
                 compression = Some(Compression::Rq(rq.into()));
             }
+            StageParams::Vamana(_) => {} // recorded as vamana_index_config below
         }
     }
 
@@ -162,6 +165,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
         hnsw_index_config,
         compression,
         runtime_hints,
+        vamana_index_config: super::vamana::details::config(params),
     };
     prost_types::Any::from_msg(&details).unwrap()
 }
@@ -230,6 +234,7 @@ pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorI
                 }
             }
             StageParams::RQ(_) => {}
+            StageParams::Vamana(_) => {}
         }
     }
 }
@@ -258,6 +263,15 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
     let mut ivf = IvfBuildParams::default();
     if d.target_partition_size > 0 {
         ivf.target_partition_size = Some(d.target_partition_size as usize);
+    }
+    if let Some(vamana) = d.vamana_index_config {
+        return super::vamana::details::vector_params(
+            metric,
+            ivf,
+            vamana,
+            d.compression,
+            &d.runtime_hints,
+        );
     }
 
     let hnsw = d.hnsw_index_config.map(|h| HnswBuildParams {
@@ -430,6 +444,9 @@ pub fn derive_vector_index_type(details: &prost_types::Any) -> String {
     if d.hnsw_index_config.is_some() {
         index_type.push_str("HNSW_");
     }
+    if d.vamana_index_config.is_some() {
+        index_type.push_str("VAMANA_");
+    }
     match d.compression {
         None | Some(Compression::Flat(_)) => index_type.push_str("FLAT"),
         Some(Compression::Pq(_)) => index_type.push_str("PQ"),
@@ -494,6 +511,7 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
         hnsw,
         compression,
         runtime_hints: d.runtime_hints,
+        vamana: d.vamana_index_config.map(Into::into),
     };
 
     serde_json::to_string(&json).map_err(|e| Error::index(format!("Failed to serialize: {}", e)))
@@ -564,6 +582,7 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
         hnsw_index_config: None,
         compression,
         runtime_hints: Default::default(),
+        vamana_index_config: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -619,6 +638,9 @@ async fn convert_v3_metadata_to_details(
         SupportedIvfIndexType::IvfHnswFlat => (true, CompressionKind::Flat),
         SupportedIvfIndexType::IvfHnswPq => (true, CompressionKind::Pq),
         SupportedIvfIndexType::IvfHnswSq => (true, CompressionKind::Sq),
+        SupportedIvfIndexType::IvfVamanaFlat => (false, CompressionKind::Flat),
+        SupportedIvfIndexType::IvfVamanaPq => (false, CompressionKind::Pq),
+        SupportedIvfIndexType::IvfVamanaSq => (false, CompressionKind::Sq),
     };
 
     let hnsw_index_config = if has_hnsw {
@@ -703,6 +725,7 @@ async fn convert_v3_metadata_to_details(
         hnsw_index_config,
         compression,
         runtime_hints: Default::default(),
+        vamana_index_config: super::vamana::details::infer(main_meta, supported_type)?,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -752,6 +775,7 @@ mod tests {
             hnsw_index_config: hnsw,
             compression,
             runtime_hints: Default::default(),
+            vamana_index_config: None,
         };
         prost_types::Any::from_msg(&details).unwrap()
     }
@@ -901,6 +925,7 @@ mod tests {
                 hnsw_index_config: None,
                 compression: None,
                 runtime_hints: Default::default(),
+                vamana_index_config: None,
             };
             prost_types::Any::from_msg(&d).unwrap()
         };
