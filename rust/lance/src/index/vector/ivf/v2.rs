@@ -1318,9 +1318,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             partition_centroid.as_ref(),
             query,
         )?;
-        let param = (&query).into();
+        let param = S::query_params(&query)?;
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-        let k = query.k * refine_factor;
+        let k = query.k.checked_mul(refine_factor).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "k {} times refine_factor {refine_factor} overflows",
+                query.k
+            ))
+        })?;
         let batch = part_entry.index.search_with_scratch(
             query.key,
             k,
@@ -1402,9 +1407,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             partition_centroid.as_ref(),
             query,
         )?;
-        let param = (&query).into();
+        let param = S::query_params(&query)?;
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-        let k = query.k * refine_factor;
+        let k = query.k.checked_mul(refine_factor).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "k {} times refine_factor {refine_factor} overflows",
+                query.k
+            ))
+        })?;
         part_entry.index.accumulate_topk_with_scratch(
             query.key,
             k,
@@ -2268,9 +2278,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let local_metrics = LocalMetricsCollector::default();
             local_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
             let search_timer = IndexTimer::new(&local_metrics, IndexTiming::Search);
-            let param = (&query).into();
+            let param = S::query_params(&query)?;
             let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-            let k = query.k * refine_factor;
+            let k = query.k.checked_mul(refine_factor).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "k {} times refine_factor {refine_factor} overflows",
+                    query.k
+                ))
+            })?;
             let rotated_partition_centroid =
                 rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
             let residual = Self::query_context_for_scratch(

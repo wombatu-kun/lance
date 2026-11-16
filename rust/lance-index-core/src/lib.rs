@@ -294,7 +294,9 @@ impl IndexType {
         }
     }
 
-    /// Returns the highest supported vector index version in this Lance build.
+    /// Returns the generic vector compatibility ceiling for this Lance build.
+    /// Vamana version 4 is admitted separately by its subtype; raising this
+    /// ceiling would also admit unsupported IVF_HNSW_RQ version 3 indices.
     pub fn max_vector_version() -> u32 {
         [
             Self::Vector,

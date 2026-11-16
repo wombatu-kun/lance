@@ -118,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn test_max_vector_version_tracks_highest_supported() {
+    fn test_generic_vector_version_ceiling_excludes_subtype_exceptions() {
         assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
     }
 

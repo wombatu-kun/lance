@@ -50,6 +50,9 @@ public class VectorIndexParams {
     if (hnswParams.isPresent() && vamanaParams.isPresent()) {
       throw new IllegalArgumentException("Only one of HNSW or Vamana can be specified at a time.");
     }
+    if (vamanaParams.isPresent() && rqParams.isPresent()) {
+      throw new IllegalArgumentException("Vamana cannot be combined with RQ; use FLAT, SQ, or PQ.");
+    }
     if (hnswParams.isPresent() && !pqParams.isPresent() && !sqParams.isPresent()) {
       throw new IllegalArgumentException("HNSW must be combined with either PQ or SQ");
     }

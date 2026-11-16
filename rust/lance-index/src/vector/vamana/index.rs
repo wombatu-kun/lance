@@ -431,7 +431,7 @@ fn score(
     in_bounds: impl Fn(f32) -> bool,
 ) -> Searched {
     let calculator = storage.dist_calculator(query, params.dist_q_c);
-    let mut heap = BinaryHeap::<OrderedNode>::with_capacity(keep + 1);
+    let mut heap = BinaryHeap::<OrderedNode>::with_capacity(keep.min(passing.len()));
     for position in passing {
         let distance = calculator.distance(*position as u32);
         if !in_bounds(distance) {
@@ -467,6 +467,10 @@ impl DeepSizeOf for Vamana {
 impl IvfSubIndex for Vamana {
     type QueryParams = VamanaQueryParams;
     type BuildParams = VamanaBuildParams;
+
+    fn query_params(query: &crate::vector::Query) -> Result<Self::QueryParams> {
+        VamanaQueryParams::try_from_query(query)
+    }
 
     fn load(data: RecordBatch) -> Result<Self> {
         if data.num_rows() == 0 {

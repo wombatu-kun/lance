@@ -934,8 +934,6 @@ async fn merge_partial_vector_auxiliary_files_inner(
             .parent()
             .unwrap_or_default()
             .join(crate::INDEX_FILE_NAME);
-        let mut idx_reader: Option<V2Reader> = None;
-        let mut idx_reader_checked = false;
 
         // Inherit format version from the first shard file
         if format_version.is_none() {
@@ -957,46 +955,63 @@ async fn merge_partial_vector_auxiliary_files_inner(
             ));
         }
 
-        // Detect index type (first iteration only)
-        if detected_index_type.is_none() {
-            // Try to derive precise type from sibling partial index.idx metadata if available
-            if !idx_reader_checked {
-                idx_reader = open_sibling_index_reader(object_store, &sched, &idx_path).await?;
-                idx_reader_checked = true;
+        let idx_reader = open_sibling_index_reader(object_store, &sched, &idx_path).await?;
+        let schema_arrow: ArrowSchema = reader.schema().as_ref().into();
+        let auxiliary_type = detect_supported_index_type(&reader, &schema_arrow)?;
+        let mut declared_type = None;
+        // Every shard must agree, including its root and auxiliary metadata.
+        // Without an explicit auxiliary type, graph storage has only code columns.
+        for (path, metadata) in [
+            (
+                aux,
+                meta.file_schema.metadata.get(INDEX_METADATA_SCHEMA_KEY),
+            ),
+            (
+                &idx_path,
+                idx_reader.as_ref().and_then(|reader| {
+                    reader
+                        .metadata()
+                        .file_schema
+                        .metadata
+                        .get(INDEX_METADATA_SCHEMA_KEY)
+                }),
+            ),
+        ] {
+            let Some(metadata) = metadata else { continue };
+            let metadata: IndexMetaSchema = serde_json::from_str(metadata)?;
+            let index_type = SupportedIvfIndexType::from_index_type_str(&metadata.index_type)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "Unsupported index type {} in shard {path}",
+                        metadata.index_type
+                    ))
+                })?;
+            if DistanceType::try_from(metadata.distance_type.as_str())? != dt {
+                return Err(Error::index(format!(
+                    "Distance type {} in {path} disagrees with auxiliary distance type {dt}",
+                    metadata.distance_type
+                )));
             }
-            if let Some(idx_reader) = idx_reader.as_ref()
-                && let Some(idx_meta_json) = idx_reader
-                    .metadata()
-                    .file_schema
-                    .metadata
-                    .get(INDEX_METADATA_SCHEMA_KEY)
+            if let Some(expected) = declared_type
+                && expected != index_type
             {
-                let idx_meta: IndexMetaSchema = serde_json::from_str(idx_meta_json)?;
-                detected_index_type = Some(match idx_meta.index_type.as_str() {
-                    "IVF_FLAT" => SupportedIvfIndexType::IvfFlat,
-                    "IVF_PQ" => SupportedIvfIndexType::IvfPq,
-                    "IVF_SQ" => SupportedIvfIndexType::IvfSq,
-                    "IVF_RQ" => SupportedIvfIndexType::IvfRq,
-                    "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
-                    "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
-                    "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
-                    "IVF_VAMANA_FLAT" => SupportedIvfIndexType::IvfVamanaFlat,
-                    "IVF_VAMANA_PQ" => SupportedIvfIndexType::IvfVamanaPq,
-                    "IVF_VAMANA_SQ" => SupportedIvfIndexType::IvfVamanaSq,
-                    other => {
-                        return Err(Error::index(format!(
-                            "Unsupported index type in shard index.idx: {}",
-                            other
-                        )));
-                    }
-                });
+                return Err(Error::index(format!(
+                    "Index type mismatch between auxiliary and root metadata in shard {path}"
+                )));
             }
-            // Fallback: infer from auxiliary schema
-            if detected_index_type.is_none() {
-                let schema_arrow: ArrowSchema = reader.schema().as_ref().into();
-                detected_index_type = Some(detect_supported_index_type(&reader, &schema_arrow)?);
-            }
+            declared_type = Some(index_type);
         }
+        let index_type = declared_type.unwrap_or(auxiliary_type);
+        if let Some(expected) = detected_index_type
+            && expected != index_type
+        {
+            return Err(Error::index(format!(
+                "Index type mismatch across shards: expected {}, got {} in {aux}",
+                expected.as_str(),
+                index_type.as_str()
+            )));
+        }
+        detected_index_type = Some(index_type);
 
         // Read IVF lengths from global buffer
         let pb_ivf = try_read_ivf_proto(&reader)
@@ -1006,15 +1021,24 @@ async fn merge_partial_vector_auxiliary_files_inner(
         let nlist = lengths.len();
 
         let mut current_centroids = ivf_centroids_from_proto(&pb_ivf)?;
-        if current_centroids.is_none() {
-            if !idx_reader_checked {
-                idx_reader = open_sibling_index_reader(object_store, &sched, &idx_path).await?;
-            }
-            if let Some(idx_reader) = idx_reader.as_ref()
-                && let Some(index_ivf) = try_read_ivf_proto(idx_reader).await?
-            {
-                current_centroids = ivf_centroids_from_proto(&index_ivf)?;
-            }
+        if current_centroids.is_none()
+            && let Some(idx_reader) = idx_reader.as_ref()
+            && let Some(index_ivf) = try_read_ivf_proto(idx_reader).await?
+        {
+            current_centroids = ivf_centroids_from_proto(&index_ivf)?;
+        }
+        if current_centroids.is_none()
+            && matches!(
+                index_type,
+                SupportedIvfIndexType::IvfVamanaFlat
+                    | SupportedIvfIndexType::IvfVamanaPq
+                    | SupportedIvfIndexType::IvfVamanaSq
+            )
+        {
+            return Err(Error::index(format!(
+                "IVF centroids required to merge {} are missing from {aux} and its sibling {idx_path}",
+                index_type.as_str()
+            )));
         }
         if nlist_opt.is_none() {
             nlist_opt = Some(nlist);

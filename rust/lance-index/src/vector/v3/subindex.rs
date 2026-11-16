@@ -20,6 +20,21 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     type QueryParams: Send + Sync + for<'a> From<&'a Query>;
     type BuildParams: Clone + Send + Sync;
 
+    /// Validate and construct the parameters used to search a partition.
+    /// Sub-indices with fallible parameter arithmetic override this hook.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_index::vector::{Query, v3::subindex::IvfSubIndex, vamana::Vamana};
+    /// # fn prepare(query: &Query) -> Result<()> {
+    /// let params = Vamana::query_params(query)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn query_params(query: &Query) -> Result<Self::QueryParams> {
+        Ok(query.into())
+    }
+
     /// Load the sub index from a record batch with a single row
     fn load(data: RecordBatch) -> Result<Self>
     where

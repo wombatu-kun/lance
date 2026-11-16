@@ -11,9 +11,10 @@
 
 use std::sync::Arc;
 
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema;
-use lance_core::utils::tokio::spawn_cpu;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::versions as file_versions;
 use lance_file::writer::FileWriterOptions;
@@ -131,8 +132,14 @@ pub async fn write_merged_root(
 ) -> Result<IndexFile> {
     let sources = read_sources(object_store, sources).await?;
     let loss = sources.loss().await?;
-    // Without parameters every partition is empty, and no graph is drawn.
+    if sources.params.is_none() && ivf.lengths.iter().any(|length| *length != 0) {
+        return Err(Error::index(
+            "Cannot rebuild nonempty IVF_VAMANA partitions: source graph build parameters are missing",
+        ));
+    }
+    // No parameters are needed when every merged partition is empty.
     let params = sources.params.unwrap_or_default();
+    params.validate()?;
     macro_rules! write_root {
         ($storage:expr) => {
             write_root(
@@ -278,8 +285,8 @@ async fn read_sources(object_store: &ObjectStore, sources: &[Path]) -> Result<So
     Ok(Sources { params, roots })
 }
 
-/// Draw the graph of each partition of `ivf` over its rows in `storage`, one
-/// partition at a time, and write the graphs as the root file in `index_dir`
+/// Draw partition graphs with bounded concurrency, then write them in partition
+/// order as the root file in `index_dir`
 /// with the IVF model and the metadata an index build writes.
 #[allow(clippy::too_many_arguments)]
 async fn write_root<Q: Quantization + 'static>(
@@ -328,21 +335,34 @@ async fn write_root<Q: Quantization + 'static>(
 
     let mut root_ivf = IvfModel::new(centroids, loss);
     let mut partition_metadata = Vec::with_capacity(num_partitions);
-    for partition in 0..num_partitions {
-        if ivf.partition_size(partition) == 0 {
-            root_ivf.add_partition(0);
-            partition_metadata.push(String::new());
-        } else {
+    let storage = &storage;
+    let params = &params;
+    let mut graphs = stream::iter(0..num_partitions)
+        .map(|partition| async move {
+            if ivf.partition_size(partition) == 0 {
+                return Ok(None);
+            }
             let rows = storage.load_partition(partition, None).await?;
             let params = params.clone();
-            let graph = spawn_cpu(move || Vamana::index_vectors(&rows, params)).await?;
+            spawn_cpu(move || Vamana::index_vectors(&rows, params))
+                .await
+                .map(Some)
+        })
+        .buffered(get_num_compute_intensive_cpus().max(1));
+    let mut partition = 0;
+    while let Some(graph) = graphs.try_next().await? {
+        if let Some(graph) = graph {
             let batch = graph.to_batch()?;
             writer.write_batch(&batch).await?;
             root_ivf.add_partition(batch.num_rows() as u32);
             partition_metadata.push(serde_json::to_string(graph.metadata())?);
+        } else {
+            root_ivf.add_partition(0);
+            partition_metadata.push(String::new());
         }
+        partition += 1;
         progress
-            .stage_progress("rebuild_vamana_graph", partition as u64 + 1)
+            .stage_progress("rebuild_vamana_graph", partition)
             .await?;
     }
     progress.stage_complete("rebuild_vamana_graph").await?;

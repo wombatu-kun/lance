@@ -184,14 +184,7 @@ public class VamanaIndexTest {
                 GRAPH,
                 new SQBuildParams.Builder().setNumBits((short) 16).build()),
             UnsupportedOperationException.class,
-            "IVF_VAMANA_SQ encodes 8-bit scalar codes only"),
-        Arguments.of(
-            new VectorIndexParams.Builder(ivf)
-                .setVamanaParams(GRAPH)
-                .setRqParams(new RQBuildParams.Builder().build())
-                .build(),
-            UnsupportedOperationException.class,
-            "at most one PQ or SQ stage"));
+            "IVF_VAMANA_SQ encodes 8-bit scalar codes only"));
   }
 
   @ParameterizedTest
@@ -217,6 +210,19 @@ public class VamanaIndexTest {
       assertTrue(failure.getMessage().contains(message), failure.getMessage());
       assertTrue(dataset.describeIndices().isEmpty());
     }
+  }
+
+  @Test
+  public void testVamanaRejectsRq() {
+    IllegalArgumentException failure =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                new VectorIndexParams.Builder(new IvfBuildParams.Builder().build())
+                    .setVamanaParams(GRAPH)
+                    .setRqParams(new RQBuildParams.Builder().build())
+                    .build());
+    assertEquals("Vamana cannot be combined with RQ; use FLAT, SQ, or PQ.", failure.getMessage());
   }
 
   @Test

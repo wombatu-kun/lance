@@ -131,6 +131,34 @@ impl SupportedIvfIndexType {
             }
         };
 
+        if let Some(metadata) = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(INDEX_METADATA_SCHEMA_KEY)
+        {
+            let metadata: IndexMetaSchema = serde_json::from_str(metadata)?;
+            let declared = Self::from_index_type_str(&metadata.index_type).ok_or_else(|| {
+                Error::index(format!(
+                    "Unsupported auxiliary index type {}",
+                    metadata.index_type
+                ))
+            })?;
+            let expected_storage = match declared {
+                Self::IvfVamanaFlat | Self::IvfHnswFlat => Self::IvfFlat,
+                Self::IvfVamanaPq | Self::IvfHnswPq => Self::IvfPq,
+                Self::IvfVamanaSq | Self::IvfHnswSq => Self::IvfSq,
+                other => other,
+            };
+            if index_type != declared && index_type != expected_storage {
+                return Err(Error::index(format!(
+                    "Auxiliary index type {} disagrees with storage schema {}",
+                    declared.as_str(),
+                    index_type.as_str()
+                )));
+            }
+            return Ok(declared);
+        }
         Ok(index_type)
     }
 }

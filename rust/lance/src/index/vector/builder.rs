@@ -1767,6 +1767,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         // maintain the IVF partitions
         let mut storage_ivf = IvfModel::empty();
+        if S::name() == lance_index::vector::vamana::VAMANA_TYPE {
+            // A detached auxiliary shard must identify its layout and centroids
+            // without relying on a sibling graph file.
+            storage_ivf.centroids = ivf.centroids.clone();
+        }
         let mut index_ivf = IvfModel::new(ivf.centroids.clone().unwrap(), ivf.loss);
         let mut partition_index_metadata = Vec::with_capacity(ivf.num_partitions());
 
@@ -1951,6 +1956,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         );
 
         let index_type_str = index_type_string(S::name().try_into()?, Q::quantization_type());
+        if S::name() == lance_index::vector::vamana::VAMANA_TYPE {
+            storage_writer.add_schema_metadata(
+                INDEX_METADATA_SCHEMA_KEY,
+                serde_json::to_string(&IndexMetadata {
+                    index_type: index_type_str.clone(),
+                    distance_type: self.distance_type.to_string(),
+                })?,
+            );
+        }
         if let Some(idx_type) = SupportedIvfIndexType::from_index_type_str(&index_type_str) {
             write_unified_ivf_and_index_metadata(
                 &mut index_writer,

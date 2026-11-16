@@ -628,7 +628,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     .await?
                 };
                 CreatedIndex {
-                    index_details: vector_index_details(vec_params),
+                    index_details: vector_index_details(vec_params)?,
                     index_version,
                     files: table_files_to_index(files),
                 }
@@ -4531,7 +4531,7 @@ mod tests {
                     uuid,
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params)),
+                    Arc::new(vector_index_details(&params).unwrap()),
                     IndexType::IvfHnswFlat.version(),
                     source_dataset_version,
                     vec![],
@@ -4557,7 +4557,7 @@ mod tests {
                     Uuid::new_v4(),
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params)),
+                    Arc::new(vector_index_details(&params).unwrap()),
                     IndexType::IvfHnswFlat.version(),
                     dataset.manifest.version + 1,
                     vec![],

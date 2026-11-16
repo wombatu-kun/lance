@@ -58,6 +58,12 @@ impl VamanaBuildParams {
                 "Vamana search_list_size must be greater than zero".to_string(),
             ));
         }
+        if u32::try_from(self.search_list_size).is_err() {
+            return Err(Error::invalid_input(format!(
+                "Vamana search_list_size {} does not fit in 32 bits",
+                self.search_list_size
+            )));
+        }
         validate_alpha(self.alpha)
     }
 }
@@ -131,6 +137,55 @@ pub struct VamanaQueryParams {
     pub stop: Option<AdaptiveStop>,
 }
 
+impl VamanaQueryParams {
+    /// Construct search parameters, rejecting overflow in the candidate count
+    /// or the default list size. An explicit `ef` does not evaluate the default.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_index::vector::{Query, vamana::VamanaQueryParams};
+    /// # fn checked(query: &Query) -> Result<()> {
+    /// let params = VamanaQueryParams::try_from_query(query)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_from_query(query: &Query) -> Result<Self> {
+        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
+        let k = query.k.checked_mul(refine_factor).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Vamana k {} times refine_factor {refine_factor} overflows",
+                query.k
+            ))
+        })?;
+        let ef = match query.ef {
+            Some(ef) => ef,
+            None => k.checked_add(k / 2).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Vamana default search_list_size overflows for {k} candidates"
+                ))
+            })?,
+        };
+        Ok(Self {
+            ef,
+            lower_bound: query.lower_bound,
+            upper_bound: query.upper_bound,
+            dist_q_c: query.dist_q_c,
+            stop: query.adaptive_stop,
+        })
+    }
+
+    /// Legacy infallible conversion. The `From`/`Into` trait conversion remains
+    /// available for source compatibility but does not validate arithmetic.
+    #[deprecated(note = "use VamanaQueryParams::try_from_query to reject parameter overflow")]
+    pub fn from<T>(value: T) -> Self
+    where
+        Self: From<T>,
+    {
+        <Self as From<T>>::from(value)
+    }
+}
+
+/// Legacy conversion; use [`VamanaQueryParams::try_from_query`] for validation.
 impl From<&Query> for VamanaQueryParams {
     fn from(query: &Query) -> Self {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
@@ -158,7 +213,88 @@ pub struct VamanaMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::Float32Array;
+    use rstest::rstest;
+
     use super::*;
+
+    #[rstest]
+    #[case::maximum(u32::MAX as u64, true)]
+    #[case::too_wide(u32::MAX as u64 + 1, false)]
+    fn build_list_size_fits_the_wire_field(#[case] size: u64, #[case] valid: bool) {
+        let Ok(size) = usize::try_from(size) else {
+            return;
+        };
+        let result = VamanaBuildParams::default()
+            .with_search_list_size(size)
+            .validate();
+        if valid {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(
+                error.to_string().contains("does not fit in 32 bits"),
+                "{error}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::default(10, None, None, Some(15))]
+    #[case::refine(10, Some(2), None, Some(30))]
+    #[case::product_overflow(usize::MAX, Some(2), Some(usize::MAX), None)]
+    #[case::default_overflow(usize::MAX, None, None, None)]
+    #[case::explicit_ef(usize::MAX, None, Some(usize::MAX), Some(usize::MAX))]
+    fn checked_query_parameters(
+        #[case] k: usize,
+        #[case] refine_factor: Option<u32>,
+        #[case] ef: Option<usize>,
+        #[case] expected: Option<usize>,
+    ) {
+        let query = Query {
+            column: "vec".into(),
+            key: Arc::new(Float32Array::from(vec![1.0])),
+            k,
+            lower_bound: Some(0.25),
+            upper_bound: Some(0.75),
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            search_effort: 0.5,
+            ef,
+            refine_factor,
+            metric_type: None,
+            use_index: true,
+            query_parallelism: 1,
+            dist_q_c: 0.5,
+            approx_mode: Default::default(),
+            adaptive_stop: None,
+        };
+        match expected {
+            Some(expected) => {
+                let params = VamanaQueryParams::try_from_query(&query).unwrap();
+                assert_eq!(params.ef, expected);
+                assert_eq!(params.lower_bound, query.lower_bound);
+                assert_eq!(params.upper_bound, query.upper_bound);
+                assert_eq!(params.dist_q_c, query.dist_q_c);
+                #[allow(deprecated)]
+                let identity = VamanaQueryParams::from(params);
+                assert_eq!(identity.ef, params.ef);
+                if k <= 10 {
+                    #[allow(deprecated)]
+                    let legacy = VamanaQueryParams::from(&query);
+                    assert_eq!(legacy.ef, params.ef);
+                }
+            }
+            None => {
+                let error = VamanaQueryParams::try_from_query(&query).unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+                assert!(error.to_string().contains("overflows"), "{error}");
+            }
+        }
+    }
 
     #[test]
     fn invalid_build_params_are_rejected() {

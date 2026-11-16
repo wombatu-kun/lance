@@ -4,9 +4,6 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::compute::concat_batches;
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Float32Type, UInt64Type};
 use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
@@ -29,10 +26,12 @@ use lance_io::scheduler::{IoStats, ScanStats};
 use lance_io::spill::SpillStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
+use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 
 use super::rescore::rescore;
+use super::shortlist::Shortlist;
 use crate::dataset::Dataset;
 use crate::index::resolve_index_column;
 use crate::{Error, Result};
@@ -113,10 +112,15 @@ impl Sizes {
                 "ef must be greater than or equal to k ({ef} < {results})"
             )));
         }
-        let search_list_size = query
-            .ef
-            .unwrap_or(shortlist.saturating_add(shortlist / 2))
-            .max(shortlist);
+        let search_list_size = match query.ef {
+            Some(ef) => ef,
+            None => shortlist.checked_add(shortlist / 2).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Vamana default search_list_size overflows for shortlist {shortlist}"
+                ))
+            })?,
+        }
+        .max(shortlist);
         Ok(Self {
             results,
             shortlist,
@@ -173,31 +177,21 @@ impl VamanaIvfIndex {
         partition_query
     }
 
-    /// The query's results among the nearest candidates of `found` together,
+    /// The query's results among the retained candidates of `shortlist`,
     /// at their exact distances, with the reads counted in `io_stats`.
     async fn rescore_shortlist(
         &self,
         query: &Query,
         sizes: &Sizes,
-        found: &[RecordBatch],
+        shortlist: Shortlist,
         io_stats: Option<IoStats>,
     ) -> Result<RecordBatch> {
-        let found = concat_batches(&VECTOR_RESULT_SCHEMA, found)?;
-        let distances = found.column(0).as_primitive::<Float32Type>().values();
-        let row_ids = found.column(1).as_primitive::<UInt64Type>().values();
-        let mut shortlist = (0..found.num_rows()).collect::<Vec<_>>();
-        shortlist.sort_by(|a, b| {
-            distances[*a]
-                .total_cmp(&distances[*b])
-                .then(row_ids[*a].cmp(&row_ids[*b]))
-        });
-        shortlist.truncate(sizes.shortlist);
         rescore(
             &self.dataset,
             &self.column,
             self.inner.metric_type(),
             query,
-            shortlist.into_iter().map(|row| row_ids[row]).collect(),
+            shortlist.into_row_ids(),
             sizes.results,
             io_stats,
         )
@@ -293,7 +287,37 @@ impl VectorIndex for VamanaIvfIndex {
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        self.inner.search(query, pre_filter, metrics).await
+        let sizes = Sizes::of(query)?;
+        let mut query = query.clone();
+        if self.metric_type() == DistanceType::Cosine {
+            query.key = normalize_arrow(&query.key)?.0;
+        }
+        let (partitions, q_c_dists) = self.find_partitions(&query)?;
+        let mut partition_query = self.partition_query(&query, &sizes);
+        let mut shortlist = Shortlist::new(if self.rescores(&query) {
+            sizes.shortlist
+        } else {
+            sizes.results
+        });
+        for (partition, distance) in partitions.values().iter().zip(q_c_dists.values()) {
+            partition_query.dist_q_c = *distance;
+            let found = self
+                .inner
+                .search_in_partition(
+                    *partition as usize,
+                    &partition_query,
+                    pre_filter.clone(),
+                    metrics,
+                )
+                .await?;
+            shortlist.extend(&found)?;
+        }
+        if self.rescores(&query) {
+            self.rescore_shortlist(&query, &sizes, shortlist, metrics.io_stats())
+                .await
+        } else {
+            shortlist.into_batch()
+        }
     }
 
     fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)> {
@@ -324,7 +348,10 @@ impl VectorIndex for VamanaIvfIndex {
         if !self.rescores(query) {
             return Ok(found);
         }
-        self.rescore_shortlist(query, &sizes, &[found], metrics.io_stats())
+        let mut shortlist = Shortlist::new(sizes.shortlist);
+        shortlist.extend(&found)?;
+        drop(found);
+        self.rescore_shortlist(query, &sizes, shortlist, metrics.io_stats())
             .await
     }
 
@@ -404,7 +431,7 @@ impl VectorIndex for VamanaIvfIndex {
             )));
         }
         let io_stats = metrics.io_stats();
-        let found = self
+        let mut found = self
             .inner
             .clone()
             .search_partitions(
@@ -417,11 +444,13 @@ impl VectorIndex for VamanaIvfIndex {
                 None,
                 metrics,
             )
-            .await?
-            .try_collect::<Vec<_>>()
             .await?;
+        let mut shortlist = Shortlist::new(sizes.shortlist);
+        while let Some(batch) = found.try_next().await? {
+            shortlist.extend(&batch)?;
+        }
         let nearest = self
-            .rescore_shortlist(&query, &sizes, &found, io_stats)
+            .rescore_shortlist(&query, &sizes, shortlist, io_stats)
             .await?;
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             VECTOR_RESULT_SCHEMA.clone(),
@@ -573,6 +602,7 @@ mod tests {
     #[case::short_ef_widened(10, None, Some(15), (10, 20, 20))]
     #[case::long_ef_kept(10, None, Some(100), (10, 20, 100))]
     #[case::ef_equal_to_the_results(10, Some(2), Some(20), (20, 20, 20))]
+    #[case::explicit_ef_avoids_unused_default_overflow(usize::MAX, Some(1), Some(usize::MAX), (usize::MAX, usize::MAX, usize::MAX))]
     fn sizes_follow_k_refine_factor_and_ef(
         #[case] k: usize,
         #[case] refine_factor: Option<u32>,
@@ -602,6 +632,11 @@ mod tests {
     #[case::overflow(
         query(usize::MAX, Some(2), None),
         "overflows",
+        |error: &Error| matches!(error, Error::InvalidInput { .. })
+    )]
+    #[case::default_list_overflow(
+        query(usize::MAX / 2, None, None),
+        "default search_list_size overflows",
         |error: &Error| matches!(error, Error::InvalidInput { .. })
     )]
     fn sizes_refuse_what_no_walk_can_answer(

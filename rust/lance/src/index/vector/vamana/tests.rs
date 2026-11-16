@@ -20,27 +20,33 @@ use arrow_schema::{DataType, Field};
 use futures::TryStreamExt;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::ROW_ID;
+use lance_core::cache::LanceCache;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::exec::ExecutionSummaryCounts;
 use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
 use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, Seed, array, gen_batch};
+use lance_encoding::decoder::FilterExpression;
+use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::vector_index_details::{Compression, ScalarQuantization};
 use lance_index::pb::{HnswParameters, VamanaParameters, VectorIndexDetails};
 use lance_index::prefilter::NoFilter;
+use lance_index::progress::noop_progress;
 use lance_index::vector::bq::RQBuildParams;
+use lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files;
 use lance_index::vector::flat::index::FlatQuantizer;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
+use lance_index::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel};
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
 use lance_index::vector::quantizer::{Quantization, QuantizationType};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::sq::builder::SQBuildParams;
-use lance_index::vector::storage::VectorStore;
+use lance_index::vector::storage::{STORAGE_METADATA_KEY, VectorStore};
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::vector::vamana::graph::Adjacency;
 use lance_index::vector::vamana::{AdaptiveStop, Vamana, VamanaBuildParams};
@@ -49,15 +55,20 @@ use lance_index::vector::{
     SQ_CODE_COLUMN, VectorIndex,
 };
 use lance_index::{
-    INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, IVF_RQ_INDEX_VERSION, IVF_VAMANA_INDEX_VERSION,
-    IndexType,
+    INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IVF_RQ_INDEX_VERSION,
+    IVF_VAMANA_INDEX_VERSION, IndexType,
 };
-use lance_io::scheduler::IoStats;
+use lance_io::ReadBatchParams;
+use lance_io::scheduler::{IoStats, ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use lance_io::utils::tracking_store::IoRequestRecord;
 use lance_linalg::distance::DistanceType;
+use lance_linalg::kernels::normalize_arrow;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
 use lance_table::io::manifest::read_manifest_indexes;
 use lance_testing::datagen::generate_random_array_with_seed;
+use prost::Message;
 use roaring::RoaringBitmap;
 use rstest::rstest;
 use uuid::Uuid;
@@ -72,12 +83,13 @@ use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::scanner::{QueryFilter, Scanner};
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, Dataset, WriteMode, WriteParams};
+use crate::index::prefilter::DatasetPreFilter;
 use crate::index::vector::builder::{ExistingIndex, index_type_string};
 use crate::index::vector::ivf::v2::IVFIndex;
 use crate::index::vector::utils::get_vector_dim;
 use crate::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
-use crate::index::{unsupported_index_version, vector_index_details_default};
+use crate::index::{unsupported_index_version, vector_index_details, vector_index_details_default};
 
 const DIM: u32 = 32;
 /// The vectors of product-code cases. In a debug build a graph over product
@@ -100,6 +112,35 @@ fn vamana() -> VamanaBuildParams {
         max_degree: 16,
         search_list_size: 32,
         alpha: 1.2,
+    }
+}
+
+#[rstest]
+#[case::maximum(u32::MAX as u64, true)]
+#[case::too_wide(u32::MAX as u64 + 1, false)]
+fn build_parameters_are_checked_before_serializing_details(#[case] size: u64, #[case] valid: bool) {
+    let Ok(size) = usize::try_from(size) else {
+        return;
+    };
+    let params = VectorIndexParams::ivf_vamana(
+        DistanceType::L2,
+        ivf(),
+        vamana().with_search_list_size(size),
+    );
+    let details = vector_index_details(&params);
+    if valid {
+        let details = details.unwrap().to_msg::<VectorIndexDetails>().unwrap();
+        assert_eq!(
+            details.vamana_index_config.unwrap().search_list_size,
+            u32::MAX
+        );
+    } else {
+        let error = details.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("does not fit in 32 bits"),
+            "{error}"
+        );
     }
 }
 
@@ -976,6 +1017,160 @@ async fn partitions_answer_together_unless_a_control_steps_through_them() {
         .await
         .unwrap();
     assert!(none.iter().all(|batch| batch.num_rows() == 0), "{none:?}");
+}
+
+#[rstest]
+#[case::flat(Codes::Flat)]
+#[case::scalar(Codes::Sq)]
+#[case::product(Codes::Pq)]
+#[tokio::test]
+async fn direct_search_keeps_the_global_candidates_and_distance_contract(
+    #[case] codes: Codes,
+    #[values(DistanceType::L2, DistanceType::Cosine)] metric: DistanceType,
+    #[values(None, Some(3))] refine_factor: Option<u32>,
+) {
+    let dimension = codes.dimension();
+    let mut dataset = two_fragments_of_rows("memory://", 96, dimension, false).await;
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            Some(INDEX.into()),
+            &params(codes, metric),
+            true,
+        )
+        .await
+        .unwrap();
+    let index = open_segment(&dataset).await;
+    // These keys are deliberately not normalized, including for cosine.
+    let key = queries_of(dimension).swap_remove(0);
+    let exact = nearest(&dataset, &key, 96, Some(metric)).await;
+    let query = Query {
+        column: "vec".into(),
+        key: Arc::new(key),
+        k: 5,
+        lower_bound: None,
+        upper_bound: None,
+        minimum_nprobes: 2,
+        maximum_nprobes: Some(2),
+        search_effort: 0.5,
+        ef: Some(96),
+        refine_factor,
+        metric_type: Some(metric),
+        use_index: true,
+        query_parallelism: DEFAULT_QUERY_PARALLELISM,
+        dist_q_c: 0.0,
+        approx_mode: Default::default(),
+        adaptive_stop: None,
+    };
+    let found = index
+        .search(&query, Arc::new(NoFilter), &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let found = rows(&found);
+    assert_eq!(found.len(), query.k * refine_factor.unwrap_or(1) as usize);
+    let hits = exact[..query.k]
+        .iter()
+        .filter(|(id, _)| found.iter().any(|(row, _)| row == id))
+        .count();
+    let recall = hits as f32 / query.k as f32;
+    assert!(recall >= 0.5, "recall {recall}");
+    if refine_factor.is_none() || matches!(codes, Codes::Flat) {
+        assert_exact(&found, &exact);
+    }
+    if refine_factor.is_some() {
+        let mut partition_query = query.clone();
+        if metric == DistanceType::Cosine {
+            partition_query.key = normalize_arrow(&query.key).unwrap().0;
+        }
+        let (partitions, distances) = index.find_partitions(&partition_query).unwrap();
+        let mut reference = Vec::new();
+        for (partition, distance) in partitions.values().iter().zip(distances.values()) {
+            partition_query.dist_q_c = *distance;
+            reference.extend(rows(
+                &index
+                    .search_in_partition(
+                        *partition as usize,
+                        &partition_query,
+                        Arc::new(NoFilter),
+                        &NoOpMetricsCollector,
+                    )
+                    .await
+                    .unwrap(),
+            ));
+        }
+        reference.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        reference.truncate(found.len());
+        assert_eq!(found, reference);
+    }
+
+    let segments = dataset.load_indices_by_name(INDEX).await.unwrap();
+    let allowed: RowAddrTreeMap = exact.iter().step_by(2).map(|(id, _)| *id).collect();
+    let filter = DatasetPreFilter::new_with_filter_future(
+        Arc::new(dataset.clone()),
+        &segments,
+        Some(Box::pin(async move {
+            Ok(Arc::new(RowAddrMask::from_allowed(allowed)))
+        })),
+    );
+    let mut bounded = query.clone();
+    let filter = Arc::new(filter);
+    let scale = if refine_factor.is_some()
+        && metric == DistanceType::Cosine
+        && !matches!(codes, Codes::Flat)
+    {
+        2.0
+    } else {
+        1.0
+    };
+    bounded.lower_bound = Some(exact[2].1 * scale);
+    bounded.upper_bound = Some(exact[70].1 * scale);
+    let bounded = rows(
+        &index
+            .search(&bounded, filter.clone(), &NoOpMetricsCollector)
+            .await
+            .unwrap(),
+    );
+    assert!(!bounded.is_empty());
+    for (row, distance) in &bounded {
+        assert!(exact.iter().step_by(2).any(|(id, _)| id == row));
+        assert!(*distance >= exact[2].1 * scale && *distance < exact[70].1 * scale);
+    }
+    if refine_factor.is_none() || matches!(codes, Codes::Flat) {
+        assert_exact(&bounded, &exact);
+    }
+    let empty_filter = DatasetPreFilter::new_with_filter_future(
+        Arc::new(dataset.clone()),
+        &segments,
+        Some(Box::pin(async {
+            Ok(Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::new())))
+        })),
+    );
+    let empty = index
+        .search(&query, Arc::new(empty_filter), &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(empty.num_rows(), 0);
+
+    let mut huge = query.clone();
+    huge.k = usize::MAX;
+    huge.refine_factor = Some(1);
+    huge.ef = Some(usize::MAX);
+    huge.upper_bound = Some(f32::MAX);
+    let all = index
+        .search(&huge, filter, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(all.num_rows(), exact.len() / 2);
+    let mut overflow = query;
+    overflow.k = usize::MAX;
+    overflow.refine_factor = Some(2);
+    let error = index
+        .search(&overflow, Arc::new(NoFilter), &NoOpMetricsCollector)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    assert!(error.to_string().contains("overflows"), "{error}");
 }
 
 /// Without a refine factor a query scores twice `k` of the walk's candidates
@@ -2609,24 +2804,289 @@ async fn shards(dataset: &mut Dataset, params: &VectorIndexParams) -> Vec<IndexM
     shards
 }
 
+async fn shard_file(dataset: &Dataset, path: &object_store::path::Path) -> FileReader {
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+    FileReader::try_open(
+        scheduler
+            .open_file(path, &CachedFileSize::unknown())
+            .await
+            .unwrap(),
+        None,
+        Arc::default(),
+        &LanceCache::no_cache(),
+        FileReaderOptions::default(),
+    )
+    .await
+    .unwrap()
+}
+
+#[rstest]
+#[case::flat(Codes::Flat)]
+#[case::scalar(Codes::Sq)]
+#[case::product(Codes::Pq)]
+#[tokio::test]
+async fn auxiliary_shards_keep_their_type_and_codes_without_roots(#[case] codes: Codes) {
+    let mut dataset = if matches!(codes, Codes::Sq) {
+        fragments_over_ranges("memory://", 96, &[1.0, 4.0], false).await
+    } else {
+        two_fragments_of_rows("memory://", 96, codes.dimension(), false).await
+    };
+    let params = shard_params(codes, DistanceType::L2);
+    let shards = shards(&mut dataset, &params).await;
+    let mut paths = Vec::new();
+    let mut expected_codes = HashMap::new();
+    for shard in &shards {
+        let directory = dataset.indices_dir().join(shard.uuid.to_string());
+        let path = directory.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        if matches!(codes, Codes::Pq) {
+            let index = dataset
+                .open_vector_index_from_metadata("vec", shard, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            expected_codes.extend(product_codes_by_row_id(index.as_ref()).await);
+        }
+        dataset
+            .object_store
+            .delete(&directory.join(INDEX_FILE_NAME))
+            .await
+            .unwrap();
+        paths.push(path);
+    }
+    let target = dataset.indices_dir().join("rootless-merged");
+    merge_partial_vector_auxiliary_files(&dataset.object_store, &paths, &target, noop_progress())
+        .await
+        .unwrap();
+    let reader = shard_file(&dataset, &target.clone().join(INDEX_AUXILIARY_FILE_NAME)).await;
+    let metadata: lance_index::IndexMetadata =
+        serde_json::from_str(&reader.schema().metadata[INDEX_METADATA_SCHEMA_KEY]).unwrap();
+    assert_eq!(metadata.index_type, params.index_type().to_string());
+    let ivf_position = reader.schema().metadata[IVF_METADATA_KEY].parse().unwrap();
+    let ivf = IvfModel::try_from(
+        lance_index::pb::Ivf::decode(reader.read_global_buffer(ivf_position).await.unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        ivf.centroids.as_ref().unwrap(),
+        &shard_centroids(DistanceType::L2, codes.dimension())
+    );
+    assert_eq!(ivf.lengths.iter().sum::<u32>(), 96);
+    let batches = reader
+        .read_stream(
+            ReadBatchParams::RangeFull,
+            128,
+            1,
+            FilterExpression::no_filter(),
+        )
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let stored_metadata: Vec<String> =
+        serde_json::from_str(&reader.schema().metadata[STORAGE_METADATA_KEY]).unwrap();
+    match codes {
+        Codes::Pq => {
+            let metadata: lance_index::vector::pq::storage::ProductQuantizationMetadata =
+                serde_json::from_str(&stored_metadata[0]).unwrap();
+            assert!(!metadata.transposed);
+            let mut actual = HashMap::new();
+            for batch in &batches {
+                let codes = batch[PQ_CODE_COLUMN].as_fixed_size_list();
+                for (row, row_id) in batch[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .enumerate()
+                {
+                    actual.insert(
+                        *row_id,
+                        codes
+                            .value(row)
+                            .as_primitive::<UInt8Type>()
+                            .values()
+                            .to_vec(),
+                    );
+                }
+            }
+            assert_eq!(actual, expected_codes);
+        }
+        Codes::Sq => {
+            let metadata: lance_index::vector::sq::storage::ScalarQuantizationMetadata =
+                serde_json::from_str(&stored_metadata[0]).unwrap();
+            let expected_bounds = value_range(&dataset).await;
+            // JSON can round a bound's f64 promotion; compare at the source precision.
+            assert_eq!(
+                metadata.bounds.start as f32..metadata.bounds.end as f32,
+                expected_bounds
+            );
+            let vectors = vectors_by_row_id(&dataset).await;
+            let step = (metadata.bounds.end - metadata.bounds.start) / 255.0;
+            let mut count = 0;
+            for batch in &batches {
+                let codes = batch[SQ_CODE_COLUMN].as_fixed_size_list();
+                for (row, row_id) in batch[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .enumerate()
+                {
+                    let codes = codes.value(row);
+                    for (value, code) in vectors[row_id]
+                        .iter()
+                        .zip(codes.as_primitive::<UInt8Type>().values())
+                    {
+                        let decoded = metadata.bounds.start + f64::from(*code) * step;
+                        assert!((f64::from(*value) - decoded).abs() <= 1.5 * step + 1e-9);
+                    }
+                    count += 1;
+                }
+            }
+            assert_eq!(count, vectors.len());
+        }
+        Codes::Flat => {
+            let vectors = vectors_by_row_id(&dataset).await;
+            let mut count = 0;
+            for batch in &batches {
+                let stored =
+                    batch[lance_index::vector::flat::storage::FLAT_COLUMN].as_fixed_size_list();
+                for (row, row_id) in batch[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .enumerate()
+                {
+                    assert_eq!(
+                        stored
+                            .value(row)
+                            .as_primitive::<Float32Type>()
+                            .values()
+                            .as_ref(),
+                        vectors[row_id].as_slice()
+                    );
+                    count += 1;
+                }
+            }
+            assert_eq!(count, vectors.len());
+        }
+    }
+    let error = super::segments::write_merged_root(
+        &dataset.object_store,
+        &target,
+        reader,
+        &ivf,
+        &metadata,
+        &[],
+        noop_progress(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::Index { .. }), "{error:?}");
+    assert!(
+        error
+            .to_string()
+            .contains("source graph build parameters are missing"),
+        "{error}"
+    );
+}
+
+#[rstest]
+#[case::across_shards(false, "Index type mismatch across shards")]
+#[case::root_and_auxiliary(true, "Index type mismatch between auxiliary and root")]
+#[tokio::test]
+async fn auxiliary_merge_rejects_inconsistent_index_types(
+    #[case] swap_root: bool,
+    #[case] reason: &str,
+) {
+    let mut dataset = two_fragments_of_rows("memory://", 48, DIM, false).await;
+    let flat = shard(
+        &mut dataset,
+        0,
+        &shard_params(Codes::Flat, DistanceType::L2),
+    )
+    .await;
+    let sq = shard(&mut dataset, 1, &shard_params(Codes::Sq, DistanceType::L2)).await;
+    let flat_dir = dataset.indices_dir().join(flat.uuid.to_string());
+    let sq_dir = dataset.indices_dir().join(sq.uuid.to_string());
+    let paths = if swap_root {
+        let root = dataset
+            .object_store
+            .read_one_all(&flat_dir.join(INDEX_FILE_NAME))
+            .await
+            .unwrap();
+        dataset
+            .object_store
+            .put(&sq_dir.clone().join(INDEX_FILE_NAME), &root)
+            .await
+            .unwrap();
+        vec![sq_dir.join(INDEX_AUXILIARY_FILE_NAME)]
+    } else {
+        vec![
+            flat_dir.join(INDEX_AUXILIARY_FILE_NAME),
+            sq_dir.join(INDEX_AUXILIARY_FILE_NAME),
+        ]
+    };
+    let error = merge_partial_vector_auxiliary_files(
+        &dataset.object_store,
+        &paths,
+        &dataset.indices_dir().join("mismatched"),
+        noop_progress(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::Index { .. }), "{error:?}");
+    assert!(error.to_string().contains(reason), "{error}");
+}
+
 /// Shards of the index built apart merge into one segment whose partitions
 /// each hold a graph drawn over all of their merged rows, with the build
 /// parameters the shards share, under every kind of codes and either metric.
 #[rstest]
-#[case::flat(Codes::Flat, DistanceType::L2, 400)]
-#[case::scalar(Codes::Sq, DistanceType::L2, 400)]
+#[case::flat(Codes::Flat, DistanceType::L2, 400, 2)]
+#[case::scalar(Codes::Sq, DistanceType::L2, 400, 2)]
 // The given codebook needs no rows to train on, so the case keeps few.
-#[case::product(Codes::Pq, DistanceType::L2, ROWS / 5)]
-#[case::flat_cosine(Codes::Flat, DistanceType::Cosine, 400)]
+#[case::product(Codes::Pq, DistanceType::L2, ROWS / 5, 2)]
+#[case::flat_cosine(Codes::Flat, DistanceType::Cosine, 400, 2)]
+#[case::empty_middle(Codes::Flat, DistanceType::L2, 96, 1)]
 #[tokio::test]
 async fn shards_built_apart_merge_into_graphs_drawn_over_their_rows(
     #[case] codes: Codes,
     #[case] distance_type: DistanceType,
     #[case] rows: u64,
+    #[case] empty_partition: usize,
 ) {
     let dir = TempStrDir::default();
     let mut dataset = two_fragments_of_rows(dir.as_str(), rows, codes.dimension(), false).await;
-    let params = shard_params(codes, distance_type);
+    let mut params = shard_params(codes, distance_type);
+    if empty_partition == 1 {
+        let centroids = shard_centroids(distance_type, codes.dimension());
+        let values = [0, 2, 1]
+            .into_iter()
+            .flat_map(|i| {
+                centroids
+                    .value(i)
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        params.stages[0] = StageParams::Ivf(
+            IvfBuildParams::try_with_centroids(
+                3,
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(values),
+                        codes.dimension() as i32,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap(),
+        );
+    }
     let shards = shards(&mut dataset, &params).await;
     let merged = dataset.merge_existing_index_segments(shards).await.unwrap();
     assert_eq!(merged.index_version, IVF_VAMANA_INDEX_VERSION as i32);
@@ -2654,8 +3114,12 @@ async fn shards_built_apart_merge_into_graphs_drawn_over_their_rows(
     assert_eq!(merged.len(), 3);
     // A graph read back empty records the default parameters, so the empty
     // partition is checked by its size.
-    assert!(merged[2].row_ids.is_empty());
-    for (partition, fresh) in merged.iter().zip(&fresh).take(2) {
+    assert!(merged[empty_partition].row_ids.is_empty());
+    for (partition, fresh) in merged
+        .iter()
+        .zip(&fresh)
+        .filter(|(partition, _)| !partition.row_ids.is_empty())
+    {
         // Both shards brought rows to the partition.
         let fragments = partition
             .row_ids

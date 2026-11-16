@@ -24,8 +24,8 @@ use crate::{Error, Result};
 
 /// The graph parameters an IVF_VAMANA_* index records in its details, or
 /// `None` for the parameters of any other index.
-pub fn config(params: &VectorIndexParams) -> Option<VamanaParameters> {
-    super::vamana_stage(params).map(config_of)
+pub fn config(params: &VectorIndexParams) -> Result<Option<VamanaParameters>> {
+    super::vamana_stage(params).map(config_of).transpose()
 }
 
 /// The build parameters `config` records.
@@ -53,17 +53,13 @@ pub fn recorded_params(segment: &IndexMetadata) -> Option<VamanaBuildParams> {
         .map(build_params)
 }
 
-fn config_of(vamana: &VamanaBuildParams) -> VamanaParameters {
-    debug_assert!(
-        u32::try_from(vamana.search_list_size).is_ok(),
-        "check_params refuses a search list of {} rows, wider than 32 bits",
-        vamana.search_list_size
-    );
-    VamanaParameters {
+fn config_of(vamana: &VamanaBuildParams) -> Result<VamanaParameters> {
+    vamana.validate()?;
+    Ok(VamanaParameters {
         max_degree: vamana.max_degree,
-        search_list_size: u32::try_from(vamana.search_list_size).unwrap_or(u32::MAX),
+        search_list_size: vamana.search_list_size as u32,
         alpha: vamana.alpha,
-    }
+    })
 }
 
 /// The parameters that build an index like the one `config` and
@@ -159,5 +155,5 @@ pub fn infer(
             params.search_list_size
         )));
     }
-    Ok(Some(config_of(&params)))
+    Ok(Some(config_of(&params)?))
 }

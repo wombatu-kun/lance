@@ -747,7 +747,7 @@ async fn plan_split_rebuild(
         covering_fields: Vec::new(),
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(RoaringBitmap::new()),
-        index_details: Some(Arc::new(vector_index_details(&params))),
+        index_details: Some(Arc::new(vector_index_details(&params)?)),
         index_version: params.index_type().version(),
         created_at: Some(Utc::now()),
         base_id: None,

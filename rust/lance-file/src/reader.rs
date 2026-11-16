@@ -2498,7 +2498,7 @@ mod tests {
         Array, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array, Int32Array, ListArray,
         RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
         cast::AsArray,
-        types::{Float64Type, Int8Type, Int32Type},
+        types::{Float64Type, Int8Type, Int32Type, UInt32Type},
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
@@ -3128,6 +3128,42 @@ mod tests {
             .await?
             .try_collect::<Vec<_>>()
             .await
+    }
+
+    #[tokio::test]
+    async fn test_default_reader_rejects_decreasing_list_offsets() {
+        let lists = ListArray::from_iter_primitive::<UInt32Type, _, _>([
+            Some(vec![Some(7), Some(11)]),
+            Some(vec![Some(13)]),
+        ]);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "__neighbors",
+            lists.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(lists)]).unwrap();
+        // V2.0 stores list offsets as plain u64 values, omitting the initial zero.
+        let offsets = [2_u64, 3]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect::<Vec<_>>();
+        let error = read_file_with_mutated_bytes(
+            LanceFileVersion::V2_0,
+            batch,
+            &offsets,
+            8,
+            &1_u64.to_le_bytes(),
+        )
+        .await
+        .expect_err("decreasing list offsets must fail the read");
+        assert!(
+            matches!(error, lance_core::Error::CorruptFile { .. }),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("decreases from 2 to 1"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

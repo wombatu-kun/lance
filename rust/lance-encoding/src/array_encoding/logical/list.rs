@@ -215,7 +215,13 @@ fn decode_offsets(
     offsets: &dyn Array,
     list_requests: &[ListRequest],
     null_offset_adjustment: u64,
-) -> (VecDeque<Range<u64>>, Vec<u64>, BooleanBuffer) {
+) -> Result<(VecDeque<Range<u64>>, Vec<u64>, BooleanBuffer)> {
+    if null_offset_adjustment == 0 {
+        return Err(Error::corrupt_file_named(
+            "list offsets",
+            "null_offset_adjustment must be greater than zero",
+        ));
+    }
     // In our example this is [10, 20, 120, 50, 60]
     let numeric_offsets = offsets.as_primitive::<UInt64Type>();
     // In our example there are 4 total lists
@@ -295,35 +301,51 @@ fn decode_offsets(
         // Finally, we go through and shift the offsets.  If we just returned them as is (taking care of
         // nulls) we would get [0, 10, 20, 20, 60] but our last list only has 10 items, not 40 and so we
         // need to shift that 60 to a 40.
-        normalized_offsets.extend(
-                offsets_values
-                    .slice(offsets_to_norm_start, num_offsets_to_norm)
-                    .windows(2)
-                    .map(|w| {
-                        let start = w[0] % null_offset_adjustment;
-                        let end = w[1] % null_offset_adjustment;
-                        if end < start {
-                            panic!("End is less than start in window {:?} with null_offset_adjustment={} we get start={} and end={}", w, null_offset_adjustment, start, end);
-                        }
-                        let length = end - start;
-                        last_normalized_offset += length;
-                        last_normalized_offset
-                    }),
-            );
+        for window in offsets_values
+            .slice(offsets_to_norm_start, num_offsets_to_norm)
+            .windows(2)
+        {
+            let start = window[0] % null_offset_adjustment;
+            let end = window[1] % null_offset_adjustment;
+            let length = end.checked_sub(start).ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "list offsets",
+                    format!("list offset decreases from {start} to {end} with null_offset_adjustment {null_offset_adjustment}"),
+                )
+            })?;
+            last_normalized_offset =
+                last_normalized_offset.checked_add(length).ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        "list offsets",
+                        "normalized list offset exceeds u64 capacity",
+                    )
+                })?;
+            normalized_offsets.push(last_normalized_offset);
+        }
         trace!(
             "List offsets range of {} lists maps to item range {:?}",
             num_lists, items_range
         );
         offsets_offset += num_offsets_to_norm as u32;
         if !items_range.is_empty() {
-            let items_range =
-                items_range.start + req.items_offset..items_range.end + req.items_offset;
+            let shift = |offset: u64| {
+                offset.checked_add(req.items_offset).ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        "list offsets",
+                        format!(
+                            "list item offset {offset} plus page offset {} exceeds u64 capacity",
+                            req.items_offset
+                        ),
+                    )
+                })
+            };
+            let items_range = shift(items_range.start)?..shift(items_range.end)?;
             item_ranges.push_back(items_range);
         }
     }
 
     let validity = validity_buffer.finish();
-    (item_ranges, normalized_offsets, validity)
+    Ok((item_ranges, normalized_offsets, validity))
 }
 
 /// After scheduling the offsets we immediately launch this task as a new tokio task
@@ -351,7 +373,7 @@ async fn indirect_schedule_task(
     let (offsets, _) = decode_task.task.decode()?;
 
     let (item_ranges, offsets, validity) =
-        decode_offsets(offsets.as_ref(), &list_requests, null_offset_adjustment);
+        decode_offsets(offsets.as_ref(), &list_requests, null_offset_adjustment)?;
 
     trace!(
         "Indirectly scheduling items ranges {:?} from list items column with {} rows (and priority {:?})",
@@ -1388,6 +1410,27 @@ mod tests {
 
     use super::*;
     use crate::decoder::LogicalPageDecoder;
+
+    #[rstest::rstest]
+    #[case::descending(vec![2, 1], 4, 0, "decreases from 2 to 1")]
+    #[case::zero_adjustment(vec![1, 2], 0, 0, "null_offset_adjustment must be greater than zero")]
+    #[case::item_offset_overflow(vec![1, 2], 4, u64::MAX, "exceeds u64 capacity")]
+    fn corrupt_list_offsets_return_errors(
+        #[case] offsets: Vec<u64>,
+        #[case] adjustment: u64,
+        #[case] items_offset: u64,
+        #[case] message: &str,
+    ) {
+        let requests = [ListRequest {
+            num_lists: 2,
+            includes_extra_offset: false,
+            null_offset_adjustment: adjustment,
+            items_offset,
+        }];
+        let error = decode_offsets(&UInt64Array::from(offsets), &requests, adjustment).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+        assert!(error.to_string().contains(message), "{error}");
+    }
 
     #[test]
     fn oversized_binary_batch_error_is_actionable() {

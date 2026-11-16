@@ -20,6 +20,7 @@ pub mod merge;
 mod params;
 mod rescore;
 pub mod segments;
+mod shortlist;
 #[cfg(test)]
 mod tests;
 mod vectors;
@@ -138,12 +139,6 @@ pub fn check_params(dataset: &Dataset, column: &str, params: &VectorIndexParams)
         ));
     }
     vamana.validate()?;
-    if u32::try_from(vamana.search_list_size).is_err() {
-        return Err(Error::invalid_input(format!(
-            "Vamana search_list_size {} does not fit in 32 bits",
-            vamana.search_list_size
-        )));
-    }
     let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
     let DataType::FixedSizeList(_, dimension) = &vector_type else {
         return Err(Error::not_supported(format!(

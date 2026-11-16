@@ -85,7 +85,7 @@ enum CompressionDetailsJson {
 }
 
 /// Build a `VectorIndexDetails` proto from build params at index creation time.
-pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
+pub fn vector_index_details(params: &VectorIndexParams) -> Result<prost_types::Any> {
     let metric_type = match params.metric_type {
         lance_linalg::distance::DistanceType::L2 => VectorMetricType::L2,
         lance_linalg::distance::DistanceType::Cosine => VectorMetricType::Cosine,
@@ -165,9 +165,9 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
         hnsw_index_config,
         compression,
         runtime_hints,
-        vamana_index_config: super::vamana::details::config(params),
+        vamana_index_config: super::vamana::details::config(params)?,
     };
-    prost_types::Any::from_msg(&details).unwrap()
+    Ok(prost_types::Any::from_msg(&details)?)
 }
 
 pub fn vector_index_details_default() -> prost_types::Any {
@@ -1169,7 +1169,7 @@ mod tests {
             },
         );
 
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params).unwrap();
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details
@@ -1285,7 +1285,7 @@ mod tests {
         );
         params.skip_transpose = true;
 
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params).unwrap();
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details.runtime_hints.get("lance.hnsw.prefetch_distance"),
@@ -1338,7 +1338,7 @@ mod tests {
         };
         let params = VectorIndexParams::ivf_hnsw(DistanceType::L2, IvfBuildParams::default(), hnsw);
 
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params).unwrap();
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details.runtime_hints.get("lance.hnsw.prefetch_distance"),
@@ -1376,7 +1376,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params).unwrap();
         let json = vector_details_as_json(&any).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["runtime_hints"]["lance.ivf.max_iters"], "100");
@@ -1471,7 +1471,7 @@ mod tests {
 
         let params = build_roundtrip_params(combo, metric);
 
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params).unwrap();
         let restored = vector_params_from_details(&any)
             .expect("non-empty details should round-trip to params");
 

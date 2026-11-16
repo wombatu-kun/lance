@@ -394,8 +394,10 @@ mod tests {
     }
 
     /// Applying a re-encoding rewrites the code column only.
-    #[test]
-    fn applying_a_recode_rewrites_only_the_codes() {
+    #[rstest::rstest]
+    #[case::whole(0, 2)]
+    #[case::nonzero_slice(1, 1)]
+    fn applying_a_recode_rewrites_only_the_codes(#[case] offset: usize, #[case] length: usize) {
         let recode = ScalarRecode::between(&(0.0..1.0), &(0.0..2.0));
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0, 128, 255, 7]), 2)
@@ -406,10 +408,11 @@ mod tests {
             Field::new(SQ_CODE_COLUMN, codes.data_type().clone(), true),
         ]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(other), Arc::new(codes)]).unwrap();
-        let recoded = recode.apply(batch).unwrap();
+        let recoded = recode.apply(batch.slice(offset, length)).unwrap();
+        assert_eq!(recoded.num_rows(), length);
         assert_eq!(
             recoded["other"].as_primitive::<Float32Type>().values(),
-            &[1.5, 2.5]
+            &[1.5, 2.5][offset..offset + length]
         );
         let codes = recoded[SQ_CODE_COLUMN].as_fixed_size_list();
         assert_eq!(
@@ -419,7 +422,7 @@ mod tests {
                 recode.codes[128],
                 recode.codes[255],
                 recode.codes[7]
-            ]
+            ][offset * 2..(offset + length) * 2]
         );
     }
 }
