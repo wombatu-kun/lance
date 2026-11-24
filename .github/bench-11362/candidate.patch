@@ -1,0 +1,73 @@
+diff --git a/rust/lance/src/session.rs b/rust/lance/src/session.rs
+index 781e0394c..582965ca4 100644
+--- a/rust/lance/src/session.rs
++++ b/rust/lance/src/session.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ // SPDX-FileCopyrightText: Copyright The Lance Authors
+
++use std::borrow::Borrow;
+ use std::collections::HashMap;
+ use std::sync::Arc;
+
+@@ -126,8 +127,9 @@ pub struct Session {
+     /// Optional runtime strategy, rebound for each opened index.
+     pub(crate) rabit_scan_factory: Option<Arc<dyn RabitScanFactory>>,
+
+-    /// See [`Self::with_datafusion_session`].
+-    datafusion_session: Option<SessionContext>,
++    /// Storing the concrete context here makes type checking [`crate::Dataset`]
++    /// and its callers expensive. See [`Self::with_datafusion_session`].
++    datafusion_session: Option<Arc<dyn Borrow<SessionContext> + Send + Sync>>,
+ }
+
+ impl DeepSizeOf for Session {
+@@ -387,13 +389,13 @@ impl Session {
+     /// session's datasets, e.g. with
+     /// [`lance_datafusion::planner::Planner::new_with_session`].
+     pub fn with_datafusion_session(mut self, session: SessionContext) -> Self {
+-        self.datafusion_session = Some(session);
++        self.datafusion_session = Some(Arc::new(session));
+         self
+     }
+
+     /// The session set by [`Self::with_datafusion_session`], if any.
+     pub fn datafusion_session(&self) -> Option<&SessionContext> {
+-        self.datafusion_session.as_ref()
++        self.datafusion_session.as_deref().map(Borrow::borrow)
+     }
+
+     /// Return a reference to the session's spill store.
+@@ -667,6 +669,8 @@ impl Default for Session {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use datafusion::execution::FunctionRegistry;
++    use datafusion::functions::core::coalesce;
+     use lance_core::cache::{CacheKey, UnsizedCacheKey};
+     use lance_core::deepsize::Context;
+     use lance_index::vector::VectorIndex;
+@@ -1142,11 +1146,18 @@ mod tests {
+
+         let datafusion_session = SessionContext::new();
+         let session = Session::default().with_datafusion_session(datafusion_session.clone());
+-        for session in [&session, &session.clone()] {
+-            assert_eq!(
+-                session.datafusion_session().unwrap().session_id(),
+-                datafusion_session.session_id()
+-            );
++        let cloned = session.clone();
++        let replaced = cloned
++            .clone()
++            .with_datafusion_session(SessionContext::new());
++
++        datafusion_session.register_udf(coalesce().as_ref().clone().with_aliases(["session_fn"]));
++        for session in [&session, &cloned] {
++            let context = session.datafusion_session().unwrap();
++            assert_eq!(context.session_id(), datafusion_session.session_id());
++            assert!(context.udf("session_fn").is_ok());
+         }
++        let replacement = replaced.datafusion_session().unwrap();
++        assert!(replacement.udf("session_fn").is_err());
+     }
+ }

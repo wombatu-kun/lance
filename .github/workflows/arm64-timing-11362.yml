@@ -1,0 +1,34 @@
+name: Time both ARM64 JNI release builds
+on:
+  push:
+    branches: [codex/11362-arm64-timing]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    if: github.repository == 'wombatu-kun/lance'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: lance-format/lance
+          ref: f9eb14ace1f0b153e9092087f9a1026e0182d11d
+          path: pinned-source
+          persist-credentials: false
+      - name: Measure both builds on this VM
+        timeout-minutes: 355
+        run: bash .github/bench-11362/measure.sh
+      - name: Save build logs and measurements
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: arm64-jni-build-times
+          path: ${{ runner.temp }}/arm64-jni-measurements/
+          if-no-files-found: warn
+          retention-days: 1
