@@ -230,6 +230,30 @@ pub struct Query {
 }
 
 impl Query {
+    /// Number of candidates the index must return before exact refinement.
+    ///
+    /// With no refinement the count is `k`. Returns an error if the requested
+    /// `k * refine_factor` exceeds the addressable candidate count.
+    ///
+    /// ```
+    /// # use lance_index::vector::Query;
+    /// # fn example(mut query: Query) -> lance_core::Result<()> {
+    /// query.k = 5;
+    /// query.refine_factor = Some(3);
+    /// assert_eq!(query.candidate_count()?, 15);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn candidate_count(&self) -> Result<usize> {
+        let factor = self.refine_factor.unwrap_or(1) as usize;
+        self.k.checked_mul(factor).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "k {} times refine_factor {factor} overflows",
+                self.k
+            ))
+        })
+    }
+
     /// Validate the resolved effort range.
     pub fn validate_search_effort(&self) -> Result<()> {
         if !self.search_effort.is_finite() || !(0.0..=1.0).contains(&self.search_effort) {

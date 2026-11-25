@@ -88,7 +88,7 @@ pub async fn check_mergeable(
         }
         roots.push(dir.join(INDEX_FILE_NAME));
     }
-    if let Some(params) = read_sources(object_store, &roots).await?.params {
+    if let Some(params) = read_sources(object_store, &roots, None).await?.params {
         agree(&mut recorded, params, || {
             "the graphs their root files record".to_string()
         })?;
@@ -130,7 +130,7 @@ pub async fn write_merged_root(
     sources: &[Path],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<IndexFile> {
-    let sources = read_sources(object_store, sources).await?;
+    let sources = read_sources(object_store, sources, Some(index_metadata)).await?;
     let loss = sources.loss().await?;
     if sources.params.is_none() && ivf.lengths.iter().any(|length| *length != 0) {
         return Err(Error::index(
@@ -213,9 +213,13 @@ impl Sources {
 }
 
 /// Open the root files `sources` of the segments a merge unites, refusing
-/// roots of different index types or metrics and graphs built under
-/// different parameters.
-async fn read_sources(object_store: &ObjectStore, sources: &[Path]) -> Result<Sources> {
+/// roots with incompatible types, metrics or graph build parameters. When
+/// rebuilding a graph, the roots must also agree with the merged storage.
+async fn read_sources(
+    object_store: &ObjectStore,
+    sources: &[Path],
+    auxiliary_metadata: Option<&IndexMetadata>,
+) -> Result<Sources> {
     let scheduler = ScanScheduler::new(
         Arc::new(object_store.clone()),
         SchedulerConfig::max_bandwidth(object_store),
@@ -249,10 +253,11 @@ async fn read_sources(object_store: &ObjectStore, sources: &[Path]) -> Result<So
                     "{INDEX_METADATA_SCHEMA_KEY} does not decode: {error}"
                 ))
             })?;
-        match &index_metadata {
+        match auxiliary_metadata.or(index_metadata.as_ref()) {
             Some(expected)
                 if expected.index_type != metadata.index_type
-                    || expected.distance_type != metadata.distance_type =>
+                    || DistanceType::try_from(expected.distance_type.as_str())?
+                        != DistanceType::try_from(metadata.distance_type.as_str())? =>
             {
                 return Err(Error::invalid_input(format!(
                     "Cannot merge an {} segment under {} with an {} segment under {} in {source}",

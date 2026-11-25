@@ -6,7 +6,7 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
 use arrow::array::{Float32Builder, Int32Builder, UInt64Builder};
@@ -47,6 +47,7 @@ use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
     PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
 };
+use lance_index::IndexType;
 use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::DIST_Q_C_COLUMN;
@@ -1277,7 +1278,7 @@ pub fn new_knn_exec(
     prefilter_source: PreFilterSource,
     overlay_block: Option<RowAddrMask>,
     external_mask: Option<Arc<RowAddrMask>>,
-) -> Result<Arc<dyn ExecutionPlan>> {
+) -> Result<ANNIvfSubIndexExec> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
         indices.iter().map(|idx| idx.uuid).collect_vec(),
@@ -1298,7 +1299,7 @@ pub fn new_knn_exec(
         sub_index = sub_index.with_external_mask(external_mask);
     }
 
-    Ok(Arc::new(sub_index))
+    Ok(sub_index)
 }
 
 /// [ExecutionPlan] to execute the find the closest IVF partitions.
@@ -1556,6 +1557,10 @@ pub struct ANNIvfSubIndexExec {
     /// Vector Query.
     query: Query,
 
+    /// A scanner-supplied range is in exact cosine units. A directly
+    /// constructed node takes bounds in the index's own units.
+    pub(super) exact_cosine_bounds: bool,
+
     /// Prefiltering input
     prefilter_source: PreFilterSource,
 
@@ -1587,6 +1592,7 @@ impl ANNIvfSubIndexExec {
                 PART_ID_COLUMN
             )));
         }
+        query.candidate_count()?;
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -1599,11 +1605,19 @@ impl ANNIvfSubIndexExec {
             indices,
             query,
             prefilter_source,
+            exact_cosine_bounds: false,
             overlay_block: None,
             external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    pub(crate) fn with_exact_refinement(mut self) -> Self {
+        self.exact_cosine_bounds = self.query.refine_factor.is_some()
+            && self.query.metric_type == Some(DistanceType::Cosine)
+            && (self.query.lower_bound.is_some() || self.query.upper_bound.is_some());
+        self
     }
 
     /// Block stale row addresses (see the `overlay_block` field) from index results.
@@ -1675,6 +1689,7 @@ impl DisplayAs for ANNIvfSubIndexExec {
 
 struct ANNIvfEarlySearchResults {
     k: usize,
+    first_score_scale: OnceLock<f32>,
     initial_ids: Mutex<Vec<u64>>,
     num_results_found: AtomicUsize,
     deltas_remaining: AtomicUsize,
@@ -1686,6 +1701,7 @@ impl ANNIvfEarlySearchResults {
     fn new(deltas_remaining: usize, k: usize) -> Self {
         Self {
             k,
+            first_score_scale: OnceLock::new(),
             initial_ids: Mutex::new(Vec::with_capacity(k)),
             num_results_found: AtomicUsize::new(0),
             deltas_remaining: AtomicUsize::new(deltas_remaining),
@@ -2273,6 +2289,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 dataset: self.dataset.clone(),
                 indices: self.indices.clone(),
                 query: self.query.clone(),
+                exact_cosine_bounds: self.exact_cosine_bounds,
                 prefilter_source,
                 overlay_block: self.overlay_block.clone(),
                 external_mask: self.external_mask.clone(),
@@ -2299,6 +2316,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let ds = self.dataset.clone();
         let column = self.query.column.clone();
         let indices = self.indices.clone();
+        let exact_cosine_bounds = self.exact_cosine_bounds;
         // Per-segment fragment restriction, applied to every partition result before
         // the shared search accounting sees it. Only enabled when every segment has a
         // fragment_bitmap, mirroring the `all_have_bitmaps` gate in
@@ -2406,6 +2424,27 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             ds.open_vector_index(&column, &index_uuid, &metrics.index_metrics).await?
                         };
                         query = normalize_query_for_index(raw_index.as_ref(), query)?;
+                        // Use the physical type even when a manifest has no quantizer details.
+                        let score_multiplier = if exact_cosine_bounds {
+                            let scale = if matches!(
+                                raw_index.index_type(),
+                                IndexType::IvfSq | IndexType::IvfPq | IndexType::IvfRq
+                                    | IndexType::IvfHnswSq | IndexType::IvfHnswPq
+                                    | IndexType::IvfVamanaSq | IndexType::IvfVamanaPq
+                            ) && raw_index.metric_type() == DistanceType::Cosine {
+                                // Squared L2 on normalized codes is twice the cosine distance.
+                                query.lower_bound = query.lower_bound.map(|bound| bound * 2.0);
+                                query.upper_bound = query.upper_bound.map(|bound| bound * 2.0);
+                                2.0
+                            } else {
+                                1.0
+                            };
+                            // Rank on the first segment's scale. Homogeneous segments
+                            // pass their batches through without copying any distances.
+                            *state.first_score_scale.get_or_init(|| scale) / scale
+                        } else {
+                            1.0
+                        };
                         let policy = AutoProbePolicy::from_env(&query, raw_index.as_ref())?;
                         policy.apply(&mut query, q_c_dists.values(), raw_index.metric_type());
 
@@ -2447,7 +2486,19 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             target_partitions,
                             seg_mask,
                         );
-                        DataFusionResult::Ok(early_search.chain(late_search).boxed())
+                        let results = early_search.chain(late_search);
+                        // The global shortlist sorts candidates before reranking.
+                        // Scores from different segments must use comparable units.
+                        if score_multiplier != 1.0 {
+                            Ok(results.map(move |batch| {
+                                let batch = batch?;
+                                let distances = batch[DIST_COL].as_primitive::<Float32Type>();
+                                let scaled = distances.unary::<_, Float32Type>(|d| d * score_multiplier);
+                                Ok(batch.replace_column_by_name(DIST_COL, Arc::new(scaled))?)
+                            }).boxed())
+                        } else {
+                            DataFusionResult::Ok(results.boxed())
+                        }
                     }
                 })
                 // Must use flatten_unordered to avoid deadlock.
@@ -2572,6 +2623,7 @@ impl ANNIvfBatchExec {
                 query.key.len()
             )));
         }
+        query.candidate_count()?;
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(knn_empty_result_schema(true)),
             Partitioning::RoundRobinBatch(1),

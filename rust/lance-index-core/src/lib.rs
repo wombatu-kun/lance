@@ -89,9 +89,10 @@ pub enum IndexType {
     IvfHnswPq = 105,
     IvfHnswFlat = 106,
     IvfRq = 107,
-    IvfVamanaFlat = 108,
-    IvfVamanaSq = 109,
-    IvfVamanaPq = 110,
+    // Keep fork-specific JNI codes clear of upstream IVF types.
+    IvfVamanaFlat = 200,
+    IvfVamanaSq = 201,
+    IvfVamanaPq = 202,
 }
 
 impl std::fmt::Display for IndexType {

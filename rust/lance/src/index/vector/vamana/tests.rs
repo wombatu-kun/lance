@@ -458,19 +458,19 @@ fn the_vamana_types_name_and_number_themselves() {
         (
             IndexType::IvfVamanaFlat,
             "IVF_VAMANA_FLAT",
-            108,
+            200,
             QuantizationType::Flat,
         ),
         (
             IndexType::IvfVamanaSq,
             "IVF_VAMANA_SQ",
-            109,
+            201,
             QuantizationType::Scalar,
         ),
         (
             IndexType::IvfVamanaPq,
             "IVF_VAMANA_PQ",
-            110,
+            202,
             QuantizationType::Product,
         ),
     ] {
@@ -2993,14 +2993,8 @@ async fn auxiliary_shards_keep_their_type_and_codes_without_roots(#[case] codes:
     );
 }
 
-#[rstest]
-#[case::across_shards(false, "Index type mismatch across shards")]
-#[case::root_and_auxiliary(true, "Index type mismatch between auxiliary and root")]
 #[tokio::test]
-async fn auxiliary_merge_rejects_inconsistent_index_types(
-    #[case] swap_root: bool,
-    #[case] reason: &str,
-) {
+async fn auxiliary_merge_rejects_inconsistent_index_types() {
     let mut dataset = two_fragments_of_rows("memory://", 48, DIM, false).await;
     let flat = shard(
         &mut dataset,
@@ -3009,26 +3003,12 @@ async fn auxiliary_merge_rejects_inconsistent_index_types(
     )
     .await;
     let sq = shard(&mut dataset, 1, &shard_params(Codes::Sq, DistanceType::L2)).await;
-    let flat_dir = dataset.indices_dir().join(flat.uuid.to_string());
-    let sq_dir = dataset.indices_dir().join(sq.uuid.to_string());
-    let paths = if swap_root {
-        let root = dataset
-            .object_store
-            .read_one_all(&flat_dir.join(INDEX_FILE_NAME))
-            .await
-            .unwrap();
+    let paths = [flat, sq].map(|shard| {
         dataset
-            .object_store
-            .put(&sq_dir.clone().join(INDEX_FILE_NAME), &root)
-            .await
-            .unwrap();
-        vec![sq_dir.join(INDEX_AUXILIARY_FILE_NAME)]
-    } else {
-        vec![
-            flat_dir.join(INDEX_AUXILIARY_FILE_NAME),
-            sq_dir.join(INDEX_AUXILIARY_FILE_NAME),
-        ]
-    };
+            .indices_dir()
+            .join(shard.uuid.to_string())
+            .join(INDEX_AUXILIARY_FILE_NAME)
+    });
     let error = merge_partial_vector_auxiliary_files(
         &dataset.object_store,
         &paths,
@@ -3038,7 +3018,47 @@ async fn auxiliary_merge_rejects_inconsistent_index_types(
     .await
     .unwrap_err();
     assert!(matches!(error, Error::Index { .. }), "{error:?}");
-    assert!(error.to_string().contains(reason), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("Index type mismatch across shards"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn merged_graph_rejects_source_roots_that_disagree_with_storage() {
+    let mut dataset = two_fragments_of_rows("memory://", 48, DIM, false).await;
+    let flat = shard(
+        &mut dataset,
+        0,
+        &shard_params(Codes::Flat, DistanceType::L2),
+    )
+    .await;
+    let flat_root = dataset
+        .indices_dir()
+        .join(flat.uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let root_bytes = dataset.object_store.read_one_all(&flat_root).await.unwrap();
+    let segments = shards(&mut dataset, &shard_params(Codes::Sq, DistanceType::L2)).await;
+    // All roots agree with one another, but the merged storage contains scalar codes.
+    for segment in &segments {
+        let root = dataset
+            .indices_dir()
+            .join(segment.uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        dataset.object_store.put(&root, &root_bytes).await.unwrap();
+    }
+    let error = dataset
+        .merge_existing_index_segments(segments)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    let message = error.to_string();
+    assert!(
+        message.contains("IVF_VAMANA_SQ") && message.contains("IVF_VAMANA_FLAT"),
+        "{message}"
+    );
 }
 
 /// Shards of the index built apart merge into one segment whose partitions

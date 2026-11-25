@@ -230,7 +230,25 @@ pub async fn ann_ivf_sub_index_exec_to_proto(
     exec: &ANNIvfSubIndexExec,
 ) -> Result<pb::AnnIvfSubIndexExecProto> {
     let table = table_identifier_from_dataset(exec.dataset()).await?;
-    let query = query_to_proto(exec.query())?;
+    let mut query = query_to_proto(exec.query())?;
+    let refined_cosine_range = exec.exact_cosine_bounds.then(|| {
+        let exact = pb::ann_ivf_sub_index_exec_proto::RefinedCosineRange {
+            lower_bound: query.lower_bound,
+            upper_bound: query.upper_bound,
+        };
+        // Older executors consume the query bounds directly. Preserve the
+        // planner's previous units for them, including its legacy metadata fallback.
+        if exec.indices().iter().any(|segment| {
+            segment.index_details.as_deref().is_some_and(|details| {
+                let kind = crate::index::vector::details::derive_vector_index_type(details);
+                kind.ends_with("SQ") || kind.ends_with("PQ")
+            })
+        }) {
+            query.lower_bound = query.lower_bound.map(|bound| bound * 2.0);
+            query.upper_bound = query.upper_bound.map(|bound| bound * 2.0);
+        }
+        exact
+    });
 
     let indices: Vec<table_pb::IndexMetadata> =
         exec.indices().iter().map(|idx| idx.into()).collect();
@@ -250,6 +268,7 @@ pub async fn ann_ivf_sub_index_exec_to_proto(
         table: Some(table),
         indices,
         prefilter_type,
+        refined_cosine_range,
     })
 }
 
@@ -269,7 +288,12 @@ pub async fn ann_ivf_sub_index_exec_from_proto(
     let query_proto = proto.query.ok_or_else(|| {
         Error::invalid_input_source("Missing VectorQueryProto in ANNIvfSubIndexExecProto".into())
     })?;
-    let query = query_from_proto(query_proto)?;
+    let mut query = query_from_proto(query_proto)?;
+    let exact_cosine_bounds = proto.refined_cosine_range.is_some();
+    if let Some(exact) = proto.refined_cosine_range {
+        query.lower_bound = exact.lower_bound;
+        query.upper_bound = exact.upper_bound;
+    }
 
     let indices: Vec<IndexMetadata> = proto
         .indices
@@ -309,7 +333,12 @@ pub async fn ann_ivf_sub_index_exec_from_proto(
         }
     };
 
-    ANNIvfSubIndexExec::try_new(input, dataset, indices, query, prefilter_source)
+    let exec = ANNIvfSubIndexExec::try_new(input, dataset, indices, query, prefilter_source)?;
+    Ok(if exact_cosine_bounds {
+        exec.with_exact_refinement()
+    } else {
+        exec
+    })
 }
 
 #[cfg(test)]
@@ -558,14 +587,14 @@ mod tests {
             column: "vector".to_string(),
             key,
             k: 10,
-            lower_bound: None,
-            upper_bound: None,
+            lower_bound: Some(0.5),
+            upper_bound: Some(0.9),
             minimum_nprobes: 2,
             maximum_nprobes: Some(4),
             search_effort: 0.5,
             ef: None,
             refine_factor: Some(2),
-            metric_type: Some(DistanceType::L2),
+            metric_type: Some(DistanceType::Cosine),
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
@@ -594,6 +623,9 @@ mod tests {
         // Encode
         let proto = ann_ivf_sub_index_exec_to_proto(&exec).await.unwrap();
         assert_eq!(proto.indices.len(), indices.len());
+        assert!(proto.refined_cosine_range.is_none());
+        assert_eq!(proto.query.as_ref().unwrap().lower_bound, Some(0.5));
+        assert_eq!(proto.query.as_ref().unwrap().upper_bound, Some(0.9));
 
         // Decode
         let back = ann_ivf_sub_index_exec_from_proto(proto, Some(dataset.clone()), input, None)

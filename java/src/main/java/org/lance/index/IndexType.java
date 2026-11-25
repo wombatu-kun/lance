@@ -34,9 +34,9 @@ public enum IndexType {
   IVF_HNSW_PQ(105),
   IVF_HNSW_FLAT(106),
   IVF_RQ(107),
-  IVF_VAMANA_FLAT(108),
-  IVF_VAMANA_SQ(109),
-  IVF_VAMANA_PQ(110);
+  IVF_VAMANA_FLAT(200),
+  IVF_VAMANA_SQ(201),
+  IVF_VAMANA_PQ(202);
 
   private final int value;
 

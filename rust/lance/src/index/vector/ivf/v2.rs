@@ -1318,14 +1318,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             partition_centroid.as_ref(),
             query,
         )?;
+        let k = query.candidate_count()?;
         let param = S::query_params(&query)?;
-        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-        let k = query.k.checked_mul(refine_factor).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "k {} times refine_factor {refine_factor} overflows",
-                query.k
-            ))
-        })?;
         let batch = part_entry.index.search_with_scratch(
             query.key,
             k,
@@ -1407,14 +1401,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             partition_centroid.as_ref(),
             query,
         )?;
+        let k = query.candidate_count()?;
         let param = S::query_params(&query)?;
-        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-        let k = query.k.checked_mul(refine_factor).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "k {} times refine_factor {refine_factor} overflows",
-                query.k
-            ))
-        })?;
         part_entry.index.accumulate_topk_with_scratch(
             query.key,
             k,
@@ -2278,14 +2266,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let local_metrics = LocalMetricsCollector::default();
             local_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
             let search_timer = IndexTimer::new(&local_metrics, IndexTiming::Search);
+            let k = query.candidate_count()?;
             let param = S::query_params(&query)?;
-            let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-            let k = query.k.checked_mul(refine_factor).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "k {} times refine_factor {refine_factor} overflows",
-                    query.k
-                ))
-            })?;
             let rotated_partition_centroid =
                 rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
             let residual = Self::query_context_for_scratch(
@@ -2393,7 +2375,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
 
         if control.is_none() && S::supports_global_topk_heap() {
-            let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
+            let heap_capacity = query.candidate_count()?;
             {
                 let _wait_timer = IndexTimer::new(metrics.as_ref(), IndexTiming::PrefilterWait);
                 pre_filter.wait_for_ready().await?;
@@ -2803,7 +2785,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         let use_query_residual = self.use_query_residual;
         let use_residual_scratch = self.use_residual_scratch;
-        let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
+        let heap_capacity = query.candidate_count()?;
         let mut heaps: Vec<BinaryHeap<OrderedNode<u64>>> = (0..query_count)
             .map(|_| BinaryHeap::with_capacity(heap_capacity))
             .collect();
@@ -3139,6 +3121,7 @@ mod tests {
     use lance_index::prefilter::{NoFilter, PreFilter};
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
+    use lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files;
     use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
     use lance_index::vector::flat::storage::FlatFloatStorage;
     use lance_index::vector::hnsw::builder::{HNSW_METADATA_KEY, HnswBuildParams};
@@ -3554,7 +3537,7 @@ mod tests {
         vectors
     }
 
-    async fn open_rq_aux_reader(
+    async fn open_aux_reader(
         dataset: &Dataset,
         scheduler: Arc<ScanScheduler>,
         index_uuid: &str,
@@ -3583,7 +3566,7 @@ mod tests {
         scheduler: Arc<ScanScheduler>,
         index_uuid: &str,
     ) -> RabitQuantizationMetadata {
-        let reader = open_rq_aux_reader(dataset, scheduler, index_uuid).await;
+        let reader = open_aux_reader(dataset, scheduler, index_uuid).await;
         let metadata = reader.schema().metadata.get(STORAGE_METADATA_KEY).unwrap();
         let metadata_entries: Vec<String> = serde_json::from_str(metadata).unwrap();
         serde_json::from_str(&metadata_entries[0]).unwrap()
@@ -5791,6 +5774,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_hnsw_auxiliary_merge_with_missing_or_inconsistent_root_metadata() {
+        let (batch, schema) = make_seeded_vector_batch(32);
+        let centroids = batch["vector"].as_fixed_size_list().slice(0, 1);
+        let ivf = IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap();
+        let mut dataset =
+            write_dataset_from_batches_with_max_rows("memory://", schema, vec![batch], 16).await;
+        let mut directories = Vec::new();
+        for (fragment, metric) in [(0, DistanceType::L2), (1, DistanceType::Dot)] {
+            let params =
+                VectorIndexParams::ivf_hnsw(metric, ivf.clone(), lightweight_hnsw_params());
+            let segment = dataset
+                .create_index_builder(&["vector"], IndexType::Vector, &params)
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            directories.push(dataset.indices_dir().join(segment.uuid.to_string()));
+        }
+        let store = &dataset.object_store;
+        let aux = directories[0].clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let merged = dataset.indices_dir().join("merged");
+        let progress = lance_index::progress::noop_progress();
+        let l2_root = directories[0].clone().join(super::INDEX_FILE_NAME);
+        let _ = store.io_stats_incremental();
+        merge_partial_vector_auxiliary_files(
+            store,
+            std::slice::from_ref(&aux),
+            &merged,
+            progress.clone(),
+        )
+        .await
+        .unwrap();
+        let requests = store.io_stats_incremental().requests;
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.path == l2_root && r.method == "head")
+                .count(),
+            1
+        );
+
+        // The 14.0.2 builder writes the type only in the root. Its auxiliary
+        // makes a valid file without lance:index to use as the merged shard's sibling.
+        let original_aux = store.read_one_all(&aux).await.unwrap();
+        let missing_metadata_root = merged.clone().join(super::INDEX_FILE_NAME);
+        store
+            .put(&missing_metadata_root, &original_aux)
+            .await
+            .unwrap();
+        let result = dataset.indices_dir().join("remerged");
+        let _ = store.io_stats_incremental();
+        merge_partial_vector_auxiliary_files(
+            store,
+            &[merged.join(INDEX_AUXILIARY_FILE_NAME)],
+            &result,
+            progress.clone(),
+        )
+        .await
+        .unwrap();
+        let requests = store.io_stats_incremental().requests;
+        assert!(requests.iter().all(|r| r.path != missing_metadata_root));
+        let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::default_for_testing());
+        let reader = open_aux_reader(&dataset, scheduler, "remerged").await;
+        let metadata: lance_index::IndexMetadata =
+            serde_json::from_str(&reader.schema().metadata[lance_index::INDEX_METADATA_SCHEMA_KEY])
+                .unwrap();
+        assert_eq!(metadata.index_type, "IVF_HNSW_FLAT");
+        assert_eq!(metadata.distance_type, "l2");
+        assert_eq!(reader.num_rows(), 16);
+
+        // A legacy auxiliary needs its own sibling for the type and centroids.
+        // Mixing two real HNSW shards with incompatible metrics must fail.
+        let dot_root = store
+            .read_one_all(&directories[1].clone().join(super::INDEX_FILE_NAME))
+            .await
+            .unwrap();
+        store.put(&l2_root, &dot_root).await.unwrap();
+        let error = merge_partial_vector_auxiliary_files(store, &[aux], &result, progress)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::Index { .. }),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("disagrees with auxiliary distance type l2"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_merge_existing_hnsw_segments_rejects_mismatched_build_params() {
         let test_dir = TempStrDir::default();
         let base_uri = test_dir.as_str();
@@ -6642,7 +6718,7 @@ mod tests {
         assert_eq!(rq_meta.num_bits, num_bits);
         assert_eq!(rq_meta.query_estimator, RabitQueryEstimator::RawQuery);
 
-        let reader = open_rq_aux_reader(&dataset, scheduler, &index_uuid).await;
+        let reader = open_aux_reader(&dataset, scheduler, &index_uuid).await;
         let schema = reader.schema();
         let ex_field = schema.field(RABIT_BLOCKED_EX_CODE_COLUMN).unwrap();
         let DataType::FixedSizeList(_, ex_code_bytes) = ex_field.data_type() else {
@@ -6997,7 +7073,7 @@ mod tests {
         });
         let probed = Arc::new(probed);
         let scheduler = ScanScheduler::new(probed, SchedulerConfig::default_for_testing());
-        let reader = open_rq_aux_reader(&dataset, scheduler, &indices[0].uuid.to_string()).await;
+        let reader = open_aux_reader(&dataset, scheduler, &indices[0].uuid.to_string()).await;
         max_in_flight.store(0, Ordering::SeqCst);
         let _storage = lance_index::vector::storage::IvfQuantizationStorage::<
             lance_index::vector::pq::ProductQuantizer,

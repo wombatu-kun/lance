@@ -203,28 +203,19 @@ fn ivf_centroids_from_proto(ivf: &pb::Ivf) -> Result<Option<FixedSizeListArray>>
         .transpose()
 }
 
-async fn open_sibling_index_reader(
-    object_store: &lance_io::object_store::ObjectStore,
+async fn open_shard_file(
     sched: &Arc<ScanScheduler>,
-    idx_path: &object_store::path::Path,
-) -> Result<Option<V2Reader>> {
-    if !object_store.exists(idx_path).await? {
-        return Ok(None);
-    }
-
-    let fh = sched
-        .open_file(idx_path, &CachedFileSize::unknown())
-        .await?;
-    Ok(Some(
-        V2Reader::try_open(
-            fh,
-            None,
-            Arc::default(),
-            &lance_core::cache::LanceCache::no_cache(),
-            V2ReaderOptions::default(),
-        )
-        .await?,
-    ))
+    path: &object_store::path::Path,
+) -> Result<V2Reader> {
+    let file = sched.open_file(path, &CachedFileSize::unknown()).await?;
+    V2Reader::try_open(
+        file,
+        None,
+        Arc::default(),
+        &lance_core::cache::LanceCache::no_cache(),
+        V2ReaderOptions::default(),
+    )
+    .await
 }
 
 /// Initialize schema-level metadata on a writer for a given storage.
@@ -920,15 +911,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
 
     // Iterate over each shard auxiliary file and merge its metadata and collect lengths
     for (idx, aux) in aux_paths.iter().enumerate() {
-        let fh = sched.open_file(aux, &CachedFileSize::unknown()).await?;
-        let reader = V2Reader::try_open(
-            fh,
-            None,
-            Arc::default(),
-            &lance_core::cache::LanceCache::no_cache(),
-            V2ReaderOptions::default(),
-        )
-        .await?;
+        let reader = open_shard_file(&sched, aux).await?;
         let meta = reader.metadata();
         let idx_path = aux
             .parent()
@@ -955,17 +938,30 @@ async fn merge_partial_vector_auxiliary_files_inner(
             ));
         }
 
-        let idx_reader = open_sibling_index_reader(object_store, &sched, &idx_path).await?;
+        // Read IVF lengths from global buffer
+        let pb_ivf = try_read_ivf_proto(&reader)
+            .await?
+            .ok_or_else(|| Error::index("IVF meta missing".to_string()))?;
+        let lengths = pb_ivf.lengths.clone();
+        let nlist = lengths.len();
+
+        let mut current_centroids = ivf_centroids_from_proto(&pb_ivf)?;
+        let aux_metadata = meta.file_schema.metadata.get(INDEX_METADATA_SCHEMA_KEY);
+        // Older auxiliaries keep the graph type or IVF centroids only in the root.
+        let idx_reader = if aux_metadata.is_none() || current_centroids.is_none() {
+            match open_shard_file(&sched, &idx_path).await {
+                Ok(reader) => Some(reader),
+                Err(error) if error.is_not_found() => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
         let schema_arrow: ArrowSchema = reader.schema().as_ref().into();
         let auxiliary_type = detect_supported_index_type(&reader, &schema_arrow)?;
         let mut declared_type = None;
-        // Every shard must agree, including its root and auxiliary metadata.
-        // Without an explicit auxiliary type, graph storage has only code columns.
         for (path, metadata) in [
-            (
-                aux,
-                meta.file_schema.metadata.get(INDEX_METADATA_SCHEMA_KEY),
-            ),
+            (aux, aux_metadata),
             (
                 &idx_path,
                 idx_reader.as_ref().and_then(|reader| {
@@ -1013,14 +1009,6 @@ async fn merge_partial_vector_auxiliary_files_inner(
         }
         detected_index_type = Some(index_type);
 
-        // Read IVF lengths from global buffer
-        let pb_ivf = try_read_ivf_proto(&reader)
-            .await?
-            .ok_or_else(|| Error::index("IVF meta missing".to_string()))?;
-        let lengths = pb_ivf.lengths.clone();
-        let nlist = lengths.len();
-
-        let mut current_centroids = ivf_centroids_from_proto(&pb_ivf)?;
         if current_centroids.is_none()
             && let Some(idx_reader) = idx_reader.as_ref()
             && let Some(index_ivf) = try_read_ivf_proto(idx_reader).await?

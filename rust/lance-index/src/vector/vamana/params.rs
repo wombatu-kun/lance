@@ -150,13 +150,7 @@ impl VamanaQueryParams {
     /// # }
     /// ```
     pub fn try_from_query(query: &Query) -> Result<Self> {
-        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-        let k = query.k.checked_mul(refine_factor).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Vamana k {} times refine_factor {refine_factor} overflows",
-                query.k
-            ))
-        })?;
+        let k = query.candidate_count()?;
         let ef = match query.ef {
             Some(ef) => ef,
             None => k.checked_add(k / 2).ok_or_else(|| {

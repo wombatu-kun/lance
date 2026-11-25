@@ -1343,16 +1343,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     batches.extend(extra);
                     loss += extra_loss;
                 }
-                // The old graph of the partition, for Vamana to extend over the
-                // storage of these rows.
-                let sources: &[ExistingIndex] = if is_affected { &[] } else { &indices };
-                let storage_rows = batches.iter().map(RecordBatch::num_rows).sum();
-                let base =
-                    super::vamana::merge::merge_base::<S, Q>(sources, partition, storage_rows)
-                        .await?;
+                let num_rows = batches.iter().map(RecordBatch::num_rows).sum();
+                let base = if S::name() == lance_index::vector::vamana::VAMANA_TYPE && !is_affected
+                {
+                    super::vamana::merge::merge_base::<S, Q>(&indices, partition, num_rows).await?
+                } else {
+                    None
+                };
 
                 spawn_cpu(move || {
-                    let num_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
                     if num_rows == 0 {
                         return Ok(Budgeted::untracked(PartitionBuildResult {
                             partition_id: output_partition_id,

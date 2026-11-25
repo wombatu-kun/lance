@@ -99,6 +99,17 @@ message ANNIvfSubIndexExecProto {
   lance.datafusion.TableIdentifier table = 2;
   repeated lance.table.IndexMetadata indices = 3;
   PreFilterType prefilter_type = 4;
+
+  message RefinedCosineRange {
+    optional float lower_bound = 1;
+    optional float upper_bound = 2;
+  }
+
+  /* Exact cosine bounds to translate for each physical segment before refinement.
+   * When present, query still carries the legacy index-scale bounds for older
+   * executors. When absent, pass query bounds directly to the index.
+   */
+  RefinedCosineRange refined_cosine_range = 5;
 }
 
 // Serializable form of ANNIvfPartitionExec — the IVF centroid routing node.

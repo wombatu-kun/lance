@@ -236,23 +236,6 @@ fn collect_fts_columns_in_order(query: &FtsQuery) -> Vec<String> {
     columns
 }
 
-/// The multiple of the exact distance a vector index ranks by. Lance indexes
-/// cosine on SQ and PQ as L2 over normalized vectors, twice `1 - cos`; FLAT
-/// and RQ rank it, and every other metric, on its own scale.
-fn index_distance_scale(metric: MetricType, segments: &[IndexMetadata]) -> f32 {
-    let quantized_as_l2 = segments.iter().any(|segment| {
-        segment.index_details.as_ref().is_some_and(|details| {
-            let index_type = crate::index::vector::details::derive_vector_index_type(details);
-            index_type.ends_with("PQ") || index_type.ends_with("SQ")
-        })
-    });
-    if metric == MetricType::Cosine && quantized_as_l2 {
-        2.0
-    } else {
-        1.0
-    }
-}
-
 fn collect_phrase_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
     match query {
         FtsQuery::Phrase(query) => {
@@ -6899,28 +6882,8 @@ impl Scanner {
 
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => {
-                    // Refine applies the distance range to exact distances, but
-                    // the search still has to, or a lower bound leaves it only
-                    // candidates refine then drops. It ranks on the index's own
-                    // scale, so it gets the range on that scale.
-                    let ann_query = match q.refine_factor {
-                        Some(_) => {
-                            let scale = index_distance_scale(index_metric, &index_segments);
-                            Query {
-                                lower_bound: q.lower_bound.map(|lower| lower * scale),
-                                upper_bound: q.upper_bound.map(|upper| upper * scale),
-                                ..q.clone()
-                            }
-                        }
-                        None => q.clone(),
-                    };
-                    self.ann(
-                        &ann_query,
-                        &index_segments,
-                        filter_plan,
-                        overlay_block.clone(),
-                    )
-                    .await?
+                    self.ann(&q, &index_segments, filter_plan, overlay_block.clone())
+                        .await?
                 }
                 DataType::List(_) => {
                     self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
@@ -8316,14 +8279,17 @@ impl Scanner {
         overlay_block: Option<RowAddrMask>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let prefilter_source = self.ann_prefilter_source(filter_plan, index).await?;
-        let inner_fanout_search = new_knn_exec(
-            self.dataset.clone(),
-            index,
-            q,
-            prefilter_source,
-            overlay_block,
-            self.external_row_mask.clone(),
-        )?;
+        let inner_fanout_search = Arc::new(
+            new_knn_exec(
+                self.dataset.clone(),
+                index,
+                q,
+                prefilter_source,
+                overlay_block,
+                self.external_row_mask.clone(),
+            )?
+            .with_exact_refinement(),
+        );
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
@@ -8340,7 +8306,7 @@ impl Scanner {
         };
         Ok(Arc::new(
             SortExec::new([sort_expr, sort_expr_row_id].into(), inner_fanout_search)
-                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+                .with_fetch(Some(q.candidate_count()?)),
         ))
     }
 
@@ -8376,14 +8342,14 @@ impl Scanner {
         let mut ann_nodes = Vec::with_capacity(new_queries.len());
         for query in new_queries {
             // this produces `nprobes * k * over_fetch_factor * num_indices` candidates
-            let ann_node = new_knn_exec(
+            let ann_node = Arc::new(new_knn_exec(
                 self.dataset.clone(),
                 index,
                 &query,
                 prefilter_source.clone(),
                 overlay_block.clone(),
                 self.external_row_mask.clone(),
-            )?;
+            )?);
             let sort_expr = PhysicalSortExpr {
                 expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
                 options: SortOptions {
@@ -8400,7 +8366,7 @@ impl Scanner {
             };
             let ann_node = Arc::new(
                 SortExec::new([sort_expr, sort_expr_row_id].into(), ann_node)
-                    .with_fetch(Some(q.k * over_fetch_factor as usize)),
+                    .with_fetch(Some(query.candidate_count()?)),
             );
             ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
@@ -8423,7 +8389,7 @@ impl Scanner {
         };
         let ann_node = Arc::new(
             SortExec::new([sort_expr, sort_expr_row_id].into(), ann_node)
-                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+                .with_fetch(Some(q.candidate_count()?)),
         );
 
         Ok(ann_node)
@@ -9126,10 +9092,12 @@ mod test {
     };
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::prefilter::NoFilter;
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
     };
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+    use lance_index::vector::bq::RQBuildParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -9151,10 +9119,17 @@ mod test {
     use crate::dataset::WriteMode;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
+    use crate::dataset::transaction::{Operation, Transaction};
     use crate::dataset::{NewColumnTransform, WriteParams};
     use crate::index::vector::{StageParams, VectorIndexParams};
     // Imported through the public `io::exec` re-export rather than the crate-private
     // `knn` module, so the tests below cover that surface too.
+    #[cfg(feature = "substrait")]
+    use crate::io::exec::ANNIvfSubIndexExec;
+    #[cfg(feature = "substrait")]
+    use crate::io::exec::ann_proto::{
+        ann_ivf_sub_index_exec_from_proto, ann_ivf_sub_index_exec_to_proto,
+    };
     use crate::io::exec::{ANNIvfBatchExec, QUERY_INDEX_COL};
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
@@ -12315,6 +12290,219 @@ mod test {
         }
     }
 
+    #[rstest]
+    #[case::flat_first(0, true, false)]
+    #[case::sq_first(1, true, false)]
+    #[case::empty_sq_details(1, false, false)]
+    #[case::rq_first(0, true, true)]
+    #[tokio::test]
+    async fn test_refined_cosine_range_across_segments(
+        #[case] first: usize,
+        #[case] has_sq_details: bool,
+        #[case] use_rq: bool,
+    ) {
+        // SQ ranks row 3 at roughly 0.6 internally. Row 0 scores 0.4 with
+        // FLAT and 0.8 with RQ. For RQ all rows equal their centroid, so its
+        // zero residuals give the same squared L2 under every rotation.
+        let unit = |x, y| [x, y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let query_values = unit(1.0, 0.0);
+        let orthogonal = unit(0.0, 1.0);
+        let row0 = unit(0.6, 0.8);
+        let rows = [
+            row0,
+            if use_rq { row0 } else { query_values },
+            if use_rq { row0 } else { orthogonal },
+            unit(0.7, 0.51_f32.sqrt()),
+            query_values,
+            orthogonal,
+        ];
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(rows.into_iter().flatten()),
+            8,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..6)) as ArrayRef,
+            ),
+            ("vec", Arc::new(vectors) as ArrayRef),
+        ])
+        .unwrap();
+        let schema = batch.schema();
+        let tmp = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &tmp,
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let query = Float32Array::from_iter_values(query_values);
+        let ivf = |centroid| {
+            let centroid = FixedSizeListArray::try_new_from_values(
+                Float32Array::from_iter_values(centroid),
+                8,
+            )
+            .unwrap();
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroid)).unwrap()
+        };
+        let params = [
+            if use_rq {
+                VectorIndexParams::with_ivf_rq_params(
+                    DistanceType::Cosine,
+                    ivf(row0),
+                    RQBuildParams::default(),
+                )
+            } else {
+                VectorIndexParams::with_ivf_flat_params(DistanceType::Cosine, ivf(query_values))
+            },
+            VectorIndexParams::with_ivf_sq_params(
+                DistanceType::Cosine,
+                ivf(query_values),
+                SQBuildParams::default(),
+            ),
+        ];
+        let mut segments = Vec::new();
+        for (fragment_id, params) in params.iter().enumerate() {
+            let mut segment = dataset
+                .create_index_builder(&["vec"], IndexType::Vector, params)
+                .name("vec_idx".to_string())
+                .fragments(vec![fragment_id as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            if fragment_id == 1 && !has_sq_details {
+                Arc::make_mut(segment.index_details.as_mut().unwrap())
+                    .value
+                    .clear();
+            }
+            segments.push(segment);
+        }
+        let initial = segments.remove(first);
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", vec![initial])
+            .await
+            .unwrap();
+
+        let scan = |dataset: &Dataset, k| {
+            let mut scan = dataset.scan();
+            scan.nearest("vec", &query, k)
+                .unwrap()
+                .fast_search()
+                .refine(1)
+                .distance_range(Some(0.25), Some(0.45))
+                .project(&["id"])
+                .unwrap();
+            scan
+        };
+        let search = async |dataset: &Dataset, k| {
+            let batch = scan(dataset, k).try_into_batch().await.unwrap();
+            batch["id"].as_primitive::<Int32Type>().values().to_vec()
+        };
+        assert_eq!(search(&dataset, 1).await, [(first * 3) as i32]);
+
+        if use_rq {
+            let batch = dataset
+                .scan()
+                .nearest("vec", &query, 1)
+                .unwrap()
+                .fast_search()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let native = batch[DIST_COL].as_primitive::<Float32Type>().value(0);
+            assert!((native - 0.8).abs() < 1e-5, "native RQ distance: {native}");
+        }
+
+        #[cfg(feature = "substrait")]
+        {
+            // Older executors consume the native bounds after dropping the extension.
+            let plan = scan(&dataset, 1).create_plan().await.unwrap();
+            let exec = find_exec::<ANNIvfSubIndexExec>(plan.as_ref()).unwrap();
+            let decode = async |wire| {
+                let inputs = exec.children();
+                ann_ivf_sub_index_exec_from_proto(
+                    wire,
+                    Some(exec.dataset().clone()),
+                    inputs[0].clone(),
+                    inputs.get(1).map(|p| (*p).clone()),
+                )
+                .await
+                .unwrap()
+            };
+            let count_candidates = async |wire| {
+                let stream = decode(wire)
+                    .await
+                    .execute(0, Arc::new(datafusion::execution::TaskContext::default()))
+                    .unwrap();
+                stream
+                    .try_fold(0usize, |count, batch| async move {
+                        Ok(count + batch.num_rows())
+                    })
+                    .await
+                    .unwrap()
+            };
+            let mut wire = ann_ivf_sub_index_exec_to_proto(exec).await.unwrap();
+            // The scanner infers missing manifest details from the standalone index.
+            let legacy_scale = if first == 1 { 2.0 } else { 1.0 };
+            let native = wire.query.as_ref().unwrap();
+            assert_eq!(native.lower_bound, Some(0.25 * legacy_scale));
+            assert_eq!(native.upper_bound, Some(0.45 * legacy_scale));
+            let exact = wire.refined_cosine_range.as_ref().unwrap();
+            assert_eq!(
+                (exact.lower_bound, exact.upper_bound),
+                (Some(0.25), Some(0.45))
+            );
+            assert_eq!(count_candidates(wire.clone()).await, 1);
+            if !has_sq_details {
+                // A distributed caller can supply genuinely empty physical-plan
+                // metadata, bypassing the scanner's manifest inference.
+                let mut missing = wire.clone();
+                missing.indices[0]
+                    .index_details
+                    .as_mut()
+                    .unwrap()
+                    .value
+                    .clear();
+                let mut missing = ann_ivf_sub_index_exec_to_proto(&decode(missing).await)
+                    .await
+                    .unwrap();
+                let native = missing.query.as_ref().unwrap();
+                assert_eq!(
+                    (native.lower_bound, native.upper_bound),
+                    (Some(0.25), Some(0.45))
+                );
+                assert_eq!(count_candidates(missing.clone()).await, 1);
+                missing.refined_cosine_range = None;
+                assert_eq!(count_candidates(missing).await, 0);
+            }
+            wire.refined_cosine_range = None;
+            assert_eq!(count_candidates(wire).await, usize::from(!use_rq));
+        }
+
+        // Lance 12 checked only the detail type URL when committing segments;
+        // these quantizers all declare VectorIndexDetails. Recreate that manifest
+        // directly since the current segment builder checks physical types too.
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: segments,
+                removed_indices: Vec::new(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(search(&dataset, 2).await, [3, 0]);
+        assert_eq!(search(&dataset, 1).await, [3]);
+    }
+
     #[tokio::test]
     async fn test_batch_knn_indexed() {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
@@ -13079,14 +13267,12 @@ mod test {
         }
     }
 
-    /// Finds the batch vector-search node in a physical plan.
-    fn find_ann_ivf_batch_exec(plan: &dyn ExecutionPlan) -> Option<&ANNIvfBatchExec> {
-        if let Some(batch_exec) = plan.downcast_ref::<ANNIvfBatchExec>() {
-            return Some(batch_exec);
-        }
-        plan.children()
-            .into_iter()
-            .find_map(|child| find_ann_ivf_batch_exec(child.as_ref()))
+    fn find_exec<T: ExecutionPlan>(plan: &dyn ExecutionPlan) -> Option<&T> {
+        plan.downcast_ref::<T>().or_else(|| {
+            plan.children()
+                .into_iter()
+                .find_map(|child| find_exec::<T>(child.as_ref()))
+        })
     }
 
     /// A caller that matches the batch node in a plan reads the search back out
@@ -13114,7 +13300,7 @@ mod test {
         scan.project(&["i"]).unwrap();
 
         let plan = scan.create_plan().await.unwrap();
-        let batch_exec = find_ann_ivf_batch_exec(plan.as_ref())
+        let batch_exec = find_exec::<ANNIvfBatchExec>(plan.as_ref())
             .expect("indexed batch KNN should plan an ANNIvfBatchExec");
 
         let query = batch_exec.query();
@@ -13694,6 +13880,123 @@ mod test {
         let mut values = batch["foo"].as_primitive::<Int32Type>().values().to_vec();
         values.sort_unstable();
         assert_eq!(values, (0..12_288).map(|idx| idx * 2).collect::<Vec<_>>());
+    }
+
+    #[rstest]
+    #[case::flat(VectorIndexParams::ivf_flat(1, DistanceType::L2))]
+    #[case::hnsw(VectorIndexParams::ivf_hnsw(
+        DistanceType::L2,
+        IvfBuildParams::new(1),
+        HnswBuildParams::default()
+    ))]
+    #[tokio::test]
+    async fn test_ivf_refine_factor_overflow(#[case] params: VectorIndexParams) {
+        let mut dataset = gen_batch()
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(2)))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(8))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &Float32Array::from(vec![1.0, 1.0]), usize::MAX)
+            .unwrap()
+            .refine(2);
+        let assert_overflow = |error: Error| {
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("k {} times refine_factor 2 overflows", usize::MAX)),
+                "{error}"
+            );
+        };
+        assert_overflow(scan.try_into_batch().await.unwrap_err());
+
+        let query = scan.nearest.as_ref().unwrap();
+        let segments = dataset.load_indices_by_name("idx").await.unwrap();
+        assert_overflow(
+            new_knn_exec(
+                scan.dataset.clone(),
+                &segments,
+                query,
+                PreFilterSource::None,
+                None,
+                None,
+            )
+            .unwrap_err(),
+        );
+        assert_overflow(
+            new_knn_batch_exec(
+                scan.dataset.clone(),
+                &segments,
+                query,
+                1,
+                PreFilterSource::None,
+            )
+            .unwrap_err(),
+        );
+        let index = dataset
+            .open_vector_index("vec", &segments[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let filter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+        assert_overflow(
+            index
+                .search_in_partition(0, query, filter.clone(), metrics.as_ref())
+                .await
+                .unwrap_err(),
+        );
+        let partition = index
+            .prepare_partition_search(0, query, filter.clone(), metrics.as_ref())
+            .await
+            .unwrap();
+        assert_overflow(
+            index
+                .search_prepared_partition(partition, metrics.as_ref())
+                .unwrap_err(),
+        );
+
+        if index.supports_batch_partition_search() {
+            let (partitions, distances) = index.find_partitions(query).unwrap();
+            let partitions = Arc::new(partitions);
+            let distances = Arc::new(distances);
+            let result = index
+                .clone()
+                .search_partitions(
+                    query.clone(),
+                    partitions.clone(),
+                    distances.clone(),
+                    0,
+                    1,
+                    filter.clone(),
+                    None,
+                    metrics.clone(),
+                )
+                .await;
+            assert_overflow(result.err().expect("overflow must precede heap allocation"));
+            assert_overflow(
+                index
+                    .search_partitions_batch(
+                        query.clone(),
+                        vec![partitions],
+                        vec![distances],
+                        filter,
+                        metrics,
+                    )
+                    .await
+                    .unwrap_err(),
+            );
+        }
     }
 
     #[rstest]
